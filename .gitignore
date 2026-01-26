@@ -14,11 +14,10 @@ logs/
 bugtrace.db
 reports/
 .claude/
-.agent/
 backups/
 data/
 uploads/
 .pytest_cache/
 .ralph/
-alembic/versions/
 alembic.ini
+# Keep .agent/ and alembic/versions to preserve framework logic and DB schema
