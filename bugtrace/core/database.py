@@ -373,11 +373,6 @@ class DatabaseManager:
         Returns:
             Scan ID
         """
-        import traceback
-        logger.info(f"DEBUG: save_scan_result called for {len(findings)} findings")
-        for line in traceback.format_stack()[-6:]:
-            logger.info(f"Stack: {line.strip()}")
-
         with self.get_session() as session:
             if scan_id:
                 scan = session.get(ScanTable, scan_id)
