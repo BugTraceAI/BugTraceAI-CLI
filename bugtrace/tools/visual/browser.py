@@ -43,25 +43,19 @@ class BrowserManager:
             pass
             
     async def _kill_orphans(self):
-        """Kill any zombie chrome/chromium processes to prevent locks (async-safe).
+        """Kill zombie chrome/chromium processes launched by Playwright only.
 
-        Uses subprocess_exec with argument arrays to avoid shell injection risks.
+        Only kills processes with remote-debugging-port (Playwright's Chrome),
+        leaving user's personal Chrome untouched.
         """
         try:
-            # Use create_subprocess_exec with argument arrays (no shell interpretation)
-            proc1 = await asyncio.create_subprocess_exec(
-                "pkill", "-f", "chrome",
+            # Only kill Chrome instances launched with debugging port (Playwright)
+            proc = await asyncio.create_subprocess_exec(
+                "pkill", "-f", "remote-debugging-port",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL
             )
-            proc2 = await asyncio.create_subprocess_exec(
-                "pkill", "-f", "chromium",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
-            # Wait for both, ignore exit codes (pkill returns 1 if no process found)
-            await asyncio.gather(proc1.wait(), proc2.wait(), return_exceptions=True)
-            # Async sleep to allow OS to reclaim resources
+            await proc.wait()
             await asyncio.sleep(0.3)
         except Exception:
             pass  # Non-critical cleanup
@@ -191,11 +185,10 @@ class BrowserManager:
             self._browser = None
             self._playwright = None
             self._context = None
-            # System level kill using subprocess with argument arrays (no shell)
+            # Only kill Playwright's Chrome (with debugging port), not user's Chrome
             import subprocess
             try:
-                subprocess.run(["pkill", "-f", "chrome"], check=False, timeout=5)
-                subprocess.run(["pkill", "-f", "chromium"], check=False, timeout=5)
+                subprocess.run(["pkill", "-f", "remote-debugging-port"], check=False, timeout=5)
             except Exception:
                 pass
             logger.info("Emergency browser cleanup performed.")

@@ -40,22 +40,18 @@ class Dashboard:
         self._lock = threading.RLock() # Thread safety first!
         self.active = False
         
-        # Ultra compact layout: 2 header lines + sections + 1 footer
+        # Compact layout: reduced separators for smaller terminals (min ~20 lines)
         self.layout.split(
             Layout(name="header1", size=1),
-            Layout(name="sep1", size=1),
             Layout(name="header2", size=1),
-            Layout(name="sep2", size=1),
             Layout(name="status_bar", size=1),
-            Layout(name="sep_status", size=1),
-            Layout(name="payloads", ratio=1, minimum_size=4),
+            Layout(name="sep1", size=1),
+            Layout(name="payloads", ratio=1, minimum_size=3),
+            Layout(name="tasks", ratio=1, minimum_size=2),
+            Layout(name="sep2", size=1),
+            Layout(name="log", ratio=2, minimum_size=5),
             Layout(name="sep3", size=1),
-            Layout(name="tasks", ratio=1, minimum_size=3),
-            Layout(name="sep_tasks", size=1),
-            Layout(name="log", ratio=2, minimum_size=8),
-            Layout(name="sep4", size=1),
-            Layout(name="findings", ratio=1, minimum_size=6),
-            Layout(name="sep5", size=1),
+            Layout(name="findings", ratio=1, minimum_size=4),
             Layout(name="footer", size=1)
         )
         
@@ -222,7 +218,7 @@ class Dashboard:
         # Dynamic Sizing for Robustness
         try:
             width = self.console.size.width
-        except:
+        except Exception:
             width = 80
             
         # Fixed length parts approx: Title (40) + Metrics (~30) = 70
@@ -379,24 +375,23 @@ class Dashboard:
 
     def update_log_section(self):
         with self._lock:
-            recent_logs = self.logs[-8:] if len(self.logs) >= 8 else self.logs
-            # Copy to avoid mutation during iteration if we were iterating logic, but slicing creates a copy.
-        
+            recent_logs = self.logs[-5:] if len(self.logs) >= 5 else self.logs
+
         lines = []
         for timestamp, level, msg in recent_logs:
             if "SUCCESS" in level or "✓" in str(msg): icon, color = "✓", "bright_green"
             elif "WARN" in level or "⚠" in str(msg): icon, color = "⚠", "bright_yellow"
             elif "ERROR" in level or "CRITICAL" in level: icon, color = "✗", "bright_red"
             else: icon, color = "", "white"
-            
+
             display_msg = str(msg)[:75] + "..." if len(str(msg)) > 75 else str(msg)
             lines.append(Text.assemble((f"[{timestamp}] ", "white dim"), (f"{icon} " if icon else "", color), (display_msg, "white")))
-        
-        while len(lines) < 8: lines.append(Text("", style="white"))
+
+        while len(lines) < 5: lines.append(Text("", style="white"))
         content = Text("\n").join(lines)
         panel = Panel(content, title="[bright_yellow bold]📋 LOG[/bright_yellow bold]", border_style="cyan", padding=(0, 1))
         self.layout["log"].update(panel)
-        # Ensure tasks are rendered after logs to keep UI order
+
     def update_tasks_section(self):
         """Render active tasks with spinner for running tasks."""
         with self._lock:
@@ -423,8 +418,8 @@ class Dashboard:
                 lines.append(line)
         else:
             lines.append(Text("No active tasks", style="white dim"))
-        # Pad to fixed height (5 lines)
-        while len(lines) < 5:
+        # Pad to fixed height (3 lines)
+        while len(lines) < 3:
             lines.append(Text("", style="white"))
         content = Text("\n").join(lines)
         panel = Panel(content, title="[bright_yellow bold]⚙️ TASKS[/bright_yellow bold]", border_style="bright_cyan", padding=(0,1))
@@ -436,7 +431,7 @@ class Dashboard:
             current_findings = list(self.findings)
         
         severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
-        sorted_findings = sorted(current_findings, key=lambda x: severity_order.get(x[2], 99))[:5]
+        sorted_findings = sorted(current_findings, key=lambda x: severity_order.get(x[2], 99))[:4]
         
         lines = []
         if sorted_findings:
@@ -450,8 +445,8 @@ class Dashboard:
                 lines.append(Text.assemble((emoji + " ", color), (f"[{severity}] ", color), (f"{finding_type} @ ", "white"), (details_display, "white")))
         else:
             lines.append(Text("No findings yet...", style="white dim"))
-        
-        while len(lines) < 5: lines.append(Text("", style="white"))
+
+        while len(lines) < 4: lines.append(Text("", style="white"))
         content = Text("\n").join(lines)
         panel = Panel(content, title=f"[bright_yellow bold]🔍 FINDINGS ({len(current_findings)} total)[/bright_yellow bold]", border_style="magenta", padding=(0, 1))
         self.layout["findings"].update(panel)
@@ -463,12 +458,11 @@ class Dashboard:
     def update_separators(self):
         try:
             width = self.console.size.width
-        except:
+        except Exception:
             width = 80
         separator = Text("─" * width, style="white dim")
-        # Update all defined separators including the new task separator
-        # Update all defined separators including the new task separator
-        for name in ["sep1", "sep2", "sep_status", "sep3", "sep_tasks", "sep4", "sep5"]:
+        # Update all defined separators
+        for name in ["sep1", "sep2", "sep3"]:
             self.layout[name].update(separator)
 
     def render(self) -> Layout:
@@ -551,6 +545,6 @@ class Dashboard:
             
         return str(report_path)
 
-import logging
+
 # Global singleton
 dashboard = Dashboard()
