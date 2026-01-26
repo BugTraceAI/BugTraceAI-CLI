@@ -6,6 +6,9 @@ from rich.layout import Layout
 from rich.panel import Panel
 from rich.text import Text
 from rich.traceback import install
+from rich.columns import Columns
+from rich.table import Table
+from rich.box import ROUNDED, SIMPLE
 import threading
 import time
 import logging  # Added missing import
@@ -40,18 +43,14 @@ class Dashboard:
         self._lock = threading.RLock() # Thread safety first!
         self.active = False
         
-        # Compact layout: reduced separators for smaller terminals (min ~20 lines)
+        # Compact layout: cleaner design without extra separators
         self.layout.split(
             Layout(name="header1", size=1),
             Layout(name="header2", size=1),
-            Layout(name="status_bar", size=1),
-            Layout(name="sep1", size=1),
-            Layout(name="payloads", ratio=1, minimum_size=3),
-            Layout(name="tasks", ratio=1, minimum_size=2),
-            Layout(name="sep2", size=1),
-            Layout(name="log", ratio=2, minimum_size=5),
-            Layout(name="sep3", size=1),
-            Layout(name="findings", ratio=1, minimum_size=4),
+            Layout(name="payloads", ratio=1, minimum_size=5),
+            Layout(name="tasks", ratio=1, minimum_size=3),
+            Layout(name="log", ratio=2, minimum_size=6),
+            Layout(name="findings", ratio=1, minimum_size=5),
             Layout(name="footer", size=1)
         )
         
@@ -286,17 +285,8 @@ class Dashboard:
         self.layout["header2"].update(text)
 
     def update_status_bar(self):
-        with self._lock:
-            status = self.status_msg
-            progress = self.progress_msg
-            
-        text = Text.assemble(
-            ("Status: ", "white dim"),
-            (status, "bright_cyan"),
-            (" | ", "white dim"),
-            (progress, "white")
-        )
-        self.layout["status_bar"].update(Panel(text, style="on black", border_style="dim"))
+        # Status bar removed - info now shown in header2 and status panel
+        pass
 
     def update_payload_section(self):
         with self._lock:
@@ -312,7 +302,16 @@ class Dashboard:
              phase = self.phase
              status_msg = self.status_msg
 
-        # LEFT COLUMN: STATUS
+        # Calculate available width for proper alignment
+        try:
+            total_width = self.console.size.width
+        except Exception:
+            total_width = 120
+        
+        # Each panel gets half the width minus borders/padding
+        panel_width = max(30, (total_width - 4) // 2)
+
+        # LEFT COLUMN: STATUS - Build content with fixed 4 lines
         status_lines = []
         status_lines.append(Text.assemble(
             ("📍 Phase: ", "white"),
@@ -331,9 +330,8 @@ class Dashboard:
             (f"{tested} tested | {success}✓ | {failed}✗", "white dim")
         ))
         status_content = Text("\n").join(status_lines)
-        status_panel = Panel(status_content, title="[bright_cyan bold]📌 STATUS[/bright_cyan bold]", border_style="bright_cyan", padding=(0, 1))
 
-        # RIGHT COLUMN: PAYLOAD
+        # RIGHT COLUMN: PAYLOAD - Build content with fixed 4 lines
         payload_lines = []
         if payload:
             test_num = f"[#{tested}]" if tested > 0 else "[#0]"
@@ -342,7 +340,8 @@ class Dashboard:
                 (" ", "white"),
                 (vector or "unknown", "bright_yellow bold")
             ))
-            payload_display = payload[:50] + "..." if len(payload) > 50 else payload
+            max_payload_len = panel_width - 10
+            payload_display = payload[:max_payload_len] + "..." if len(payload) > max_payload_len else payload
             payload_lines.append(Text(payload_display, style="white"))
             
             payload_status_style = "bright_green" if "Success" in status else ("bright_red" if "Failed" in status else "bright_yellow")
@@ -360,18 +359,22 @@ class Dashboard:
             (f"{rate:.1f}/s", "bright_green")
         ))
         payload_content = Text("\n").join(payload_lines)
-        payload_panel = Panel(payload_content, title="[bright_yellow bold]🧪 PAYLOAD[/bright_yellow bold]", border_style="bright_yellow", padding=(0, 1))
 
-        # Combine into 2-column layout using a sub-layout
-        from rich.table import Table
-        from rich.box import ROUNDED
+        # Create a unified table with internal divider instead of separate panels
+        # This ensures borders align perfectly
+        combined_table = Table(
+            show_header=True,
+            header_style="bold",
+            box=ROUNDED,
+            expand=True,
+            border_style="bright_cyan",
+            padding=(0, 1)
+        )
+        combined_table.add_column("📌 STATUS", style="bright_cyan", ratio=1)
+        combined_table.add_column("🧪 PAYLOAD", style="bright_yellow", ratio=1)
+        combined_table.add_row(status_content, payload_content)
         
-        table = Table.grid(expand=True)
-        table.add_column(ratio=1)
-        table.add_column(ratio=1)
-        table.add_row(status_panel, payload_panel)
-        
-        self.layout["payloads"].update(table)
+        self.layout["payloads"].update(combined_table)
 
     def update_log_section(self):
         with self._lock:
@@ -456,20 +459,12 @@ class Dashboard:
         self.layout["footer"].update(text)
 
     def update_separators(self):
-        try:
-            width = self.console.size.width
-        except Exception:
-            width = 80
-        separator = Text("─" * width, style="white dim")
-        # Update all defined separators
-        for name in ["sep1", "sep2", "sep3"]:
-            self.layout[name].update(separator)
+        # Separators removed for cleaner design
+        pass
 
     def render(self) -> Layout:
         self.update_header1()
         self.update_header2()
-        self.update_status_bar()
-        self.update_separators()
         self.update_payload_section()
         self.update_tasks_section()
         self.update_log_section()
