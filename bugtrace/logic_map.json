@@ -1,0 +1,70 @@
+{
+    "architecture_mode": "Vertical (Phoenix Edition)",
+    "description": "Code-accurate flow of team.py (Vertical Mode) and url_master.py",
+    "workflow": {
+        "1_Global_Reconnaissance": {
+            "executor": "TeamOrchestrator (team.py)",
+            "logic": "Pre-agent execution",
+            "sequence": [
+                {
+                    "tool": "GoSpider (ExternalToolManager)",
+                    "purpose": "Fast URL & File Discovery (Primary)",
+                    "input": "Target Domain + Session Cookies (if auth)"
+                },
+                {
+                    "tool": "VisualCrawler (VisualCrawler)",
+                    "purpose": "SPA/JS Supplement (Secondary - Only if low results)",
+                    "condition": "len(urls) < threshold"
+                }
+            ],
+            "output": "deduplicated_url_list"
+        },
+        "2_Vertical_Execution": {
+            "concept": "1 Agent per URL (Parallel/Semaphore Limited)",
+            "agent": "URLMasterAgent (url_master.py)",
+            "internal_loop": [
+                {
+                    "step": "Feature Extraction",
+                    "skill": "ReconSkill / Internal",
+                    "data": "Inputs, Params, Tech Stack"
+                },
+                {
+                    "step": "Vulnerability Analysis",
+                    "skill": "AnalysisSkill (AnalysisAgent)",
+                    "action": "LLM checks Headers+HTML+Params for risk patterns"
+                },
+                {
+                    "step": "Specialized Exploitation",
+                    "logic": "Route based on Analysis or Exhaustive Mode",
+                    "skills": {
+                        "XSS": {
+                            "manager": "ManipulatorOrchestrator",
+                            "action": "Payload Mutation -> Request",
+                            "validation": "BrowserSkill (Verify Alert + Screenshot)"
+                        },
+                        "SQLi": {
+                            "manager": "SQLiSkill",
+                            "action": "Python Detector -> SQLMap (Docker)",
+                            "validation": "Error Pattern / Bool Inference"
+                        },
+                        "LFI/XXE/Other": {
+                            "manager": "GenericExploitSkill",
+                            "action": "Payload Injection",
+                            "validation": "Response Regex Match"
+                        }
+                    }
+                }
+            ]
+        },
+        "3_Consolidation_Reporting": {
+            "executor": "ReportingAgent (reporting.py)",
+            "trigger": "All URLAgents Complete",
+            "process": [
+                "Collect findings from all URLAgents",
+                "Filter & Enrich (AI added context)",
+                "Generate REPORT.html (with linked screenshots)",
+                "Generate JSON/Markdown artifacts"
+            ]
+        }
+    }
+}

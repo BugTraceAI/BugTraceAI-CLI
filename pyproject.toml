@@ -1,0 +1,31 @@
+[project]
+name = "bugtraceai-cli"
+version = "1.6.1"
+description = "AI-Driven Professional Penetration Testing Framework"
+authors = [
+    { name = "Bugtrace AI Team" }
+]
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "playwright>=1.40.0",
+    "httpx>=0.25.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "loguru>=0.7.0",
+    "aiofiles>=23.0.0",
+    "python-dotenv>=1.0.0",
+    "jinja2>=3.1.0",
+    "markdown>=3.5.0",
+    "lancedb>=0.4.0",
+    "openai>=1.0.0",
+    "psutil>=5.9.0",
+    "sqlparse>=0.4.4"
+]
+
+[project.scripts]
+bugtrace = "bugtrace.__main__:app"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

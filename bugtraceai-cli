@@ -1,0 +1,67 @@
+#!/bin/bash
+# BugtraceAI-CLI Quick Launch Script
+# Activates venv and runs the framework with a clean state
+
+# Check if --resume is present in arguments
+# Parse arguments to detect flags and filter out bash-only flags
+RESUME=false
+CLEAN=false
+PYTHON_ARGS=()
+
+for arg in "$@"; do
+    if [ "$arg" == "--resume" ]; then
+        RESUME=true
+        PYTHON_ARGS+=("$arg")
+    elif [ "$arg" == "--clean" ]; then
+        CLEAN=true
+        # Do NOT add to PYTHON_ARGS, consume it here
+    else
+        PYTHON_ARGS+=("$arg")
+    fi
+done
+
+if [ "$CLEAN" = true ]; then
+    echo "🔥 EXPLICIT CLEANUP REQUESTED (--clean) 🔥"
+    echo "   - Removing reports..."
+    if [ -d "reports" ]; then rm -rf reports/*; fi
+    echo "   - Removing logs..."
+    if [ -d "logs" ]; then rm -rf logs/*; fi
+    if [ -d "bugtrace/logs" ]; then rm -rf bugtrace/logs/*; fi
+    echo "   - Removing database..."
+    if [ -f "bugtrace.db" ]; then rm -f bugtrace.db; fi
+    echo "✅ Environment completely reset."
+elif [ "$RESUME" = false ]; then
+    # Default cleanup (Safe) - Keeps DB, cleans reports/logs
+    echo "🧹 Standard cleanup (Preserving DB)..."
+    if [ -d "reports" ]; then rm -rf reports/*; fi
+    if [ -d "bugtrace/logs" ]; then rm -rf bugtrace/logs/*; fi
+    # if [ -f "bugtrace.db" ]; then rm -f bugtrace.db; fi # Keep DB by default to avoid accidental data loss
+    echo "✅ Cleanup complete."
+else
+    echo "🔄 Resume mode detected. Skipping cleanup to preserve state."
+fi
+
+# Determine which venv to use
+if [ -d ".venv_fresh" ]; then
+    VENV_PATH=".venv_fresh"
+elif [ -d ".venv" ]; then
+    VENV_PATH=".venv"
+elif [ -d "venv" ]; then
+    VENV_PATH="venv"
+else
+    echo "Error: Virtual environment (.venv_fresh, .venv or venv) not found."
+    exit 1
+fi
+
+source "$VENV_PATH/bin/activate"
+
+# Use filtered arguments for Python
+# Check if the first argument is a URL (implicitly "full" command)
+FIRST_ARG="${PYTHON_ARGS[0]}"
+
+if [[ "$FIRST_ARG" != "scan" && "$FIRST_ARG" != "full" && "$FIRST_ARG" != "audit" && "$FIRST_ARG" != -* && -n "$FIRST_ARG" ]]; then
+    # Default to FULL scan if just a target is provided
+    python3 -m bugtrace full "${PYTHON_ARGS[@]}"
+else
+    python3 -m bugtrace "${PYTHON_ARGS[@]}"
+fi
