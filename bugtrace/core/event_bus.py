@@ -49,7 +49,7 @@ class EventBus:
         
         logger.info("Event Bus initialized")
     
-    async def subscribe(self, event: str, handler: Callable) -> None:
+    def subscribe(self, event: str, handler: Callable) -> None:
         """
         Suscribirse a un evento.
 
@@ -59,14 +59,14 @@ class EventBus:
                      Firma: async def handler(data: Dict) -> None
 
         Example:
-            await event_bus.subscribe("new_input_discovered", self.handle_new_input)
+            event_bus.subscribe("new_input_discovered", self.handle_new_input)
         """
         if not asyncio.iscoroutinefunction(handler):
             raise ValueError(f"Handler must be async function, got {type(handler)}")
 
-        async with self._lock:
-            self._subscribers[event].append(handler)
-            self._stats["total_subscribers"] += 1
+        # Append is atomic in Python due to GIL - no lock needed
+        self._subscribers[event].append(handler)
+        self._stats["total_subscribers"] += 1
 
         logger.debug(
             f"Subscriber added: {handler.__name__} → {event} "
@@ -132,7 +132,7 @@ class EventBus:
                 exc_info=True
             )
     
-    async def unsubscribe(self, event: str, handler: Callable) -> bool:
+    def unsubscribe(self, event: str, handler: Callable) -> bool:
         """
         Desuscribirse de un evento.
 
@@ -146,17 +146,16 @@ class EventBus:
         Use case:
             Cleanup cuando agent se detiene
         """
-        async with self._lock:
-            try:
-                self._subscribers[event].remove(handler)
-                self._stats["total_subscribers"] -= 1
-                logger.debug(f"Subscriber removed: {handler.__name__} from {event}")
-                return True
-            except ValueError:
-                logger.warning(
-                    f"Handler {handler.__name__} not found in {event} subscribers"
-                )
-                return False
+        try:
+            self._subscribers[event].remove(handler)
+            self._stats["total_subscribers"] -= 1
+            logger.debug(f"Subscriber removed: {handler.__name__} from {event}")
+            return True
+        except ValueError:
+            logger.warning(
+                f"Handler {handler.__name__} not found in {event} subscribers"
+            )
+            return False
     
     def get_stats(self) -> Dict[str, Any]:
         """

@@ -1,12 +1,20 @@
 import asyncio
 import typer
 import click
+import warnings
 from typing import Optional
 from datetime import datetime
 from rich.console import Console
 from bugtrace.core.team import TeamOrchestrator
 from bugtrace.core.config import settings
 from pathlib import Path
+
+# Suppress subprocess cleanup warnings (cosmetic issue only)
+# These occur when subprocesses cleanup after event loop closes
+# Functionality is not affected - just prevents confusing error messages
+warnings.filterwarnings("ignore", category=RuntimeWarning,
+                       module="asyncio.base_subprocess")
+warnings.filterwarnings("ignore", message=".*Event loop is closed.*")
 
 # Q-Learning WAF Strategy Router (for graceful shutdown persistence)
 from bugtrace.tools.waf import strategy_router
