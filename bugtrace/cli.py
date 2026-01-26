@@ -30,6 +30,7 @@ def main(
     target: Optional[str] = typer.Argument(None, help="The target URL to engage the framework against"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, help="Resume from previous state file"),
+    clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
     horizontal: bool = typer.Option(False, "--horizontal", help="Use legacy horizontal architecture (not recommended)"),
     # Focused testing modes
     xss: bool = typer.Option(False, "--xss", help="XSS-only mode: Run only XSSAgent for focused testing"),
@@ -40,9 +41,10 @@ def main(
 ):
     """
     BugtraceAI: Autonomous Multi-Agent Security Framework
-    
+
     Examples:
-        bugtraceai-cli https://target.com                  # Full scan
+        bugtraceai-cli https://target.com                  # Full scan (keeps previous data)
+        bugtraceai-cli https://target.com --clean          # Full scan with clean start
         bugtraceai-cli https://target.com --xss            # XSS-only mode
         bugtraceai-cli https://target.com --xss -p search  # XSS on specific param
         bugtraceai-cli https://target.com --sqli           # SQLi-only mode
@@ -55,9 +57,11 @@ def main(
         console.print("[bold red]Error:[/bold red] Target URL is required to engage the framework.")
         raise typer.Exit(code=1)
 
-    # 0. The Janitor (Environment Purge)
-    from bugtrace.utils.janitor import clean_environment
-    clean_environment()
+    # 0. The Janitor (Environment Purge) - Only if --clean flag is passed
+    if clean:
+        from bugtrace.utils.janitor import clean_environment
+        clean_environment()
+        console.print("[yellow]🧹 Previous scan data cleaned.[/yellow]")
 
     # Use configuration file values by default, allow minor CLI overrides
     if safe_mode is not None:

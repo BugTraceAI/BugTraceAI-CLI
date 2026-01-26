@@ -38,6 +38,7 @@ def scan(
     target: str = typer.Argument(..., help="The target URL to scan (Hunter phase)"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
+    clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
     xss: bool = typer.Option(False, "--xss", help="XSS-only mode"),
     sqli: bool = typer.Option(False, "--sqli", help="SQLi-only mode"),
     jwt: bool = typer.Option(False, "--jwt", help="JWT-only mode: Run only JWTAgent for focused testing"),
@@ -47,7 +48,7 @@ def scan(
     param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
 ):
     """Run the Discovery (Hunter) phase only."""
-    _run_pipeline(target, phase="hunter", safe_mode=safe_mode, resume=resume, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    _run_pipeline(target, phase="hunter", safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
 
 @app.command(name="audit")
 def audit(
@@ -62,6 +63,7 @@ def full_scan(
     target: str = typer.Argument(..., help="The target URL for full engagement"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
+    clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
     continuous: bool = typer.Option(False, "--continuous", help="Run Auditor in parallel with Hunter"),
     xss: bool = typer.Option(False, "--xss", help="XSS-only mode"),
     sqli: bool = typer.Option(False, "--sqli", help="SQLi-only mode"),
@@ -72,9 +74,9 @@ def full_scan(
     param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
 ):
     """Run Hunter followed by Auditor (The complete professional workflow)."""
-    _run_pipeline(target, phase="all", safe_mode=safe_mode, resume=resume, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    _run_pipeline(target, phase="all", safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
 
-def _run_pipeline(target, phase="all", safe_mode=None, resume=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
+def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
     """Internal helper to run the pipeline phases."""
     if safe_mode is not None:
         settings.SAFE_MODE = safe_mode
@@ -123,9 +125,11 @@ def _run_pipeline(target, phase="all", safe_mode=None, resume=False, xss=False, 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         common_output_dir = Path(settings.REPORT_DIR) / f"{domain}_{timestamp}"
 
-        if not resume and phase != "manager":
+        # Only clean if explicitly requested with --clean flag
+        if clean and phase != "manager":
             from bugtrace.utils.janitor import clean_environment
             clean_environment()
+            console.print("[yellow]🧹 Previous scan data cleaned.[/yellow]")
 
         dashboard.reset()
         dashboard.start_keyboard_listener()
