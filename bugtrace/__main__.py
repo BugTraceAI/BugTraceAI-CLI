@@ -101,6 +101,12 @@ def serve(
         import traceback
         traceback.print_exc()
 
+@app.command(name="mcp")
+def mcp():
+    """Start the MCP server for AI assistant integration (STDIO transport)."""
+    from bugtrace.mcp.server import run_mcp_server
+    run_mcp_server()
+
 def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
     """Internal helper to run the pipeline phases."""
     if safe_mode is not None:
