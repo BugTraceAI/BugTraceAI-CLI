@@ -15,6 +15,7 @@ Version: 2.0.0
 
 import os
 import sqlite3
+import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
@@ -25,7 +26,7 @@ from fastapi.responses import JSONResponse
 from bugtrace.core.config import settings
 from bugtrace.api.deps import ScanServiceDep, ReportServiceDep, EventBusDep, get_scan_service
 from bugtrace.services.event_bus import service_event_bus
-from bugtrace.utils.logger import get_logger
+from bugtrace.utils.logger import get_logger, set_correlation_id
 
 logger = get_logger("api.main")
 
@@ -138,6 +139,44 @@ app.add_middleware(
     expose_headers=["X-Scan-Progress"],
     max_age=3600,  # Cache preflight for 1 hour
 )
+
+
+# Correlation ID middleware — sets correlation_id per request for structured log tracing
+@app.middleware("http")
+async def correlation_id_middleware(request: Request, call_next):
+    """
+    Assign a correlation_id for every request.
+
+    Priority:
+        1. scan_id from URL path (e.g. /api/scans/42 -> "scan-42")
+        2. X-Correlation-ID or X-Request-ID request header
+        3. Auto-generated short UUID
+    """
+    correlation_id = ""
+
+    # 1. Extract scan_id from path if present
+    parts = request.url.path.split("/")
+    for i, part in enumerate(parts):
+        if part == "scans" and i + 1 < len(parts) and parts[i + 1].isdigit():
+            correlation_id = f"scan-{parts[i + 1]}"
+            break
+
+    # 2. Check request headers
+    if not correlation_id:
+        correlation_id = (
+            request.headers.get("x-correlation-id")
+            or request.headers.get("x-request-id")
+            or ""
+        )
+
+    # 3. Fallback to generated UUID
+    if not correlation_id:
+        correlation_id = uuid.uuid4().hex[:8]
+
+    set_correlation_id(correlation_id)
+    response = await call_next(request)
+    response.headers["X-Correlation-ID"] = correlation_id
+    return response
 
 
 # Root endpoint
