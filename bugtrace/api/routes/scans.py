@@ -1,12 +1,13 @@
 """
 Scan Routes - REST endpoints for scan lifecycle management.
 
-Provides 5 core endpoints:
+Provides 6 core endpoints:
 - POST /api/scans - Create and start a new scan
 - GET /api/scans/{scan_id}/status - Get scan status and progress
 - GET /api/scans/{scan_id}/findings - Get scan findings with filtering
 - GET /api/scans - List scan history with pagination
 - POST /api/scans/{scan_id}/stop - Stop a running scan
+- DELETE /api/scans/{scan_id} - Delete a scan and its findings
 
 Author: BugtraceAI Team
 Date: 2026-01-27
@@ -25,6 +26,7 @@ from bugtrace.api.schemas import (
     ScanListResponse,
     ScanSummary,
     StopScanResponse,
+    DeleteScanResponse,
 )
 from bugtrace.services.scan_context import ScanOptions
 from bugtrace.utils.logger import get_logger
@@ -70,8 +72,8 @@ async def create_scan(
             param=request.param,
         )
 
-        # Create scan
-        scan_id = await scan_service.create_scan(options)
+        # Create scan (origin='web' since it comes from the API)
+        scan_id = await scan_service.create_scan(options, origin="web")
 
         # Get initial status
         status_dict = await scan_service.get_scan_status(scan_id)
@@ -274,4 +276,49 @@ async def stop_scan(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
+        )
+
+
+@router.delete("/scans/{scan_id}", response_model=DeleteScanResponse)
+async def delete_scan(
+    scan_id: int,
+    scan_service: ScanServiceDep,
+):
+    """
+    Delete a scan and its associated findings.
+
+    Cannot delete a scan that is currently running.
+
+    Args:
+        scan_id: Scan ID to delete
+        scan_service: Injected ScanService
+
+    Returns:
+        DeleteScanResponse with confirmation message
+
+    Raises:
+        404: Scan not found
+        409: Scan is currently running
+    """
+    try:
+        result = await scan_service.delete_scan(scan_id)
+        logger.info(f"Deleted scan {scan_id}")
+        return DeleteScanResponse(**result)
+
+    except PermissionError as e:
+        logger.warning(f"Permission denied deleting scan {scan_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(e),
+        )
+    except ValueError as e:
+        error_msg = str(e)
+        if "still running" in error_msg:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=error_msg,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=error_msg,
         )

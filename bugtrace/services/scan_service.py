@@ -16,6 +16,7 @@ Version: 2.0.0
 """
 
 import asyncio
+import shutil
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from pathlib import Path
@@ -37,7 +38,7 @@ class ScanService:
 
     Key responsibilities:
     - Create and start scans with create_scan()
-    - Enforce concurrent scan limit (default 5)
+    - Enforce concurrent scan limit (default 1)
     - Track active scans in memory
     - Provide status queries for active and completed scans
     - Stop running scans gracefully
@@ -46,12 +47,12 @@ class ScanService:
     CRITICAL: Uses asyncio.create_task (NOT threading.Thread) to avoid event loop conflicts.
     """
 
-    def __init__(self, max_concurrent: int = 5):
+    def __init__(self, max_concurrent: int = 1):
         """
         Initialize ScanService.
 
         Args:
-            max_concurrent: Maximum number of concurrent scans (default 5)
+            max_concurrent: Maximum number of concurrent scans (default 1)
         """
         self.db = get_db_manager()
         self.event_bus = service_event_bus
@@ -66,12 +67,13 @@ class ScanService:
 
         logger.info(f"ScanService initialized (max_concurrent={max_concurrent})")
 
-    async def create_scan(self, options: ScanOptions) -> int:
+    async def create_scan(self, options: ScanOptions, origin: str = "cli") -> int:
         """
         Create and start a new scan.
 
         Args:
             options: Scan configuration (target_url, scan_type, etc.)
+            origin: Where the scan was launched from ('cli' or 'web')
 
         Returns:
             scan_id: Database ID for tracking this scan
@@ -95,8 +97,8 @@ class ScanService:
                 )
 
             # Create database scan record
-            scan_id = self.db.create_new_scan(options.target_url)
-            logger.info(f"Created scan {scan_id} for target: {options.target_url}")
+            scan_id = self.db.create_new_scan(options.target_url, origin=origin)
+            logger.info(f"Created scan {scan_id} for target: {options.target_url} (origin={origin})")
 
             # Create scan context
             ctx = ScanContext(scan_id, options, self.event_bus)
@@ -278,6 +280,7 @@ class ScanService:
                 "findings_count": len(findings),
                 "active_agent": None,
                 "phase": None,
+                "origin": getattr(scan, "origin", "cli"),
             }
 
     async def stop_scan(self, scan_id: int) -> Dict[str, Any]:
@@ -369,6 +372,7 @@ class ScanService:
                     "status": scan.status.value,
                     "progress": scan.progress_percent,
                     "timestamp": scan.timestamp.isoformat(),
+                    "origin": getattr(scan, "origin", "cli"),
                 })
 
             return {
@@ -377,6 +381,146 @@ class ScanService:
                 "page": page,
                 "per_page": per_page,
             }
+
+    async def delete_scan(self, scan_id: int, force: bool = False) -> Dict[str, Any]:
+        """
+        Delete a scan and its associated findings from the database,
+        and remove report files from disk.
+
+        Args:
+            scan_id: Scan ID to delete
+            force: If True, bypass origin check (used by CLI delete command)
+
+        Returns:
+            Dictionary with scan_id and message
+
+        Raises:
+            ValueError: If scan not found or is currently running
+            PermissionError: If scan origin is 'cli' and force=False (web cannot delete CLI scans)
+        """
+        with self.db.get_session() as session:
+            from sqlmodel import select
+            from bugtrace.schemas.db_models import ScanTable, FindingTable, ScanStateTable, TargetTable
+
+            scan = session.get(ScanTable, scan_id)
+            if not scan:
+                raise ValueError(f"Scan {scan_id} not found")
+
+            if scan.status == ScanStatus.RUNNING:
+                raise ValueError(f"Cannot delete scan {scan_id}: scan is still running")
+
+            # Origin check: web UI cannot delete CLI-originated scans
+            scan_origin = getattr(scan, "origin", "cli")
+            if scan_origin == "cli" and not force:
+                raise PermissionError(
+                    f"Cannot delete scan {scan_id} from web: scan was launched from CLI. "
+                    f"Use 'bugtrace delete {scan_id}' from the command line."
+                )
+
+            # Resolve target URL and timestamp for report directory cleanup
+            target = session.get(TargetTable, scan.target_id)
+            target_url = target.url if target else None
+            scan_timestamp = scan.timestamp
+
+            # Delete associated findings first (FK constraint)
+            findings = session.exec(
+                select(FindingTable).where(FindingTable.scan_id == scan_id)
+            ).all()
+            for finding in findings:
+                session.delete(finding)
+
+            # Delete associated scan state (FK constraint)
+            scan_states = session.exec(
+                select(ScanStateTable).where(ScanStateTable.scan_id == scan_id)
+            ).all()
+            for state in scan_states:
+                session.delete(state)
+
+            # Delete the scan
+            session.delete(scan)
+            session.commit()
+
+            logger.info(f"Deleted scan {scan_id} with {len(findings)} findings")
+
+        # Delete report files from disk (outside DB session)
+        deleted_dirs = self._delete_report_dirs(scan_id, target_url, scan_timestamp)
+
+        parts = [f"Scan {scan_id} deleted ({len(findings)} findings removed)"]
+        if deleted_dirs:
+            parts.append(f"{len(deleted_dirs)} report folder(s) removed")
+
+        return {
+            "scan_id": scan_id,
+            "message": ", ".join(parts),
+        }
+
+    def _delete_report_dirs(
+        self,
+        scan_id: int,
+        target_url: Optional[str],
+        scan_timestamp: Optional[datetime] = None,
+    ) -> List[Path]:
+        """
+        Find and delete report directories associated with a scan.
+
+        Searches two patterns:
+        1. scan_{scan_id}/ (created by ReportService API)
+        2. {domain}_{YYYYMMDD}_{HHMMSS}/ (created by scan pipeline)
+
+        Uses the scan's timestamp to precisely match the pipeline directory
+        and avoid deleting reports from other scans of the same target.
+
+        Args:
+            scan_id: Scan ID
+            target_url: Target URL for domain extraction
+            scan_timestamp: Scan creation timestamp for precise directory matching
+
+        Returns:
+            List of deleted directory paths
+        """
+        report_base = settings.REPORT_DIR
+        deleted = []
+
+        # Pattern 1: API-generated reports (scan_{id}/)
+        api_dir = report_base / f"scan_{scan_id}"
+        if api_dir.is_dir():
+            try:
+                shutil.rmtree(api_dir)
+                deleted.append(api_dir)
+                logger.info(f"Deleted report directory: {api_dir}")
+            except OSError as e:
+                logger.warning(f"Failed to delete report directory {api_dir}: {e}")
+
+        # Pattern 2: Pipeline-generated reports ({domain}_{timestamp}/)
+        if target_url:
+            try:
+                hostname = urlparse(target_url).hostname or ""
+                if hostname:
+                    if scan_timestamp:
+                        # Precise match: {domain}_{YYYYMMDD}_{HHMMSS}
+                        ts_prefix = scan_timestamp.strftime("%Y%m%d_%H%M")
+                        for match in report_base.glob(f"{hostname}_{ts_prefix}*"):
+                            if match.is_dir():
+                                try:
+                                    shutil.rmtree(match)
+                                    deleted.append(match)
+                                    logger.info(f"Deleted report directory: {match}")
+                                except OSError as e:
+                                    logger.warning(f"Failed to delete report directory {match}: {e}")
+                    else:
+                        # Fallback: match all dirs for this domain (less precise)
+                        for match in report_base.glob(f"{hostname}_*"):
+                            if match.is_dir():
+                                try:
+                                    shutil.rmtree(match)
+                                    deleted.append(match)
+                                    logger.info(f"Deleted report directory: {match}")
+                                except OSError as e:
+                                    logger.warning(f"Failed to delete report directory {match}: {e}")
+            except Exception as e:
+                logger.warning(f"Error finding report dirs for {target_url}: {e}")
+
+        return deleted
 
     async def get_findings(
         self,

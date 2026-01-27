@@ -5,7 +5,7 @@ This agent performs intelligent pre-exploitation analysis using multiple LLM mod
 with different personas to identify likely vulnerabilities before wasting resources
 on blind testing.
 
-Inspired by: BugTrace-AI by @yz9yt
+Inspired by: BugTraceAI by @yz9yt
 Architecture: Multi-agent event-driven system
 
 Author: BugtraceAI-CLI Team
@@ -57,7 +57,7 @@ class AnalysisAgent(BaseAgent):
     def __init__(self, event_bus: EventBus):
         super().__init__("Analysis-1", "Vulnerability Analysis", event_bus=event_bus, agent_id="analysis_agent")
         
-        # Using single model with 5 different analysis approaches (BugTrace-AI methodology)
+        # Using single model with 5 different analysis approaches (BugTraceAI methodology)
         self.model = getattr(settings, "ANALYSIS_PENTESTER_MODEL", "google/gemini-2.0-flash-exp")
         
         # 5 different analysis approaches for maximum coverage

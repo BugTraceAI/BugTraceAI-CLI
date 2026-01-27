@@ -45,6 +45,7 @@ class ScanStatusResponse(BaseModel):
     findings_count: int
     active_agent: Optional[str] = None
     phase: Optional[str] = None
+    origin: str = "cli"  # "cli" or "web" — where scan was launched
 
 
 class FindingItem(BaseModel):
@@ -85,6 +86,7 @@ class ScanSummary(BaseModel):
     status: str
     progress: int
     timestamp: str  # ISO format
+    origin: str = "cli"  # "cli" or "web"
 
 
 class ScanListResponse(BaseModel):
@@ -105,6 +107,14 @@ class StopScanResponse(BaseModel):
     """
     scan_id: int
     status: str
+    message: str
+
+
+class DeleteScanResponse(BaseModel):
+    """
+    Response for DELETE /api/scans/{scan_id}.
+    """
+    scan_id: int
     message: str
 
 

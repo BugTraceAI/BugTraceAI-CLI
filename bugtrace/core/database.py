@@ -175,9 +175,26 @@ class DatabaseManager:
     def _create_tables(self):
         try:
             SQLModel.metadata.create_all(self.engine)
+            self._run_migrations()
             logger.info("SQL Tables initialized.")
         except Exception as e:
             logger.error(f"Failed to create SQL tables: {e}")
+
+    def _run_migrations(self):
+        """Run lightweight schema migrations for new columns on existing tables."""
+        with self.get_session() as session:
+            # Migration: Add 'origin' column to scan table (v2.1)
+            try:
+                session.exec(text("SELECT origin FROM scan LIMIT 1"))
+            except Exception:
+                session.rollback()
+                try:
+                    session.exec(text("ALTER TABLE scan ADD COLUMN origin VARCHAR DEFAULT 'cli'"))
+                    session.commit()
+                    logger.info("Migration: Added 'origin' column to scan table")
+                except Exception as e:
+                    session.rollback()
+                    logger.warning(f"Migration 'origin' column skipped: {e}")
 
     def _init_vector_store(self):
         try:
@@ -282,11 +299,16 @@ class DatabaseManager:
             
             scan = session.exec(scan_query).first()
             return scan.id if scan else None
-    def create_new_scan(self, target_url: str) -> int:
-        """Create a new scan record with RUNNING status."""
+    def create_new_scan(self, target_url: str, origin: str = "cli") -> int:
+        """Create a new scan record with RUNNING status.
+
+        Args:
+            target_url: Target URL to scan
+            origin: Where the scan was launched from ('cli' or 'web')
+        """
         with self.get_session() as session:
             target = self.get_or_create_target(target_url)
-            scan = ScanTable(target_id=target.id, status=ScanStatus.RUNNING, progress_percent=0)
+            scan = ScanTable(target_id=target.id, status=ScanStatus.RUNNING, progress_percent=0, origin=origin)
             session.add(scan)
             session.commit()
             session.refresh(scan)

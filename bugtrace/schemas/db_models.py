@@ -39,6 +39,7 @@ class ScanTable(SQLModel, table=True):
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     status: ScanStatus = Field(default=ScanStatus.PENDING)
     progress_percent: int = 0
+    origin: str = Field(default="cli")  # "cli" or "web" — tracks where scan was launched
 
     target: Optional[TargetTable] = Relationship(back_populates="scans")
     findings: List["FindingTable"] = Relationship(back_populates="scan")
