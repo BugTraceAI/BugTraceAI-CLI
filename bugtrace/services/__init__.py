@@ -11,10 +11,14 @@ Version: 2.0.0
 
 from bugtrace.services.scan_context import ScanContext, ScanOptions
 from bugtrace.services.event_bus import ServiceEventBus, service_event_bus
+from bugtrace.services.scan_service import ScanService
+from bugtrace.services.report_service import ReportService
 
 __all__ = [
     "ScanContext",
     "ScanOptions",
     "ServiceEventBus",
     "service_event_bus",
+    "ScanService",
+    "ReportService",
 ]
