@@ -1,10 +1,24 @@
 from rich.logging import RichHandler
+import contextvars
 import logging
 import sys
 import os
 import json
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
+
+# ContextVar for correlation_id — set per-request by API middleware
+correlation_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("correlation_id", default="")
+
+
+def set_correlation_id(cid: str) -> None:
+    """Set the correlation_id for the current async/thread context."""
+    correlation_id_var.set(cid)
+
+
+def get_correlation_id() -> str:
+    """Return the current correlation_id (empty string if unset)."""
+    return correlation_id_var.get("")
 
 # Define log directory
 LOG_DIR = "logs"
@@ -17,9 +31,10 @@ class JSONFormatter(logging.Formatter):
     def format(self, record):
         log_record = {
             "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+            "correlation_id": correlation_id_var.get(""),
             "level": record.levelname,
             "module": record.name,
-            "message":record.getMessage(),
+            "message": record.getMessage(),
             "file": record.filename,
             "line": record.lineno
         }
