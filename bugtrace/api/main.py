@@ -178,11 +178,12 @@ async def health_check(
 
 # Router includes
 from bugtrace.api.routes.scans import router as scans_router
-app.include_router(scans_router, prefix="/api", tags=["scans"])
+from bugtrace.api.routes.reports import router as reports_router
+from bugtrace.api.routes.config import router as config_router
 
-# Plan 05 will add report endpoints:
-# from bugtrace.api.routes.reports import router as reports_router
-# app.include_router(reports_router, prefix="/api", tags=["reports"])
+app.include_router(scans_router, prefix="/api", tags=["scans"])
+app.include_router(reports_router, prefix="/api", tags=["reports"])
+app.include_router(config_router, prefix="/api", tags=["config"])
 
 
 # Global exception handlers
