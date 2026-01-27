@@ -49,7 +49,11 @@ def run_mcp_server() -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    # Step 4: Start the MCP server with STDIO transport
+    # Step 4: Register tools by importing the tools module
+    # The @mcp_server.tool() decorators execute on import, registering tools
+    import bugtrace.mcp.tools  # noqa: F401
+
+    # Step 5: Start the MCP server with STDIO transport
     # This blocks until the server is shut down
     logger.info("Starting BugTraceAI MCP server on STDIO transport")
     mcp_server.run(transport="stdio")
