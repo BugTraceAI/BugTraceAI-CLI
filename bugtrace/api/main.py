@@ -50,6 +50,12 @@ async def lifespan(app: FastAPI):
     logger.info(f"Environment: {settings.ENV}")
     logger.info(f"CORS Origins: {_get_cors_origins()}")
 
+    # Clean up orphaned scans (RUNNING/PENDING in DB but no process behind them)
+    scan_service = get_scan_service()
+    orphaned = scan_service.cleanup_orphaned_scans()
+    if orphaned:
+        logger.info(f"Marked {orphaned} orphaned scan(s) as FAILED on startup")
+
     yield
 
     # Shutdown

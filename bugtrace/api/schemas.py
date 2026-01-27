@@ -87,6 +87,7 @@ class ScanSummary(BaseModel):
     progress: int
     timestamp: str  # ISO format
     origin: str = "cli"  # "cli" or "web"
+    has_report: bool = True  # Whether report files exist on disk
 
 
 class ScanListResponse(BaseModel):
@@ -116,6 +117,7 @@ class DeleteScanResponse(BaseModel):
     """
     scan_id: int
     message: str
+    files_cleaned: bool = False
 
 
 class ErrorResponse(BaseModel):

@@ -922,9 +922,13 @@ class TeamOrchestrator:
 
             self.url_queue = urls_to_scan
             self._save_checkpoint()
-        
-        # V4 Checkpoint (DB)
-        # await self._checkpoint("Reconnaissance (Nuclei + GoSpider)") # Legacy deprecated
+
+        # Stop check after recon (GoSpider can take minutes)
+        if dashboard.stop_requested or self._stop_event.is_set():
+            dashboard.log("🛑 Stop requested after reconnaissance. Exiting.", "WARN")
+            from bugtrace.schemas.db_models import ScanStatus
+            self.db.update_scan_status(self.scan_id, ScanStatus.STOPPED)
+            return
 
         # 2. PHASE 2: URL-BY-URL ANALYSIS
         dashboard.set_phase("PHASE_2_ANALYSIS")
@@ -1111,9 +1115,21 @@ class TeamOrchestrator:
                     agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, idor_agent, process_result))
 
                 # Execute all agents in parallel (respecting semaphore limit)
+                # Uses cancellation-aware pattern: polls stop flag every 0.5s
+                # and cancels remaining tasks if 'q' is pressed
                 if agent_tasks:
                     logger.info(f"[TeamOrchestrator] Executing {len(agent_tasks)} agents in parallel (max {settings.MAX_CONCURRENT_URL_AGENTS} concurrent)")
-                    await asyncio.gather(*agent_tasks, return_exceptions=True)
+                    pending = {asyncio.ensure_future(t) for t in agent_tasks}
+                    while pending:
+                        done, pending = await asyncio.wait(pending, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+                        if dashboard.stop_requested or self._stop_event.is_set():
+                            dashboard.log("🛑 Stop requested. Cancelling running agents...", "WARN")
+                            for task in pending:
+                                task.cancel()
+                            # Wait for cancellations to complete
+                            if pending:
+                                await asyncio.wait(pending, timeout=5)
+                            break
 
             # C. NO-SWARM MODE
             # We no longer unleash the swarm unconditionally. 
@@ -1135,6 +1151,13 @@ class TeamOrchestrator:
         # V4 Checkpoint
         await self._checkpoint("Analysis & Exploitation (DAST + Specialists)")
 
+        # Stop check before Phase 3
+        if dashboard.stop_requested or self._stop_event.is_set():
+            dashboard.log("🛑 Stop requested. Skipping review and reporting.", "WARN")
+            from bugtrace.schemas.db_models import ScanStatus
+            self.db.update_scan_status(self.scan_id, ScanStatus.STOPPED)
+            return
+
         # 3. PHASE 3: GLOBAL REVIEW
         logger.info("=== PHASE 3: GLOBAL REVIEW ===")
         dashboard.set_phase("PHASE_3_REVIEW")
@@ -1147,6 +1170,13 @@ class TeamOrchestrator:
         
         # V4 Checkpoint
         await self._checkpoint("Global Review")
+
+        # Stop check before Phase 4
+        if dashboard.stop_requested or self._stop_event.is_set():
+            dashboard.log("🛑 Stop requested. Skipping report generation.", "WARN")
+            from bugtrace.schemas.db_models import ScanStatus
+            self.db.update_scan_status(self.scan_id, ScanStatus.STOPPED)
+            return
 
         # 4. PHASE 4: REPORTING
         logger.info("=== PHASE 4: REPORTING ===")

@@ -363,16 +363,25 @@ class ScanService:
             scans = session.exec(statement).all()
 
             # Format results
+            report_base = settings.REPORT_DIR
             results = []
             for scan in scans:
                 target = session.get(TargetTable, scan.target_id)
+                target_url = target.url if target else None
+
+                # Check if report files exist on disk (uses timestamp for precise match)
+                has_report = self._has_report_dir(
+                    report_base, scan.id, target_url, scan.timestamp
+                )
+
                 results.append({
                     "scan_id": scan.id,
-                    "target": target.url if target else "unknown",
+                    "target": target_url or "unknown",
                     "status": scan.status.value,
                     "progress": scan.progress_percent,
                     "timestamp": scan.timestamp.isoformat(),
                     "origin": getattr(scan, "origin", "cli"),
+                    "has_report": has_report,
                 })
 
             return {
@@ -409,13 +418,8 @@ class ScanService:
             if scan.status == ScanStatus.RUNNING:
                 raise ValueError(f"Cannot delete scan {scan_id}: scan is still running")
 
-            # Origin check: web UI cannot delete CLI-originated scans
-            scan_origin = getattr(scan, "origin", "cli")
-            if scan_origin == "cli" and not force:
-                raise PermissionError(
-                    f"Cannot delete scan {scan_id} from web: scan was launched from CLI. "
-                    f"Use 'bugtrace delete {scan_id}' from the command line."
-                )
+            # Origin field available for informational purposes
+            # All scans can be deleted from any interface
 
             # Resolve target URL and timestamp for report directory cleanup
             target = session.get(TargetTable, scan.target_id)
@@ -452,7 +456,44 @@ class ScanService:
         return {
             "scan_id": scan_id,
             "message": ", ".join(parts),
+            "files_cleaned": len(deleted_dirs) > 0,
         }
+
+    @staticmethod
+    def _has_report_dir(
+        report_base: Path,
+        scan_id: int,
+        target_url: Optional[str],
+        scan_timestamp: Optional[datetime] = None,
+    ) -> bool:
+        """Check if a report directory with actual report files exists for this scan."""
+        report_files = {"final_report.md", "validated_findings.json", "raw_findings.json"}
+
+        def _has_files(d: Path) -> bool:
+            """Check if directory contains at least one known report file."""
+            return d.is_dir() and any((d / f).is_file() for f in report_files)
+
+        # Pattern 1: API-generated (scan_{id}/)
+        if _has_files(report_base / f"scan_{scan_id}"):
+            return True
+
+        # Pattern 2: Pipeline-generated ({domain}_{timestamp}/)
+        if target_url:
+            hostname = urlparse(target_url).hostname or ""
+            if hostname:
+                if scan_timestamp:
+                    # Precise match using scan timestamp (minute-level)
+                    ts_prefix = scan_timestamp.strftime("%Y%m%d_%H%M")
+                    for match in report_base.glob(f"{hostname}_{ts_prefix}*"):
+                        if _has_files(match):
+                            return True
+                # Fallback: any dir for this domain that contains report files.
+                # Needed because report dir timestamp = generation time (post-scan),
+                # which differs from scan creation timestamp stored in DB.
+                for match in report_base.glob(f"{hostname}_*"):
+                    if _has_files(match):
+                        return True
+        return False
 
     def _delete_report_dirs(
         self,
@@ -604,3 +645,27 @@ class ScanService:
     def get_active_scan_ids(self) -> List[int]:
         """Get list of active scan IDs."""
         return list(self._active_scans.keys())
+
+    def cleanup_orphaned_scans(self) -> int:
+        """Mark any RUNNING/PENDING scans as FAILED on startup.
+
+        When the backend restarts, no scans are actually running in-process.
+        Any scan still marked RUNNING in the DB is orphaned (process died).
+        """
+        from bugtrace.schemas.db_models import ScanTable, ScanStatus
+        from sqlmodel import select
+
+        count = 0
+        with self.db.get_session() as session:
+            stmt = select(ScanTable).where(
+                ScanTable.status.in_([ScanStatus.RUNNING, ScanStatus.PENDING])
+            )
+            orphans = session.exec(stmt).all()
+            for scan in orphans:
+                scan.status = ScanStatus.FAILED
+                session.add(scan)
+                count += 1
+            if count:
+                session.commit()
+                logger.info(f"Cleaned up {count} orphaned scan(s) → FAILED")
+        return count

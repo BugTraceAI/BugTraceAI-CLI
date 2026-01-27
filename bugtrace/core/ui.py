@@ -122,13 +122,22 @@ class Dashboard:
         """Non-blocking keyboard listener."""
         import sys
         import select
-        
+        import time as _time
+
         # Only works on Unix-like systems
         try:
             import tty
             import termios
         except ImportError:
             return
+
+        # Wait for dashboard to become active (set after Live starts)
+        for _ in range(100):  # up to 10 seconds
+            if self.active:
+                break
+            _time.sleep(0.1)
+        if not self.active:
+            return  # Dashboard never activated
 
         try:
             fd = sys.stdin.fileno()
@@ -138,8 +147,7 @@ class Dashboard:
                     # Blocking read on stdin
                     char = sys.stdin.read(1)
                     if not char:
-                        import time
-                        time.sleep(0.5)
+                        _time.sleep(0.5)
                         continue
                     if char.lower() == 'q':
                         with self._lock:
@@ -149,7 +157,7 @@ class Dashboard:
                         with self._lock:
                             self.paused = not self.paused
                 return
-                
+
             old_settings = termios.tcgetattr(fd)
             try:
                 tty.setcbreak(fd)

@@ -305,12 +305,6 @@ async def delete_scan(
         logger.info(f"Deleted scan {scan_id}")
         return DeleteScanResponse(**result)
 
-    except PermissionError as e:
-        logger.warning(f"Permission denied deleting scan {scan_id}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(e),
-        )
     except ValueError as e:
         error_msg = str(e)
         if "still running" in error_msg:

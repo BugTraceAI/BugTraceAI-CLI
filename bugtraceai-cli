@@ -31,12 +31,9 @@ if [ "$CLEAN" = true ]; then
     if [ -f "bugtrace.db" ]; then rm -f bugtrace.db; fi
     echo "✅ Environment completely reset."
 elif [ "$RESUME" = false ]; then
-    # Default cleanup (Safe) - Keeps DB, cleans reports/logs
-    echo "🧹 Standard cleanup (Preserving DB)..."
-    if [ -d "reports" ]; then rm -rf reports/*; fi
-    if [ -d "bugtrace/logs" ]; then rm -rf bugtrace/logs/*; fi
-    # if [ -f "bugtrace.db" ]; then rm -f bugtrace.db; fi # Keep DB by default to avoid accidental data loss
-    echo "✅ Cleanup complete."
+    # No automatic cleanup — data is preserved between runs.
+    # Use --clean to explicitly reset reports/logs/db.
+    echo "🔄 Launching (data preserved). Use --clean to reset."
 else
     echo "🔄 Resume mode detected. Skipping cleanup to preserve state."
 fi

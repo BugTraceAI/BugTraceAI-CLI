@@ -165,9 +165,31 @@ def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False
         dashboard.reset()
         dashboard.start_keyboard_listener()
 
+        # Stop monitor runs as a real OS thread (NOT asyncio task).
+        # asyncio tasks starve when the event loop is blocked by synchronous
+        # subprocess calls (GoSpider, sqlmap, etc.). A thread runs independently.
+        import threading, time as _time
+        def _stop_monitor_thread():
+            import os, signal as sig_mod
+            while dashboard.active:
+                _time.sleep(0.5)
+                if dashboard.stop_requested:
+                    # Give graceful stop checks 3 seconds to react
+                    _time.sleep(3)
+                    if dashboard.active:
+                        # Still running after grace period — force kill
+                        try:
+                            os.killpg(os.getpgrp(), sig_mod.SIGKILL)
+                        except Exception:
+                            os._exit(1)
+
         with Live(dashboard, refresh_per_second=4, screen=True):
             dashboard.active = True
-            
+
+            # Start stop monitor as daemon thread (survives event loop blocks)
+            stop_thread = threading.Thread(target=_stop_monitor_thread, daemon=True)
+            stop_thread.start()
+
             # Phase 1: Hunter (Discovery)
             orchestrator = None
             if phase in ["hunter", "all"]:
@@ -183,12 +205,12 @@ def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False
                             queued = len(state.get("url_queue", []))
                             total = processed + queued
                             pct = int((processed / total * 100)) if total > 0 else 0
-                            
+
                             console.print(f"\n[bold yellow]⚠️  Found UNFINISHED SCAN for {target}[/bold yellow]")
                             console.print(f"   • Scan ID: {active_scan_id}")
                             console.print(f"   • Progress: {processed} analyzed / {total} total (~{pct}%)")
                             console.print(f"   • Queued: {queued} URLs waiting")
-                            
+
                             # Auto-resume for headless operations or CLI convenience
                             console.print("[green]🔄 Auto-resuming detected active scan...[/green]")
                             resume = True
@@ -198,16 +220,16 @@ def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False
 
                 from bugtrace.core.team import TeamOrchestrator
                 orchestrator = TeamOrchestrator(
-                    target, 
-                    resume=resume, 
-                    max_depth=settings.MAX_DEPTH, 
-                    max_urls=settings.MAX_URLS, 
+                    target,
+                    resume=resume,
+                    max_depth=settings.MAX_DEPTH,
+                    max_urls=settings.MAX_URLS,
                     use_vertical_agents=True,
                     output_dir=common_output_dir
                 )
                 console.print(f"\n[bold green]🏹 Launching Hunter Phase (Scan ID: {orchestrator.scan_id})[/bold green]")
                 await orchestrator.start()
-                
+
                 # --- PHASE TRANSITION CLEANUP ---
                 from bugtrace.tools.visual.browser import browser_manager
                 await browser_manager.stop()
@@ -216,12 +238,12 @@ def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False
             if phase in ["manager", "all"]:
                 from bugtrace.core.validator_engine import ValidationEngine
                 sid = scan_id or (orchestrator.scan_id if orchestrator else db.get_active_scan(target))
-                
+
                 # V3.5 Fallback: if no active scan, take the latest completed one
                 if not sid:
                     sid = db.get_latest_scan_id(target)
-                
-                # If we didn't run hunter in this process, we might not have common_output_dir defined 
+
+                # If we didn't run hunter in this process, we might not have common_output_dir defined
                 # if we are running 'audit' command directly.
                 out_dir = common_output_dir if 'common_output_dir' in locals() else None
 
@@ -233,18 +255,9 @@ def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False
                 engine = ValidationEngine(scan_id=sid, output_dir=out_dir)
                 await engine.run(continuous=continuous)
                 console.print(f"[bold green]✅ Auditor Phase Complete.[/bold green]")
-            
+
             dashboard.active = False
-            
-            if dashboard.stop_requested:
-                console.print("\n[bold red]🛑 Emergency stop requested. Cleaning up and exiting...[/bold red]")
-                import os
-                import signal
-                try:
-                    os.killpg(os.getpgrp(), signal.SIGKILL)
-                except:
-                    import sys
-                    sys.exit(1)
+            # stop_thread exits automatically (daemon + dashboard.active=False)
 
     try:
         asyncio.run(_execute_phases())
