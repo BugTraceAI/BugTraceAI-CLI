@@ -48,6 +48,9 @@ class ServiceEventBus:
         # Scan-scoped stream queues: {scan_id: [queue1, queue2, ...]}
         self._scan_queues: Dict[int, List[asyncio.Queue]] = defaultdict(list)
 
+        # Sequence number counters per scan: {scan_id: next_seq}
+        self._seq_counters: Dict[int, int] = {}
+
         # Lock for thread-safe history/queue operations
         self._lock = asyncio.Lock()
 
@@ -87,11 +90,39 @@ class ServiceEventBus:
         scan_id = data.get("scan_id")
         if scan_id is not None:
             async with self._lock:
+                # Assign monotonically increasing sequence number
+                current_seq = self._seq_counters.get(scan_id, 0) + 1
+                self._seq_counters[scan_id] = current_seq
+
+                # Map internal event names to WS-02 types
+                event_type_mapping = {
+                    "scan.created": "scan_started",
+                    "scan.started": "scan_started",
+                    "scan.completed": "scan_complete",
+                    "scan.stopped": "scan_complete",
+                    "scan.failed": "error",
+                    "scan.error": "error",
+                }
+
+                # Check for event categories
+                if event in event_type_mapping:
+                    event_type = event_type_mapping[event]
+                elif "agent" in event:
+                    event_type = "agent_active"
+                elif "finding" in event:
+                    event_type = "finding_discovered"
+                elif "phase" in event:
+                    event_type = "phase_complete"
+                else:
+                    event_type = event  # Use original event name as-is
+
                 # Create history entry
                 history_entry = {
                     "event": event,
                     "data": data,
                     "timestamp": datetime.utcnow().isoformat(),
+                    "seq": current_seq,
+                    "event_type": event_type,
                 }
 
                 # Append to history with cap
@@ -110,23 +141,29 @@ class ServiceEventBus:
                     except asyncio.QueueFull:
                         logger.warning(f"Queue full for scan {scan_id}, dropping event {event}")
 
-    def get_history(self, scan_id: int, since_index: int = 0) -> List[Dict[str, Any]]:
+    def get_history(self, scan_id: int, since_seq: int = 0) -> List[Dict[str, Any]]:
         """
         Get event history for a scan.
 
         Args:
             scan_id: Scan ID to get history for
-            since_index: Start index (for incremental polling)
+            since_seq: Sequence number filter (returns events with seq > since_seq)
 
         Returns:
-            List of event dictionaries from since_index onwards
+            List of event dictionaries after since_seq (or all if since_seq=0)
 
         Use cases:
-            - WebSocket reconnection (Phase 2): Client sends last_index, gets missed events
+            - WebSocket reconnection (Phase 2): Client sends last_seq, gets missed events
             - MCP polling (Phase 3): Poll for new events since last check
         """
         history = self._event_history.get(scan_id, [])
-        return history[since_index:]
+
+        # Backward compatible: if since_seq is 0, return all events
+        if since_seq == 0:
+            return history
+
+        # Filter events by sequence number
+        return [event for event in history if event.get("seq", 0) > since_seq]
 
     async def stream(self, scan_id: int) -> AsyncIterator[Dict[str, Any]]:
         """
@@ -195,6 +232,10 @@ class ServiceEventBus:
             del self._scan_queues[scan_id]
             logger.info(f"Cleared {queue_count} stream queues for scan {scan_id}")
 
+        if scan_id in self._seq_counters:
+            del self._seq_counters[scan_id]
+            logger.debug(f"Cleared sequence counter for scan {scan_id}")
+
     def get_stats(self) -> Dict[str, Any]:
         """
         Get statistics about the service event bus.
@@ -217,6 +258,7 @@ class ServiceEventBus:
                 scan_id: len(queues)
                 for scan_id, queues in self._scan_queues.items()
             },
+            "sequence_counters": dict(self._seq_counters),
             "total_scans_tracked": len(self._event_history),
         }
 
