@@ -55,12 +55,37 @@ async def lifespan(app: FastAPI):
     logger.info("FastAPI application shutting down...")
 
 
+# OpenAPI tag metadata for Swagger documentation
+openapi_tags = [
+    {
+        "name": "scans",
+        "description": "Security scan lifecycle management - create, monitor, stop scans",
+    },
+    {
+        "name": "reports",
+        "description": "Scan report retrieval in HTML, JSON, and Markdown formats",
+    },
+    {
+        "name": "config",
+        "description": "Runtime configuration viewing and updating",
+    },
+    {
+        "name": "health",
+        "description": "Server health and readiness monitoring",
+    },
+]
+
 # Create FastAPI app
 app = FastAPI(
     title="BugTraceAI API",
     description="REST API for security scanning and report management",
     version=settings.VERSION,
     lifespan=lifespan,
+    openapi_tags=openapi_tags,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    contact={"name": "BugTraceAI", "url": "https://github.com/BugTraceAI"},
+    license_info={"name": "MIT"},
 )
 
 
@@ -134,7 +159,7 @@ async def root() -> Dict[str, Any]:
 
 
 # Health check endpoint
-@app.get("/health")
+@app.get("/health", tags=["health"])
 async def health_check(
     scan_service: ScanServiceDep,
     event_bus: EventBusDep,
