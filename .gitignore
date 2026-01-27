@@ -12,6 +12,8 @@ venv/
 *.log
 logs/
 bugtrace.db
+bugtrace.db-shm
+bugtrace.db-wal
 reports/
 .claude/
 backups/
@@ -20,4 +22,24 @@ uploads/
 .pytest_cache/
 .ralph/
 alembic.ini
+
+# Dev scripts and archives (local-only)
+scripts/
+archive/
+analyze_*.py
+check_*.py
+inspect_*.py
+list_tables.py
+query_db.py
+verify_db.py
+verify_dedupe.py
+patch_report_images.py
+api.py
+
+# Old dev docs
+COMPREHENSIVE_AUDIT_REPORT.md
+GEMINI_HANDOFF_TIERED_VALIDATION.md
+PENDING_TO_IMPLEMENTATION.md
+PROJECT_REVIEW_SESSION_*.md
+
 # Keep .agent/ and alembic/versions to preserve framework logic and DB schema
