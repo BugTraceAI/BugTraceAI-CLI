@@ -17,8 +17,9 @@ import os
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from bugtrace.core.config import settings
 from bugtrace.api.deps import ScanServiceDep, ReportServiceDep, EventBusDep
@@ -175,14 +176,29 @@ async def health_check(
     }
 
 
-# Placeholder comments for router includes (Plans 04, 05)
-# Plan 04 will add scan endpoints:
-# from bugtrace.api.routers import scans
-# app.include_router(scans.router, prefix="/scans", tags=["scans"])
+# Router includes
+from bugtrace.api.routes.scans import router as scans_router
+app.include_router(scans_router, prefix="/api", tags=["scans"])
 
 # Plan 05 will add report endpoints:
-# from bugtrace.api.routers import reports
-# app.include_router(reports.router, prefix="/reports", tags=["reports"])
+# from bugtrace.api.routes.reports import router as reports_router
+# app.include_router(reports_router, prefix="/api", tags=["reports"])
+
+
+# Global exception handlers
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
+    """
+    Global ValueError exception handler.
+
+    Converts ValueError exceptions to 400 Bad Request responses.
+    """
+    logger.warning(f"ValueError in {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=400,
+        content={"detail": str(exc)},
+    )
+
 
 # WebSocket endpoint will be added in Phase 2 (WebSocket Streaming)
 # @app.websocket("/ws/scans/{scan_id}")
