@@ -226,7 +226,7 @@ class TeamOrchestrator:
         
         dashboard.log("🔒 Enforcing Sequential Hunter Loop for stability", "INFO")
         
-        if dashboard.stop_requested:
+        if dashboard.stop_requested or self._stop_event.is_set():
             return
 
         # Register Global Event Handlers
@@ -938,14 +938,14 @@ class TeamOrchestrator:
             dashboard.log(f"🚀 Processing URL {i+1}/{len(urls_to_scan)}: {url[:60]}", "INFO")
             dashboard.update_task("Orchestrator", status=f"Processing {url[:40]}")
             
-            if dashboard.stop_requested:
+            if dashboard.stop_requested or self._stop_event.is_set():
                 dashboard.log("🛑 Stop requested. Finishing current URL and exiting...", "WARN")
                 break
-            
+
             # Reset findings for this URL
             all_validated_findings = []
             seen_keys = set()
-            
+
             # Create URL Folder in analysis/ subdirectory (ensure uniqueness for URLs with different parameters)
             import hashlib
             # Create readable base name (truncated)
@@ -955,12 +955,12 @@ class TeamOrchestrator:
             safe_url_name = f"{safe_base}_{url_hash}"
             url_dir = analysis_dir / f"url_{safe_url_name}"  # Place in analysis/ subdirectory
             url_dir.mkdir(exist_ok=True)
-            
+
             # A. DAST+SAST ANALYSIS
-            if dashboard.stop_requested: break
+            if dashboard.stop_requested or self._stop_event.is_set(): break
             dast = DASTySASTAgent(url, self.tech_profile, url_dir, state_manager=self.state_manager)
             analysis_result = await dast.run()
-            if dashboard.stop_requested: break
+            if dashboard.stop_requested or self._stop_event.is_set(): break
             
             vulnerabilities = analysis_result.get("vulnerabilities", [])
             
