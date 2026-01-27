@@ -17,12 +17,13 @@ import os
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from bugtrace.core.config import settings
-from bugtrace.api.deps import ScanServiceDep, ReportServiceDep, EventBusDep
+from bugtrace.api.deps import ScanServiceDep, ReportServiceDep, EventBusDep, get_scan_service
+from bugtrace.services.event_bus import service_event_bus
 from bugtrace.utils.logger import get_logger
 
 logger = get_logger("api.main")
@@ -201,9 +202,80 @@ async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse
     )
 
 
-# WebSocket endpoint will be added in Phase 2 (WebSocket Streaming)
-# @app.websocket("/ws/scans/{scan_id}")
-# async def websocket_scan_stream(websocket: WebSocket, scan_id: int):
-#     await websocket.accept()
-#     async for event in service_event_bus.stream(scan_id):
-#         await websocket.send_json(event)
+# WebSocket endpoint for real-time scan event streaming
+@app.websocket("/ws/scans/{scan_id}")
+async def websocket_scan_stream(
+    websocket: WebSocket,
+    scan_id: int,
+    last_seq: int = Query(default=0, description="Last received sequence number for reconnection"),
+):
+    """
+    WebSocket endpoint for streaming real-time scan events.
+
+    Args:
+        websocket: WebSocket connection
+        scan_id: Scan ID to stream events for
+        last_seq: Last received sequence number (for reconnection, default 0)
+
+    Behavior:
+        1. Accept WebSocket connection
+        2. Validate scan_id exists
+        3. If last_seq > 0 (reconnection): Send missed events first
+        4. Stream live events using ServiceEventBus.stream()
+        5. Handle WebSocketDisconnect gracefully
+        6. Close cleanly on scan completion (scan_complete or error events)
+
+    Reconnection support:
+        Client can reconnect with ?last_seq=N to receive only missed events
+        since sequence number N.
+
+    Solves WS-02: Real-time event streaming with reconnection support
+    """
+    await websocket.accept()
+    logger.info(f"WebSocket client connected to scan {scan_id} (last_seq={last_seq})")
+
+    try:
+        # Validate scan_id exists
+        scan_service = get_scan_service()
+        try:
+            scan_service.get_scan_status(scan_id)
+        except Exception as e:
+            logger.warning(f"Invalid scan_id {scan_id}: {e}")
+            await websocket.close(code=1008, reason=f"Invalid scan_id: {scan_id}")
+            return
+
+        # Handle reconnection: send missed events first
+        highest_sent = 0
+        if last_seq > 0:
+            logger.info(f"Reconnection detected for scan {scan_id}, replaying events since seq {last_seq}")
+            missed = service_event_bus.get_history(scan_id, since_seq=last_seq)
+            for event in missed:
+                await websocket.send_json(event)
+            highest_sent = missed[-1]["seq"] if missed else last_seq
+
+        # Stream live events with sequence-based deduplication
+        async for event in service_event_bus.stream(scan_id):
+            # Skip events already sent (prevents duplicates during reconnection)
+            if event.get("seq", 0) <= highest_sent:
+                continue
+
+            # Send event to client
+            await websocket.send_json(event)
+            highest_sent = event.get("seq", highest_sent)
+
+            # Check for terminal events
+            if event.get("event_type") in ("scan_complete", "error"):
+                logger.info(f"Scan {scan_id} completed with event_type={event.get('event_type')}, closing WebSocket")
+                break
+
+        # Close WebSocket cleanly after scan completion
+        await websocket.close(code=1000, reason="Scan complete")
+
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket client disconnected from scan {scan_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error for scan {scan_id}: {e}", exc_info=True)
+        try:
+            await websocket.close(code=1011, reason="Internal server error")
+        except Exception:
+            pass
