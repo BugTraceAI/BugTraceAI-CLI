@@ -14,6 +14,7 @@ Version: 2.0.0
 """
 
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
@@ -128,6 +129,7 @@ async def root() -> Dict[str, Any]:
         "version": settings.VERSION,
         "docs": "/docs",
         "health": "/health",
+        "ready": "/ready",
     }
 
 
@@ -174,6 +176,57 @@ async def health_check(
         "docker_available": docker_available,
         "active_scans": active_scans,
         "event_bus_stats": event_stats,
+    }
+
+
+# Readiness check endpoint
+@app.get("/ready", tags=["health"])
+async def readiness_check() -> Dict[str, Any]:
+    """
+    Readiness check endpoint for deployment orchestration.
+
+    Unlike /health (liveness probe) which indicates the server process is running,
+    /ready (readiness probe) verifies that the application can serve requests by
+    checking external dependencies like database connectivity.
+
+    Returns:
+        ready: Overall readiness status (true only if database is reachable)
+        checks:
+            database: Whether SQLite database is accessible
+            docker_available: Whether Docker is available for scan execution
+
+    Use /health for liveness probes (is the process alive?).
+    Use /ready for readiness probes (can it handle requests?).
+    """
+    # Check database connectivity
+    database_ok = False
+    try:
+        conn = sqlite3.connect("bugtrace.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.close()
+        conn.close()
+        database_ok = True
+    except Exception as e:
+        logger.warning(f"Database readiness check failed: {e}")
+
+    # Check Docker availability
+    docker_available = False
+    try:
+        from bugtrace.tools.external import docker_cmd
+        docker_available = docker_cmd is not None
+    except Exception as e:
+        logger.warning(f"Docker readiness check failed: {e}")
+
+    # Overall readiness: database must be reachable (Docker is optional)
+    ready = database_ok
+
+    return {
+        "ready": ready,
+        "checks": {
+            "database": database_ok,
+            "docker_available": docker_available,
+        },
     }
 
 
