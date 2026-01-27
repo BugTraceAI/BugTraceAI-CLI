@@ -49,9 +49,11 @@ def run_mcp_server() -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    # Step 4: Register tools by importing the tools module
-    # The @mcp_server.tool() decorators execute on import, registering tools
-    import bugtrace.mcp.tools  # noqa: F401
+    # Step 4: Register tools and resources by importing modules
+    # The @mcp_server.tool() and @mcp_server.resource() decorators execute on import
+    import bugtrace.mcp.tools      # noqa: F401
+    import bugtrace.mcp.resources  # noqa: F401
+    import bugtrace.mcp.explain    # noqa: F401
 
     # Step 5: Start the MCP server with STDIO transport
     # This blocks until the server is shut down
