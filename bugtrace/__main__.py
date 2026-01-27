@@ -76,6 +76,31 @@ def full_scan(
     """Run Hunter followed by Auditor (The complete professional workflow)."""
     _run_pipeline(target, phase="all", safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
 
+@app.command(name="serve")
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host", help="Host to bind to"),
+    port: int = typer.Option(8000, "--port", help="Port to bind to"),
+    reload: bool = typer.Option(False, "--reload", help="Enable auto-reload on code changes")
+):
+    """Start the FastAPI server for REST API access."""
+    from bugtrace.api.server import start_api_server
+
+    console.print(f"\n[bold green]Starting BugTraceAI API Server[/bold green]")
+    console.print(f"[bold green]Host:[/bold green] {host}")
+    console.print(f"[bold green]Port:[/bold green] {port}")
+    console.print(f"[bold green]Docs:[/bold green] http://{host}:{port}/docs")
+    console.print(f"[bold green]Health:[/bold green] http://{host}:{port}/health")
+    console.print("")
+
+    try:
+        start_api_server(host=host, port=port, reload=reload)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Server stopped by user.[/yellow]")
+    except Exception as e:
+        console.print(f"\n[bold red]Server error:[/bold red] {e}")
+        import traceback
+        traceback.print_exc()
+
 def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
     """Internal helper to run the pipeline phases."""
     if safe_mode is not None:
