@@ -122,41 +122,50 @@ class DASTySASTAgent(BaseAgent):
         logger.info(f"🔍 DASTySAST Result: {len(vulnerabilities)} candidates for {self.url[:50]}")
 
         for v in vulnerabilities:
-            # Normalize field names
-            v_name = v.get("vulnerability_name") or v.get("name") or v.get("vulnerability") or "Vulnerability"
-            v_desc = v.get("description") or v.get("reasoning") or v.get("details") or "No description provided."
-
-            # Ensure v_name is descriptive
-            if v_name.lower() in ["vulnerability", "security issue", "finding"]:
-                desc_lower = str(v_desc).lower()
-                if "xss" in desc_lower or "script" in desc_lower:
-                    v_name = "Potential XSS Issue"
-                elif "sql" in desc_lower:
-                    v_name = "Potential SQL Injection Issue"
-                else:
-                    v_name = f"Potential {v.get('type', 'Security')} Issue"
-
-            # Get severity
-            v_type_upper = (v.get("type") or v_name or "").upper()
-            v_severity = self._get_severity_for_type(v_type_upper, v.get("severity"))
-
-            self.state_manager.add_finding(
-                url=self.url,
-                type=str(v_name),
-                description=str(v_desc),
-                severity=str(v_severity),
-                parameter=v.get("parameter") or v.get("vulnerable_parameter"),
-                payload=v.get("payload") or v.get("logic") or v.get("exploitation_strategy"),
-                evidence=v.get("evidence") or v.get("reasoning"),
-                screenshot_path=v.get("screenshot_path"),
-                validated=v.get("validated", False)
-            )
+            self._save_single_vulnerability(v)
 
         # Save markdown report
         report_path = self.report_dir / f"vulnerabilities_{self._get_safe_name()}.md"
         self._save_markdown_report(report_path, vulnerabilities)
 
         dashboard.log(f"[{self.name}] Found {len(vulnerabilities)} potential vulnerabilities.", "SUCCESS")
+
+    def _save_single_vulnerability(self, v: Dict):
+        """Save a single vulnerability to state manager."""
+        # Normalize field names
+        v_name = v.get("vulnerability_name") or v.get("name") or v.get("vulnerability") or "Vulnerability"
+        v_desc = v.get("description") or v.get("reasoning") or v.get("details") or "No description provided."
+
+        # Ensure v_name is descriptive
+        v_name = self._normalize_vulnerability_name(v_name, v_desc, v)
+
+        # Get severity
+        v_type_upper = (v.get("type") or v_name or "").upper()
+        v_severity = self._get_severity_for_type(v_type_upper, v.get("severity"))
+
+        self.state_manager.add_finding(
+            url=self.url,
+            type=str(v_name),
+            description=str(v_desc),
+            severity=str(v_severity),
+            parameter=v.get("parameter") or v.get("vulnerable_parameter"),
+            payload=v.get("payload") or v.get("logic") or v.get("exploitation_strategy"),
+            evidence=v.get("evidence") or v.get("reasoning"),
+            screenshot_path=v.get("screenshot_path"),
+            validated=v.get("validated", False)
+        )
+
+    def _normalize_vulnerability_name(self, v_name: str, v_desc: str, v: Dict) -> str:
+        """Normalize vulnerability name to be more descriptive."""
+        if v_name.lower() not in ["vulnerability", "security issue", "finding"]:
+            return v_name
+
+        desc_lower = str(v_desc).lower()
+        if "xss" in desc_lower or "script" in desc_lower:
+            return "Potential XSS Issue"
+        if "sql" in desc_lower:
+            return "Potential SQL Injection Issue"
+        return f"Potential {v.get('type', 'Security')} Issue"
 
     def _get_safe_name(self) -> str:
         """Generate safe filename from URL."""
@@ -312,26 +321,37 @@ Return ONLY valid XML tags. Do not add markdown code blocks.
 
         vulnerabilities = []
         for vc in vuln_contents:
-            try:
-                conf_str = parser.extract_tag(vc, "confidence_score") or parser.extract_tag(vc, "confidence") or "5"
-                try:
-                    conf = int(float(conf_str))
-                    conf = max(0, min(10, conf))  # Clamp to 0-10
-                except (ValueError, TypeError):
-                    conf = 5
-
-                vulnerabilities.append({
-                    "type": parser.extract_tag(vc, "type") or "Unknown",
-                    "parameter": parser.extract_tag(vc, "parameter") or "unknown",
-                    "confidence_score": conf,
-                    "reasoning": parser.extract_tag(vc, "reasoning") or "",
-                    "severity": parser.extract_tag(vc, "severity") or "Medium",
-                    "exploitation_strategy": parser.extract_tag(vc, "payload") or parser.extract_tag(vc, "exploitation_strategy") or ""
-                })
-            except Exception as ex:
-                logger.warning(f"Failed to parse vulnerability entry: {ex}")
+            vuln = self._parse_single_vulnerability(parser, vc)
+            if vuln:
+                vulnerabilities.append(vuln)
 
         return {"vulnerabilities": vulnerabilities}
+
+    def _parse_single_vulnerability(self, parser: XmlParser, vc: str) -> Optional[Dict]:
+        """Parse a single vulnerability entry."""
+        try:
+            conf = self._parse_confidence_score(parser, vc)
+
+            return {
+                "type": parser.extract_tag(vc, "type") or "Unknown",
+                "parameter": parser.extract_tag(vc, "parameter") or "unknown",
+                "confidence_score": conf,
+                "reasoning": parser.extract_tag(vc, "reasoning") or "",
+                "severity": parser.extract_tag(vc, "severity") or "Medium",
+                "exploitation_strategy": parser.extract_tag(vc, "payload") or parser.extract_tag(vc, "exploitation_strategy") or ""
+            }
+        except Exception as ex:
+            logger.warning(f"Failed to parse vulnerability entry: {ex}")
+            return None
+
+    def _parse_confidence_score(self, parser: XmlParser, vc: str) -> int:
+        """Parse and validate confidence score."""
+        conf_str = parser.extract_tag(vc, "confidence_score") or parser.extract_tag(vc, "confidence") or "5"
+        try:
+            conf = int(float(conf_str))
+            return max(0, min(10, conf))  # Clamp to 0-10
+        except (ValueError, TypeError):
+            return 5
 
     def _get_system_prompt(self, approach: str) -> str:
         """Get system prompt from external config."""
@@ -485,30 +505,37 @@ Return XML:
         approved = []
 
         for block in finding_blocks:
-            try:
-                idx = int(parser.extract_tag(block, "index")) - 1
-                vuln_type = parser.extract_tag(block, "type") or "UNKNOWN"
-                final_score = int(parser.extract_tag(block, "final_score") or "0")
-                reasoning = parser.extract_tag(block, "reasoning") or ""
-
-                # Get type-specific threshold
-                threshold = settings.get_threshold_for_type(vuln_type)
-
-                if 0 <= idx < len(vulnerabilities):
-                    vuln = vulnerabilities[idx]
-                    vuln["skeptical_score"] = final_score
-                    vuln["skeptical_reasoning"] = reasoning
-
-                    if final_score >= threshold:
-                        logger.info(f"[{self.name}] ✅ APPROVED #{idx+1} {vuln_type} (score: {final_score}/10 >= {threshold}): {reasoning[:60]}")
-                        approved.append(vuln)
-                    else:
-                        logger.info(f"[{self.name}] ❌ REJECTED #{idx+1} {vuln_type} (score: {final_score}/10 < {threshold}): {reasoning[:60]}")
-            except Exception as e:
-                logger.warning(f"[{self.name}] Failed to parse finding: {e}")
+            self._process_review_finding(parser, block, vulnerabilities, approved)
 
         logger.info(f"[{self.name}] Skeptical Review: {len(approved)} passed, {len(vulnerabilities)-len(approved)} rejected")
         return approved
+
+    def _process_review_finding(self, parser: XmlParser, block: str,
+                                vulnerabilities: List[Dict], approved: List[Dict]):
+        """Process a single review finding."""
+        try:
+            idx = int(parser.extract_tag(block, "index")) - 1
+            vuln_type = parser.extract_tag(block, "type") or "UNKNOWN"
+            final_score = int(parser.extract_tag(block, "final_score") or "0")
+            reasoning = parser.extract_tag(block, "reasoning") or ""
+
+            if not (0 <= idx < len(vulnerabilities)):
+                return
+
+            vuln = vulnerabilities[idx]
+            vuln["skeptical_score"] = final_score
+            vuln["skeptical_reasoning"] = reasoning
+
+            # Get type-specific threshold
+            threshold = settings.get_threshold_for_type(vuln_type)
+
+            if final_score >= threshold:
+                logger.info(f"[{self.name}] ✅ APPROVED #{idx+1} {vuln_type} (score: {final_score}/10 >= {threshold}): {reasoning[:60]}")
+                approved.append(vuln)
+            else:
+                logger.info(f"[{self.name}] ❌ REJECTED #{idx+1} {vuln_type} (score: {final_score}/10 < {threshold}): {reasoning[:60]}")
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse finding: {e}")
 
     def _save_markdown_report(self, path: Path, vulnerabilities: List[Dict]):
         """Saves a human-readable markdown report of potential vulnerabilities."""

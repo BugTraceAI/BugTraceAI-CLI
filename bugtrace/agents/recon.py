@@ -218,25 +218,45 @@ class ReconAgent(BaseAgent):
         """
         # 1. Standard Critical Paths (Always check)
         paths = ["/robots.txt", "/sitemap.xml", "/.env", "/.git/config", "/admin", "/login"]
-        
-        # 2. LLM Hallucinated Paths (Good kind of hallucination - Prediction)
-        if analysis_context:
-            prompt = f"""
-            Based on this analysis of a web application: "{analysis_context}"
-            Suggest 5 likely hidden URL paths that might exist (e.g. specific admin panels, API docs, dev endpoints).
-            Return ONLY the paths, one per line. Start with /.
-            """
-            import re
-            if self.system_prompt and re.search(r'#+\s+Path Prediction Prompt', self.system_prompt, flags=re.IGNORECASE):
-                parts = re.split(r'#+\s+Path Prediction Prompt', self.system_prompt, flags=re.IGNORECASE)
-                template = parts[1].strip()
-                prompt = template.replace("{analysis_context}", analysis_context)
 
-            suggestion = await llm_client.generate(prompt, module_name="Recon-PathPred")
-            if suggestion:
-                for line in suggestion.splitlines():
-                    clean = line.strip()
-                    if clean.startswith("/") and " " not in clean:
-                         paths.append(clean)
-                         
+        # 2. LLM Hallucinated Paths (Good kind of hallucination - Prediction)
+        if not analysis_context:
+            return list(set(paths))
+
+        llm_paths = await self._generate_llm_predicted_paths(analysis_context)
+        paths.extend(llm_paths)
         return list(set(paths))
+
+    async def _generate_llm_predicted_paths(self, analysis_context: str) -> List[str]:
+        """Generate LLM-predicted paths based on analysis context."""
+        prompt = self._build_path_prediction_prompt(analysis_context)
+        suggestion = await llm_client.generate(prompt, module_name="Recon-PathPred")
+
+        if not suggestion:
+            return []
+
+        return self._extract_paths_from_suggestion(suggestion)
+
+    def _build_path_prediction_prompt(self, analysis_context: str) -> str:
+        """Build prompt for path prediction."""
+        import re
+
+        if self.system_prompt and re.search(r'#+\s+Path Prediction Prompt', self.system_prompt, flags=re.IGNORECASE):
+            parts = re.split(r'#+\s+Path Prediction Prompt', self.system_prompt, flags=re.IGNORECASE)
+            template = parts[1].strip()
+            return template.replace("{analysis_context}", analysis_context)
+
+        return f"""
+        Based on this analysis of a web application: "{analysis_context}"
+        Suggest 5 likely hidden URL paths that might exist (e.g. specific admin panels, API docs, dev endpoints).
+        Return ONLY the paths, one per line. Start with /.
+        """
+
+    def _extract_paths_from_suggestion(self, suggestion: str) -> List[str]:
+        """Extract valid paths from LLM suggestion."""
+        paths = []
+        for line in suggestion.splitlines():
+            clean = line.strip()
+            if clean.startswith("/") and " " not in clean:
+                paths.append(clean)
+        return paths
