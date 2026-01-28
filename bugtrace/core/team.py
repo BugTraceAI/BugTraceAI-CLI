@@ -812,118 +812,356 @@ class TeamOrchestrator:
         """Deprecated: Logic moved to __init__ via StateManager."""
         return set()
 
-    async def _run_sequential_pipeline(self, dashboard):
-        """Implements the V2 Sequential Pipeline Flow."""
-        logger.info("Entering V2 Sequential Pipeline")
-        start_time = datetime.now()
-        
-        # 0. Setup Scan Folder with organized structure
+    def _setup_scan_directory(self, start_time: datetime) -> tuple:
+        """Setup scan folder with organized structure. Returns (scan_dir, recon_dir, analysis_dir, captures_dir)."""
         timestamp = start_time.strftime("%Y%m%d_%H%M%S")
-        from urllib.parse import urlparse
         domain = urlparse(self.target).netloc or "unknown"
         if ":" in domain:
             domain = domain.split(":")[0]
-            
+
         if self.output_dir:
             scan_dir = self.output_dir
         else:
             scan_dir = settings.REPORT_DIR / f"{domain}_{timestamp}"
-        
+
         self.scan_dir = scan_dir
         scan_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create organized subdirectories
+
         recon_dir = scan_dir / "recon"
         analysis_dir = scan_dir / "analysis"
         captures_dir = scan_dir / "captures"
         recon_dir.mkdir(exist_ok=True)
         analysis_dir.mkdir(exist_ok=True)
         captures_dir.mkdir(exist_ok=True)
-        
-        dashboard.log(f"📂 Scan directory created: {scan_dir.name}", "INFO")
-        
-        # 1. PHASE 1: RECONNAISSANCE
-        dashboard.set_phase("PHASE_1_RECON")
-        
-        # Target Health Check (Sentinel Guard)
+
+        return scan_dir, recon_dir, analysis_dir, captures_dir
+
+    async def _check_target_health(self, dashboard) -> bool:
+        """Check if target is reachable and stable. Returns True if healthy, False otherwise."""
         async with httpx.AsyncClient() as client:
             try:
                 resp = await client.get(self.target, timeout=10.0)
                 if resp.status_code >= 500:
                     dashboard.log(f"Target {self.target} is unstable (HTTP {resp.status_code}). Aborting scan.", "ERROR")
-                    return
+                    return False
+                return True
             except Exception as e:
                 dashboard.log(f"Target {self.target} is unreachable. Skipping engagement. Error: {e}", "ERROR")
-                return
+                return False
 
-        urls_to_scan = []
-        self.tech_profile = {"frameworks": [], "server": "unknown"}
-        
+    async def _run_reconnaissance(self, dashboard, recon_dir) -> list:
+        """Run reconnaissance phase and return discovered URLs."""
         if self.resume and self.url_queue:
             dashboard.log(f"⏩ Skipping Recon: Resuming with {len(self.url_queue)} URLs found in DB.", "INFO")
-            urls_to_scan = self.url_queue
-            # Try to load tech profile from state
             loaded_state = self.state_manager.load_state()
             self.tech_profile = loaded_state.get("tech_profile", self.tech_profile)
-        else:
-            dashboard.log("Starting Phase 1: Reconnaissance (Nuclei + GoSpider)", "INFO")
-            
-            # GoSpider: URL discovery
+            return self.url_queue
+
+        dashboard.log("Starting Phase 1: Reconnaissance (Nuclei + GoSpider)", "INFO")
+
+        try:
+            logger.info(f"Triggering GoSpiderAgent for {self.target}")
+            gospider = GoSpiderAgent(self.target, recon_dir, max_depth=self.max_depth, max_urls=self.max_urls)
+            urls_to_scan = await gospider.run()
+            logger.info(f"GoSpiderAgent finished. Found {len(urls_to_scan)} URLs")
+
+            # TOKEN SCANNING
+            dashboard.log("🔍 Scanning discovery artifacts for authentication tokens...", "INFO")
+            combined_recon_data = " ".join(urls_to_scan) + " " + json.dumps(self.tech_profile)
+            found_jwts = find_jwts(combined_recon_data)
+            if found_jwts:
+                dashboard.log(f"🔑 Found {len(found_jwts)} potential JWT(s) in recon data!", "WARN")
+                for token in found_jwts:
+                    self.event_bus.publish("auth_token_found", {
+                        "token": token,
+                        "url": self.target,
+                        "location": "recon_discovery"
+                    })
+        except Exception as e:
+            logger.error(f"GoSpiderAgent crash: {e}")
+            urls_to_scan = [self.target]
+
+        return self._normalize_urls(urls_to_scan)
+
+    def _normalize_urls(self, urls_to_scan: list) -> list:
+        """Deduplicate and normalize URLs."""
+        unique_urls = set()
+        normalized_list = []
+        has_parameterized = False
+
+        for u in urls_to_scan:
+            u_norm = u.rstrip('/')
+            if '?' in u_norm or '=' in u_norm:
+                has_parameterized = True
+
+            if u_norm not in unique_urls:
+                unique_urls.add(u_norm)
+                normalized_list.append(u)
+
+        # Smart Filter: If we have parameterized URLs, remove Root URL
+        if has_parameterized:
+            root_norm = self.target.rstrip('/')
+            normalized_list = [u for u in normalized_list if u.rstrip('/') != root_norm]
+            if not normalized_list:
+                normalized_list = [self.target]
+
+        urls_to_scan = normalized_list
+        logger.info(f"Deduplicated URLs to scan: {len(urls_to_scan)}")
+        for u in urls_to_scan:
+            logger.info(f">> To Scan: {u}")
+
+        self.url_queue = urls_to_scan
+        self._save_checkpoint()
+        return urls_to_scan
+
+    def _create_url_directory(self, url: str, analysis_dir: Path) -> Path:
+        """Create unique directory for URL analysis outputs."""
+        safe_base = url.replace("://", "_").replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_")[:40]
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+        safe_url_name = f"{safe_base}_{url_hash}"
+        url_dir = analysis_dir / f"url_{safe_url_name}"
+        url_dir.mkdir(exist_ok=True)
+        return url_dir
+
+    def _create_finding_processor(self, seen_keys: set, all_validated_findings: list, dashboard):
+        """Create a processor function for handling specialist agent results."""
+        def process_result(res):
+            if res and res.get("findings"):
+                for f in res["findings"]:
+                    is_valid, error_msg = conductor._validate_payload_format(f)
+                    if not is_valid:
+                        logger.warning(f"[TeamOrchestrator] {error_msg}")
+                        continue
+
+                    finding_url = f.get('url', '')
+                    finding_path = urlparse(finding_url).path if finding_url else ''
+                    key = f"{f['type']}:{finding_path}:{f.get('parameter', 'none')}"
+                    logger.info(f"[TeamOrchestrator] Processing finding Key: {key}")
+                    if key not in seen_keys:
+                        logger.info(f"[TeamOrchestrator] New Key! Adding finding.")
+                        seen_keys.add(key)
+                        all_validated_findings.append(f)
+                        dashboard.add_finding(f['type'], f"{f['url']} [{f.get('parameter')}]", f.get('severity', 'HIGH'))
+
+                        self.state_manager.add_finding(
+                            url=f['url'], type=f['type'], description=f.get('description', f"Discovery finding"),
+                            severity=f.get('severity', 'HIGH'), parameter=f.get('parameter'), payload=f.get('payload'),
+                            evidence=f.get('evidence'), screenshot_path=f.get('screenshot') or f.get('screenshot_path'),
+                            validated=f.get('validated', False),
+                            status=f.get('status', 'PENDING_VALIDATION'),
+                            reproduction=f.get('reproduction') or f.get('reproduction_command')
+                        )
+        return process_result
+
+    async def _dispatch_specialists(self, vulnerabilities: list, url: str, dashboard, process_result) -> dict:
+        """Analyze vulnerabilities and dispatch appropriate specialist agents."""
+        specialist_dispatches = set()
+        params_map = {}
+        idor_params = []
+
+        parsed_url = urlparse(url)
+        current_qs = parse_qs(parsed_url.query)
+
+        for vuln in vulnerabilities:
+            specialist_type = await self._decide_specialist(vuln)
+            dashboard.log(f"🤖 Dispatcher chose: {specialist_type} for {vuln.get('parameter')}", "INFO")
+            specialist_dispatches.add(specialist_type)
+
+            param = vuln.get("parameter")
+            if param and str(param).lower() not in ["none", "unknown", "null"]:
+                if specialist_type == "IDOR_AGENT":
+                    original_val = current_qs.get(param, ["1"])[0]
+                    idor_params.append({"parameter": param, "original_value": original_val})
+                else:
+                    if specialist_type not in params_map:
+                        params_map[specialist_type] = set()
+                    params_map[specialist_type].add(param)
+
+            if specialist_type == "HEADER_INJECTION":
+                res = {
+                    "findings": [{
+                        "type": vuln.get("type", "Header Injection"),
+                        "url": url,
+                        "parameter": param,
+                        "evidence": vuln.get("reasoning") or "Header Injection detected via CRLF probe",
+                        "payload": vuln.get("payload") or "%0d%0aX-Injected: true",
+                        "validated": True,
+                        "severity": "MEDIUM"
+                    }]
+                }
+                process_result(res)
+
+        return {
+            "specialist_dispatches": specialist_dispatches,
+            "params_map": params_map,
+            "idor_params": idor_params,
+            "parsed_url": parsed_url,
+            "current_qs": current_qs
+        }
+
+    async def _build_agent_tasks(self, dispatch_info: dict, url: str, url_dir: Path, process_result) -> list:
+        """Build list of specialist agent tasks based on dispatch decisions."""
+        agent_tasks = []
+        specialist_dispatches = dispatch_info["specialist_dispatches"]
+        params_map = dispatch_info["params_map"]
+        idor_params = dispatch_info["idor_params"]
+        parsed_url = dispatch_info["parsed_url"]
+        current_qs = dispatch_info["current_qs"]
+
+        if "XSS_AGENT" in specialist_dispatches:
+            p_list = list(params_map.get("XSS_AGENT", [])) or None
+            xss_agent = XSSAgent(url, params=p_list, report_dir=url_dir)
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, xss_agent, process_result))
+
+        url_has_params = bool(parsed_url.query)
+        if "SQL_AGENT" in specialist_dispatches or url_has_params:
+            p_list = list(params_map.get("SQL_AGENT", []))
+            if not p_list and url_has_params:
+                p_list = list(current_qs.keys())
+            sql_agent = SQLMapAgent(url, p_list or None, url_dir)
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, sql_agent, process_result))
+
+        if "CSTI_AGENT" in specialist_dispatches:
+            p_list = list(params_map.get("CSTI_AGENT", [])) or None
+            csti_agent = CSTIAgent(url, params=[{"parameter": p} for p in p_list] if p_list else None, report_dir=url_dir)
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, csti_agent, process_result))
+
+        if "XXE_AGENT" in specialist_dispatches:
+            from bugtrace.agents.exploit_specialists import XXEAgent
+            p_list = list(params_map.get("XXE_AGENT", [])) or None
+            xxe_agent = XXEAgent(url, p_list, url_dir)
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, xxe_agent, process_result))
+
+        if "SSRF_AGENT" in specialist_dispatches:
+            from bugtrace.agents.ssrf_agent import SSRFAgent
+            p_list = list(params_map.get("SSRF_AGENT", [])) or None
+            ssrf_agent = SSRFAgent(url, p_list, url_dir)
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, ssrf_agent, process_result))
+
+        if "LFI_AGENT" in specialist_dispatches:
+            from bugtrace.agents.lfi_agent import LFIAgent
+            p_list = list(params_map.get("LFI_AGENT", [])) or None
+            lfi_agent = LFIAgent(url, p_list, url_dir)
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, lfi_agent, process_result))
+
+        if "RCE_AGENT" in specialist_dispatches:
+            from bugtrace.agents.rce_agent import RCEAgent
+            p_list = list(params_map.get("RCE_AGENT", [])) or None
+            rce_agent = RCEAgent(url, p_list, url_dir)
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, rce_agent, process_result))
+
+        if "PROTO_AGENT" in specialist_dispatches:
+            from bugtrace.agents.exploit_specialists import ProtoAgent
+            p_list = list(params_map.get("PROTO_AGENT", [])) or None
+            proto_agent = ProtoAgent(url, p_list, url_dir)
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, proto_agent, process_result))
+
+        if "FILE_UPLOAD_AGENT" in specialist_dispatches:
+            from bugtrace.agents.fileupload_agent import FileUploadAgent
+            upload_agent = FileUploadAgent(url)
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, upload_agent, process_result))
+
+        if "JWT_AGENT" in specialist_dispatches:
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, self.jwt_agent, process_result))
+
+        if "IDOR_AGENT" in specialist_dispatches:
+            from bugtrace.agents.idor_agent import IDORAgent
+            idor_agent = IDORAgent(url, params=idor_params, report_dir=url_dir)
+            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, idor_agent, process_result))
+
+        return agent_tasks
+
+    async def _execute_agents(self, agent_tasks: list, dashboard) -> bool:
+        """Execute agent tasks with stop request handling. Returns False if stopped."""
+        if not agent_tasks:
+            return True
+
+        logger.info(f"[TeamOrchestrator] Executing {len(agent_tasks)} agents in parallel (max {settings.MAX_CONCURRENT_URL_AGENTS} concurrent)")
+        pending = {asyncio.ensure_future(t) for t in agent_tasks}
+        while pending:
+            done, pending = await asyncio.wait(pending, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+            if dashboard.stop_requested or self._stop_event.is_set():
+                dashboard.log("🛑 Stop requested. Cancelling running agents...", "WARN")
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.wait(pending, timeout=5)
+                return False
+        return True
+
+    async def _process_url(self, url: str, url_index: int, total_urls: int, analysis_dir: Path, dashboard) -> list:
+        """Process a single URL for vulnerabilities. Returns list of validated findings."""
+        if url in self.processed_urls:
+            dashboard.log(f"⏩ Skipping already processed URL: {url[:60]}", "INFO")
+            return []
+
+        dashboard.log(f"🚀 Processing URL {url_index+1}/{total_urls}: {url[:60]}", "INFO")
+        dashboard.update_task("Orchestrator", status=f"Processing {url[:40]}")
+
+        if dashboard.stop_requested or self._stop_event.is_set():
+            return []
+
+        all_validated_findings = []
+        seen_keys = set()
+        url_dir = self._create_url_directory(url, analysis_dir)
+
+        # Run DAST analysis
+        if dashboard.stop_requested or self._stop_event.is_set():
+            return []
+
+        dast = DASTySASTAgent(url, self.tech_profile, url_dir, state_manager=self.state_manager)
+        analysis_result = await dast.run()
+
+        if dashboard.stop_requested or self._stop_event.is_set():
+            return []
+
+        vulnerabilities = analysis_result.get("vulnerabilities", [])
+
+        if vulnerabilities:
+            dashboard.log(f"🧠 Orchestrator deciding on {len(vulnerabilities)} potential vulnerabilities...", "INFO")
+
+            process_result = self._create_finding_processor(seen_keys, all_validated_findings, dashboard)
+            dispatch_info = await self._dispatch_specialists(vulnerabilities, url, dashboard, process_result)
+            agent_tasks = await self._build_agent_tasks(dispatch_info, url, url_dir, process_result)
+
+            if agent_tasks:
+                continue_scan = await self._execute_agents(agent_tasks, dashboard)
+                if not continue_scan:
+                    return all_validated_findings
+
+        dashboard.log(f"🎯 Intelligent dispatch complete for {url[:50]}", "SUCCESS")
+
+        # Save findings to DB
+        if all_validated_findings:
             try:
-                logger.info(f"Triggering GoSpiderAgent for {self.target}")
-                gospider = GoSpiderAgent(self.target, recon_dir, max_depth=self.max_depth, max_urls=self.max_urls)  # Output to recon/
-                urls_to_scan = await gospider.run()
-                logger.info(f"GoSpiderAgent finished. Found {len(urls_to_scan)} URLs")
-                
-                # --- TOKEN SCANNING (V4 Skill) ---
-                dashboard.log("🔍 Scanning discovery artifacts for authentication tokens...", "INFO")
-                combined_recon_data = " ".join(urls_to_scan) + " " + json.dumps(self.tech_profile)
-                found_jwts = find_jwts(combined_recon_data)
-                if found_jwts:
-                    dashboard.log(f"🔑 Found {len(found_jwts)} potential JWT(s) in recon data!", "WARN")
-                    for token in found_jwts:
-                        # Signal the JWTAgent
-                        self.event_bus.publish("auth_token_found", {
-                            "token": token,
-                            "url": self.target,
-                            "location": "recon_discovery"
-                        })
+                from bugtrace.core.database import get_db_manager
+                db = get_db_manager()
+                db.save_scan_result(self.target, all_validated_findings, scan_id=self.scan_id)
             except Exception as e:
-                logger.error(f"GoSpiderAgent crash: {e}")
-                urls_to_scan = [self.target]
-            
-            # Update State
-            # Deduplicate and Normalize URLs
-            unique_urls = set()
-            normalized_list = []
-            has_parameterized = False
-            
-            for u in urls_to_scan:
-                u_norm = u.rstrip('/')
-                if '?' in u_norm or '=' in u_norm:
-                    has_parameterized = True
-                
-                if u_norm not in unique_urls:
-                    unique_urls.add(u_norm)
-                    normalized_list.append(u)
-            
-            # Smart Filter: If we have parameterized URLs, remove Root URL to prevent redundant scraping
-            if has_parameterized:
-                # Remove root if present
-                root_norm = self.target.rstrip('/')
-                normalized_list = [u for u in normalized_list if u.rstrip('/') != root_norm]
-                if not normalized_list: # If filtering removed everything (rare)
-                    normalized_list = [self.target]
-            
-            urls_to_scan = normalized_list
-            logger.info(f"Deduplicated URLs to scan: {len(urls_to_scan)}")
-            for u in urls_to_scan:
-                logger.info(f">> To Scan: {u}")
+                logger.error(f"Failed to save findings to DB: {e}")
 
-            self.url_queue = urls_to_scan
-            self._save_checkpoint()
+        self._save_checkpoint(url)
+        return all_validated_findings
 
-        # Stop check after recon (GoSpider can take minutes)
+    async def _run_sequential_pipeline(self, dashboard):
+        """Implements the V2 Sequential Pipeline Flow."""
+        logger.info("Entering V2 Sequential Pipeline")
+        start_time = datetime.now()
+
+        # Setup
+        scan_dir, recon_dir, analysis_dir, captures_dir = self._setup_scan_directory(start_time)
+        dashboard.log(f"📂 Scan directory created: {scan_dir.name}", "INFO")
+        
+        # 1. PHASE 1: RECONNAISSANCE
+        dashboard.set_phase("PHASE_1_RECON")
+
+        if not await self._check_target_health(dashboard):
+            return
+
+        self.tech_profile = {"frameworks": [], "server": "unknown"}
+        urls_to_scan = await self._run_reconnaissance(dashboard, recon_dir)
+
+        # Stop check after recon
         if dashboard.stop_requested or self._stop_event.is_set():
             dashboard.log("🛑 Stop requested after reconnaissance. Exiting.", "WARN")
             from bugtrace.schemas.db_models import ScanStatus
@@ -935,218 +1173,10 @@ class TeamOrchestrator:
         # variables moved inside loop
         
         for i, url in enumerate(urls_to_scan):
-            if url in self.processed_urls:
-                dashboard.log(f"⏩ Skipping already processed URL: {url[:60]}", "INFO")
-                continue
-
-            dashboard.log(f"🚀 Processing URL {i+1}/{len(urls_to_scan)}: {url[:60]}", "INFO")
-            dashboard.update_task("Orchestrator", status=f"Processing {url[:40]}")
-            
+            await self._process_url(url, i, len(urls_to_scan), analysis_dir, dashboard)
             if dashboard.stop_requested or self._stop_event.is_set():
                 dashboard.log("🛑 Stop requested. Finishing current URL and exiting...", "WARN")
                 break
-
-            # Reset findings for this URL
-            all_validated_findings = []
-            seen_keys = set()
-
-            # Create URL Folder in analysis/ subdirectory (ensure uniqueness for URLs with different parameters)
-            import hashlib
-            # Create readable base name (truncated)
-            safe_base = url.replace("://", "_").replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_")[:40]
-            # Add hash of full URL to ensure uniqueness
-            url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-            safe_url_name = f"{safe_base}_{url_hash}"
-            url_dir = analysis_dir / f"url_{safe_url_name}"  # Place in analysis/ subdirectory
-            url_dir.mkdir(exist_ok=True)
-
-            # A. DAST+SAST ANALYSIS
-            if dashboard.stop_requested or self._stop_event.is_set(): break
-            dast = DASTySASTAgent(url, self.tech_profile, url_dir, state_manager=self.state_manager)
-            analysis_result = await dast.run()
-            if dashboard.stop_requested or self._stop_event.is_set(): break
-            
-            vulnerabilities = analysis_result.get("vulnerabilities", [])
-            
-            # B. ORCHESTRATOR DECISION & SPECIALISTS
-            if vulnerabilities:
-                dashboard.log(f"🧠 Orchestrator deciding on {len(vulnerabilities)} potential vulnerabilities...", "INFO")
-                
-                # Helper to process results (De-duplication & State Update)
-                def process_result(res):
-                    if res and res.get("findings"):
-                        for f in res["findings"]:
-                            # --- PRE-FLIGHT VALIDATION (V3.5 Reactor) ---
-                            # Reject conversational payloads before they pollute the DB
-                            is_valid, error_msg = conductor._validate_payload_format(f)
-                            if not is_valid:
-                                logger.warning(f"[TeamOrchestrator] {error_msg}")
-                                continue
-
-                            # DEDUPE FIX: Use PATH only (not full URL with query params)
-                            # This groups SQLi in productId=18 and productId=11 as the SAME finding
-                            finding_url = f.get('url', '')
-                            finding_path = urlparse(finding_url).path if finding_url else ''
-                            key = f"{f['type']}:{finding_path}:{f.get('parameter', 'none')}"
-                            logger.info(f"[TeamOrchestrator] Processing finding Key: {key}")
-                            if key not in seen_keys:
-                                logger.info(f"[TeamOrchestrator] New Key! Adding finding.")
-                                seen_keys.add(key)
-                                all_validated_findings.append(f)
-                                # UI marking
-                                dashboard.add_finding(f['type'], f"{f['url']} [{f.get('parameter')}]", f.get('severity', 'HIGH'))
-                                
-                                self.state_manager.add_finding(
-                                    url=f['url'], type=f['type'], description=f.get('description', f"Discovery finding"),
-                                    severity=f.get('severity', 'HIGH'), parameter=f.get('parameter'), payload=f.get('payload'),
-                                    evidence=f.get('evidence'), screenshot_path=f.get('screenshot') or f.get('screenshot_path'),
-                                    validated=f.get('validated', False), # Respect Specialist Agent decision
-                                    status=f.get('status', 'PENDING_VALIDATION'),
-                                    # 2026-01-24 FIX: Include reproduction command from specialist agents (e.g., SQLMap)
-                                    reproduction=f.get('reproduction') or f.get('reproduction_command')
-                                )
-
-                # Group findings for optimization
-                specialist_dispatches = set()
-                params_map = {} # type -> set of params
-                idor_params = [] # List[Dict] for IDORAgent
-                
-                # Pre-parse URL for IDOR original values
-                parsed_url = urlparse(url)
-                current_qs = parse_qs(parsed_url.query)
-                
-                for vuln in vulnerabilities:
-                    specialist_type = await self._decide_specialist(vuln)
-                    dashboard.log(f"🤖 Dispatcher chose: {specialist_type} for {vuln.get('parameter')}", "INFO")
-                    specialist_dispatches.add(specialist_type)
-                    
-                    param = vuln.get("parameter")
-                    if param and str(param).lower() not in ["none", "unknown", "null"]:
-                        if specialist_type == "IDOR_AGENT":
-                            original_val = current_qs.get(param, ["1"])[0] # Default to 1 if not found
-                            idor_params.append({"parameter": param, "original_value": original_val})
-                        else:
-                            if specialist_type not in params_map: params_map[specialist_type] = set()
-                            params_map[specialist_type].add(param)
-
-                    # Handle non-agent types immediately
-                    if specialist_type == "HEADER_INJECTION":
-                         res = {
-                            "findings": [{
-                                "type": vuln.get("type", "Header Injection"),
-                                "url": url,
-                                "parameter": param,
-                                "evidence": vuln.get("reasoning") or "Header Injection detected via CRLF probe",
-                                "payload": vuln.get("payload") or "%0d%0aX-Injected: true",
-                                "validated": True,
-                                "severity": "MEDIUM"
-                            }]
-                        }
-                         process_result(res)
-
-                # Execute Batched Agents IN PARALLEL
-                agent_tasks = []
-
-                if "XSS_AGENT" in specialist_dispatches:
-                    p_list = list(params_map.get("XSS_AGENT", [])) or None
-                    xss_agent = XSSAgent(url, params=p_list, report_dir=url_dir)
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, xss_agent, process_result))
-
-                # 2026-01-23 FIX: ALWAYS run SQLMapAgent when URL has query params
-                # SQLMap is a definitive validator - don't gate it behind LLM analysis
-                # If skeptical review rejected SQLi, we still test with SQLMap
-                url_has_params = bool(parsed_url.query)
-                if "SQL_AGENT" in specialist_dispatches or url_has_params:
-                    # Use params from skeptical review if available, else extract from URL
-                    p_list = list(params_map.get("SQL_AGENT", []))
-                    if not p_list and url_has_params:
-                        # Extract all param names from URL query string
-                        p_list = list(current_qs.keys())
-                        dashboard.log(f"🔧 [SQLMapAgent] Auto-dispatching for URL params: {p_list}", "INFO")
-                    sql_agent = SQLMapAgent(url, p_list or None, url_dir)
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, sql_agent, process_result))
-
-                if "CSTI_AGENT" in specialist_dispatches:
-                    p_list = list(params_map.get("CSTI_AGENT", [])) or None
-                    csti_agent = CSTIAgent(url, params=[{"parameter": p} for p in p_list] if p_list else None, report_dir=url_dir)
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, csti_agent, process_result))
-
-                if "XXE_AGENT" in specialist_dispatches:
-                    from bugtrace.agents.exploit_specialists import XXEAgent
-                    p_list = list(params_map.get("XXE_AGENT", [])) or None
-                    xxe_agent = XXEAgent(url, p_list, url_dir)
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, xxe_agent, process_result))
-
-                if "SSRF_AGENT" in specialist_dispatches:
-                    from bugtrace.agents.ssrf_agent import SSRFAgent
-                    p_list = list(params_map.get("SSRF_AGENT", [])) or None
-                    ssrf_agent = SSRFAgent(url, p_list, url_dir)
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, ssrf_agent, process_result))
-
-                if "LFI_AGENT" in specialist_dispatches:
-                    from bugtrace.agents.lfi_agent import LFIAgent
-                    p_list = list(params_map.get("LFI_AGENT", [])) or None
-                    lfi_agent = LFIAgent(url, p_list, url_dir)
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, lfi_agent, process_result))
-
-                if "RCE_AGENT" in specialist_dispatches:
-                    from bugtrace.agents.rce_agent import RCEAgent
-                    p_list = list(params_map.get("RCE_AGENT", [])) or None
-                    rce_agent = RCEAgent(url, p_list, url_dir)
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, rce_agent, process_result))
-
-                if "PROTO_AGENT" in specialist_dispatches:
-                    from bugtrace.agents.exploit_specialists import ProtoAgent
-                    p_list = list(params_map.get("PROTO_AGENT", [])) or None
-                    proto_agent = ProtoAgent(url, p_list, url_dir)
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, proto_agent, process_result))
-
-                if "FILE_UPLOAD_AGENT" in specialist_dispatches:
-                    from bugtrace.agents.fileupload_agent import FileUploadAgent
-                    upload_agent = FileUploadAgent(url)
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, upload_agent, process_result))
-                
-                if "JWT_AGENT" in specialist_dispatches:
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, self.jwt_agent, process_result))
-
-                if "IDOR_AGENT" in specialist_dispatches:
-                    from bugtrace.agents.idor_agent import IDORAgent
-                    idor_agent = IDORAgent(url, params=idor_params, report_dir=url_dir)
-                    agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, idor_agent, process_result))
-
-                # Execute all agents in parallel (respecting semaphore limit)
-                # Uses cancellation-aware pattern: polls stop flag every 0.5s
-                # and cancels remaining tasks if 'q' is pressed
-                if agent_tasks:
-                    logger.info(f"[TeamOrchestrator] Executing {len(agent_tasks)} agents in parallel (max {settings.MAX_CONCURRENT_URL_AGENTS} concurrent)")
-                    pending = {asyncio.ensure_future(t) for t in agent_tasks}
-                    while pending:
-                        done, pending = await asyncio.wait(pending, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
-                        if dashboard.stop_requested or self._stop_event.is_set():
-                            dashboard.log("🛑 Stop requested. Cancelling running agents...", "WARN")
-                            for task in pending:
-                                task.cancel()
-                            # Wait for cancellations to complete
-                            if pending:
-                                await asyncio.wait(pending, timeout=5)
-                            break
-
-            # C. NO-SWARM MODE
-            # We no longer unleash the swarm unconditionally. 
-            # Only specialists decided by DASTySAST in step B are executed.
-            dashboard.log(f"🎯 Intelligent dispatch complete for {url[:50]}", "SUCCESS")
-
-            # Incremental save to DB (V3 Style)
-            if all_validated_findings:
-                try:
-                    from bugtrace.core.database import get_db_manager
-                    db = get_db_manager()
-                    db.save_scan_result(self.target, all_validated_findings, scan_id=self.scan_id)
-                except Exception as e:
-                    logger.error(f"Failed to save findings to DB: {e}")
-            
-            # Step 5: Save URL Checkpoint
-            self._save_checkpoint(url)
         
         # V4 Checkpoint
         await self._checkpoint("Analysis & Exploitation (DAST + Specialists)")

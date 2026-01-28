@@ -99,53 +99,38 @@ class CDPClient:
             logger.warning(f"CDP exit with error: {exc_val}, cleaning up...")
             await self.stop()
         
-    async def start(self):
-        """Start Chrome and connect via CDP. Reuses existing connection if available."""
-        # 1. Check if already connected and healthy
+    async def _check_existing_connection(self) -> bool:
+        """Check if existing connection is still healthy."""
         if self.ws and not self.ws.closed and self.session and not self.session.closed:
             try:
                 await self._send("Runtime.enable")
-                return
+                return True
             except Exception:
                 logger.warning("CDP connection stale, restarting...")
                 await self.stop()
+        return False
 
-        # 2. Dynamic Port Selection Logic
-        # If we failed to connect or are starting fresh, ensure we pick a clean port
-        # if the default 9222 is having issues.
-        # For this fix, let's always try to find a free port if we are creating a NEW process.
-        # This completely avoids the "Address already in use" or "Connect failed" loops.
-        
-        # NOTE: If we want to reuse, we have to store the port we used. 
-        # Since self.port is set in __init__, we update it here for the new process.
-        if self.port == 9222: # If using default, feel free to rotate
-             self.port = self._find_free_port()
-             logger.info(f"CDP: Switched to dynamic free port: {self.port}")
-        
-        # Create temp directory for Chrome user data
-        if not self._temp_dir:
-            self._temp_dir = Path(tempfile.mkdtemp(prefix="bugtrace_cdp_"))
-        
-        # CLEANUP: Ensure no zombie Chrome processes are blocking our port
-        # TASK-51/RCE-FIX: Use subprocess list args instead of shell=True to prevent command injection
-        if self.port:
-            import shlex
-            try:
-                # Kill any process listening on our port (safe - port is validated as int)
-                port_str = str(int(self.port))  # Ensure port is numeric
-                subprocess.run(["fuser", "-k", f"{port_str}/tcp"], stderr=subprocess.DEVNULL)
-                # General cleanup of zombies (safer to do this only on start)
-                subprocess.run(["pkill", "-f", "chrome --remote-debugging-port"], stderr=subprocess.DEVNULL)
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.debug(f"Port cleanup failed: {e}")
-        
-        # Find Chrome executable
-        chrome_path = self._find_chrome()
-        if not chrome_path:
-            raise RuntimeError("Chrome/Chromium not found. Please install Chrome.")
-        
-        # Start Chrome with remote debugging
+    def _select_port(self):
+        """Select an available port for Chrome."""
+        if self.port == 9222:
+            self.port = self._find_free_port()
+            logger.info(f"CDP: Switched to dynamic free port: {self.port}")
+
+    async def _cleanup_zombie_processes(self):
+        """Cleanup zombie Chrome processes blocking the port."""
+        if not self.port:
+            return
+
+        try:
+            port_str = str(int(self.port))
+            subprocess.run(["fuser", "-k", f"{port_str}/tcp"], stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-f", "chrome --remote-debugging-port"], stderr=subprocess.DEVNULL)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"Port cleanup failed: {e}")
+
+    def _build_chrome_args(self, chrome_path: str) -> list:
+        """Build Chrome command line arguments."""
         chrome_args = [
             chrome_path,
             f"--remote-debugging-port={self.port}",
@@ -165,108 +150,70 @@ class CDPClient:
             "--safebrowsing-disable-auto-update",
             "--enable-features=NetworkService,NetworkServiceInProcess",
             "--disable-features=TranslateUI",
-            "--no-sandbox", # CRITICAL FIX for many environments
-            "--disable-dev-shm-usage", # Fix for low shm memory in containers
-            "about:blank",  # Open a blank page initially
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "about:blank",
         ]
-        
+
         if self.headless:
             chrome_args.append("--headless=new")
-            
-        # SAFETY: Wrap in system 'timeout' to prevent infinite zombies if Python crashes
-        # 180s (3m) hard limit per session. -k 5 ensures SIGKILL if SIGTERM fails.
-        chrome_args = ["timeout", "-k", "5", "180s"] + chrome_args
-        
-        logger.info(f"Starting Chrome on port {self.port}...")
-        # Capture output for debugging crashes
-        self.chrome_process = subprocess.Popen(
-            chrome_args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True 
-        )
-        
-        # Wait for Chrome to start (increased for reliability)
-        await asyncio.sleep(4.0)
-        
-        self.session = aiohttp.ClientSession()
-        
-        # Get list of pages/targets and connect to the first page
+
+        return ["timeout", "-k", "5", "180s"] + chrome_args
+
+    async def _connect_to_chrome_page(self) -> str:
+        """Connect to Chrome page and return WebSocket URL."""
         page_ws_url = None
         last_error = None
-        for attempt in range(20):  # Increased attempts
+
+        for attempt in range(20):
             try:
-                # Use 127.0.0.1 to avoid localhost resolution issues
-                async with self.session.get(f"http://127.0.0.1:{self.port}/json/list", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                async with self.session.get(
+                    f"http://127.0.0.1:{self.port}/json/list",
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
                     targets = await resp.json()
-                    # Find a page target (not background page, not devtools)
                     for target in targets:
                         if target.get("type") == "page":
                             page_ws_url = target.get("webSocketDebuggerUrl")
                             if page_ws_url:
                                 logger.info(f"CDP connected to page: {page_ws_url[:60]}...")
-                                break
-                    if page_ws_url:
-                        break
+                                return page_ws_url
             except Exception as e:
                 last_error = e
-                # Check if process is still alive
                 if self.chrome_process.poll() is not None:
-                     logger.error(f"Chrome process died early. Return code: {self.chrome_process.returncode}")
-                     break
-                
+                    logger.error(f"Chrome process died early. Return code: {self.chrome_process.returncode}")
+                    break
                 logger.debug(f"Waiting for Chrome... attempt {attempt+1}: {e}")
                 await asyncio.sleep(0.5)
-        
+
+        # Try creating new target if connection failed
         if not page_ws_url:
-            # Try creating a new target
             try:
-                async with self.session.put(f"http://127.0.0.1:{self.port}/json/new?about:blank", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                async with self.session.put(
+                    f"http://127.0.0.1:{self.port}/json/new?about:blank",
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
                     target = await resp.json()
                     page_ws_url = target.get("webSocketDebuggerUrl")
             except Exception as e:
                 logger.error(f"Failed to create new page: {e}")
-        
+
         if not page_ws_url:
-            # Capture stderr for debugging
             stderr_output = ""
             if self.chrome_process and self.chrome_process.stderr:
-                 stderr_output = self.chrome_process.stderr.read()
-            
+                stderr_output = self.chrome_process.stderr.read()
             logger.error(f"Chrome Start Failed. Stderr: {stderr_output}")
-
-            # Cleanup on failure
             await self.stop()
             raise RuntimeError(f"Failed to connect to Chrome CDP page on port {self.port}. Last error: {last_error}")
-        
-        self.ws_url = page_ws_url
-        
-        # Connect WebSocket to the PAGE target (not browser)
-        self.ws = await self.session.ws_connect(self.ws_url)
-        
-        # Start message receiver
-        self._receive_task = asyncio.create_task(self._receive_messages())
-        
-        # Enable domains
-        await self._send("Page.enable")
-        await self._send("Runtime.enable")
-        await self._send("DOM.enable")
-        await self._send("Network.enable")
-        
-        # -----------------------------------------------------------
-        # VISUAL XSS POLYFILL
-        # Overrides window.alert to render a visible element instead of blocking
-        # This allows screenshots to capture the "alert" for Vision verification
-        # -----------------------------------------------------------
+
+        return page_ws_url
+
+    async def _inject_xss_polyfill(self):
+        """Inject Visual XSS polyfill for alert() detection."""
         polyfill_script = """
         window.alert = function(msg) {
-            // 1. Log for internal detection (replacing dialog event)
             console.log("BUGTRACE_ALERT_HIT::" + msg);
-            
-            // 2. Render Visual Proof (High Z-Index Overlay)
-            // Use a unique ID to avoid duplicates if called multiple times
             if (document.getElementById('bugtrace-alert-box')) return;
-            
             var d = document.createElement("div");
             d.id = "bugtrace-alert-box";
             d.style.cssText = "position:fixed;top:10%;left:50%;transform:translate(-50%,0);z-index:2147483647;background:#fff;border:4px solid #ef4444;padding:20px;font-family:system-ui,sans-serif;box-shadow:0 10px 25px rgba(0,0,0,0.5);border-radius:8px;text-align:center;min-width:300px;";
@@ -275,17 +222,59 @@ class CDPClient:
             return true;
         };
         """
-        
-        await self._send("Page.addScriptToEvaluateOnNewDocument", {
-            "source": polyfill_script
-        })
-        
-        logger.info("CDP Client ready (Visual Polyfill Injected)")
-        
-        # Set up console log handler
+        await self._send("Page.addScriptToEvaluateOnNewDocument", {"source": polyfill_script})
+
+    async def start(self):
+        """Start Chrome and connect via CDP. Reuses existing connection if available."""
+        # Guard: Check existing connection
+        if await self._check_existing_connection():
+            return
+
+        # Setup
+        self._select_port()
+
+        if not self._temp_dir:
+            self._temp_dir = Path(tempfile.mkdtemp(prefix="bugtrace_cdp_"))
+
+        await self._cleanup_zombie_processes()
+
+        # Find Chrome
+        chrome_path = self._find_chrome()
+        if not chrome_path:
+            raise RuntimeError("Chrome/Chromium not found. Please install Chrome.")
+
+        # Launch Chrome
+        chrome_args = self._build_chrome_args(chrome_path)
+        logger.info(f"Starting Chrome on port {self.port}...")
+        self.chrome_process = subprocess.Popen(
+            chrome_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        await asyncio.sleep(4.0)
+
+        self.session = aiohttp.ClientSession()
+
+        # Connect to page
+        self.ws_url = await self._connect_to_chrome_page()
+        self.ws = await self.session.ws_connect(self.ws_url)
+
+        # Start receiver and enable domains
+        self._receive_task = asyncio.create_task(self._receive_messages())
+        await self._send("Page.enable")
+        await self._send("Runtime.enable")
+        await self._send("DOM.enable")
+        await self._send("Network.enable")
+
+        # Inject polyfill
+        await self._inject_xss_polyfill()
+
+        # Setup listeners
         self._add_listener("Console.messageAdded", self._on_console_message)
         self._add_listener("Runtime.consoleAPICalled", self._on_runtime_console)
-        
+
         logger.info("CDP Client ready")
         
     async def stop(self):
@@ -538,6 +527,60 @@ class CDPClient:
         
         raise RuntimeError("Screenshot failed")
     
+    async def _check_xss_in_console(self, xss_marker: str) -> bool:
+        """Check if XSS marker appears in console logs."""
+        return any(xss_marker in log.get("text", "") for log in self._console_logs)
+
+    async def _check_xss_in_dom_executed(self) -> bool:
+        """Check if XSS was executed (not just reflected) in DOM."""
+        return await self.execute_js('''
+            (() => {
+                const marker = "BUGTRACE-XSS-CONFIRMED";
+                const bodyText = document.body.innerText || "";
+                const hasVisibleMarker = bodyText.includes(marker);
+
+                const styledElements = document.querySelectorAll('[style*="color"], [style*="background"]');
+                const hasStyledMarker = Array.from(styledElements).some(el =>
+                    el.textContent && el.textContent.includes(marker)
+                );
+
+                const poeElements = document.querySelectorAll('[id^="BTPOE_"]');
+                const hasPoeMarker = poeElements.length > 0;
+
+                const scriptCreatedDivs = document.querySelectorAll('div[id], span[id]');
+                const hasScriptCreatedElement = Array.from(scriptCreatedDivs).some(el => {
+                    return el.id.startsWith('BTPOE_') || (el.textContent && el.textContent.includes(marker));
+                });
+
+                return hasStyledMarker || hasPoeMarker || hasScriptCreatedElement;
+            })()
+        ''')
+
+    async def _check_expected_marker(self, expected_marker: str) -> bool:
+        """Check if expected marker element exists in DOM."""
+        try:
+            res = await self.execute_js(f'document.getElementById("{expected_marker}") !== null')
+            return bool(res)
+        except Exception as e:
+            logger.debug(f"Marker check failed: {e}")
+            return False
+
+    def _determine_xss_confirmed(
+        self,
+        xss_in_console: bool,
+        xss_in_dom_raw: bool,
+        xss_in_dom_executed: bool,
+        marker_found: bool,
+        expected_marker: Optional[str]
+    ) -> bool:
+        """Determine if XSS is confirmed based on multiple checks."""
+        # Priority: alert > expected_marker > console > DOM execution
+        if self._alert_detected:
+            return True
+        if expected_marker:
+            return marker_found or xss_in_console
+        return xss_in_console or xss_in_dom_executed
+
     async def validate_xss(
         self,
         url: str,
@@ -548,30 +591,30 @@ class CDPClient:
     ) -> CDPResult:
         """
         Validate XSS by navigating to URL and checking for markers.
-        
+
         This method:
         1. Navigates to the potentially vulnerable URL
         2. Monitors console for XSS marker (logged via injected payload)
         3. Checks DOM for marker element
         4. Takes screenshot as evidence
-        
+
         Args:
             url: URL to test (with XSS payload in params)
             xss_marker: Marker to look for in console/DOM
             timeout: Time to wait for XSS execution
             screenshot_dir: Directory to save screenshot
-            
+
         Returns:
             CDPResult with validation outcome
         """
         logger.info(f"CDP: Validating XSS at {url[:80]}...")
-        
-        # Reset state for new validation
+
+        # Reset state
         self._console_logs.clear()
         self._alert_detected = False
         self._last_alert_message = None
-        
-        # Navigate to URL
+
+        # Navigate
         nav_success = await self.navigate(url)
         if not nav_success:
             return CDPResult(
@@ -579,81 +622,27 @@ class CDPClient:
                 error="Navigation failed",
                 console_logs=self._console_logs.copy()
             )
-        
-        # Wait for potential XSS execution
+
+        # Wait for XSS execution
         await asyncio.sleep(timeout)
-        
-        # Check 1: Look for marker in console logs (STRONGEST PROOF - script executed)
-        xss_in_console = any(
-            xss_marker in log.get("text", "") 
-            for log in self._console_logs
-        )
-        
-        # Check 2: Look for marker in DOM - but verify it's NOT just escaped text
-        # We need to check if a script actually executed, not just reflected text
-        xss_in_dom_raw = await self.execute_js(
-            f'document.body.innerHTML.includes("{xss_marker}")'
-        )
-        
-        # Check if marker appears in a real executed script context
-        # by looking for a dynamically created element with our marker
-        xss_in_dom_executed = await self.execute_js('''
-            (() => {
-                // Multiple checks for JavaScript execution proof
-                const marker = "BUGTRACE-XSS-CONFIRMED";
-                
-                // 1. Check for visible text that matches marker (real XSS creates visible elements)
-                const bodyText = document.body.innerText || "";
-                const hasVisibleMarker = bodyText.includes(marker);
-                
-                // 2. Check if marker is in a style attribute (common XSS pattern)
-                const styledElements = document.querySelectorAll('[style*="color"], [style*="background"]');
-                const hasStyledMarker = Array.from(styledElements).some(el => 
-                    el.textContent && el.textContent.includes(marker)
-                );
-                
-                // 3. Check for dynamically created elements with IDs starting with "BTPOE_" (PoE markers)
-                const poeElements = document.querySelectorAll('[id^="BTPOE_"]');
-                const hasPoeMarker = poeElements.length > 0;
-                
-                // 4. Check if document structure was modified by script (scripts create new nodes)
-                const scriptCreatedDivs = document.querySelectorAll('div[id], span[id]');
-                const hasScriptCreatedElement = Array.from(scriptCreatedDivs).some(el => {
-                    // Check if element looks like it was created by our PoE script
-                    return el.id.startsWith('BTPOE_') || (el.textContent && el.textContent.includes(marker));
-                });
-                
-                // True XSS execution: styled markers OR PoE markers OR script-created elements
-                return hasStyledMarker || hasPoeMarker || hasScriptCreatedElement;
-            })()
-        ''')
-        
-        # Check 4: Explicit expected marker (STRONG PoE)
+
+        # Perform checks
+        xss_in_console = await self._check_xss_in_console(xss_marker)
+        xss_in_dom_raw = await self.execute_js(f'document.body.innerHTML.includes("{xss_marker}")')
+        xss_in_dom_executed = await self._check_xss_in_dom_executed()
+
         marker_found = False
         if expected_marker:
-            try:
-                res = await self.execute_js(f'document.getElementById("{expected_marker}") !== null')
-                marker_found = bool(res)
-            except Exception as e:
-                logger.debug(f"Marker check failed: {e}")
+            marker_found = await self._check_expected_marker(expected_marker)
 
-        # STRICT XSS VALIDATION:
-        # XSS requires JavaScript EXECUTION, not just HTML injection
-        # Priority: alert_detected > expected_marker > console logs > DOM execution proof
-        if self._alert_detected:
-            xss_confirmed = True
-        elif expected_marker:
-            # If we have an expected marker, require either the marker or console proof
-            xss_confirmed = marker_found or xss_in_console
-        else:
-            # Without expected marker, accept console OR DOM execution proof
-            # This prevents false negatives when XSS executes but doesn't log to console
-            xss_confirmed = xss_in_console or xss_in_dom_executed
-        
-        # Log the distinction
+        # Determine if XSS confirmed
+        xss_confirmed = self._determine_xss_confirmed(
+            xss_in_console, xss_in_dom_raw, xss_in_dom_executed, marker_found, expected_marker
+        )
+
         if xss_in_dom_raw and not xss_confirmed:
             logger.info("NOTE: Marker found in DOM but no JS execution - may be HTML injection, not XSS")
-        
+
         # Take screenshot
         screenshot_path = None
         if screenshot_dir:
@@ -663,9 +652,9 @@ class CDPClient:
                 await self.screenshot(screenshot_path)
             except Exception as e:
                 logger.warning(f"Screenshot failed: {e}")
-        
+
         logger.info(f"CDP XSS Result: alert={self._alert_detected}, console={xss_in_console}, dom_raw={xss_in_dom_raw}, dom_executed={xss_in_dom_executed}, marker_found={marker_found}")
-        
+
         return CDPResult(
             success=xss_confirmed,
             data={
