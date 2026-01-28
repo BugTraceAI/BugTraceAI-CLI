@@ -233,12 +233,19 @@ class ConductorV2:
         """Validate type-specific evidence requirements."""
         if vuln_type == "XSS":
             return self._validate_xss_evidence(evidence)
-        elif vuln_type == "SQLi":
-            return self._validate_sqli_evidence(evidence)
-        elif vuln_type == "CSTI":
-            if not evidence.get('template_executed'):
-                return False, "CSTI requires template execution proof"
 
+        if vuln_type == "SQLi":
+            return self._validate_sqli_evidence(evidence)
+
+        if vuln_type == "CSTI":
+            return self._validate_csti_evidence(evidence)
+
+        return True, ""
+
+    def _validate_csti_evidence(self, evidence: Dict) -> Tuple[bool, str]:
+        """Validate CSTI-specific evidence."""
+        if not evidence.get('template_executed'):
+            return False, "CSTI requires template execution proof"
         return True, ""
 
     def validate_finding(self, finding: Dict) -> Tuple[bool, str]:

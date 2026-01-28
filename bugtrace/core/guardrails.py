@@ -228,21 +228,30 @@ class OutputGuardrails:
     def _detect_encoded_injection(self, text: str) -> bool:
         """Detect base64/hex encoded prompt injections."""
         import base64
-        
+
         # Check for base64 patterns
         base64_pattern = r"[A-Za-z0-9+/]{20,}={0,2}"
         matches = re.findall(base64_pattern, text)
-        
+
         for match in matches:
-            try:
-                decoded = base64.b64decode(match).decode('utf-8', errors='ignore')
-                # Check if decoded content contains injection patterns
-                for pattern, _ in self.PROMPT_INJECTION_PATTERNS:
-                    if re.search(pattern, decoded.lower()):
-                        return True
-            except (ValueError, UnicodeDecodeError) as e:
-                logger.debug(f"Base64 decode failed: {e}")
-        
+            if self._check_base64_injection(match):
+                return True
+
+        return False
+
+    def _check_base64_injection(self, match: str) -> bool:
+        """Check if base64 match contains injection patterns."""
+        import base64
+
+        try:
+            decoded = base64.b64decode(match).decode('utf-8', errors='ignore')
+            # Check if decoded content contains injection patterns
+            for pattern, _ in self.PROMPT_INJECTION_PATTERNS:
+                if re.search(pattern, decoded.lower()):
+                    return True
+        except (ValueError, UnicodeDecodeError) as e:
+            logger.debug(f"Base64 decode failed: {e}")
+
         return False
     
     def validate_llm_response(self, response: str) -> Tuple[bool, str]:

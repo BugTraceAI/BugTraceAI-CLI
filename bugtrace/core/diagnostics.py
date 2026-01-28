@@ -85,13 +85,17 @@ class DiagnosticSystem:
             headers = {"Authorization": f"Bearer {settings.OPENROUTER_API_KEY}"}
             async with aiohttp.ClientSession() as session:
                 async with session.get("https://openrouter.ai/api/v1/auth/key", headers=headers, timeout=5) as resp:
-                    if resp.status == 200:
-                        await self._process_credit_response(resp)
-                    else:
-                        dashboard.log(f"Credit check failed (Status {resp.status})", "WARN")
+                    await self._handle_credit_response(resp)
         except Exception as e:
-            logger.error(f"Credit check failed: {e}")
+            logger.error(f"Credit check failed: {e}", exc_info=True)
             dashboard.log("Could not verify credits", "DEBUG")
+
+    async def _handle_credit_response(self, resp):
+        """Handle credit check response."""
+        if resp.status == 200:
+            await self._process_credit_response(resp)
+        else:
+            dashboard.log(f"Credit check failed (Status {resp.status})", "WARN")
 
     async def _process_credit_response(self, resp):
         """Process credit check API response."""

@@ -369,14 +369,25 @@ class TeamOrchestrator:
         from shutil import move
         for folder in ["evidence", "screenshots", "test_results"]:
             p = Path(folder)
-            if p.exists() and p.is_dir():
-                for file in p.glob("*"):
-                    if file.is_file():
-                        move(str(file), str(report_dir / "logs" / file.name))
-                try:
-                    p.rmdir()
-                except OSError as e:
-                    logger.debug(f"Failed to remove directory {p}: {e}")
+            if not (p.exists() and p.is_dir()):
+                continue
+
+            self._move_files_to_logs(p, report_dir)
+            self._remove_empty_folder(p)
+
+    def _move_files_to_logs(self, folder: Path, report_dir: Path):
+        """Move files from folder to logs directory."""
+        from shutil import move
+        for file in folder.glob("*"):
+            if file.is_file():
+                move(str(file), str(report_dir / "logs" / file.name))
+
+    def _remove_empty_folder(self, folder: Path):
+        """Remove empty folder after cleanup."""
+        try:
+            folder.rmdir()
+        except OSError as e:
+            logger.debug(f"Failed to remove directory {folder}: {e}")
 
     def _print_completion_summary(self, report_dir: Path, findings: list):
         """Print scan completion summary."""
@@ -790,23 +801,43 @@ class TeamOrchestrator:
     async def _handle_hitl_choice(self, choice: str):
         """Handle HITL menu choice."""
         if choice == 'c':
-            print("▶️  Resuming scan...")
-            self.hitl_active = False
-            self.sigint_count = 0
-        elif choice == 'f':
+            self._resume_scan()
+            return
+
+        if choice == 'f':
             self._show_findings()
             await self._enter_hitl_mode()
-        elif choice == 's':
-            print("💾 Saving progress...")
-            await self._save_hitl_progress()
-            print("✅ Progress saved. Exiting...")
-            self._stop_event.set()
-        elif choice == 'q':
-            print("👋 Quitting...")
-            sys.exit(0)
-        else:
-            print(f"❓ Unknown option: {choice}")
-            await self._enter_hitl_mode()
+            return
+
+        if choice == 's':
+            await self._save_and_exit()
+            return
+
+        if choice == 'q':
+            self._quit_scan()
+            return
+
+        # Unknown option
+        print(f"❓ Unknown option: {choice}")
+        await self._enter_hitl_mode()
+
+    def _resume_scan(self):
+        """Resume scan from HITL mode."""
+        print("▶️  Resuming scan...")
+        self.hitl_active = False
+        self.sigint_count = 0
+
+    async def _save_and_exit(self):
+        """Save progress and exit."""
+        print("💾 Saving progress...")
+        await self._save_hitl_progress()
+        print("✅ Progress saved. Exiting...")
+        self._stop_event.set()
+
+    def _quit_scan(self):
+        """Quit scan immediately."""
+        print("👋 Quitting...")
+        sys.exit(0)
 
     def _show_findings(self):
         """Display current findings in HITL mode."""
@@ -1054,33 +1085,10 @@ class TeamOrchestrator:
         current_qs = parse_qs(parsed_url.query)
 
         for vuln in vulnerabilities:
-            specialist_type = await self._decide_specialist(vuln)
-            dashboard.log(f"🤖 Dispatcher chose: {specialist_type} for {vuln.get('parameter')}", "INFO")
-            specialist_dispatches.add(specialist_type)
-
-            param = vuln.get("parameter")
-            if param and str(param).lower() not in ["none", "unknown", "null"]:
-                if specialist_type == "IDOR_AGENT":
-                    original_val = current_qs.get(param, ["1"])[0]
-                    idor_params.append({"parameter": param, "original_value": original_val})
-                else:
-                    if specialist_type not in params_map:
-                        params_map[specialist_type] = set()
-                    params_map[specialist_type].add(param)
-
-            if specialist_type == "HEADER_INJECTION":
-                res = {
-                    "findings": [{
-                        "type": vuln.get("type", "Header Injection"),
-                        "url": url,
-                        "parameter": param,
-                        "evidence": vuln.get("reasoning") or "Header Injection detected via CRLF probe",
-                        "payload": vuln.get("payload") or "%0d%0aX-Injected: true",
-                        "validated": True,
-                        "severity": "MEDIUM"
-                    }]
-                }
-                process_result(res)
+            await self._process_vulnerability(
+                vuln, url, dashboard, specialist_dispatches, params_map,
+                idor_params, current_qs, process_result
+            )
 
         return {
             "specialist_dispatches": specialist_dispatches,
@@ -1089,6 +1097,61 @@ class TeamOrchestrator:
             "parsed_url": parsed_url,
             "current_qs": current_qs
         }
+
+    async def _process_vulnerability(
+        self,
+        vuln: dict,
+        url: str,
+        dashboard,
+        specialist_dispatches: set,
+        params_map: dict,
+        idor_params: list,
+        current_qs: dict,
+        process_result
+    ):
+        """Process a single vulnerability and update dispatch info."""
+        specialist_type = await self._decide_specialist(vuln)
+        dashboard.log(f"🤖 Dispatcher chose: {specialist_type} for {vuln.get('parameter')}", "INFO")
+        specialist_dispatches.add(specialist_type)
+
+        param = vuln.get("parameter")
+        if param and str(param).lower() not in ["none", "unknown", "null"]:
+            self._categorize_parameter(param, specialist_type, params_map, idor_params, current_qs)
+
+        if specialist_type == "HEADER_INJECTION":
+            self._process_header_injection(vuln, url, param, process_result)
+
+    def _categorize_parameter(
+        self,
+        param: str,
+        specialist_type: str,
+        params_map: dict,
+        idor_params: list,
+        current_qs: dict
+    ):
+        """Categorize parameter for specialist agent."""
+        if specialist_type == "IDOR_AGENT":
+            original_val = current_qs.get(param, ["1"])[0]
+            idor_params.append({"parameter": param, "original_value": original_val})
+        else:
+            if specialist_type not in params_map:
+                params_map[specialist_type] = set()
+            params_map[specialist_type].add(param)
+
+    def _process_header_injection(self, vuln: dict, url: str, param: str, process_result):
+        """Process header injection finding."""
+        res = {
+            "findings": [{
+                "type": vuln.get("type", "Header Injection"),
+                "url": url,
+                "parameter": param,
+                "evidence": vuln.get("reasoning") or "Header Injection detected via CRLF probe",
+                "payload": vuln.get("payload") or "%0d%0aX-Injected: true",
+                "validated": True,
+                "severity": "MEDIUM"
+            }]
+        }
+        process_result(res)
 
     async def _build_agent_tasks(self, dispatch_info: dict, url: str, url_dir: Path, process_result) -> list:
         """Build list of specialist agent tasks based on dispatch decisions."""
