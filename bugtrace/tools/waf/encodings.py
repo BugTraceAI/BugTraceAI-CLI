@@ -38,10 +38,17 @@ class EncodingTechniques:
 
     def _build_techniques(self) -> List[EncodingTechnique]:
         """Build the list of all encoding techniques."""
+        return (
+            self._build_tier1_universal() +
+            self._build_tier2_cloudflare() +
+            self._build_tier3_advanced() +
+            self._build_tier4_exotic() +
+            self._build_tier5_evasion()
+        )
+
+    def _build_tier1_universal(self) -> List[EncodingTechnique]:
+        """Universal encodings that work against most WAFs."""
         return [
-            # ================================================================
-            # TIER 1: Universal encodings (work against most WAFs)
-            # ================================================================
             EncodingTechnique(
                 name="url_encode",
                 description="Standard URL encoding",
@@ -63,10 +70,11 @@ class EncodingTechniques:
                 effective_against=["cloudflare", "akamai", "imperva"],
                 priority=3
             ),
+        ]
 
-            # ================================================================
-            # TIER 2: Cloudflare-specific bypasses
-            # ================================================================
+    def _build_tier2_cloudflare(self) -> List[EncodingTechnique]:
+        """Cloudflare-specific bypass techniques."""
+        return [
             EncodingTechnique(
                 name="html_entity_encode",
                 description="HTML entity encoding",
@@ -88,10 +96,11 @@ class EncodingTechniques:
                 effective_against=["cloudflare", "modsecurity"],
                 priority=6
             ),
+        ]
 
-            # ================================================================
-            # TIER 3: Advanced bypasses
-            # ================================================================
+    def _build_tier3_advanced(self) -> List[EncodingTechnique]:
+        """Advanced bypass techniques."""
+        return [
             EncodingTechnique(
                 name="null_byte_injection",
                 description="Insert null bytes",
@@ -113,10 +122,11 @@ class EncodingTechniques:
                 effective_against=["cloudflare", "akamai"],
                 priority=9
             ),
+        ]
 
-            # ================================================================
-            # TIER 4: Exotic bypasses
-            # ================================================================
+    def _build_tier4_exotic(self) -> List[EncodingTechnique]:
+        """Exotic bypass techniques."""
+        return [
             EncodingTechnique(
                 name="base64_encode",
                 description="Base64 encoding (for specific contexts)",
@@ -145,10 +155,11 @@ class EncodingTechniques:
                 effective_against=["cloudflare", "akamai", "aws_waf", "modsecurity"],
                 priority=5  # Higher priority for XSS contexts
             ),
+        ]
 
-            # ================================================================
-            # TIER 5: Advanced evasion techniques (TASK-76)
-            # ================================================================
+    def _build_tier5_evasion(self) -> List[EncodingTechnique]:
+        """Advanced evasion techniques (TASK-76)."""
+        return [
             EncodingTechnique(
                 name="concat_string",
                 description="Break strings with concatenation",
@@ -544,64 +555,102 @@ class EncodingTechniques:
         """
         import itertools
 
-        # Get techniques prioritized for this WAF
-        if waf == "unknown":
-            relevant_techniques = sorted(self.techniques, key=lambda t: t.priority)[:6]
-        else:
-            def waf_score(tech: EncodingTechnique) -> int:
-                if waf in tech.effective_against:
-                    return tech.priority
-                return tech.priority + 100
-            relevant_techniques = sorted(self.techniques, key=waf_score)[:6]
-
+        relevant_techniques = self._get_waf_prioritized_techniques(waf)
         variants = []
 
         # Single technique encodings
-        for tech in relevant_techniques:
+        variants.extend(self._generate_single_encodings(payload, relevant_techniques))
+
+        # Multi-technique combinations
+        if max_combinations >= 2:
+            variants.extend(self._generate_double_encodings(payload, relevant_techniques, max_variants, variants))
+        if max_combinations >= 3:
+            variants.extend(self._generate_triple_encodings(payload, relevant_techniques, max_variants, variants))
+
+        return self._deduplicate_variants(variants)[:max_variants]
+
+    def _get_waf_prioritized_techniques(self, waf: str) -> List[EncodingTechnique]:
+        """Get techniques prioritized for the detected WAF."""
+        if waf == "unknown":
+            return sorted(self.techniques, key=lambda t: t.priority)[:6]
+
+        def waf_score(tech: EncodingTechnique) -> int:
+            if waf in tech.effective_against:
+                return tech.priority
+            return tech.priority + 100
+
+        return sorted(self.techniques, key=waf_score)[:6]
+
+    def _generate_single_encodings(self, payload: str, techniques: List[EncodingTechnique]) -> List[Tuple[str, List[str]]]:
+        """Generate single-technique encoded variants."""
+        variants = []
+        for tech in techniques:
             try:
                 encoded = tech.encoder(payload)
                 if encoded != payload:
                     variants.append((encoded, [tech.name]))
             except Exception as e:
                 logger.debug(f"Encoding variant {tech.name} failed: {e}")
+        return variants
 
-        # Two-technique combinations
-        if max_combinations >= 2:
-            for tech1, tech2 in itertools.permutations(relevant_techniques, 2):
-                if len(variants) >= max_variants:
-                    break
-                try:
-                    # Apply tech1 first, then tech2
-                    step1 = tech1.encoder(payload)
-                    step2 = tech2.encoder(step1)
-                    if step2 != payload and step2 != step1:
-                        variants.append((step2, [tech1.name, tech2.name]))
-                except Exception as e:
-                    logger.debug(f"Encoding chain {tech1.name}+{tech2.name} failed: {e}")
+    def _generate_double_encodings(
+        self,
+        payload: str,
+        techniques: List[EncodingTechnique],
+        max_variants: int,
+        existing_variants: List
+    ) -> List[Tuple[str, List[str]]]:
+        """Generate two-technique combination variants."""
+        import itertools
+        variants = []
 
-        # Three-technique combinations (expensive, limit carefully)
-        if max_combinations >= 3:
-            for tech1, tech2, tech3 in itertools.permutations(relevant_techniques[:4], 3):
-                if len(variants) >= max_variants:
-                    break
-                try:
-                    step1 = tech1.encoder(payload)
-                    step2 = tech2.encoder(step1)
-                    step3 = tech3.encoder(step2)
-                    if step3 != payload and step3 != step2:
-                        variants.append((step3, [tech1.name, tech2.name, tech3.name]))
-                except Exception as e:
-                    logger.debug(f"Encoding chain {tech1.name}+{tech2.name}+{tech3.name} failed: {e}")
+        for tech1, tech2 in itertools.permutations(techniques, 2):
+            if len(existing_variants) + len(variants) >= max_variants:
+                break
+            try:
+                step1 = tech1.encoder(payload)
+                step2 = tech2.encoder(step1)
+                if step2 != payload and step2 != step1:
+                    variants.append((step2, [tech1.name, tech2.name]))
+            except Exception as e:
+                logger.debug(f"Encoding chain {tech1.name}+{tech2.name} failed: {e}")
 
-        # Deduplicate by encoded payload
+        return variants
+
+    def _generate_triple_encodings(
+        self,
+        payload: str,
+        techniques: List[EncodingTechnique],
+        max_variants: int,
+        existing_variants: List
+    ) -> List[Tuple[str, List[str]]]:
+        """Generate three-technique combination variants."""
+        import itertools
+        variants = []
+
+        for tech1, tech2, tech3 in itertools.permutations(techniques[:4], 3):
+            if len(existing_variants) + len(variants) >= max_variants:
+                break
+            try:
+                step1 = tech1.encoder(payload)
+                step2 = tech2.encoder(step1)
+                step3 = tech3.encoder(step2)
+                if step3 != payload and step3 != step2:
+                    variants.append((step3, [tech1.name, tech2.name, tech3.name]))
+            except Exception as e:
+                logger.debug(f"Encoding chain {tech1.name}+{tech2.name}+{tech3.name} failed: {e}")
+
+        return variants
+
+    def _deduplicate_variants(self, variants: List[Tuple[str, List[str]]]) -> List[Tuple[str, List[str]]]:
+        """Remove duplicate encoded payloads."""
         seen = set()
         unique_variants = []
         for encoded, techniques in variants:
             if encoded not in seen:
                 seen.add(encoded)
                 unique_variants.append((encoded, techniques))
-
-        return unique_variants[:max_variants]
+        return unique_variants
 
 
 # Singleton instance
