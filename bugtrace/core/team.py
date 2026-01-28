@@ -791,8 +791,8 @@ class TeamOrchestrator:
             try:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, input)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"User input wait interrupted: {e}")
             print("▶️ Resuming...")
 
     

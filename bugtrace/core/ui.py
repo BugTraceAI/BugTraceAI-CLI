@@ -177,7 +177,7 @@ class Dashboard:
             finally:
                 termios.tcsetattr(fd, termios.TCSANOW, old_settings)
         except Exception:
-            pass
+            pass  # Terminal settings restoration — safe to ignore on non-TTY
 
     def _update_system_metrics_loop(self):
         """Background thread to update system metrics safely"""

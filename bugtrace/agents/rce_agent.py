@@ -103,8 +103,8 @@ class RCEAgent(BaseAgent):
             async with session.get(target_url, timeout=10) as resp:
                 await resp.text()
                 return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Connectivity check failed: {e}")
         return False
 
     def _inject_payload(self, url, param, payload):

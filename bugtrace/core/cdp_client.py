@@ -137,8 +137,8 @@ class CDPClient:
                 # General cleanup of zombies (safer to do this only on start)
                 subprocess.run(["pkill", "-f", "chrome --remote-debugging-port"], stderr=subprocess.DEVNULL)
                 await asyncio.sleep(0.5)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Port cleanup failed: {e}")
         
         # Find Chrome executable
         chrome_path = self._find_chrome()
@@ -634,8 +634,8 @@ class CDPClient:
             try:
                 res = await self.execute_js(f'document.getElementById("{expected_marker}") !== null')
                 marker_found = bool(res)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Marker check failed: {e}")
 
         # STRICT XSS VALIDATION:
         # XSS requires JavaScript EXECUTION, not just HTML injection

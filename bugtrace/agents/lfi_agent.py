@@ -166,9 +166,9 @@ class LFIAgent(BaseAgent):
                 if any(sig in text for sig in signatures):
                     return True
 
-        except Exception:
-            pass
-            
+        except Exception as e:
+            logger.debug(f"Path traversal signature check failed: {e}")
+
         return False
 
     def _inject_payload(self, url, param, payload):

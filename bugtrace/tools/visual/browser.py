@@ -57,8 +57,8 @@ class BrowserManager:
             )
             await proc.wait()
             await asyncio.sleep(0.3)
-        except Exception:
-            pass  # Non-critical cleanup
+        except Exception as e:
+            logger.debug(f"Pre-start cleanup failed: {e}")
 
     async def start(self):
         """Starts the browser instance if not already running."""
@@ -189,8 +189,8 @@ class BrowserManager:
             import subprocess
             try:
                 subprocess.run(["pkill", "-f", "remote-debugging-port"], check=False, timeout=5)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Emergency browser cleanup failed: {e}")
             logger.info("Emergency browser cleanup performed.")
 
     async def verify_xss(self, url: str, expected_message: str = None) -> Tuple[str, List[str], bool]:

@@ -363,8 +363,8 @@ class DOMXSSDetector:
                         # TASK-49/51: Remove event listener to prevent leaks
                         try:
                             page.remove_listener("dialog", dialog_handler)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"Failed to remove dialog listener: {e}")
 
         except Exception as e:
             logger.error(f"[DOMXSSDetector] Scan error: {e}")

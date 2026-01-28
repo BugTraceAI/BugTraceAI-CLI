@@ -274,7 +274,7 @@ class XSSVerifier:
                                         if dialog_detected:
                                             break
                                 except Exception as click_err:
-                                    pass
+                                    logger.debug(f"Element click failed: {click_err}")
                             if dialog_detected:
                                 break
                     except Exception as e:

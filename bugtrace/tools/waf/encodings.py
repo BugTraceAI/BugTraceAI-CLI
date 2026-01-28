@@ -562,8 +562,8 @@ class EncodingTechniques:
                 encoded = tech.encoder(payload)
                 if encoded != payload:
                     variants.append((encoded, [tech.name]))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Encoding variant {tech.name} failed: {e}")
 
         # Two-technique combinations
         if max_combinations >= 2:
@@ -576,8 +576,8 @@ class EncodingTechniques:
                     step2 = tech2.encoder(step1)
                     if step2 != payload and step2 != step1:
                         variants.append((step2, [tech1.name, tech2.name]))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Encoding chain {tech1.name}+{tech2.name} failed: {e}")
 
         # Three-technique combinations (expensive, limit carefully)
         if max_combinations >= 3:
@@ -590,8 +590,8 @@ class EncodingTechniques:
                     step3 = tech3.encoder(step2)
                     if step3 != payload and step3 != step2:
                         variants.append((step3, [tech1.name, tech2.name, tech3.name]))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Encoding chain {tech1.name}+{tech2.name}+{tech3.name} failed: {e}")
 
         # Deduplicate by encoded payload
         seen = set()

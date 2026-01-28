@@ -256,8 +256,8 @@ class ExternalToolManager:
                     if proc.returncode is None:
                         proc.kill()
                         await proc.wait()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Process cleanup failed: {e}")
 
     async def run_nuclei(self, target: str, cookies: List[Dict] = None) -> List[Dict]:
         """
