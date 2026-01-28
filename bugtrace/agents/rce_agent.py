@@ -24,32 +24,55 @@ class RCEAgent(BaseAgent):
         self.params = params or []
         self.report_dir = report_dir or Path("./reports")
         
+    def _get_time_payloads(self) -> list:
+        """Get time-based RCE payloads."""
+        return [
+            ";sleep 5", "|sleep 5", "&sleep 5", "`sleep 5`", "$(sleep 5)", "\nsleep 5\n",
+            "__import__('time').sleep(5)", "eval('sleep(5)')", "1+1"
+        ]
+
+    def _create_time_based_finding(self, param: str, payload: str, elapsed: float) -> Dict:
+        """Create finding for time-based RCE."""
+        return {
+            "type": "Command Injection (Time-based)",
+            "url": self.url,
+            "parameter": param,
+            "payload": payload,
+            "severity": "CRITICAL",
+            "validated": True,
+            "status": "VALIDATED_CONFIRMED",
+            "evidence": f"Delay of {elapsed:.2f}s detected with payload: {payload}",
+            "description": f"Time-based Command Injection confirmed. Parameter '{param}' executes OS commands. Payload caused {elapsed:.2f}s delay (expected 5s+).",
+            "reproduction": f"# Time-based RCE test:\ntime curl '{self._inject_payload(self.url, param, payload)}'"
+        }
+
+    def _create_eval_finding(self, param: str, payload: str, target: str) -> Dict:
+        """Create finding for eval-based RCE."""
+        return {
+            "type": "Remote Code Execution (Eval)",
+            "url": self.url,
+            "parameter": param,
+            "payload": payload,
+            "severity": "CRITICAL",
+            "validated": True,
+            "status": "VALIDATED_CONFIRMED",
+            "evidence": f"Mathematical expression '1+1' evaluated to '2' in response.",
+            "description": f"Remote Code Execution via eval() confirmed. Parameter '{param}' evaluates arbitrary code. Expression '1+1' returned '2'.",
+            "reproduction": f"curl '{target}' | grep -i 'result'"
+        }
+
     async def run_loop(self) -> Dict:
         """Main RCE testing loop."""
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] 🚀 Starting RCE analysis on {self.url}", "INFO")
-        
+
         all_findings = []
-        
-        # 1. Time-based Payloads (Most reliable for discovery)
-        time_payloads = [
-            ";sleep 5",
-            "|sleep 5",
-            "&sleep 5",
-            "`sleep 5`",
-            "$(sleep 5)",
-            "\nsleep 5\n",
-            # Python specific
-            "__import__('time').sleep(5)",
-            "eval('sleep(5)')", # Won't work directly in eval unless time is imported
-            "1+1" # Simple math for eval checks
-        ]
+        time_payloads = self._get_time_payloads()
 
         async with aiohttp.ClientSession() as session:
             for param in self.params:
                 logger.info(f"[{self.name}] Testing RCE on {self.url} (Param: {param})")
-                
-                # First, check for time-based injection
+
                 for p in time_payloads:
                     if "sleep" in p:
                         dashboard.update_task(f"RCE:{param}", status=f"Testing Time: {p}")
@@ -57,44 +80,18 @@ class RCEAgent(BaseAgent):
                         if await self._test_payload(session, p, param):
                             elapsed = time.time() - start
                             if elapsed >= 5:
-                                all_findings.append({
-                                    "type": "Command Injection (Time-based)",
-                                    "url": self.url,
-                                    "parameter": param,
-                                    "payload": p,
-                                    "severity": "CRITICAL",
-                                    "validated": True,
-                                    "status": "VALIDATED_CONFIRMED",
-                                    "evidence": f"Delay of {elapsed:.2f}s detected with payload: {p}",
-                                    "description": f"Time-based Command Injection confirmed. Parameter '{param}' executes OS commands. Payload caused {elapsed:.2f}s delay (expected 5s+).",
-                                    "reproduction": f"# Time-based RCE test:\ntime curl '{self._inject_payload(self.url, param, p)}'"
-                                })
-                                break # Move to next param
+                                all_findings.append(self._create_time_based_finding(param, p, elapsed))
+                                break
                     elif "1+1" in p:
-                        # Generic Eval check
                         dashboard.update_task(f"RCE:{param}", status=f"Testing Eval: {p}")
                         target = self._inject_payload(self.url, param, p)
                         async with session.get(target) as resp:
                             text = await resp.text()
                             if "Result: 2" in text:
-                                all_findings.append({
-                                    "type": "Remote Code Execution (Eval)",
-                                    "url": self.url,
-                                    "parameter": param,
-                                    "payload": p,
-                                    "severity": "CRITICAL",
-                                    "validated": True,
-                                    "status": "VALIDATED_CONFIRMED",
-                                    "evidence": f"Mathematical expression '1+1' evaluated to '2' in response.",
-                                    "description": f"Remote Code Execution via eval() confirmed. Parameter '{param}' evaluates arbitrary code. Expression '1+1' returned '2'.",
-                                    "reproduction": f"curl '{target}' | grep -i 'result'"
-                                })
-                                break # Move to next param
+                                all_findings.append(self._create_eval_finding(param, p, target))
+                                break
 
-        return {
-            "vulnerable": len(all_findings) > 0,
-            "findings": all_findings
-        }
+        return {"vulnerable": len(all_findings) > 0, "findings": all_findings}
 
     async def _test_payload(self, session, payload, param) -> bool:
         """Injects payload and analyzes response."""
