@@ -293,13 +293,27 @@ Respond in JSON format:
         parts = re.split(r'#+\s+', self.system_prompt)
 
         for part in parts:
-            part_lower = part.lower()
-            if part_lower.startswith("xss validation prompt"):
-                prompts["xss"] = re.sub(r'^xss validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
-            elif part_lower.startswith("sqli validation prompt"):
-                prompts["sqli"] = re.sub(r'^sqli validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
-            elif part_lower.startswith("general validation prompt"):
-                prompts["general"] = re.sub(r'^general validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
+            self._process_prompt_section(part, prompts)
+
+    def _process_prompt_section(self, part: str, prompts: Dict[str, str]):
+        """Process a single prompt section and update prompts dict."""
+        import re
+        part_lower = part.lower()
+
+        # Guard: XSS validation prompt
+        if part_lower.startswith("xss validation prompt"):
+            prompts["xss"] = re.sub(r'^xss validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
+            return
+
+        # Guard: SQLi validation prompt
+        if part_lower.startswith("sqli validation prompt"):
+            prompts["sqli"] = re.sub(r'^sqli validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
+            return
+
+        # Guard: General validation prompt
+        if part_lower.startswith("general validation prompt"):
+            prompts["general"] = re.sub(r'^general validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
+            return
     
     async def run_loop(self):
         """Typically triggered by orchestrator, not continuous."""

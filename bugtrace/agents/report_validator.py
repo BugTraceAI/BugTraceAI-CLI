@@ -523,17 +523,25 @@ class ReportValidator(BaseAgent):
         """Detect vulnerability type from finding."""
         title = finding.get("title", "").upper()
         ftype = finding.get("type", "").upper()
-        
+
+        # Guard: XSS detection
         if "XSS" in title or "CROSS-SITE" in title or "XSS" in ftype:
             return "xss"
-        elif "SQL" in title or "SQLI" in ftype:
+
+        # Guard: SQLi detection
+        if "SQL" in title or "SQLI" in ftype:
             return "sqli"
-        elif "SSRF" in title:
+
+        # Guard: SSRF detection
+        if "SSRF" in title:
             return "ssrf"
-        elif "CRLF" in title or "HEADER" in title:
+
+        # Guard: CRLF/Header injection detection
+        if "CRLF" in title or "HEADER" in title:
             return "crlf"
-        else:
-            return "general"
+
+        # Default: general vulnerability type
+        return "general"
     
     def _generate_summary(self) -> Dict[str, Any]:
         """Generate validation summary statistics."""
