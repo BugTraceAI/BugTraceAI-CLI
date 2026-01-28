@@ -140,7 +140,7 @@ class XSSVerifier:
                 timeout=timeout + 30.0  # Extra 30s for CDP overhead
             )
         except asyncio.TimeoutError:
-            logger.error(f"CDP validation timed out after {timeout + 30}s - likely alert() popup hang")
+            logger.error(f"CDP validation timed out after {timeout + 30}s - likely alert() popup hang", exc_info=True)
             return VerificationResult(
                 success=False,
                 method="cdp",
