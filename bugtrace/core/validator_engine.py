@@ -95,113 +95,127 @@ class ValidationEngine:
         if sink_id:
             logger.remove(sink_id)
 
+    def _check_stop_requested(self) -> bool:
+        """Check if user requested stop."""
+        if dashboard.stop_requested:
+            self._cancellation_token["cancelled"] = True
+            dashboard.log("🛑 Audit stop requested. Exiting...", "WARN")
+            return True
+        return False
+
+    def _handle_no_pending_findings(self, continuous: bool) -> bool:
+        """Handle case when no pending findings. Returns True if should break loop."""
+        if not continuous:
+            dashboard.log("✅ No pending findings to validate. Audit complete.", "SUCCESS")
+            return True
+        dashboard.log("⏳ Waiting for new findings...", "DEBUG")
+        return False
+
+    def _get_vuln_type_str(self, finding) -> str:
+        """Extract vulnerability type as uppercase string."""
+        vuln_type_raw = finding.type
+        if hasattr(vuln_type_raw, 'value'):
+            return str(vuln_type_raw.value).upper()
+        return str(vuln_type_raw or "").upper()
+
+    def _classify_sqli_finding(self, finding, specialist_authority: List, unvalidated_sqli: List):
+        """Classify SQLi finding based on SQLMap evidence."""
+        has_sqlmap_evidence = (
+            finding.reproduction_command and
+            "sqlmap" in str(finding.reproduction_command).lower()
+        )
+        if has_sqlmap_evidence:
+            specialist_authority.append(finding)
+        else:
+            unvalidated_sqli.append(finding)
+
+    def _triage_findings(self, pending: List) -> Dict[str, List]:
+        """Triage findings into categories for processing."""
+        already_confirmed = []
+        needs_cdp = []
+        specialist_authority = []
+        unvalidated_sqli = []
+
+        for f in pending:
+            if f.status == "VALIDATED_CONFIRMED":
+                already_confirmed.append(f)
+            elif f.status == "PENDING_CDP_VALIDATION":
+                needs_cdp.append(f)
+            elif f.status in ["PENDING_VALIDATION", "PENDING"]:
+                vuln_type = self._get_vuln_type_str(f)
+                if vuln_type in ["XSS", "CSTI", "SSTI"]:
+                    needs_cdp.append(f)
+                elif vuln_type in ["SQLI", "SQL"]:
+                    self._classify_sqli_finding(f, specialist_authority, unvalidated_sqli)
+                else:
+                    specialist_authority.append(f)
+
+        return {
+            "already_confirmed": already_confirmed,
+            "needs_cdp": needs_cdp,
+            "specialist_authority": specialist_authority,
+            "unvalidated_sqli": unvalidated_sqli
+        }
+
+    def _process_unvalidated_sqli(self, unvalidated_sqli: List):
+        """Mark unvalidated SQLi findings as false positives."""
+        for f in unvalidated_sqli:
+            self.db.update_finding_status(
+                f.id,
+                FindingStatus.VALIDATED_FALSE_POSITIVE,
+                notes="SQLi hypothesis rejected: No SQLMap validation evidence. LLM-only finding."
+            )
+            dashboard.log(f"❌ SQLi on {f.vuln_parameter or 'N/A'} - rejected (no SQLMap evidence)", "WARN")
+
+    def _process_specialist_authority(self, specialist_authority: List):
+        """Mark specialist authority findings as confirmed."""
+        for f in specialist_authority:
+            self.db.update_finding_status(
+                f.id,
+                FindingStatus.VALIDATED_CONFIRMED,
+                notes="Confirmed by specialist agent (CDP not required)"
+            )
+            dashboard.log(f"✅ {f.type} on {f.vuln_parameter or 'N/A'} - specialist authority", "SUCCESS")
+
     async def _run_validation_core(self, continuous: bool):
         """Core validation logic separated from UI lifecycle."""
         while self.is_running:
-            if dashboard.stop_requested:
-                # Signal cancellation to the validator
-                self._cancellation_token["cancelled"] = True
-                dashboard.log("🛑 Audit stop requested. Exiting...", "WARN")
+            if self._check_stop_requested():
                 break
 
-            # 1. Fetch pending findings
             pending = self.db.get_pending_findings(self.scan_id)
 
             if not pending:
-                if not continuous:
-                    dashboard.log("✅ No pending findings to validate. Audit complete.", "SUCCESS")
+                if self._handle_no_pending_findings(continuous):
                     break
-                dashboard.log("⏳ Waiting for new findings...", "DEBUG")
                 await asyncio.sleep(5)
                 continue
 
             dashboard.log(f"🔎 Audit: {len(pending)} findings queued for validation.", "INFO")
 
-            # =====================================================================
-            # SMART FILTERING: Only send CDP-needed findings to AgenticValidator
-            # Specialists (SQLi, SSRF, LFI, etc.) have full authority - skip CDP
-            # =====================================================================
-            already_confirmed = []
-            needs_cdp = []
-            specialist_authority = []
-            unvalidated_sqli = []  # 2026-01-23: LLM hypotheses without SQLMap confirmation
-
-            for f in pending:
-                if f.status == "VALIDATED_CONFIRMED":
-                    # Already confirmed - no action needed
-                    already_confirmed.append(f)
-                elif f.status == "PENDING_CDP_VALIDATION":
-                    # Explicitly marked for CDP validation
-                    needs_cdp.append(f)
-                elif f.status in ["PENDING_VALIDATION", "PENDING"]:
-                    # Legacy status - check vuln type to decide
-                    # FIX: Handle both enum and string types
-                    vuln_type_raw = f.type
-                    if hasattr(vuln_type_raw, 'value'):
-                        vuln_type = str(vuln_type_raw.value).upper()
-                    else:
-                        vuln_type = str(vuln_type_raw or "").upper()
-                    if vuln_type in ["XSS", "CSTI", "SSTI"]:
-                        # XSS/CSTI might need CDP for DOM/fragment validation
-                        needs_cdp.append(f)
-                    elif vuln_type in ["SQLI", "SQL"]:
-                        # 2026-01-23 FIX: SQLi requires ACTUAL SQLMap validation evidence
-                        # Don't auto-confirm LLM hypotheses - check for reproduction_command
-                        has_sqlmap_evidence = (
-                            f.reproduction_command and
-                            "sqlmap" in str(f.reproduction_command).lower()
-                        )
-                        if has_sqlmap_evidence:
-                            # SQLMap actually ran and confirmed
-                            specialist_authority.append(f)
-                        else:
-                            # LLM hypothesis without SQLMap confirmation - reject as FP
-                            unvalidated_sqli.append(f)
-                    else:
-                        # SSRF, LFI, RCE, XXE, JWT, IDOR - specialists have authority
-                        # Mark as confirmed since their validation is definitive
-                        specialist_authority.append(f)
-                else:
-                    # Other statuses (FALSE_POSITIVE, ERROR, etc.) - skip
-                    pass
+            # Triage findings
+            categories = self._triage_findings(pending)
 
             # Log triage results
             dashboard.log(
-                f"📊 Triage: {len(already_confirmed)} confirmed, {len(needs_cdp)} need CDP, "
-                f"{len(specialist_authority)} specialist authority, {len(unvalidated_sqli)} SQLi without evidence",
+                f"📊 Triage: {len(categories['already_confirmed'])} confirmed, {len(categories['needs_cdp'])} need CDP, "
+                f"{len(categories['specialist_authority'])} specialist authority, {len(categories['unvalidated_sqli'])} SQLi without evidence",
                 "INFO"
             )
 
-            # 2026-01-23 FIX: Reject SQLi findings that lack SQLMap validation evidence
-            # These are LLM hypotheses that SQLMapAgent never confirmed
-            for f in unvalidated_sqli:
-                self.db.update_finding_status(
-                    f.id,
-                    FindingStatus.VALIDATED_FALSE_POSITIVE,
-                    notes="SQLi hypothesis rejected: No SQLMap validation evidence. LLM-only finding."
-                )
-                dashboard.log(f"❌ SQLi on {f.vuln_parameter or 'N/A'} - rejected (no SQLMap evidence)", "WARN")
+            # Process categorized findings
+            self._process_unvalidated_sqli(categories["unvalidated_sqli"])
+            self._process_specialist_authority(categories["specialist_authority"])
 
-            # Mark specialist-authority findings as confirmed (skip CDP)
-            for f in specialist_authority:
-                self.db.update_finding_status(
-                    f.id,
-                    FindingStatus.VALIDATED_CONFIRMED,
-                    notes="Confirmed by specialist agent (CDP not required)"
-                )
-                dashboard.log(f"✅ {f.type} on {f.vuln_parameter or 'N/A'} - specialist authority", "SUCCESS")
+            if categories["already_confirmed"]:
+                dashboard.log(f"✅ {len(categories['already_confirmed'])} findings already validated (fast-path).", "SUCCESS")
 
-            if already_confirmed:
-                dashboard.log(f"✅ {len(already_confirmed)} findings already validated (fast-path).", "SUCCESS")
-
-            # =====================================================================
-            # ONLY send CDP-needed findings to AgenticValidator
-            # =====================================================================
+            # Validate CDP-needed findings
+            needs_cdp = categories["needs_cdp"]
             if self.USE_BATCH_VALIDATION and needs_cdp:
                 dashboard.log(f"🔬 Sending {len(needs_cdp)} findings to CDP validator...", "INFO")
                 await self._validate_batch_optimized(needs_cdp)
             elif needs_cdp:
-                # Fallback to sequential (for debugging or if batch disabled)
                 await self._validate_sequential(needs_cdp)
 
             if not continuous:
