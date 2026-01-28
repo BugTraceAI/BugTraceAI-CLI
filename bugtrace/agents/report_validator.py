@@ -72,38 +72,60 @@ class ReportValidator(BaseAgent):
         pass
     
     async def validate_report(
-        self, 
+        self,
         report_dir: Path,
         max_findings: int = 20
     ) -> Dict[str, Any]:
         """
         Main entry point: Take a report directory and validate all findings.
-        
+
         Args:
             report_dir: Path to report folder (contains engagement_data.json)
             max_findings: Maximum findings to validate (to control cost/time)
-            
+
         Returns:
             Validation summary with updated findings
         """
         self.think(f"Starting report validation for: {report_dir}")
-        
-        # 1. Load the report
+
+        # 1. Load report
+        report_data = self._report_load(report_dir)
+        findings = report_data.get("findings", [])
+
+        # 2. Select candidates
+        candidates = self._get_validation_candidates(findings, max_findings)
+        self.think(f"Selected {len(candidates)} findings for validation")
+
+        # 3. Validate findings
+        validated_findings = await self._report_validate_findings(findings, candidates, report_dir)
+
+        # 4. Save results
+        report_data["findings"] = validated_findings
+        report_data["validation_summary"] = self._generate_summary()
+        self._report_save(report_dir, report_data)
+
+        self.think(f"Validation complete! Results saved to {report_dir / 'engagement_data_validated.json'}")
+        return report_data
+
+    def _report_load(self, report_dir: Path) -> Dict[str, Any]:
+        """Load engagement data from report directory."""
         engagement_file = report_dir / "engagement_data.json"
         if not engagement_file.exists():
             raise FileNotFoundError(f"No engagement_data.json in {report_dir}")
-            
+
         with open(engagement_file) as f:
             report_data = json.load(f)
-            
-        findings = report_data.get("findings", [])
-        self.think(f"Loaded {len(findings)} findings from report")
-        
-        # 2. Filter to findings worth validating
-        candidates = self._get_validation_candidates(findings, max_findings)
-        self.think(f"Selected {len(candidates)} findings for validation")
-        
-        # 3. Validate each finding
+
+        self.think(f"Loaded {len(report_data.get('findings', []))} findings from report")
+        return report_data
+
+    async def _report_validate_findings(
+        self,
+        findings: List[Dict],
+        candidates: List[Dict],
+        report_dir: Path
+    ) -> List[Dict]:
+        """Validate all findings, processing candidates."""
         validated_findings = []
         for i, finding in enumerate(findings):
             if finding in candidates:
@@ -112,19 +134,13 @@ class ReportValidator(BaseAgent):
                 validated_findings.append(validated)
             else:
                 validated_findings.append(finding)
-                
-        # 4. Update report
-        report_data["findings"] = validated_findings
-        report_data["validation_summary"] = self._generate_summary()
-        
-        # 5. Save updated report
+        return validated_findings
+
+    def _report_save(self, report_dir: Path, report_data: Dict[str, Any]):
+        """Save validated report to disk."""
         output_file = report_dir / "engagement_data_validated.json"
         with open(output_file, "w") as f:
             json.dump(report_data, f, indent=2, default=str)
-            
-        self.think(f"Validation complete! Results saved to {output_file}")
-        
-        return report_data
     
     def _get_validation_candidates(
         self, 
@@ -153,13 +169,13 @@ class ReportValidator(BaseAgent):
         return candidates[:max_count]
     
     async def _validate_single_finding(
-        self, 
+        self,
         finding: Dict[str, Any],
         report_dir: Path
     ) -> Dict[str, Any]:
         """
         Validate a single finding using browser automation + vision.
-        
+
         This is where the "superpowers" happen:
         1. Navigate to URL with payload
         2. Capture screenshot
@@ -167,104 +183,126 @@ class ReportValidator(BaseAgent):
         4. DELEGATE TO SPECIALIZED AGENTS if vision is inconclusive
         5. Update finding with results
         """
-        vuln_type = self._detect_vuln_type(finding)
-        url = finding.get("url") or finding.get("metadata", {}).get("url")
-        payload = self._extract_payload(finding)
-        parameter = finding.get("parameter") or finding.get("metadata", {}).get("parameter")
-        
-        if not url:
+        # Extract finding context
+        context = self._finding_extract_context(finding)
+        if not context["url"]:
             return finding
-            
+
         try:
-            # STEP 1: Browser Automation
+            # Test with browser
             screenshot_path, browser_logs, basic_triggered = await self._browser_test(
-                url, payload, vuln_type, report_dir
+                context["url"], context["payload"], context["vuln_type"], report_dir
             )
-            
-            # STEP 2: Check if basic test succeeded
+
+            # Check browser test result
             if basic_triggered:
-                finding["validated"] = True
-                finding["validation_method"] = "ReportValidator + Browser Alert"
-                finding["validation_confidence"] = 1.0
-                finding["screenshot_path"] = str(screenshot_path) if screenshot_path else None
-                
-                self.validation_results.append(ValidationResult(
-                    finding_id=finding.get("id", "unknown"),
-                    validated=True,
-                    confidence=1.0,
-                    evidence="Alert/error triggered in browser",
-                    screenshot_path=str(screenshot_path) if screenshot_path else None,
-                    method="Browser Alert Detection"
-                ))
-                return finding
-                
-            # STEP 3: Vision Analysis
-            vision_result = {"success": False, "confidence": 0}
-            if screenshot_path and Path(screenshot_path).exists():
-                vision_result = await self._vision_analysis(
-                    screenshot_path, vuln_type, url, payload
+                return self._finding_mark_validated(finding, screenshot_path, "Browser Alert Detection", 1.0, "Alert/error triggered in browser")
+
+            # Try vision analysis
+            vision_result = await self._finding_vision_check(screenshot_path, context)
+            if vision_result.get("success") and vision_result.get("confidence", 0) >= 0.7:
+                return self._finding_mark_validated(
+                    finding, screenshot_path, "Vision LLM Analysis",
+                    vision_result.get("confidence", 0), vision_result.get("evidence", "")
                 )
-                
-                if vision_result.get("success") and vision_result.get("confidence", 0) >= 0.7:
-                    finding["validated"] = True
-                    finding["validation_method"] = "ReportValidator + Vision LLM"
-                    finding["validation_confidence"] = vision_result.get("confidence")
-                    finding["validation_evidence"] = vision_result.get("evidence")
-                    finding["screenshot_path"] = str(screenshot_path)
-                    
-                    self.validation_results.append(ValidationResult(
-                        finding_id=finding.get("id", "unknown"),
-                        validated=True,
-                        confidence=vision_result.get("confidence", 0),
-                        evidence=vision_result.get("evidence", ""),
-                        screenshot_path=str(screenshot_path),
-                        method="Vision LLM Analysis"
-                    ))
-                    return finding
-            
-            # STEP 4: DELEGATE TO SPECIALIZED AGENTS if inconclusive
-            # This is the key enhancement - using the right tool for the job
-            
-            if vuln_type == "sqli" and not finding.get("validated"):
-                self.think(f"Vision inconclusive for SQLi, delegating to SQLMapAgent...")
-                sqlmap_result = await self._delegate_to_sqlmap(url, parameter, report_dir)
-                
-                if sqlmap_result.get("validated"):
-                    finding["validated"] = True
-                    finding["validation_method"] = "ReportValidator -> SQLMapAgent"
-                    finding["validation_confidence"] = 1.0
-                    finding["validation_evidence"] = sqlmap_result.get("evidence")
-                    finding["reproduction"] = sqlmap_result.get("reproduction")
-                    
-                    self.validation_results.append(ValidationResult(
-                        finding_id=finding.get("id", "unknown"),
-                        validated=True,
-                        confidence=1.0,
-                        evidence=sqlmap_result.get("evidence", "SQLMap confirmed"),
-                        screenshot_path=str(screenshot_path) if screenshot_path else None,
-                        method="SQLMapAgent Delegation"
-                    ))
-                    return finding
-            
-            # If we get here, validation was inconclusive
-            if screenshot_path:
-                finding["screenshot_path"] = str(screenshot_path)
-            finding["validation_attempted"] = True
-            finding["validation_notes"] = vision_result.get("evidence", "Inconclusive - all methods tried")
-            
-            self.validation_results.append(ValidationResult(
-                finding_id=finding.get("id", "unknown"),
-                validated=False,
-                confidence=vision_result.get("confidence", 0),
-                evidence=vision_result.get("evidence", ""),
-                screenshot_path=str(screenshot_path) if screenshot_path else None,
-                method="All Methods Inconclusive"
-            ))
-                
+
+            # Try delegation to specialized agents
+            delegated = await self._finding_try_delegation(finding, context, report_dir, screenshot_path)
+            if delegated:
+                return delegated
+
+            # Mark as inconclusive
+            return self._finding_mark_inconclusive(finding, screenshot_path, vision_result)
+
         except Exception as e:
             logger.error(f"Validation failed for {finding.get('title')}: {e}", exc_info=True)
             finding["validation_error"] = str(e)
-            
+
+        return finding
+
+    def _finding_extract_context(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract validation context from finding."""
+        return {
+            "vuln_type": self._detect_vuln_type(finding),
+            "url": finding.get("url") or finding.get("metadata", {}).get("url"),
+            "payload": self._extract_payload(finding),
+            "parameter": finding.get("parameter") or finding.get("metadata", {}).get("parameter")
+        }
+
+    async def _finding_vision_check(self, screenshot_path: Optional[Path], context: Dict) -> Dict[str, Any]:
+        """Perform vision analysis if screenshot exists."""
+        if not screenshot_path or not Path(screenshot_path).exists():
+            return {"success": False, "confidence": 0}
+
+        return await self._vision_analysis(
+            screenshot_path, context["vuln_type"], context["url"], context["payload"]
+        )
+
+    async def _finding_try_delegation(
+        self,
+        finding: Dict[str, Any],
+        context: Dict,
+        report_dir: Path,
+        screenshot_path: Optional[Path]
+    ) -> Optional[Dict[str, Any]]:
+        """Try delegating to specialized agents."""
+        if context["vuln_type"] == "sqli" and not finding.get("validated"):
+            self.think(f"Vision inconclusive for SQLi, delegating to SQLMapAgent...")
+            sqlmap_result = await self._delegate_to_sqlmap(context["url"], context["parameter"], report_dir)
+
+            if sqlmap_result.get("validated"):
+                return self._finding_mark_validated(
+                    finding, screenshot_path, "SQLMapAgent Delegation", 1.0,
+                    sqlmap_result.get("evidence", "SQLMap confirmed")
+                )
+        return None
+
+    def _finding_mark_validated(
+        self,
+        finding: Dict[str, Any],
+        screenshot_path: Optional[Path],
+        method: str,
+        confidence: float,
+        evidence: str
+    ) -> Dict[str, Any]:
+        """Mark finding as validated with given method."""
+        finding["validated"] = True
+        finding["validation_method"] = f"ReportValidator + {method}"
+        finding["validation_confidence"] = confidence
+        finding["validation_evidence"] = evidence
+        if screenshot_path:
+            finding["screenshot_path"] = str(screenshot_path)
+
+        self.validation_results.append(ValidationResult(
+            finding_id=finding.get("id", "unknown"),
+            validated=True,
+            confidence=confidence,
+            evidence=evidence,
+            screenshot_path=str(screenshot_path) if screenshot_path else None,
+            method=method
+        ))
+        return finding
+
+    def _finding_mark_inconclusive(
+        self,
+        finding: Dict[str, Any],
+        screenshot_path: Optional[Path],
+        vision_result: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Mark finding as inconclusive."""
+        if screenshot_path:
+            finding["screenshot_path"] = str(screenshot_path)
+        finding["validation_attempted"] = True
+        finding["validation_notes"] = vision_result.get("evidence", "Inconclusive - all methods tried")
+
+        self.validation_results.append(ValidationResult(
+            finding_id=finding.get("id", "unknown"),
+            validated=False,
+            confidence=vision_result.get("confidence", 0),
+            evidence=vision_result.get("evidence", ""),
+            screenshot_path=str(screenshot_path) if screenshot_path else None,
+            method="All Methods Inconclusive"
+        ))
         return finding
     
     async def _delegate_to_sqlmap(
@@ -323,7 +361,7 @@ class ReportValidator(BaseAgent):
     ) -> Tuple[Optional[Path], List[str], bool]:
         """
         Execute browser-based testing.
-        
+
         This includes:
         - Navigating to URL
         - Injecting payloads
@@ -333,63 +371,75 @@ class ReportValidator(BaseAgent):
         logs = []
         triggered = False
         screenshot_path = None
-        
-        # Construct target URL with payload
         target_url = self._construct_test_url(url, payload)
-        
+
         async with browser_manager.get_page() as page:
             try:
-                # Setup XSS detection for XSS vulnerabilities
+                # Setup detection
                 if vuln_type == "xss":
-                    async def on_alert(msg):
-                        nonlocal triggered
-                        triggered = True
-                        logs.append(f"ALERT TRIGGERED: {msg}")
-                        
-                    await page.expose_function("bugtrace_alert", on_alert)
-                    await page.add_init_script("""
-                        window.alert = function(msg) {
-                            // Visual proof
-                            const div = document.createElement('div');
-                            div.id = 'xss-proof';
-                            div.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:999999;background:#dc2626;color:white;padding:20px;border-radius:8px;font-size:20px;font-weight:bold;';
-                            div.innerText = '⚠️ XSS VERIFIED: ' + msg;
-                            document.body.appendChild(div);
-                            // Callback
-                            window.bugtrace_alert(msg);
-                        };
-                    """)
-                
-                # Navigate
+                    triggered = await self._browser_setup_xss_detection(page, logs)
+
+                # Navigate and test
                 logs.append(f"Navigating to: {target_url}")
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(3000)  # Wait for JS execution
-                
-                # For SQLi, check page content for errors
+                await page.wait_for_timeout(3000)
+
+                # Check for SQL errors
                 if vuln_type == "sqli":
-                    content = await page.content()
-                    sql_indicators = [
-                        "sql syntax", "mysql", "postgresql", "sqlite",
-                        "ora-", "microsoft sql", "syntax error"
-                    ]
-                    for indicator in sql_indicators:
-                        if indicator in content.lower():
-                            triggered = True
-                            logs.append(f"SQL indicator found: {indicator}")
-                            break
-                
+                    triggered = await self._browser_check_sqli(page, logs)
+
                 # Capture screenshot
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                screenshot_path = report_dir / "validation_screenshots" / f"validate_{timestamp}.png"
-                screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-                await page.screenshot(path=str(screenshot_path))
-                logs.append(f"Screenshot captured: {screenshot_path}")
-                
+                screenshot_path = await self._browser_capture_screenshot(page, report_dir, logs)
+
             except Exception as e:
                 logs.append(f"Browser error: {e}")
                 logger.error(f"Browser test failed: {e}", exc_info=True)
-                
+
         return screenshot_path, logs, triggered
+
+    async def _browser_setup_xss_detection(self, page, logs: List[str]) -> bool:
+        """Setup XSS alert detection in browser."""
+        triggered = False
+
+        async def on_alert(msg):
+            nonlocal triggered
+            triggered = True
+            logs.append(f"ALERT TRIGGERED: {msg}")
+
+        await page.expose_function("bugtrace_alert", on_alert)
+        await page.add_init_script("""
+            window.alert = function(msg) {
+                const div = document.createElement('div');
+                div.id = 'xss-proof';
+                div.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:999999;background:#dc2626;color:white;padding:20px;border-radius:8px;font-size:20px;font-weight:bold;';
+                div.innerText = '⚠️ XSS VERIFIED: ' + msg;
+                document.body.appendChild(div);
+                window.bugtrace_alert(msg);
+            };
+        """)
+        return triggered
+
+    async def _browser_check_sqli(self, page, logs: List[str]) -> bool:
+        """Check page content for SQL error indicators."""
+        content = await page.content()
+        sql_indicators = [
+            "sql syntax", "mysql", "postgresql", "sqlite",
+            "ora-", "microsoft sql", "syntax error"
+        ]
+        for indicator in sql_indicators:
+            if indicator in content.lower():
+                logs.append(f"SQL indicator found: {indicator}")
+                return True
+        return False
+
+    async def _browser_capture_screenshot(self, page, report_dir: Path, logs: List[str]) -> Path:
+        """Capture and save screenshot."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_path = report_dir / "validation_screenshots" / f"validate_{timestamp}.png"
+        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(path=str(screenshot_path))
+        logs.append(f"Screenshot captured: {screenshot_path}")
+        return screenshot_path
     
     async def _vision_analysis(
         self,
