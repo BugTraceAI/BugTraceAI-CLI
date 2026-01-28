@@ -60,115 +60,137 @@ class JWTAgent(BaseAgent):
             "findings": self.findings
         }
 
+
+    async def _scan_page_for_tokens(self, page, target_url, jwt_re, discovered):
+        """Scan a single page for JWT tokens in various locations."""
+        try:
+            self.think(f"Scanning page: {target_url}")
+            
+            # Intercept headers
+            auth_header_token = None
+            async def handle_request(request):
+                nonlocal auth_header_token
+                auth = request.headers.get("authorization")
+                if auth and "Bearer " in auth:
+                    t = auth.split("Bearer ")[1]
+                    if self._is_jwt(t):
+                        auth_header_token = t
+
+            page.on("request", handle_request)
+            await page.goto(target_url, wait_until="networkidle", timeout=10000)
+            
+            # Check URL parameters
+            await self._check_url_for_tokens(page.url, discovered)
+            
+            # Check page content
+            await self._check_page_content_for_tokens(page, jwt_re, discovered)
+            
+            # Check storage
+            await self._check_storage_for_tokens(page, discovered)
+            
+            if auth_header_token:
+                discovered.append((auth_header_token, "header"))
+
+        except Exception as e:
+            logger.debug(f"Scan failed for {target_url}: {e}")
+
+    async def _check_url_for_tokens(self, url, discovered):
+        """Check URL parameters for JWT tokens."""
+        from urllib.parse import urlparse, parse_qs
+        
+        p_curr = urlparse(url)
+        p_params = parse_qs(p_curr.query)
+        for val_list in p_params.values():
+            for val in val_list:
+                if self._is_jwt(val):
+                    discovered.append((val, "url_param"))
+
+    async def _check_page_content_for_tokens(self, page, jwt_re, discovered):
+        """Check page links and text for JWT tokens."""
+        from urllib.parse import urlparse, parse_qs
+        
+        data = await page.evaluate("""
+            () => ({
+                links: Array.from(document.querySelectorAll('a[href]')).map(a => a.href),
+                text: document.body.innerText,
+                html: document.documentElement.innerHTML
+            })
+        """)
+        
+        # Check Links
+        for link in data['links']:
+            p_link = urlparse(link)
+            l_params = parse_qs(p_link.query)
+            for val_list in l_params.values():
+                for val in val_list:
+                    if self._is_jwt(val):
+                        discovered.append((val, "link_param"))
+        
+        # Check Text/HTML for JWT strings
+        matches = jwt_re.findall(data['text']) + jwt_re.findall(data['html'])
+        for m in matches:
+            if self._is_jwt(m):
+                discovered.append((m, "body_text"))
+
+    async def _check_storage_for_tokens(self, page, discovered):
+        """Check cookies and localStorage for JWT tokens."""
+        import json
+        
+        cookies = await page.context.cookies()
+        for cookie in cookies:
+            if self._is_jwt(cookie['value']):
+                discovered.append((cookie['value'], "cookie"))
+        
+        storage = await page.evaluate("() => JSON.stringify(localStorage)")
+        storage_dict = json.loads(storage)
+        for k, v in storage_dict.items():
+            if isinstance(v, str) and self._is_jwt(v):
+                discovered.append((v, "localStorage"))
+
+
     async def _discover_tokens(self, url: str) -> List[Tuple[str, str]]:
         """Use browser to find JWTs in URL, cookies, local storage, page links, and body text."""
         from bugtrace.tools.visual.browser import browser_manager
         from urllib.parse import urlparse, parse_qs
         import re
-        
+
         discovered = []
         self.think(f"🔍 Starting token discovery for {url}")
-        
-        # Regex for potential JWT (header.payload.signature)
-        # Base64url characters: a-zA-Z0-9_-
+
         jwt_re = re.compile(r'(eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]*)')
 
-        # 1. Check current URL passed to the method
-        parsed_url = urlparse(url)
-        params = parse_qs(parsed_url.query)
-        for val_list in params.values():
-            for val in val_list:
-                if self._is_jwt(val):
-                    discovered.append((val, "url_param"))
+        # Check initial URL parameters
+        await self._check_url_for_tokens(url, discovered)
 
         async with browser_manager.get_page() as page:
-            async def scan_page(target_url):
-                try:
-                    self.think(f"Scanning page: {target_url}")
-                    # Intercept headers
-                    auth_header_token = None
-                    async def handle_request(request):
-                        nonlocal auth_header_token
-                        auth = request.headers.get("authorization")
-                        if auth and "Bearer " in auth:
-                            t = auth.split("Bearer ")[1]
-                            if self._is_jwt(t):
-                                auth_header_token = t
+            # Scan target URL
+            await self._scan_page_for_tokens(page, url, jwt_re, discovered)
 
-                    page.on("request", handle_request)
-                    await page.goto(target_url, wait_until="networkidle", timeout=10000)
-                    
-                    # A. Check URL
-                    curr_url = page.url
-                    p_curr = urlparse(curr_url)
-                    p_params = parse_qs(p_curr.query)
-                    for val_list in p_params.values():
-                        for val in val_list:
-                            if self._is_jwt(val):
-                                discovered.append((val, "url_param"))
-
-                    # B. Check Page Content (Links & Text)
-                    # Get all hrefs and the entire body text
-                    data = await page.evaluate("""
-                        () => ({
-                            links: Array.from(document.querySelectorAll('a[href]')).map(a => a.href),
-                            text: document.body.innerText,
-                            html: document.documentElement.innerHTML
-                        })
-                    """)
-                    
-                    # Check Links
-                    for link in data['links']:
-                        p_link = urlparse(link)
-                        l_params = parse_qs(p_link.query)
-                        for val_list in l_params.values():
-                            for val in val_list:
-                                if self._is_jwt(val):
-                                    discovered.append((val, "link_param"))
-                    
-                    # Check Text/HTML for JWT strings
-                    matches = jwt_re.findall(data['text']) + jwt_re.findall(data['html'])
-                    for m in matches:
-                        if self._is_jwt(m):
-                            discovered.append((m, "body_text"))
-
-                    # C. Check Storage
-                    cookies = await page.context.cookies()
-                    for cookie in cookies:
-                        if self._is_jwt(cookie['value']):
-                            discovered.append((cookie['value'], "cookie"))
-                    
-                    storage = await page.evaluate("() => JSON.stringify(localStorage)")
-                    storage_dict = json.loads(storage)
-                    for k, v in storage_dict.items():
-                        if isinstance(v, str) and self._is_jwt(v):
-                            discovered.append((v, "localStorage"))
-                            
-                    if auth_header_token:
-                        discovered.append((auth_header_token, "header"))
-
-                except Exception as e:
-                    logger.debug(f"Scan failed for {target_url}: {e}")
-
-            # Execute scans
-            await scan_page(url)
-            
-            # 2. Heuristic: If nothing found, try visiting parent or landing page
+            # Heuristic: If nothing found, try root page
             if not discovered:
-                # Try the root of the site if we are on a subpath
-                p = urlparse(url)
-                if p.path != "/" and p.path != "":
-                    root_url = f"{p.scheme}://{p.netloc}/"
+                root_url = self._get_root_url(url)
+                if root_url:
                     self.think(f"No tokens found on target. Trying landing page: {root_url}")
-                    await scan_page(root_url)
-        
-        # Unique tokens only
+                    await self._scan_page_for_tokens(page, root_url, jwt_re, discovered)
+
+        return self._deduplicate_tokens(discovered)
+
+    def _get_root_url(self, url: str):
+        """Get root URL if current URL has a path."""
+        from urllib.parse import urlparse
+
+        p = urlparse(url)
+        if p.path != "/" and p.path != "":
+            return f"{p.scheme}://{p.netloc}/"
+        return None
+
+    def _deduplicate_tokens(self, discovered):
+        """Remove duplicate tokens and log discoveries."""
         unique = {}
         for t, loc in discovered:
             if t not in unique:
                 unique[t] = loc
                 self.think(f"🎯 Discovered token at {loc}: {t[:20]}...")
-                
         return list(unique.items())
 
     def _is_jwt(self, token: str) -> bool:
