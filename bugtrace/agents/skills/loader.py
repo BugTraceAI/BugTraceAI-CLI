@@ -59,43 +59,57 @@ def get_skill_content(vuln_type: str) -> Optional[str]:
     return None
 
 
+def _load_skill_for_vuln_type(vuln_type: str, loaded_skills: set) -> Optional[str]:
+    """Load skill content for vulnerability type if not already loaded. Returns content or None."""
+    vuln_lower = vuln_type.lower()
+
+    for keyword, filename in SKILL_MAP.items():
+        if keyword not in vuln_lower:
+            continue
+        if filename in loaded_skills:
+            continue
+
+        content = get_skill_content(vuln_type)
+        if not content:
+            continue
+
+        loaded_skills.add(filename)
+        return content
+
+    return None
+
+
 def get_skills_for_findings(findings: List[dict], max_skills: int = 3) -> str:
     """
     Load relevant skills for a list of findings.
     Deduplicates and limits to max_skills to avoid token overload.
-    
+
     Args:
         findings: List of vulnerability findings with 'type' field
         max_skills: Maximum number of skills to include
-    
+
     Returns:
         Combined skill content as a string.
     """
     loaded_skills = set()
     skill_contents = []
-    
+
     for finding in findings:
-        vuln_type = finding.get("type", "")
-        vuln_lower = vuln_type.lower()
-        
-        # Find matching skill
-        for keyword, filename in SKILL_MAP.items():
-            if keyword in vuln_lower and filename not in loaded_skills:
-                content = get_skill_content(vuln_type)
-                if content:
-                    loaded_skills.add(filename)
-                    skill_contents.append(content)
-                    
-                    if len(skill_contents) >= max_skills:
-                        break
-        
         if len(skill_contents) >= max_skills:
             break
-    
-    if skill_contents:
-        return "\n\n---\n\n".join(skill_contents)
-    
-    return ""
+
+        vuln_type = finding.get("type", "")
+        if not vuln_type:
+            continue
+
+        content = _load_skill_for_vuln_type(vuln_type, loaded_skills)
+        if content:
+            skill_contents.append(content)
+
+    if not skill_contents:
+        return ""
+
+    return "\n\n---\n\n".join(skill_contents)
 
 
 import re
