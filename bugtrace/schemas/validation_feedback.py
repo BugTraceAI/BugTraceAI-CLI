@@ -323,80 +323,22 @@ def create_feedback_from_validation_result(
     """
     Función de conveniencia para crear un ValidationFeedback desde los resultados
     del AgenticValidator.
-    
+
     Esta función analiza los logs del navegador y el resultado de visión para
     determinar automáticamente la razón del fallo.
-    
+
     Args:
         finding: El finding original de la base de datos
         vision_result: Resultado del modelo de visión (puede ser None)
         browser_logs: Lista de logs de consola del navegador
         screenshot_path: Ruta al screenshot si existe
-        
+
     Returns:
         Un ValidationFeedback configurado con la razón del fallo detectada
     """
-    # Detectar razón del fallo analizando los logs
-    failure_reason = FailureReason.UNKNOWN
-    waf_signature = None
-    stripped_chars = []
-    csp_violation = None
-    detected_context = None
-    reflected_portion = None
-    
-    # Analizar logs del navegador
-    for log in browser_logs:
-        log_text = str(log.get('text', log)) if isinstance(log, dict) else str(log)
-        log_lower = log_text.lower()
-        
-        # Detectar CSP
-        if 'content-security-policy' in log_lower or "csp" in log_lower:
-            failure_reason = FailureReason.CSP_BLOCKED
-            csp_violation = log
-            break
-        
-        # Detectar WAF
-        if any(waf in log_lower for waf in ['blocked', '403', 'forbidden', 'waf', 'firewall']):
-            failure_reason = FailureReason.WAF_BLOCKED
-            # Intentar identificar el WAF
-            if 'cloudflare' in log_lower:
-                waf_signature = "Cloudflare"
-            elif 'akamai' in log_lower:
-                waf_signature = "Akamai"
-            elif 'aws' in log_lower:
-                waf_signature = "AWS WAF"
-            elif 'modsecurity' in log_lower:
-                waf_signature = "ModSecurity"
-            break
-        
-        # Detectar errores de sintaxis (contexto incorrecto)
-        if 'syntaxerror' in log_lower or 'unexpected token' in log_lower:
-            failure_reason = FailureReason.CONTEXT_MISMATCH
-    
-    # Analizar resultado de visión si existe
-    if vision_result:
-        vision_text = str(vision_result).lower()
-        
-        # Detectar reflexión parcial
-        if 'partial' in vision_text or 'partially' in vision_text:
-            failure_reason = FailureReason.PARTIAL_REFLECTION
-            reflected_portion = vision_result.get('reflected_portion', '')
-        
-        # Detectar filtrado
-        if 'filtered' in vision_text or 'sanitized' in vision_text or 'stripped' in vision_text:
-            failure_reason = FailureReason.ENCODING_STRIPPED
-            
-            # Intentar detectar qué caracteres fueron filtrados
-            original = finding.get('payload', '')
-            reflected = vision_result.get('reflected_portion', '')
-            if original and reflected:
-                for char in '<>"\\\'()[]{}':
-                    if char in original and char not in reflected:
-                        stripped_chars.append(char)
-        
-        # Obtener contexto detectado
-        detected_context = vision_result.get('context') or vision_result.get('detected_context')
-    
+    # Analyze failure reason
+    failure_data = _analyze_failure_reason(browser_logs, vision_result, finding)
+
     return ValidationFeedback(
         finding_id=finding.get('id', 0),
         original_payload=finding.get('payload', ''),
@@ -404,14 +346,111 @@ def create_feedback_from_validation_result(
         parameter=finding.get('parameter', ''),
         vuln_type=str(finding.get('type', 'XSS')) if finding.get('type') else 'XSS',
         executed=False,
-        failure_reason=failure_reason,
-        detected_context=detected_context,
-        reflected_portion=reflected_portion,
-        stripped_chars=stripped_chars,
-        waf_signature=waf_signature,
+        failure_reason=failure_data['failure_reason'],
+        detected_context=failure_data['detected_context'],
+        reflected_portion=failure_data['reflected_portion'],
+        stripped_chars=failure_data['stripped_chars'],
+        waf_signature=failure_data['waf_signature'],
         console_errors=browser_logs[:10],  # Limitar a 10 logs
-        csp_violation=csp_violation,
+        csp_violation=failure_data['csp_violation'],
         screenshot_path=screenshot_path,
         retry_count=finding.get('_retry_count', 0),
         tried_variants=finding.get('_tried_variants', [])
     )
+
+
+def _analyze_failure_reason(
+    browser_logs: List[str],
+    vision_result: Optional[Dict[str, Any]],
+    finding: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Analyze browser logs and vision results to determine failure reason."""
+    failure_data = {
+        'failure_reason': FailureReason.UNKNOWN,
+        'waf_signature': None,
+        'stripped_chars': [],
+        'csp_violation': None,
+        'detected_context': None,
+        'reflected_portion': None
+    }
+
+    # Analyze browser logs
+    _analyze_browser_logs(browser_logs, failure_data)
+
+    # Analyze vision result
+    if vision_result:
+        _analyze_vision_result(vision_result, finding, failure_data)
+
+    return failure_data
+
+
+def _analyze_browser_logs(browser_logs: List[str], failure_data: Dict[str, Any]):
+    """Analyze browser logs for failure indicators."""
+    for log in browser_logs:
+        log_text = str(log.get('text', log)) if isinstance(log, dict) else str(log)
+        log_lower = log_text.lower()
+
+        # Detectar CSP
+        if 'content-security-policy' in log_lower or "csp" in log_lower:
+            failure_data['failure_reason'] = FailureReason.CSP_BLOCKED
+            failure_data['csp_violation'] = log
+            break
+
+        # Detectar WAF
+        if any(waf in log_lower for waf in ['blocked', '403', 'forbidden', 'waf', 'firewall']):
+            failure_data['failure_reason'] = FailureReason.WAF_BLOCKED
+            failure_data['waf_signature'] = _identify_waf(log_lower)
+            break
+
+        # Detectar errores de sintaxis (contexto incorrecto)
+        if 'syntaxerror' in log_lower or 'unexpected token' in log_lower:
+            failure_data['failure_reason'] = FailureReason.CONTEXT_MISMATCH
+
+
+def _identify_waf(log_lower: str) -> Optional[str]:
+    """Identify WAF from log text."""
+    if 'cloudflare' in log_lower:
+        return "Cloudflare"
+    elif 'akamai' in log_lower:
+        return "Akamai"
+    elif 'aws' in log_lower:
+        return "AWS WAF"
+    elif 'modsecurity' in log_lower:
+        return "ModSecurity"
+    return None
+
+
+def _analyze_vision_result(
+    vision_result: Dict[str, Any],
+    finding: Dict[str, Any],
+    failure_data: Dict[str, Any]
+):
+    """Analyze vision result for failure indicators."""
+    vision_text = str(vision_result).lower()
+
+    # Detectar reflexión parcial
+    if 'partial' in vision_text or 'partially' in vision_text:
+        failure_data['failure_reason'] = FailureReason.PARTIAL_REFLECTION
+        failure_data['reflected_portion'] = vision_result.get('reflected_portion', '')
+
+    # Detectar filtrado
+    if 'filtered' in vision_text or 'sanitized' in vision_text or 'stripped' in vision_text:
+        failure_data['failure_reason'] = FailureReason.ENCODING_STRIPPED
+        failure_data['stripped_chars'] = _detect_stripped_chars(finding, vision_result)
+
+    # Obtener contexto detectado
+    failure_data['detected_context'] = vision_result.get('context') or vision_result.get('detected_context')
+
+
+def _detect_stripped_chars(finding: Dict[str, Any], vision_result: Dict[str, Any]) -> List[str]:
+    """Detect which characters were filtered/stripped."""
+    stripped_chars = []
+    original = finding.get('payload', '')
+    reflected = vision_result.get('reflected_portion', '')
+
+    if original and reflected:
+        for char in '<>"\\\'()[]{}':
+            if char in original and char not in reflected:
+                stripped_chars.append(char)
+
+    return stripped_chars
