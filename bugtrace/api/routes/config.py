@@ -124,43 +124,66 @@ async def update_config(request: ConfigUpdateRequest):
 
     Solves API-08: PATCH /config with validation
     """
-    # Extract non-None fields
+    updates = _extract_updates(request)
+    errors = _validate_config_updates(updates)
+
+    if errors:
+        logger.warning(f"Configuration update validation failed: {errors}")
+        raise HTTPException(status_code=422, detail={"errors": errors})
+
+    applied = _apply_config_updates(updates)
+    logger.info(f"Configuration updated: {len(applied)} field(s) changed")
+
+    return ConfigUpdateResponse(
+        updated=applied,
+        message=f"Updated {len(applied)} configuration field(s)"
+    )
+
+
+def _extract_updates(request: ConfigUpdateRequest) -> dict:
+    """Extract non-None fields from update request."""
     updates = request.model_dump(exclude_none=True)
-
     if not updates:
-        raise HTTPException(
-            status_code=400,
-            detail="No fields to update"
-        )
+        raise HTTPException(status_code=400, detail="No fields to update")
+    return updates
 
-    # Validate individual fields
+
+def _validate_config_updates(updates: dict) -> list:
+    """Validate configuration update values."""
     errors = []
+    errors.extend(_validate_positive_integers(updates))
+    errors.extend(_validate_model_formats(updates))
+    return errors
 
-    # Validate positive integers
-    for key in ["MAX_DEPTH", "MAX_URLS", "MAX_CONCURRENT_URL_AGENTS", "MAX_CONCURRENT_REQUESTS"]:
+
+def _validate_positive_integers(updates: dict) -> list:
+    """Validate positive integer fields."""
+    errors = []
+    int_fields = ["MAX_DEPTH", "MAX_URLS", "MAX_CONCURRENT_URL_AGENTS", "MAX_CONCURRENT_REQUESTS"]
+    for key in int_fields:
         if key in updates:
             value = updates[key]
             if not isinstance(value, int) or value < 1:
                 errors.append(f"{key} must be a positive integer (got: {value})")
+    return errors
 
-    # Validate model format (must contain provider/model separator)
-    for key in ["DEFAULT_MODEL", "CODE_MODEL", "ANALYSIS_MODEL", "MUTATION_MODEL", "SKEPTICAL_MODEL"]:
+
+def _validate_model_formats(updates: dict) -> list:
+    """Validate model format fields."""
+    errors = []
+    model_fields = ["DEFAULT_MODEL", "CODE_MODEL", "ANALYSIS_MODEL", "MUTATION_MODEL", "SKEPTICAL_MODEL"]
+    for key in model_fields:
         if key in updates:
             value = updates[key]
             if value and "/" not in value:
                 errors.append(
                     f"{key} must be in provider/model format (e.g., 'google/gemini-3-flash-preview'), got: {value}"
                 )
+    return errors
 
-    if errors:
-        logger.warning(f"Configuration update validation failed: {errors}")
-        raise HTTPException(
-            status_code=422,
-            detail={"errors": errors}
-        )
 
-    # Apply updates to settings singleton
-    # CRITICAL: Use object.__setattr__ for Pydantic Settings objects (same pattern as restore_snapshot())
+def _apply_config_updates(updates: dict) -> dict:
+    """Apply validated updates to settings singleton."""
     applied = {}
     for key, value in updates.items():
         if hasattr(settings, key):
@@ -168,10 +191,4 @@ async def update_config(request: ConfigUpdateRequest):
             object.__setattr__(settings, key, value)
             applied[key] = {"from": old_value, "to": value}
             logger.info(f"Config updated: {key} = {old_value} -> {value}")
-
-    logger.info(f"Configuration updated: {len(applied)} field(s) changed")
-
-    return ConfigUpdateResponse(
-        updated=applied,
-        message=f"Updated {len(applied)} configuration field(s)"
-    )
+    return applied

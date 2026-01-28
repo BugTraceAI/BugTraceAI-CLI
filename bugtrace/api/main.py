@@ -348,48 +348,60 @@ async def websocket_scan_stream(
     logger.info(f"WebSocket client connected to scan {scan_id} (last_seq={last_seq})")
 
     try:
-        # Validate scan_id exists
-        scan_service = get_scan_service()
-        try:
-            scan_service.get_scan_status(scan_id)
-        except Exception as e:
-            logger.warning(f"Invalid scan_id {scan_id}: {e}")
-            await websocket.close(code=1008, reason=f"Invalid scan_id: {scan_id}")
+        if not await _ws_validate_scan(websocket, scan_id):
             return
-
-        # Handle reconnection: send missed events first
-        highest_sent = 0
-        if last_seq > 0:
-            logger.info(f"Reconnection detected for scan {scan_id}, replaying events since seq {last_seq}")
-            missed = service_event_bus.get_history(scan_id, since_seq=last_seq)
-            for event in missed:
-                await websocket.send_json(event)
-            highest_sent = missed[-1]["seq"] if missed else last_seq
-
-        # Stream live events with sequence-based deduplication
-        async for event in service_event_bus.stream(scan_id):
-            # Skip events already sent (prevents duplicates during reconnection)
-            if event.get("seq", 0) <= highest_sent:
-                continue
-
-            # Send event to client
-            await websocket.send_json(event)
-            highest_sent = event.get("seq", highest_sent)
-
-            # Check for terminal events
-            if event.get("event_type") in ("scan_complete", "error"):
-                logger.info(f"Scan {scan_id} completed with event_type={event.get('event_type')}, closing WebSocket")
-                break
-
-        # Close WebSocket cleanly after scan completion
+        highest_sent = await _ws_send_missed_events(websocket, scan_id, last_seq)
+        await _ws_stream_live_events(websocket, scan_id, highest_sent)
         await websocket.close(code=1000, reason="Scan complete")
-
     except WebSocketDisconnect:
         logger.info(f"WebSocket client disconnected from scan {scan_id}")
     except Exception as e:
-        logger.error(f"WebSocket error for scan {scan_id}: {e}", exc_info=True)
-        try:
-            await websocket.close(code=1011, reason="Internal server error")
-        except Exception as close_err:
-            # WebSocket already closed or connection lost - ignore
-            pass
+        await _ws_handle_error(websocket, scan_id, e)
+
+
+async def _ws_validate_scan(websocket: WebSocket, scan_id: int) -> bool:
+    """Validate scan exists before streaming."""
+    scan_service = get_scan_service()
+    try:
+        scan_service.get_scan_status(scan_id)
+        return True
+    except Exception as e:
+        logger.warning(f"Invalid scan_id {scan_id}: {e}")
+        await websocket.close(code=1008, reason=f"Invalid scan_id: {scan_id}")
+        return False
+
+
+async def _ws_send_missed_events(websocket: WebSocket, scan_id: int, last_seq: int) -> int:
+    """Send missed events for reconnection."""
+    if last_seq == 0:
+        return 0
+
+    logger.info(f"Reconnection detected for scan {scan_id}, replaying events since seq {last_seq}")
+    missed = service_event_bus.get_history(scan_id, since_seq=last_seq)
+    for event in missed:
+        await websocket.send_json(event)
+    return missed[-1]["seq"] if missed else last_seq
+
+
+async def _ws_stream_live_events(websocket: WebSocket, scan_id: int, highest_sent: int):
+    """Stream live events with deduplication."""
+    async for event in service_event_bus.stream(scan_id):
+        if event.get("seq", 0) <= highest_sent:
+            continue
+
+        await websocket.send_json(event)
+        highest_sent = event.get("seq", highest_sent)
+
+        if event.get("event_type") in ("scan_complete", "error"):
+            logger.info(f"Scan {scan_id} completed with event_type={event.get('event_type')}, closing WebSocket")
+            break
+
+
+async def _ws_handle_error(websocket: WebSocket, scan_id: int, error: Exception):
+    """Handle WebSocket errors gracefully."""
+    logger.error(f"WebSocket error for scan {scan_id}: {error}", exc_info=True)
+    try:
+        await websocket.close(code=1011, reason="Internal server error")
+    except Exception:
+        # WebSocket already closed or connection lost - ignore
+        pass

@@ -95,65 +95,41 @@ def register_exception_handlers(app: FastAPI) -> None:
     Args:
         app: FastAPI application instance
     """
+    app.exception_handler(StarletteHTTPException)(_create_http_exception_handler())
+    app.exception_handler(RequestValidationError)(_create_validation_exception_handler())
+    app.exception_handler(ValueError)(_create_value_error_handler())
+    app.exception_handler(Exception)(_create_generic_exception_handler())
 
-    @app.exception_handler(StarletteHTTPException)
+    logger.info("Global exception handlers registered")
+
+
+def _create_http_exception_handler():
+    """Create handler for HTTPException."""
     async def http_exception_handler(
         request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
-        """
-        Handle HTTPException raised by FastAPI routes.
-
-        Maps HTTPException to standardized error response with code "HTTP_{status_code}".
-
-        Example:
-            raise HTTPException(status_code=404, detail="Scan not found")
-            ->
-            {
-                "error": {
-                    "code": "HTTP_404",
-                    "message": "Scan not found",
-                    "timestamp": "2026-01-28T12:34:56.789Z",
-                    "path": "/api/scans/123"
-                }
-            }
-        """
+        """Handle HTTPException with standardized response."""
         logger.warning(
             f"HTTPException in {request.url.path}: status={exc.status_code} detail={exc.detail}"
         )
-
         return _error_response(
             status_code=exc.status_code,
             error_code=f"HTTP_{exc.status_code}",
             message=str(exc.detail),
             request=request,
         )
+    return http_exception_handler
 
-    @app.exception_handler(RequestValidationError)
+
+def _create_validation_exception_handler():
+    """Create handler for Pydantic validation errors."""
     async def validation_exception_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        """
-        Handle Pydantic validation errors from request models.
-
-        Returns 422 Unprocessable Entity with validation error details.
-
-        Example:
-            POST /api/scans with invalid JSON
-            ->
-            {
-                "error": {
-                    "code": "VALIDATION_ERROR",
-                    "message": "Request validation failed",
-                    "timestamp": "2026-01-28T12:34:56.789Z",
-                    "path": "/api/scans",
-                    "details": [{"loc": ["body", "target_url"], "msg": "field required"}]
-                }
-            }
-        """
+        """Handle validation errors with details."""
         logger.warning(
             f"Request validation error in {request.url.path}: {exc.errors()}"
         )
-
         return _error_response(
             status_code=422,
             error_code="VALIDATION_ERROR",
@@ -161,65 +137,36 @@ def register_exception_handlers(app: FastAPI) -> None:
             request=request,
             details=exc.errors(),
         )
+    return validation_exception_handler
 
-    @app.exception_handler(ValueError)
+
+def _create_value_error_handler():
+    """Create handler for ValueError exceptions."""
     async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
-        """
-        Handle ValueError exceptions from business logic.
-
-        Maps ValueError to 400 Bad Request with code "VALIDATION_ERROR".
-
-        Example:
-            raise ValueError("Scan ID must be positive")
-            ->
-            {
-                "error": {
-                    "code": "VALIDATION_ERROR",
-                    "message": "Scan ID must be positive",
-                    "timestamp": "2026-01-28T12:34:56.789Z",
-                    "path": "/api/scans/status"
-                }
-            }
-        """
+        """Handle ValueError as 400 Bad Request."""
         logger.warning(f"ValueError in {request.url.path}: {exc}")
-
         return _error_response(
             status_code=400,
             error_code="VALIDATION_ERROR",
             message=str(exc),
             request=request,
         )
+    return value_error_handler
 
-    @app.exception_handler(Exception)
+
+def _create_generic_exception_handler():
+    """Create catch-all handler for unhandled exceptions."""
     async def generic_exception_handler(
         request: Request, exc: Exception
     ) -> JSONResponse:
-        """
-        Catch-all handler for unhandled exceptions.
-
-        Returns 500 Internal Server Error and logs full traceback.
-
-        Example:
-            Any unhandled exception
-            ->
-            {
-                "error": {
-                    "code": "INTERNAL_ERROR",
-                    "message": "An internal server error occurred",
-                    "timestamp": "2026-01-28T12:34:56.789Z",
-                    "path": "/api/endpoint"
-                }
-            }
-        """
+        """Handle unhandled exceptions as 500 errors."""
         logger.error(
             f"Unhandled exception in {request.url.path}: {exc}", exc_info=True
         )
-
         return _error_response(
             status_code=500,
             error_code="INTERNAL_ERROR",
             message="An internal server error occurred",
             request=request,
         )
-
-    logger.info("Global exception handlers registered")
+    return generic_exception_handler

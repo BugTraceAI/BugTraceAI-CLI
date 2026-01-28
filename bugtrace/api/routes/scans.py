@@ -59,43 +59,32 @@ async def create_scan(
         400: Invalid request parameters
     """
     try:
-        # Convert request to ScanOptions
-        options = ScanOptions(
-            target_url=request.target_url,
-            scan_type=request.scan_type,
-            safe_mode=request.safe_mode,
-            max_depth=request.max_depth,
-            max_urls=request.max_urls,
-            resume=request.resume,
-            use_vertical=request.use_vertical,
-            focused_agents=request.focused_agents,
-            param=request.param,
-        )
-
-        # Create scan (origin='web' since it comes from the API)
+        options = _build_scan_options(request)
         scan_id = await scan_service.create_scan(options, origin="web")
-
-        # Get initial status
         status_dict = await scan_service.get_scan_status(scan_id)
-
         logger.info(f"Created scan {scan_id} for target: {request.target_url}")
-
         return ScanStatusResponse(**status_dict)
-
     except RuntimeError as e:
-        # Concurrent scan limit reached
         logger.warning(f"Concurrent scan limit reached: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=str(e),
-        )
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
-        # Invalid parameters
         logger.error(f"Invalid scan request: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+def _build_scan_options(request: CreateScanRequest) -> ScanOptions:
+    """Convert API request to ScanOptions."""
+    return ScanOptions(
+        target_url=request.target_url,
+        scan_type=request.scan_type,
+        safe_mode=request.safe_mode,
+        max_depth=request.max_depth,
+        max_urls=request.max_urls,
+        resume=request.resume,
+        use_vertical=request.use_vertical,
+        focused_agents=request.focused_agents,
+        param=request.param,
+    )
 
 
 @router.get("/scans/{scan_id}/status", response_model=ScanStatusResponse)
@@ -157,17 +146,7 @@ async def get_scan_findings(
         404: Scan not found
         400: Invalid filter parameters
     """
-    # Validate pagination
-    if page < 1:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Page must be >= 1",
-        )
-    if per_page < 1 or per_page > 100:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Per page must be between 1 and 100",
-        )
+    _validate_findings_pagination(page, per_page)
 
     try:
         findings_dict = await scan_service.get_findings(
@@ -177,10 +156,7 @@ async def get_scan_findings(
             page=page,
             per_page=per_page,
         )
-
-        # Convert findings to FindingItem models
         finding_items = [FindingItem(**f) for f in findings_dict["findings"]]
-
         return FindingsResponse(
             findings=finding_items,
             total=findings_dict["total"],
@@ -188,12 +164,22 @@ async def get_scan_findings(
             per_page=findings_dict["per_page"],
             scan_id=scan_id,
         )
-
     except ValueError as e:
         logger.error(f"Error getting findings for scan {scan_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+def _validate_findings_pagination(page: int, per_page: int):
+    """Validate pagination parameters."""
+    if page < 1:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e),
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Page must be >= 1",
+        )
+    if per_page < 1 or per_page > 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Per page must be between 1 and 100",
         )
 
 
