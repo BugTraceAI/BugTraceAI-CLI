@@ -48,16 +48,32 @@ class IDORAgent(BaseAgent):
 
         return "PENDING_VALIDATION"
         
+    def _create_idor_finding(self, hit: Dict, param: str, original_value: str) -> Dict:
+        """Create IDOR finding from fuzzer hit."""
+        confidence_level = "HIGH" if hit["severity"] == "CRITICAL" else "MEDIUM"
+        return {
+            "type": "IDOR",
+            "url": self.url,
+            "parameter": param,
+            "payload": hit["id"],
+            "description": f"IDOR vulnerability detected on ID {hit['id']}. Differed from baseline ID {original_value}. Status: {hit['status_code']}. Contains sensitive data: {hit.get('contains_sensitive')}",
+            "severity": hit["severity"],
+            "validated": hit["severity"] == "CRITICAL",
+            "evidence": f"Status {hit['status_code']}. Diff Type: {hit['diff_type']}. Sensitive: {hit.get('contains_sensitive')}",
+            "status": self._determine_validation_status("differential", confidence_level),
+            "reproduction": f"# Compare responses:\ncurl '{self.url}?{param}={original_value}'\ncurl '{self.url}?{param}={hit['id']}'"
+        }
+
     async def run_loop(self) -> Dict:
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] 🚀 Starting IDOR analysis on {self.url}", "INFO")
-        
+
         all_findings = []
         async with aiohttp.ClientSession() as session:
             for item in self.params:
                 param = item.get("parameter")
                 original_value = str(item.get("original_value", ""))
-                
+
                 if not param:
                     continue
 
@@ -69,36 +85,21 @@ class IDORAgent(BaseAgent):
                     logger.info(f"[{self.name}] Skipping {param} - already tested")
                     continue
 
-                # 1. High-Performance Go IDOR Fuzzer
+                # High-Performance Go IDOR Fuzzer
                 dashboard.log(f"[{self.name}] 🚀 Launching Go IDOR Fuzzer on '{param}' (Range 1-1000)...", "INFO")
-                # We use a broad range 1-1000 by default for faster identification
                 go_result = await external_tools.run_go_idor_fuzzer(self.url, param, id_range="1-1000", baseline_id=original_value)
-                
+
                 if go_result and go_result.get("hits"):
                     for hit in go_result["hits"]:
                         dashboard.log(f"[{self.name}] 🚨 IDOR HIT: ID {hit['id']} ({hit['severity']})", "CRITICAL")
-                        all_findings.append({
-                            "type": "IDOR",
-                            "url": self.url,
-                            "parameter": param,
-                            "payload": hit["id"],
-                            "description": f"IDOR vulnerability detected on ID {hit['id']}. Differed from baseline ID {original_value}. Status: {hit['status_code']}. Contains sensitive data: {hit.get('contains_sensitive')}",
-                            "severity": hit["severity"],
-                            "validated": hit["severity"] == "CRITICAL",
-                            "evidence": f"Status {hit['status_code']}. Diff Type: {hit['diff_type']}. Sensitive: {hit.get('contains_sensitive')}",
-                            "status": self._determine_validation_status("differential", "HIGH" if hit["severity"] == "CRITICAL" else "MEDIUM"),
-                            "reproduction": f"# Compare responses:\ncurl '{self.url}?{param}={original_value}'\ncurl '{self.url}?{param}={hit['id']}'"
-                        })
+                        all_findings.append(self._create_idor_finding(hit, param, original_value))
                         self._tested_params.add(key)
-                        break # Found one, move count
-                
-                # 2. Trust the fuzzer's semantic analysis
-                # If fuzzer found no hits, differences are semantic (e.g., product catalog) not access control bypass
-                if not (go_result and go_result.get("hits")):
+                        break # Found one, move on
+                else:
                     logger.info(f"[{self.name}] ✅ No IDOR found on '{param}' - semantic analysis passed")
 
                 self._tested_params.add(key)
-        
+
         return {"findings": all_findings, "status": JobStatus.COMPLETED}
 
     async def _fetch(self, session, val, param_name, original_val) -> Optional[str]:

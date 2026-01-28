@@ -93,19 +93,47 @@ class AssetDiscoveryAgent(BaseAgent):
         while self.running:
             await asyncio.sleep(1)
 
-    async def discover_assets(self, target_url: str) -> Dict[str, Any]:
-        """
-        Main discovery orchestration method.
+    def _build_discovery_tasks(self, target_url: str) -> List:
+        """Build list of discovery tasks based on enabled methods."""
+        enable_dns = settings.get("ASSET_DISCOVERY", "ENABLE_DNS_ENUMERATION", "True").lower() == "true"
+        enable_ct = settings.get("ASSET_DISCOVERY", "ENABLE_CERTIFICATE_TRANSPARENCY", "True").lower() == "true"
+        enable_wayback = settings.get("ASSET_DISCOVERY", "ENABLE_WAYBACK_DISCOVERY", "True").lower() == "true"
+        enable_cloud = settings.get("ASSET_DISCOVERY", "ENABLE_CLOUD_STORAGE_ENUM", "True").lower() == "true"
+        enable_common = settings.get("ASSET_DISCOVERY", "ENABLE_COMMON_PATHS", "True").lower() == "true"
 
-        Returns:
-            Dict with discovered assets:
-            {
-                "subdomains": [...],
-                "endpoints": [...],
-                "cloud_buckets": [...],
-                "github_mentions": [...]
-            }
-        """
+        tasks = []
+        if enable_dns:
+            tasks.append(self._dns_enumeration())
+        if enable_ct:
+            tasks.append(self._certificate_transparency())
+        if enable_wayback:
+            tasks.append(self._wayback_discovery())
+        if enable_cloud:
+            tasks.append(self._cloud_storage_enum())
+        if enable_common:
+            tasks.append(self._common_paths_discovery(target_url))
+        return tasks
+
+    def _aggregate_results(self) -> Dict[str, Any]:
+        """Aggregate and limit discovered assets."""
+        max_subdomains = int(settings.get("ASSET_DISCOVERY", "MAX_SUBDOMAINS", "50"))
+        limited_subdomains = sorted(self.discovered_subdomains)[:max_subdomains]
+
+        if len(self.discovered_subdomains) > max_subdomains:
+            dashboard.log(
+                f"⚠️  Limited to {max_subdomains} subdomains (found {len(self.discovered_subdomains)})",
+                "WARNING"
+            )
+
+        return {
+            "subdomains": limited_subdomains,
+            "endpoints": sorted(self.discovered_endpoints),
+            "cloud_buckets": sorted(self.discovered_cloud_buckets),
+            "total_assets": len(limited_subdomains) + len(self.discovered_endpoints)
+        }
+
+    async def discover_assets(self, target_url: str) -> Dict[str, Any]:
+        """Main discovery orchestration method."""
         parsed = urlparse(target_url)
         self.target_domain = parsed.netloc or parsed.path
 
@@ -124,55 +152,16 @@ class AssetDiscoveryAgent(BaseAgent):
 
         dashboard.log(f"🔍 Starting comprehensive asset discovery for: {self.target_domain}", "INFO")
 
-        # Check individual method toggles
-        enable_dns = settings.get("ASSET_DISCOVERY", "ENABLE_DNS_ENUMERATION", "True").lower() == "true"
-        enable_ct = settings.get("ASSET_DISCOVERY", "ENABLE_CERTIFICATE_TRANSPARENCY", "True").lower() == "true"
-        enable_wayback = settings.get("ASSET_DISCOVERY", "ENABLE_WAYBACK_DISCOVERY", "True").lower() == "true"
-        enable_cloud = settings.get("ASSET_DISCOVERY", "ENABLE_CLOUD_STORAGE_ENUM", "True").lower() == "true"
-        enable_common = settings.get("ASSET_DISCOVERY", "ENABLE_COMMON_PATHS", "True").lower() == "true"
-
-        # Build task list based on enabled methods
-        tasks = []
-        if enable_dns:
-            tasks.append(self._dns_enumeration())
-        if enable_ct:
-            tasks.append(self._certificate_transparency())
-        if enable_wayback:
-            tasks.append(self._wayback_discovery())
-        if enable_cloud:
-            tasks.append(self._cloud_storage_enum())
-        if enable_common:
-            tasks.append(self._common_paths_discovery(target_url))
-
+        tasks = self._build_discovery_tasks(target_url)
         if not tasks:
             dashboard.log("⚠️  All asset discovery methods disabled", "WARNING")
-            return {
-                "subdomains": [],
-                "endpoints": [],
-                "cloud_buckets": [],
-                "total_assets": 0
-            }
+            return {"subdomains": [], "endpoints": [], "cloud_buckets": [], "total_assets": 0}
 
         # Run enabled discovery methods in parallel
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Apply MAX_SUBDOMAINS limit
-        max_subdomains = int(settings.get("ASSET_DISCOVERY", "MAX_SUBDOMAINS", "50"))
-        limited_subdomains = sorted(self.discovered_subdomains)[:max_subdomains]
-
-        if len(self.discovered_subdomains) > max_subdomains:
-            dashboard.log(
-                f"⚠️  Limited to {max_subdomains} subdomains (found {len(self.discovered_subdomains)})",
-                "WARNING"
-            )
-
-        # Aggregate results
-        assets = {
-            "subdomains": limited_subdomains,
-            "endpoints": sorted(self.discovered_endpoints),
-            "cloud_buckets": sorted(self.discovered_cloud_buckets),
-            "total_assets": len(limited_subdomains) + len(self.discovered_endpoints)
-        }
+        # Aggregate and limit results
+        assets = self._aggregate_results()
 
         # Emit discovery event
         if self.event_bus:
@@ -183,7 +172,7 @@ class AssetDiscoveryAgent(BaseAgent):
             })
 
         dashboard.log(
-            f"✅ Discovery complete: {len(limited_subdomains)} subdomains, "
+            f"✅ Discovery complete: {len(assets['subdomains'])} subdomains, "
             f"{len(self.discovered_endpoints)} endpoints, "
             f"{len(self.discovered_cloud_buckets)} cloud buckets",
             "SUCCESS"

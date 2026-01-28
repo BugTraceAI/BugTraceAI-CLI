@@ -61,61 +61,67 @@ class GoSpiderAgent(BaseAgent):
         except Exception:
             return True  # If parsing fails, include the URL
         
+    async def _discover_urls(self) -> List[str]:
+        """Run GoSpider and fallback discovery if needed."""
+        gospider_urls = await external_tools.run_gospider(self.target, depth=self.max_depth)
+
+        # If GoSpider only returns 1 URL (the target itself), trigger fallback
+        if len(gospider_urls) <= 1:
+            dashboard.log(f"[{self.name}] GoSpider returned only {len(gospider_urls)} URL(s). Activating fallback link discovery...", "WARN")
+            fallback_urls = await self._fallback_discovery()
+            gospider_urls = list(set(gospider_urls + fallback_urls))
+
+        return gospider_urls
+
+    def _filter_and_prioritize_urls(self, gospider_urls: List[str]) -> List[str]:
+        """Apply scoping, filtering, prioritization and limits to URLs."""
+        if not gospider_urls:
+            return []
+
+        # Scope enforcement (same domain only)
+        target_domain = urlparse(self.target).hostname.lower()
+        scoped_urls = [u for u in gospider_urls if urlparse(u).hostname and urlparse(u).hostname.lower().endswith(target_domain)]
+
+        # Extension filtering (exclude static files)
+        filtered_urls = [u for u in scoped_urls if self._should_analyze_url(u)]
+        excluded_count = len(scoped_urls) - len(filtered_urls)
+        if excluded_count > 0:
+            dashboard.log(f"[{self.name}] Filtered out {excluded_count} static files (.js, .css, .jpg, etc.)", "INFO")
+
+        # Prioritize and limit
+        prioritized = URLPrioritizer.prioritize(filtered_urls)
+        final_urls = prioritized[:self.max_urls]
+
+        # Ensure target is always included and at the top
+        if self.target in final_urls:
+            final_urls.remove(self.target)
+        final_urls.insert(0, self.target)
+
+        return final_urls
+
     async def run(self) -> List[str]:
         """Runs GoSpider and returns a prioritized, filtered list of URLs."""
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] Starting URL discovery (max_depth={self.max_depth}, max_urls={self.max_urls})...", "INFO")
-        
+
         try:
-            # 1. Run GoSpider
-            gospider_urls = await external_tools.run_gospider(
-                self.target, 
-                depth=self.max_depth
-            )
-            
-            # If GoSpider only returns 1 URL (the target itself), it means it didn't follow links
-            # Trigger fallback discovery to find links
-            if len(gospider_urls) <= 1:
-                dashboard.log(f"[{self.name}] GoSpider returned only {len(gospider_urls)} URL(s). Activating fallback link discovery...", "WARN")
-                fallback_urls = await self._fallback_discovery()
-                # Merge with GoSpider results
-                gospider_urls = list(set(gospider_urls + fallback_urls))
-            
+            # Discover URLs
+            gospider_urls = await self._discover_urls()
             if not gospider_urls:
                 dashboard.log(f"[{self.name}] No URLs discovered. Using target URL.", "WARN")
                 return [self.target]
 
-                
-            # 2. Scope enforcement (same domain only)
-            target_domain = urlparse(self.target).hostname.lower()
-            scoped_urls = [u for u in gospider_urls if urlparse(u).hostname and urlparse(u).hostname.lower().endswith(target_domain)]
-            
-            # 3. Extension filtering (exclude static files)
-            filtered_urls = [u for u in scoped_urls if self._should_analyze_url(u)]
-            excluded_count = len(scoped_urls) - len(filtered_urls)
-            if excluded_count > 0:
-                dashboard.log(f"[{self.name}] Filtered out {excluded_count} static files (.js, .css, .jpg, etc.)", "INFO")
-            
-            # 4. Prioritize
-            prioritized = URLPrioritizer.prioritize(filtered_urls)
-            
-            # 5. Limit based on config
-            final_urls = prioritized[:self.max_urls]
-            
-            # Ensure target is always included and at the top
-            if self.target in final_urls:
-                final_urls.remove(self.target)
-            final_urls.insert(0, self.target)
-            
-            # 6. Save Artifact
+            # Filter, prioritize and limit
+            final_urls = self._filter_and_prioritize_urls(gospider_urls)
+
+            # Save artifact
             urls_path = self.report_dir / "urls.txt"
             with open(urls_path, "w") as f:
                 f.write("\n".join(final_urls))
-                
+
             dashboard.log(f"[{self.name}] Discovered {len(final_urls)} prioritized URLs (filtered from {len(gospider_urls)} raw).", "SUCCESS")
-            
             return final_urls
-            
+
         except Exception as e:
             logger.error(f"GoSpiderAgent failed: {e}")
             dashboard.log(f"[{self.name}] Error: {e}", "ERROR")
