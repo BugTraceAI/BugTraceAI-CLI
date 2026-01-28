@@ -168,6 +168,41 @@ class ReportValidator(BaseAgent):
         
         return candidates[:max_count]
     
+    async def _finding_execute_validation(
+        self,
+        finding: Dict[str, Any],
+        context: Dict[str, Any],
+        report_dir: Path
+    ) -> Dict[str, Any]:
+        """Execute validation steps: browser test, vision analysis, delegation."""
+        # Test with browser
+        screenshot_path, browser_logs, basic_triggered = await self._browser_test(
+            context["url"], context["payload"], context["vuln_type"], report_dir
+        )
+
+        # Guard: browser alert/error triggered
+        if basic_triggered:
+            return self._finding_mark_validated(
+                finding, screenshot_path, "Browser Alert Detection", 1.0,
+                "Alert/error triggered in browser"
+            )
+
+        # Try vision analysis
+        vision_result = await self._finding_vision_check(screenshot_path, context)
+        if vision_result.get("success") and vision_result.get("confidence", 0) >= 0.7:
+            return self._finding_mark_validated(
+                finding, screenshot_path, "Vision LLM Analysis",
+                vision_result.get("confidence", 0), vision_result.get("evidence", "")
+            )
+
+        # Try delegation to specialized agents
+        delegated = await self._finding_try_delegation(finding, context, report_dir, screenshot_path)
+        if delegated:
+            return delegated
+
+        # Mark as inconclusive
+        return self._finding_mark_inconclusive(finding, screenshot_path, vision_result)
+
     async def _validate_single_finding(
         self,
         finding: Dict[str, Any],
@@ -183,42 +218,18 @@ class ReportValidator(BaseAgent):
         4. DELEGATE TO SPECIALIZED AGENTS if vision is inconclusive
         5. Update finding with results
         """
-        # Extract finding context
         context = self._finding_extract_context(finding)
+
+        # Guard: no URL to test
         if not context["url"]:
             return finding
 
         try:
-            # Test with browser
-            screenshot_path, browser_logs, basic_triggered = await self._browser_test(
-                context["url"], context["payload"], context["vuln_type"], report_dir
-            )
-
-            # Check browser test result
-            if basic_triggered:
-                return self._finding_mark_validated(finding, screenshot_path, "Browser Alert Detection", 1.0, "Alert/error triggered in browser")
-
-            # Try vision analysis
-            vision_result = await self._finding_vision_check(screenshot_path, context)
-            if vision_result.get("success") and vision_result.get("confidence", 0) >= 0.7:
-                return self._finding_mark_validated(
-                    finding, screenshot_path, "Vision LLM Analysis",
-                    vision_result.get("confidence", 0), vision_result.get("evidence", "")
-                )
-
-            # Try delegation to specialized agents
-            delegated = await self._finding_try_delegation(finding, context, report_dir, screenshot_path)
-            if delegated:
-                return delegated
-
-            # Mark as inconclusive
-            return self._finding_mark_inconclusive(finding, screenshot_path, vision_result)
-
+            return await self._finding_execute_validation(finding, context, report_dir)
         except Exception as e:
             logger.error(f"Validation failed for {finding.get('title')}: {e}", exc_info=True)
             finding["validation_error"] = str(e)
-
-        return finding
+            return finding
 
     def _finding_extract_context(self, finding: Dict[str, Any]) -> Dict[str, Any]:
         """Extract validation context from finding."""
