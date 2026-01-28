@@ -160,298 +160,321 @@ class XSSVerifier:
     ) -> VerificationResult:
         """Verify XSS using Playwright (fallback)."""
         from playwright.async_api import async_playwright
-        
+
         browser = None
         context = None
         page = None
-        
+
         try:
             async with async_playwright() as p:
-                logger.info(f"[{url}] Launching browser...")
-                browser = await p.chromium.launch(headless=self.headless)
-                context = await browser.new_context(
-                    viewport={"width": 1280, "height": 720}
-                )
-                page = await context.new_page()
-                
-                # Track console logs
+                browser, context, page = await self._setup_browser(p, url)
                 console_logs = []
-                page.on("console", lambda msg: console_logs.append({
-                    "type": msg.type,
-                    "text": msg.text,
-                    "source": "playwright"
-                }))
-                
-                def _make_result():
-                     # Helper to return early if interaction succeeded
-                     return VerificationResult(
-                        success=True,
-                        method="playwright",
-                        screenshot_path=None, 
-                        console_logs=console_logs,
-                        details={"dialog_detected": True, "trigger": "user_interaction"}
-                    )
-                
-                # Track dialogs (alerts)
-                dialog_detected = False
-                async def handle_dialog(dialog):
-                    nonlocal dialog_detected
-                    dialog_detected = True
-                    await dialog.dismiss()
-                    
-                page.on("dialog", handle_dialog)
-                
-                # Navigate
-                try:
-                    logger.info(f"[{url}] Navigating to target...")
-                    await page.goto(url, timeout=20000, wait_until="load")
-                except Exception as e:
-                    logger.warning(f"Playwright navigation warning: {e}")
-                
-                # Wait for initial execution
-                wait_time = min(timeout, 5.0)
-                logger.debug(f"[{url}] Waiting {wait_time}s for execution...")
-                await asyncio.sleep(wait_time)
+                dialog_detected = await self._setup_page_handlers(page, console_logs)
 
-                # CLICK/FOCUS/HOVER SIMULATION (Enhanced Interaction)
-                if not dialog_detected:
-                    try:
-                        logger.info(f"[{url}] 🖱️ Simulating User Interactions (Focus/Hover) for Attribute Execution...")
-                        
-                        # 1. Focus inputs (for onfocus/autofocus payloads)
-                        # Use JavaScript to force the focus event because headless Chrome
-                        # doesn't always dispatch onfocus via Playwright's .focus()
-                        inputs = await page.query_selector_all("input, textarea, select")
-                        for i, inp in enumerate(inputs[:5]):
-                            if await inp.is_visible():
-                                try:
-                                    logger.debug(f"Forcing focus on input {i} via JS dispatchEvent")
-                                    # Force the onfocus event with JavaScript
-                                    await page.evaluate('''(el) => {
-                                        el.focus();
-                                        el.dispatchEvent(new FocusEvent('focus', { bubbles: true }));
-                                        el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
-                                    }''', inp)
-                                    await asyncio.sleep(0.8)
-                                    if dialog_detected: break
-                                except Exception as e:
-                                    logger.debug(f"Focus event failed: {e}")
-                        
-                        if dialog_detected: return _make_result()
+                await self._navigate_to_url(page, url)
+                await asyncio.sleep(min(timeout, 5.0))
 
-                        # 2. Hover elements (for onmouseover)
-                        # We hover over elements that might be the injection point (labels, images, divs)
-                        candidates = await page.query_selector_all("img, div, span, a, label")
-                        for i, cand in enumerate(candidates[:10]): # Limit to 10
-                            try:
-                                if await cand.is_visible():
-                                    await cand.hover(timeout=500)
-                                    if dialog_detected: break
-                            except Exception as e:
-                                logger.debug(f"Hover action failed: {e}")
-                            
-                        if dialog_detected: return _make_result()
+                if not dialog_detected[0]:
+                    early_result = await self._simulate_user_interactions(page, url, console_logs, dialog_detected)
+                    if early_result:
+                        return early_result
 
-                        # 3. Click Simulation (DOM XSS / onclick)
-                        clickable_selectors = [
-                            "a[href^='javascript:']",
-                            "button[onclick]", 
-                            "div[onclick]",
-                            "input[type='submit']",
-                            "a:has-text('Back')",
-                            "button:has-text('Back')",
-                            ".back-button"
-                        ]
+                xss_confirmed, evaluation_data = await self._evaluate_xss_indicators(
+                    page, url, dialog_detected[0], console_logs, expected_marker
+                )
 
-                        for selector in clickable_selectors:
-                            elements = await page.query_selector_all(selector)
-                            for i, elem in enumerate(elements[:3]): # Limit to first 3 to avoid infinite loops
-                                try:
-                                    if await elem.is_visible():
-                                        logger.info(f"[{url}] Clicking suspected element: {selector} [{i}]")
-                                        await elem.click(timeout=1000)
-                                        await asyncio.sleep(1.0) # Wait for event handler
-                                        if dialog_detected:
-                                            break
-                                except Exception as click_err:
-                                    logger.debug(f"Element click failed: {click_err}")
-                            if dialog_detected:
-                                break
-                    except Exception as e:
-                        logger.warning(f"Interaction simulation error: {e}")
-                
-                # Eval finished, return the helper at the end was here.
-                pass
-                
-                # Evaluation
-                xss_confirmed = dialog_detected
-                xss_in_dom = False
-                xss_in_console = False
-                marker_found = False
-                
-                if not xss_confirmed:
-                    try:
-                        # Check marker in DOM
-                        if expected_marker:
-                            marker_found = await page.evaluate(f'document.getElementById("{expected_marker}") !== null')
-                        
-                        xss_in_dom = await page.evaluate(f'document.body.innerHTML.includes("{self.XSS_MARKER}")')
-                        
-                        # NEW: Check for XSS-HACKED (DOM Modification method)
-                        if not xss_in_dom:
-                            xss_in_dom = await page.evaluate('document.body.innerHTML.includes("XSS-HACKED")')
-                            
-                        # NEW: Check for window variable (Method 3)
-                        xss_var_confirmed = await page.evaluate('window.XSS_CONFIRMED === true')
-                        if xss_var_confirmed:
-                             logger.info(f"[{url}] Window variable XSS_CONFIRMED found!")
-                        
-                        # CSTI Arithmetic Check (e.g. {{7*7}} -> 49)
-                        csti_confirmed = False
-                        if "{{7*7}}" in url:
-                            page_content = await page.content()
-                            # We check if 49 is present but {{7*7}} is NOT present (meaning it was evaluated)
-                            # Or if 49 appears in a context that suggests evaluation
-                            if "49" in page_content and "{{7*7}}" not in page_content:
-                                csti_confirmed = True
-                                logger.info(f"[{url}] CSTI Confirmed: Expression evaluated to 49!")
+                impact_data = await self._extract_impact_data(page, url, xss_confirmed)
+                screenshot_path = await self._capture_screenshot(page, screenshot_dir, xss_confirmed)
 
-                        # Visual Defacement Check (Robust ID-based)
-                        # Supports multiple markers: #bt-pwn, #bt-pwn-l8, etc.
-                        visual_confirmed = False
-                        
-                        # Check 1: Any element with ID containing "bt-pwn" (covers all variants)
-                        # This catches: #bt-pwn, #bt-pwn-l8, #bt-pwn-l7, etc.
-                        try:
-                            pwn_elements = await page.evaluate('''() => {
-                                const allElements = document.querySelectorAll('[id*="bt-pwn"]');
-                                return allElements.length;
-                            }''')
-                            if pwn_elements > 0:
-                                visual_confirmed = True
-                                logger.info(f"[{url}] Visual Defacement Confirmed: bt-pwn element found (count: {pwn_elements})!")
-                        except Exception as e:
-                            logger.debug(f"Visual defacement check failed: {e}")
-                            # Fallback to specific ID checks
-                            if await page.locator("#bt-pwn").count() > 0:
-                                visual_confirmed = True
-                                logger.info(f"[{url}] Visual Defacement Confirmed: '#bt-pwn' element found!")
-                            elif await page.locator("#bt-pwn-l8").count() > 0:
-                                visual_confirmed = True
-                                logger.info(f"[{url}] Visual Defacement Confirmed: '#bt-pwn-l8' element found!")
-                            elif await page.locator("#bt-pwn-l7").count() > 0:
-                                visual_confirmed = True
-                                logger.info(f"[{url}] Visual Defacement Confirmed: '#bt-pwn-l7' element found!")
-                        
-                        # Check 2: Text-based markers (multiple variations)
-                        # Supports: "HACKED BY BUGTRACEAI", "FRAGMENT XSS", "MXSS DETECTED", etc.
-                        if not visual_confirmed:
-                            defacement_markers = [
-                                "HACKED BY BUGTRACEAI",
-                                "FRAGMENT XSS",
-                                "MXSS DETECTED",
-                                "XSS DETECTED", 
-                                "PWNED BY BUGTRACE"
-                            ]
-                            
-                            for marker in defacement_markers:
-                                if await page.locator(f"div:has-text('{marker}')").count() > 0:
-                                    # Found div with marker text - confirm it's not just reflection
-                                    pwn_divs = await page.locator(f"div:has-text('{marker}')").all()
-                                    for div in pwn_divs:
-                                        # Check if it has our style attributes
-                                        style = await div.get_attribute("style")
-                                        div_id = await div.get_attribute("id")
-                                        
-                                        # Confirmed if it has red background style OR bt-pwn ID
-                                        if (style and "background:red" in style) or (div_id and "bt-pwn" in div_id):
-                                            visual_confirmed = True
-                                            logger.info(f"[{url}] Visual Defacement Confirmed: '{marker}' banner found!")
-                                            break
-                                
-                                if visual_confirmed:
-                                    break
-
-
-                        # Check console
-                        xss_in_console = any((self.XSS_MARKER in log.get("text", "") or "XSS-VERIFIED" in log.get("text", "")) for log in console_logs)
-                        
-                        xss_confirmed = marker_found or xss_in_dom or xss_in_console or csti_confirmed or visual_confirmed or xss_var_confirmed
-                    except Exception as eval_err:
-                        logger.debug(f"DOM evaluation failed: {eval_err}")
-
-                # IMPACT EXTRACTION (Advanced analysis)
-                impact_data = {}
-                if xss_confirmed:
-                    try:
-                        impact_data = await page.evaluate('''() => {
-                            return {
-                                cookie_count: document.cookie ? document.cookie.split(';').length : 0,
-                                cookies: document.cookie,
-                                origin: window.origin,
-                                localStorageKeys: Object.keys(localStorage),
-                                sessionStorageKeys: Object.keys(sessionStorage),
-                                has_sensitive_tokens: (document.cookie + JSON.stringify(localStorage)).match(/token|jwt|session|auth|key/i) !== null
-                            }
-                        }''')
-                        
-                        # IMPACT ASSESSMENT
-                        has_storage_access = (impact_data.get('cookies') or impact_data.get('localStorageKeys'))
-                        is_sandboxed = False
-                        
-                        # Check for sandbox (null origin or no storage access)
-                        if impact_data.get('origin') == "null" or not has_storage_access:
-                            is_sandboxed = True
-                            logger.warning(f"[{url}] ⚠️ XSS confirmed but appears SANDBOXED (No storage access/Null origin). Impact is LOW.")
-                            
-                        if impact_data.get('has_sensitive_tokens'):
-                            logger.success(f"[{url}] 💰 CRITICAL IMPACT: Sensitive tokens found in storage!")
-                            
-                        # Add sandbox status to details
-                        impact_data['is_sandboxed'] = is_sandboxed
-                        
-                    except Exception as impact_err:
-                        logger.warning(f"Impact extraction failed: {impact_err}")
-
-                # Screenshot
-                screenshot_path = None
-                if screenshot_dir:
-                    import time
-                    prefix = "playwright_xss" if xss_confirmed else "repro_attempt"
-                    screenshot_path = f"{screenshot_dir}/{prefix}_{int(time.time())}_{os.getpid()}.png"
-                    try:
-                        await page.screenshot(path=screenshot_path, timeout=5000)
-                    except Exception as s_err:
-                        logger.warning(f"Screenshot failed: {s_err}")
-                
                 return VerificationResult(
                     success=xss_confirmed,
                     method="playwright",
                     screenshot_path=screenshot_path,
                     console_logs=console_logs,
                     details={
-                        "dialog_detected": dialog_detected,
-                        "marker_found": marker_found,
+                        "dialog_detected": dialog_detected[0],
+                        "marker_found": evaluation_data.get("marker_found", False),
                         "impact_data": impact_data
                     }
                 )
-                
+
         except Exception as e:
             logger.error(f"Playwright critical error: {e}")
             return VerificationResult(success=False, method="playwright", error=str(e))
         finally:
+            await self._cleanup_browser(page, context, browser)
+
+    async def _setup_browser(self, p, url: str):
+        """Setup browser, context and page."""
+        logger.info(f"[{url}] Launching browser...")
+        browser = await p.chromium.launch(headless=self.headless)
+        context = await browser.new_context(viewport={"width": 1280, "height": 720})
+        page = await context.new_page()
+        return browser, context, page
+
+    async def _setup_page_handlers(self, page, console_logs: List):
+        """Setup console logging and dialog handlers."""
+        page.on("console", lambda msg: console_logs.append({
+            "type": msg.type,
+            "text": msg.text,
+            "source": "playwright"
+        }))
+
+        dialog_detected = [False]  # Use list for mutability in closure
+        async def handle_dialog(dialog):
+            dialog_detected[0] = True
+            await dialog.dismiss()
+
+        page.on("dialog", handle_dialog)
+        return dialog_detected
+
+    async def _navigate_to_url(self, page, url: str):
+        """Navigate to target URL."""
+        try:
+            logger.info(f"[{url}] Navigating to target...")
+            await page.goto(url, timeout=20000, wait_until="load")
+        except Exception as e:
+            logger.warning(f"Playwright navigation warning: {e}")
+
+    async def _simulate_user_interactions(self, page, url: str, console_logs: List, dialog_detected: List):
+        """Simulate user interactions to trigger XSS."""
+        try:
+            logger.info(f"[{url}] 🖱️ Simulating User Interactions...")
+
+            # Try focus events
+            if await self._simulate_focus_events(page, dialog_detected):
+                return self._make_early_result(console_logs)
+
+            # Try hover events
+            if await self._simulate_hover_events(page, dialog_detected):
+                return self._make_early_result(console_logs)
+
+            # Try click events
+            if await self._simulate_click_events(page, url, dialog_detected):
+                return self._make_early_result(console_logs)
+        except Exception as e:
+            logger.warning(f"Interaction simulation error: {e}")
+
+        return None
+
+    async def _simulate_focus_events(self, page, dialog_detected: List) -> bool:
+        """Simulate focus events on inputs."""
+        inputs = await page.query_selector_all("input, textarea, select")
+        for i, inp in enumerate(inputs[:5]):
+            if dialog_detected[0]:
+                return True
+            if await inp.is_visible():
+                try:
+                    logger.debug(f"Forcing focus on input {i}")
+                    await page.evaluate('''(el) => {
+                        el.focus();
+                        el.dispatchEvent(new FocusEvent('focus', { bubbles: true }));
+                        el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+                    }''', inp)
+                    await asyncio.sleep(0.8)
+                except Exception as e:
+                    logger.debug(f"Focus event failed: {e}")
+        return dialog_detected[0]
+
+    async def _simulate_hover_events(self, page, dialog_detected: List) -> bool:
+        """Simulate hover events on elements."""
+        candidates = await page.query_selector_all("img, div, span, a, label")
+        for i, cand in enumerate(candidates[:10]):
+            if dialog_detected[0]:
+                return True
             try:
-                if page: await page.close()
+                if await cand.is_visible():
+                    await cand.hover(timeout=500)
             except Exception as e:
-                logger.debug(f"Page/Context/Browser close error: {e}")
-            try:
-                if context: await context.close()
-            except Exception as e:
-                logger.debug(f"Context close error: {e}")
-            try:
-                if browser: await browser.close()
-            except Exception as e:
-                logger.debug(f"Context close error: {e}")
+                logger.debug(f"Hover action failed: {e}")
+        return dialog_detected[0]
+
+    async def _simulate_click_events(self, page, url: str, dialog_detected: List) -> bool:
+        """Simulate click events on clickable elements."""
+        clickable_selectors = [
+            "a[href^='javascript:']", "button[onclick]", "div[onclick]",
+            "input[type='submit']", "a:has-text('Back')",
+            "button:has-text('Back')", ".back-button"
+        ]
+
+        for selector in clickable_selectors:
+            if dialog_detected[0]:
+                return True
+            elements = await page.query_selector_all(selector)
+            for i, elem in enumerate(elements[:3]):
+                if dialog_detected[0]:
+                    return True
+                try:
+                    if await elem.is_visible():
+                        logger.info(f"[{url}] Clicking: {selector} [{i}]")
+                        await elem.click(timeout=1000)
+                        await asyncio.sleep(1.0)
+                except Exception as e:
+                    logger.debug(f"Element click failed: {e}")
+        return dialog_detected[0]
+
+    def _make_early_result(self, console_logs: List) -> VerificationResult:
+        """Create early success result for user interaction."""
+        return VerificationResult(
+            success=True,
+            method="playwright",
+            screenshot_path=None,
+            console_logs=console_logs,
+            details={"dialog_detected": True, "trigger": "user_interaction"}
+        )
+
+    async def _evaluate_xss_indicators(self, page, url: str, dialog_detected: bool,
+                                      console_logs: List, expected_marker: Optional[str]) -> Tuple[bool, Dict]:
+        """Evaluate all XSS indicators in the page."""
+        if dialog_detected:
+            return True, {}
+
+        try:
+            marker_found = await self._check_expected_marker(page, expected_marker)
+            xss_in_dom = await self._check_xss_in_dom(page)
+            xss_var_confirmed = await self._check_window_variable(page, url)
+            csti_confirmed = await self._check_csti(page, url)
+            visual_confirmed = await self._check_visual_defacement(page, url)
+            xss_in_console = self._check_console_logs(console_logs)
+
+            xss_confirmed = (marker_found or xss_in_dom or xss_in_console or
+                           csti_confirmed or visual_confirmed or xss_var_confirmed)
+
+            return xss_confirmed, {"marker_found": marker_found}
+        except Exception as e:
+            logger.debug(f"DOM evaluation failed: {e}")
+            return False, {}
+
+    async def _check_expected_marker(self, page, expected_marker: Optional[str]) -> bool:
+        """Check if expected marker exists."""
+        if expected_marker:
+            return await page.evaluate(f'document.getElementById("{expected_marker}") !== null')
+        return False
+
+    async def _check_xss_in_dom(self, page) -> bool:
+        """Check for XSS markers in DOM."""
+        if await page.evaluate(f'document.body.innerHTML.includes("{self.XSS_MARKER}")'):
+            return True
+        return await page.evaluate('document.body.innerHTML.includes("XSS-HACKED")')
+
+    async def _check_window_variable(self, page, url: str) -> bool:
+        """Check for XSS_CONFIRMED window variable."""
+        xss_var = await page.evaluate('window.XSS_CONFIRMED === true')
+        if xss_var:
+            logger.info(f"[{url}] Window variable XSS_CONFIRMED found!")
+        return xss_var
+
+    async def _check_csti(self, page, url: str) -> bool:
+        """Check for CSTI arithmetic expression evaluation."""
+        if "{{7*7}}" in url:
+            page_content = await page.content()
+            if "49" in page_content and "{{7*7}}" not in page_content:
+                logger.info(f"[{url}] CSTI Confirmed: Expression evaluated to 49!")
+                return True
+        return False
+
+    async def _check_visual_defacement(self, page, url: str) -> bool:
+        """Check for visual defacement markers."""
+        try:
+            pwn_elements = await page.evaluate('''() => {
+                const allElements = document.querySelectorAll('[id*="bt-pwn"]');
+                return allElements.length;
+            }''')
+            if pwn_elements > 0:
+                logger.info(f"[{url}] Visual Defacement Confirmed (count: {pwn_elements})!")
+                return True
+        except Exception as e:
+            logger.debug(f"Visual defacement check failed: {e}")
+            if await self._check_specific_pwn_ids(page, url):
+                return True
+
+        return await self._check_text_based_markers(page, url)
+
+    async def _check_specific_pwn_ids(self, page, url: str) -> bool:
+        """Check for specific bt-pwn ID variants."""
+        for pwn_id in ["#bt-pwn", "#bt-pwn-l8", "#bt-pwn-l7"]:
+            if await page.locator(pwn_id).count() > 0:
+                logger.info(f"[{url}] Visual Defacement Confirmed: '{pwn_id}' element found!")
+                return True
+        return False
+
+    async def _check_text_based_markers(self, page, url: str) -> bool:
+        """Check for text-based defacement markers."""
+        markers = ["HACKED BY BUGTRACEAI", "FRAGMENT XSS", "MXSS DETECTED",
+                  "XSS DETECTED", "PWNED BY BUGTRACE"]
+
+        for marker in markers:
+            if await page.locator(f"div:has-text('{marker}')").count() > 0:
+                pwn_divs = await page.locator(f"div:has-text('{marker}')").all()
+                for div in pwn_divs:
+                    style = await div.get_attribute("style")
+                    div_id = await div.get_attribute("id")
+                    if (style and "background:red" in style) or (div_id and "bt-pwn" in div_id):
+                        logger.info(f"[{url}] Visual Defacement Confirmed: '{marker}' banner!")
+                        return True
+        return False
+
+    def _check_console_logs(self, console_logs: List) -> bool:
+        """Check console logs for XSS markers."""
+        return any((self.XSS_MARKER in log.get("text", "") or
+                   "XSS-VERIFIED" in log.get("text", "")) for log in console_logs)
+
+    async def _extract_impact_data(self, page, url: str, xss_confirmed: bool) -> Dict:
+        """Extract impact data if XSS is confirmed."""
+        if not xss_confirmed:
+            return {}
+
+        try:
+            impact_data = await page.evaluate('''() => {
+                return {
+                    cookie_count: document.cookie ? document.cookie.split(';').length : 0,
+                    cookies: document.cookie,
+                    origin: window.origin,
+                    localStorageKeys: Object.keys(localStorage),
+                    sessionStorageKeys: Object.keys(sessionStorage),
+                    has_sensitive_tokens: (document.cookie + JSON.stringify(localStorage)).match(/token|jwt|session|auth|key/i) !== null
+                }
+            }''')
+
+            has_storage_access = (impact_data.get('cookies') or impact_data.get('localStorageKeys'))
+            is_sandboxed = impact_data.get('origin') == "null" or not has_storage_access
+
+            if is_sandboxed:
+                logger.warning(f"[{url}] ⚠️ XSS confirmed but SANDBOXED. Impact is LOW.")
+
+            if impact_data.get('has_sensitive_tokens'):
+                logger.success(f"[{url}] 💰 CRITICAL IMPACT: Sensitive tokens found!")
+
+            impact_data['is_sandboxed'] = is_sandboxed
+            return impact_data
+        except Exception as e:
+            logger.warning(f"Impact extraction failed: {e}")
+            return {}
+
+    async def _capture_screenshot(self, page, screenshot_dir: Optional[str], xss_confirmed: bool) -> Optional[str]:
+        """Capture screenshot as evidence."""
+        if not screenshot_dir:
+            return None
+
+        import time
+        prefix = "playwright_xss" if xss_confirmed else "repro_attempt"
+        screenshot_path = f"{screenshot_dir}/{prefix}_{int(time.time())}_{os.getpid()}.png"
+
+        try:
+            await page.screenshot(path=screenshot_path, timeout=5000)
+            return screenshot_path
+        except Exception as e:
+            logger.warning(f"Screenshot failed: {e}")
+            return None
+
+    async def _cleanup_browser(self, page, context, browser):
+        """Clean up browser resources."""
+        for resource, name in [(page, "Page"), (context, "Context"), (browser, "Browser")]:
+            if resource:
+                try:
+                    await resource.close()
+                except Exception as e:
+                    logger.debug(f"{name} close error: {e}")
 
 
 # Convenience function
