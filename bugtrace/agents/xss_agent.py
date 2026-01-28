@@ -1214,17 +1214,11 @@ class XSSAgent(BaseAgent):
             reproduction_steps=self.generate_repro_steps(self.url, param, injection_ctx, payload)
         )
 
-    async def _test_parameter(
+    async def _param_probe_and_setup(
         self,
-        param: str,
-        interactsh_domain: str,
-        screenshots_dir: Path
-    ) -> Optional[XSSFinding]:
-        """Test a single parameter for XSS."""
-        dashboard.log(f"[{self.name}] 🔬 Testing param: {param}", "INFO")
-        dashboard.set_status("XSS Analysis", f"Testing {param}")
-
-        # Phase 1: Probe and analyze context
+        param: str
+    ) -> Optional[Tuple]:
+        """Phase 1: Probe target and prepare context."""
         probe_result = await self._probe_and_analyze_context(param)
         if probe_result[0] is None:
             return None
@@ -1236,6 +1230,185 @@ class XSSAgent(BaseAgent):
 
         # Get interactsh URL
         interactsh_url = self.interactsh.get_payload_url("xss", param)
+
+        return (html, probe_url, status_code, context_data, reflection_type,
+                surviving_chars, injection_ctx, interactsh_url)
+
+    async def _param_try_fragment_xss(
+        self,
+        param: str,
+        interactsh_url: str
+    ) -> Optional[XSSFinding]:
+        """Phase 4: Try fragment XSS if WAF detected or reflection blocked."""
+        dashboard.log(f"[{self.name}] 🔗 Trying FRAGMENT XSS (Heuristic)...", "WARN")
+
+        fragment_payloads = [
+            fp.replace("{{interactsh_url}}", interactsh_url)
+            for fp in self.FRAGMENT_PAYLOADS
+        ]
+
+        if not fragment_payloads:
+            return None
+
+        return XSSFinding(
+            url=self.url,
+            parameter=param,
+            payload=fragment_payloads[0],
+            context="fragment_xss_potential",
+            validation_method="cdp_pending",
+            evidence={
+                "reason": "WAF blocked query params, fragment bypass needs CDP validation",
+                "all_payloads": fragment_payloads,
+                "needs_cdp": True
+            },
+            confidence=0.7,
+            status="PENDING_CDP_VALIDATION",
+            validated=False,
+            reflection_context="fragment",
+            successful_payloads=fragment_payloads,
+            xss_type="dom-based",
+            injection_context_type="url_fragment",
+            vulnerable_code_snippet="location.hash sink",
+            server_escaping=self._last_server_escaping,
+            escape_bypass_technique="fragment_injection",
+            bypass_explanation="Payload injected via URL fragment to avoid server-side WAF.",
+            exploit_url=self.build_exploit_url(self.url, param, fragment_payloads[0], encoded=False),
+            exploit_url_encoded=self.build_exploit_url(self.url, param, fragment_payloads[0], encoded=True),
+            verification_methods=[{
+                "type": "cdp",
+                "name": "Browser Verification",
+                "instructions": "Must use browser",
+                "url_encoded": self.build_exploit_url(self.url, param, fragment_payloads[0], encoded=True)
+            }],
+            verification_warnings=["Fragment XSS requires browser interaction"],
+            reproduction_steps=["Open URL in browser", "Check for execution"]
+        )
+
+    async def _param_test_llm_payload(
+        self,
+        param: str,
+        html: str,
+        interactsh_url: str,
+        context_data: Dict,
+        screenshots_dir: Path,
+        reflection_type: str,
+        surviving_chars: str,
+        injection_ctx: InjectionContext
+    ) -> Optional[XSSFinding]:
+        """Phase 5: LLM analysis and payload testing."""
+        llm_response = await self.exec_tool(
+            "LLM_Analysis", self._llm_analyze, html, param,
+            interactsh_url, context_data, timeout=250
+        )
+
+        if not llm_response or not llm_response.get("vulnerable"):
+            return None
+
+        payload = llm_response.get("payload", "")
+        validation_method = llm_response.get("validation_method", "interactsh")
+
+        dashboard.set_current_payload(payload[:60], "XSS", "Testing")
+
+        response_html = await self._send_payload(param, payload)
+        if not response_html:
+            return None
+
+        validated, evidence = await self._validate(
+            param, payload, response_html, validation_method, screenshots_dir
+        )
+
+        if not validated:
+            return None
+
+        finding_data = {
+            "evidence": evidence,
+            "screenshot_path": evidence.get("screenshot_path"),
+            "context": llm_response.get("context", "unknown"),
+            "reflection_context": reflection_type
+        }
+
+        if not self._should_create_finding(finding_data):
+            return None
+
+        return self._create_xss_finding(
+            param, payload, llm_response.get("context", "unknown"),
+            validation_method, evidence, llm_response.get("confidence", 0.9),
+            reflection_type, surviving_chars, [payload],
+            injection_ctx, "context_aware",
+            llm_response.get("reasoning", "LLM generated context-aware payload.")
+        )
+
+    async def _param_try_bypass_attempts(
+        self,
+        param: str,
+        payload: str,
+        response_html: str,
+        interactsh_url: str,
+        validation_method: str,
+        screenshots_dir: Path,
+        reflection_type: str,
+        surviving_chars: str,
+        injection_ctx: InjectionContext
+    ) -> Optional[XSSFinding]:
+        """Phase 6: Bypass attempts if initial payload failed."""
+        waf_active = self.consecutive_blocks > 2 or self._detected_waf is not None
+        max_attempts = self.MAX_BYPASS_ATTEMPTS if waf_active else 2
+
+        for attempt in range(max_attempts):
+            bypass_response = await self._llm_generate_bypass(
+                payload, response_html[:50000], interactsh_url
+            )
+
+            if not bypass_response or not bypass_response.get("bypass_payload"):
+                break
+
+            bypass_payload = bypass_response.get("bypass_payload")
+            dashboard.set_current_payload(bypass_payload[:60], "XSS Bypass", "Testing")
+
+            response_html = await self._send_payload(param, bypass_payload)
+            validated, evidence = await self._validate(
+                param, bypass_payload, response_html, validation_method, screenshots_dir
+            )
+
+            if not validated:
+                continue
+
+            finding_data = {
+                "evidence": evidence,
+                "screenshot_path": evidence.get("screenshot_path"),
+                "context": bypass_response.get("strategy", "bypass"),
+                "reflection_context": reflection_type
+            }
+
+            if not self._should_create_finding(finding_data):
+                continue
+
+            return self._create_xss_finding(
+                param, bypass_payload, bypass_response.get("strategy", "bypass"),
+                validation_method, evidence, 0.95,
+                reflection_type, surviving_chars, [bypass_payload],
+                injection_ctx, "waf_bypass",
+                bypass_response.get("reasoning", "LLM generated WAF bypass.")
+            )
+
+        return None
+
+    async def _test_parameter(
+        self,
+        param: str,
+        interactsh_domain: str,
+        screenshots_dir: Path
+    ) -> Optional[XSSFinding]:
+        """Test a single parameter for XSS."""
+        dashboard.log(f"[{self.name}] 🔬 Testing param: {param}", "INFO")
+        dashboard.set_status("XSS Analysis", f"Testing {param}")
+
+        # Phase 1: Probe and setup
+        probe_data = await self._param_probe_and_setup(param)
+        if not probe_data:
+            return None
+
+        html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx, interactsh_url = probe_data
 
         # Phase 2: LLM Smart DOM Analysis (Primary Strategy)
         smart_finding = await self._test_smart_llm_payloads(
@@ -1261,130 +1434,19 @@ class XSSAgent(BaseAgent):
         )
 
         if should_try_fragment:
-            dashboard.log(f"[{self.name}] 🔗 Trying FRAGMENT XSS (Heuristic)...", "WARN")
-
-            fragment_payloads = [
-                fp.replace("{{interactsh_url}}", interactsh_url)
-                for fp in self.FRAGMENT_PAYLOADS
-            ]
-
-            if fragment_payloads:
-                return XSSFinding(
-                    url=self.url,
-                    parameter=param,
-                    payload=fragment_payloads[0],
-                    context="fragment_xss_potential",
-                    validation_method="cdp_pending",
-                    evidence={
-                        "reason": "WAF blocked query params, fragment bypass needs CDP validation",
-                        "all_payloads": fragment_payloads,
-                        "needs_cdp": True
-                    },
-                    confidence=0.7,
-                    status="PENDING_CDP_VALIDATION",
-                    validated=False,
-                    reflection_context="fragment",
-                    successful_payloads=fragment_payloads,
-                    xss_type="dom-based",
-                    injection_context_type="url_fragment",
-                    vulnerable_code_snippet="location.hash sink",
-                    server_escaping=self._last_server_escaping,
-                    escape_bypass_technique="fragment_injection",
-                    bypass_explanation="Payload injected via URL fragment to avoid server-side WAF.",
-                    exploit_url=self.build_exploit_url(self.url, param, fragment_payloads[0], encoded=False),
-                    exploit_url_encoded=self.build_exploit_url(self.url, param, fragment_payloads[0], encoded=True),
-                    verification_methods=[{
-                        "type": "cdp",
-                        "name": "Browser Verification",
-                        "instructions": "Must use browser",
-                        "url_encoded": self.build_exploit_url(self.url, param, fragment_payloads[0], encoded=True)
-                    }],
-                    verification_warnings=["Fragment XSS requires browser interaction"],
-                    reproduction_steps=["Open URL in browser", "Check for execution"]
-                )
+            fragment_finding = await self._param_try_fragment_xss(param, interactsh_url)
+            if fragment_finding:
+                return fragment_finding
 
         # Phase 5: LLM Analysis (Expensive fallback)
         if not context_data.get("reflected") and not self._detected_waf:
             logger.info(f"[{self.name}] ⚡ OPTIMIZATION: Skipping LLM analysis")
             return None
 
-        llm_response = await self.exec_tool("LLM_Analysis", self._llm_analyze, html, param, interactsh_url, context_data, timeout=250)
-
-        if not llm_response or not llm_response.get("vulnerable"):
-            return None
-
-        payload = llm_response.get("payload", "")
-        validation_method = llm_response.get("validation_method", "interactsh")
-
-        dashboard.set_current_payload(payload[:60], "XSS", "Testing")
-
-        response_html = await self._send_payload(param, payload)
-        if not response_html:
-            return None
-
-        validated, evidence = await self._validate(
-            param, payload, response_html, validation_method, screenshots_dir
+        return await self._param_test_llm_payload(
+            param, html, interactsh_url, context_data, screenshots_dir,
+            reflection_type, surviving_chars, injection_ctx
         )
-
-        if validated:
-            finding_data = {
-                "evidence": evidence,
-                "screenshot_path": evidence.get("screenshot_path"),
-                "context": llm_response.get("context", "unknown"),
-                "reflection_context": reflection_type
-            }
-
-            if not self._should_create_finding(finding_data):
-                return None
-
-            return self._create_xss_finding(
-                param, payload, llm_response.get("context", "unknown"),
-                validation_method, evidence, llm_response.get("confidence", 0.9),
-                reflection_type, surviving_chars, [payload],
-                injection_ctx, "context_aware",
-                llm_response.get("reasoning", "LLM generated context-aware payload.")
-            )
-
-        # Phase 6: Bypass attempts
-        waf_active = self.consecutive_blocks > 2 or self._detected_waf is not None
-        max_attempts = self.MAX_BYPASS_ATTEMPTS if waf_active else 2
-
-        for attempt in range(max_attempts):
-            bypass_response = await self._llm_generate_bypass(
-                payload, response_html[:50000], interactsh_url
-            )
-
-            if not bypass_response or not bypass_response.get("bypass_payload"):
-                break
-
-            bypass_payload = bypass_response.get("bypass_payload")
-            dashboard.set_current_payload(bypass_payload[:60], "XSS Bypass", "Testing")
-
-            response_html = await self._send_payload(param, bypass_payload)
-            validated, evidence = await self._validate(
-                param, bypass_payload, response_html, validation_method, screenshots_dir
-            )
-
-            if validated:
-                finding_data = {
-                    "evidence": evidence,
-                    "screenshot_path": evidence.get("screenshot_path"),
-                    "context": bypass_response.get("strategy", "bypass"),
-                    "reflection_context": reflection_type
-                }
-
-                if not self._should_create_finding(finding_data):
-                    continue
-
-                return self._create_xss_finding(
-                    param, bypass_payload, bypass_response.get("strategy", "bypass"),
-                    validation_method, evidence, 0.95,
-                    reflection_type, surviving_chars, [bypass_payload],
-                    injection_ctx, "waf_bypass",
-                    bypass_response.get("reasoning", "LLM generated WAF bypass.")
-                )
-
-        return None
 
 
     def _clean_payload(self, payload: str, param: str) -> str:
