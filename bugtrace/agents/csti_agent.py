@@ -624,17 +624,9 @@ class CSTIAgent(BaseAgent):
 
         return None
 
-    async def _llm_smart_template_analysis(
-        self,
-        html: str,
-        param: str,
-        detected_engines: List[str],
-        interactsh_url: str
-    ) -> List[Dict]:
-        """
-        LLM-First Strategy: Analyze HTML and generate targeted CSTI/SSTI payloads.
-        """
-        system_prompt = """You are an elite Template Injection specialist.
+    def _template_get_system_prompt(self) -> str:
+        """Get system prompt for template analysis."""
+        return """You are an elite Template Injection specialist.
 CSTI (Client-Side): Angular, Vue - executes in browser
 SSTI (Server-Side): Jinja2, Twig, Freemarker - executes on server (more dangerous)
 
@@ -649,7 +641,11 @@ CRITICAL: Generate payloads that:
 2. Include OOB callback for blind detection
 3. Escalate to RCE if SSTI (server-side)"""
 
-        user_prompt = f"""Analyze this page for Template Injection:
+    def _template_build_user_prompt(
+        self, param: str, detected_engines: List[str], interactsh_url: str, html: str
+    ) -> str:
+        """Build user prompt for LLM template analysis."""
+        return f"""Analyze this page for Template Injection:
 URL: {self.url}
 Parameter: {param}
 Detected Engines: {detected_engines}
@@ -675,6 +671,17 @@ Response format (XML):
     <expected_output>What to look for</expected_output>
   </payload>
 </payloads>"""
+
+    async def _llm_smart_template_analysis(
+        self,
+        html: str,
+        param: str,
+        detected_engines: List[str],
+        interactsh_url: str
+    ) -> List[Dict]:
+        """LLM-First Strategy: Analyze HTML and generate targeted CSTI/SSTI payloads."""
+        system_prompt = self._template_get_system_prompt()
+        user_prompt = self._template_build_user_prompt(param, detected_engines, interactsh_url, html)
 
         try:
             response = await llm_client.generate(
@@ -711,6 +718,58 @@ Response format (XML):
         return parsed_items
 
 
+    async def _param_run_standard_probes(
+        self, session: "aiohttp.ClientSession", param: str, engines: List[str]
+    ) -> List[Dict]:
+        """Run standard probes (targeted, universal, OOB)."""
+        findings = []
+
+        # Targeted probe
+        if engines != ["unknown"]:
+            finding = await self._targeted_probe(session, param, engines)
+            if finding:
+                findings.append(finding)
+                self._record_bypass_result(finding["payload"], success=True)
+
+        # Universal probe
+        finding = await self._universal_probe(session, param)
+        if finding:
+            findings.append(finding)
+            self._record_bypass_result(finding["payload"], success=True)
+
+        # OOB probe
+        finding = await self._oob_probe(session, param, engines)
+        if finding:
+            findings.append(finding)
+            self._record_bypass_result(finding["payload"], success=True)
+
+        return findings
+
+    async def _param_run_alternative_vectors(
+        self, session: "aiohttp.ClientSession", param: str, engines: List[str], param_findings: List
+    ) -> List[Dict]:
+        """Run alternative attack vectors (POST, headers, LLM)."""
+        findings = []
+
+        # POST injection
+        finding = await self._test_post_injection(session, param, engines)
+        if finding:
+            findings.append(finding)
+
+        # Header injection (rare)
+        if not param_findings:
+            finding = await self._test_header_injection(session, engines)
+            if finding:
+                findings.append(finding)
+
+        # LLM advanced bypass (fallback)
+        if self._detected_waf and not param_findings:
+            finding = await self._llm_probe(session, param)
+            if finding:
+                findings.append(finding)
+
+        return findings
+
     async def _test_parameter(self, session: "aiohttp.ClientSession", item: Dict, html: str) -> List[Dict]:
         """Test a single parameter for CSTI/SSTI vulnerabilities."""
         param = item.get("parameter")
@@ -729,41 +788,15 @@ Response format (XML):
         if self._max_impact_achieved or len(param_findings) >= 2:
             return param_findings
 
-        # Phase 2: Targeted Probing
-        if engines != ["unknown"]:
-            finding = await self._targeted_probe(session, param, engines)
-            if finding:
-                param_findings.append(finding)
-                self._record_bypass_result(finding["payload"], success=True)
+        # Phase 2-4: Standard probes
+        standard_findings = await self._param_run_standard_probes(session, param, engines)
+        param_findings.extend(standard_findings)
 
-        # Phase 3: Universal Probe
-        finding = await self._universal_probe(session, param)
-        if finding:
-            param_findings.append(finding)
-            self._record_bypass_result(finding["payload"], success=True)
-
-        # Phase 4: OOB Probe
-        finding = await self._oob_probe(session, param, engines)
-        if finding:
-            param_findings.append(finding)
-            self._record_bypass_result(finding["payload"], success=True)
-
-        # Phase 5: POST Injection
-        finding = await self._test_post_injection(session, param, engines)
-        if finding:
-            param_findings.append(finding)
-
-        # Phase 6: Header Injection (rare)
-        if not param_findings:
-            finding = await self._test_header_injection(session, engines)
-            if finding:
-                param_findings.append(finding)
-
-        # Phase 7: LLM Advanced Bypass (fallback)
-        if self._detected_waf and not param_findings:
-            finding = await self._llm_probe(session, param)
-            if finding:
-                param_findings.append(finding)
+        # Phase 5-7: Alternative vectors
+        alternative_findings = await self._param_run_alternative_vectors(
+            session, param, engines, param_findings
+        )
+        param_findings.extend(alternative_findings)
 
         return param_findings
 
@@ -1026,61 +1059,70 @@ Response format (XML):
             }
         )
 
+    async def _feedback_generate_waf_bypass(self, original: str) -> Tuple[Optional[str], str]:
+        """Generate WAF bypass variant."""
+        encoded = await self._get_encoded_payloads([original])
+        if encoded and encoded[0] != original:
+            return encoded[0], "waf_bypass"
+        return None, ""
+
+    def _feedback_generate_engine_switch(self, engine: str) -> Tuple[Optional[str], str]:
+        """Generate engine switch variant."""
+        variant = self._try_alternative_engine(engine)
+        return variant, "engine_switch"
+
+    def _feedback_generate_char_encoding(self, original: str, stripped_chars: List[str]) -> Tuple[Optional[str], str]:
+        """Generate character encoding variant."""
+        variant = self._encode_template_chars(original, stripped_chars)
+        return variant, "char_encoding"
+
+    async def _feedback_generate_llm_fallback(self, parameter: str) -> Tuple[Optional[str], str]:
+        """Generate LLM fallback variant."""
+        llm_result = await self._llm_probe(None, parameter)
+        if llm_result:
+            return llm_result.get('payload'), "llm_fallback"
+        return None, ""
+
     async def handle_validation_feedback(
-        self, 
+        self,
         feedback: ValidationFeedback
     ) -> Optional[Dict[str, Any]]:
         """
         Recibe feedback del AgenticValidator y genera una variante de CSTI.
-        
+
         Args:
             feedback: Información sobre el fallo de validación
-            
+
         Returns:
             Diccionario con el nuevo payload, o None
         """
-        logger.info(
-            f"[CSTIAgent] Received feedback: {feedback.failure_reason.value}"
-        )
-        
+        logger.info(f"[CSTIAgent] Received feedback: {feedback.failure_reason.value}")
+
         original = feedback.original_payload
+        engine = self._detect_engine_from_payload(original)
         variant = None
         method = "feedback_adaptation"
-        
-        # Detectar el motor de plantillas del payload original
-        engine = self._detect_engine_from_payload(original)
-        
+
+        # Try specific bypass strategies based on failure reason
         if feedback.failure_reason == FailureReason.WAF_BLOCKED:
-            # Usar encoding
-            encoded = await self._get_encoded_payloads([original])
-            if encoded and encoded[0] != original:
-                variant = encoded[0]
-                method = "waf_bypass"
-        
+            variant, method = await self._feedback_generate_waf_bypass(original)
         elif feedback.failure_reason == FailureReason.CONTEXT_MISMATCH:
-            # Probar con otro motor
-            variant = self._try_alternative_engine(engine)
-            method = "engine_switch"
-        
+            variant, method = self._feedback_generate_engine_switch(engine)
         elif feedback.failure_reason == FailureReason.ENCODING_STRIPPED:
-            # Usar sintaxis alternativa
-            variant = self._encode_template_chars(original, feedback.stripped_chars)
-            method = "char_encoding"
-        
-        # Fallback a LLM
+            variant, method = self._feedback_generate_char_encoding(original, feedback.stripped_chars)
+
+        # Fallback to LLM if no variant generated
         if not variant or variant == original:
-            llm_result = await self._llm_probe(None, feedback.parameter)
-            if llm_result:
-                variant = llm_result.get('payload')
-                method = "llm_fallback"
-        
+            variant, method = await self._feedback_generate_llm_fallback(feedback.parameter)
+
+        # Return variant if valid and not tried before
         if variant and variant != original and not feedback.was_variant_tried(variant):
             return {
                 "payload": variant,
                 "method": method,
                 "engine_guess": engine
             }
-        
+
         return None
 
     def _detect_engine_from_payload(self, payload: str) -> str:
