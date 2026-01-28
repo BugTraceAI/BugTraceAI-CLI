@@ -583,11 +583,24 @@ async def suggest_remediation(
     Returns:
         Dictionary with remediation steps, code examples, and references
     """
-    # Normalize vuln_type
     vuln_upper = vuln_type.upper().replace("-", "_")
+    remediation = _get_remediation_knowledge(vuln_upper)
+    context = _build_context_string(url, parameter)
 
-    # Get remediation knowledge or use generic
-    remediation = REMEDIATION_KNOWLEDGE.get(vuln_upper, {
+    return {
+        "vuln_type": vuln_type,
+        "severity": severity,
+        "priority": get_priority(severity),
+        "remediation_steps": remediation["remediation_steps"],
+        "code_example": remediation["code_example"],
+        "references": remediation["references"],
+        "context": context
+    }
+
+
+def _get_remediation_knowledge(vuln_upper: str) -> Dict:
+    """Get remediation knowledge for vulnerability type."""
+    return REMEDIATION_KNOWLEDGE.get(vuln_upper, {
         "remediation_steps": [
             "Review the vulnerability details and understand the attack vector",
             "Implement input validation and output encoding",
@@ -602,20 +615,12 @@ async def suggest_remediation(
         ]
     })
 
-    # Build context string
+
+def _build_context_string(url: str, parameter: str) -> str:
+    """Build context string from URL and parameter."""
     context_parts = []
     if url:
         context_parts.append(f"URL: {url}")
     if parameter:
         context_parts.append(f"Parameter: {parameter}")
-    context = " | ".join(context_parts) if context_parts else "No specific context provided"
-
-    return {
-        "vuln_type": vuln_type,
-        "severity": severity,
-        "priority": get_priority(severity),
-        "remediation_steps": remediation["remediation_steps"],
-        "code_example": remediation["code_example"],
-        "references": remediation["references"],
-        "context": context
-    }
+    return " | ".join(context_parts) if context_parts else "No specific context provided"

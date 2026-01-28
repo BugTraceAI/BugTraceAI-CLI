@@ -114,59 +114,69 @@ class MemoryManager:
         Atomic operation: Updates both Graph and Vector DB.
         """
         node_id = f"{node_type}:{label}"
-        
-        # Sanitize properties for GML (keys must be strings, no nested complex objects if possible)
+        safe_props = self._sanitize_properties(properties)
+        self._update_graph_node(node_id, node_type, label, safe_props)
+        self._update_vector_db(node_type, label, properties)
+
+    def _sanitize_properties(self, properties: Dict[str, Any]) -> Dict[str, Any]:
+        """Sanitize properties for GML storage."""
         safe_props = {}
         for k, v in properties.items():
-            # Rename conflicting keys
-            if k == "type":
-                key_name = "element_type"
-            elif k == "label":
-                key_name = "node_label"
-            elif k == "created_at":
-                key_name = "original_created_at"
-            else:
-                key_name = k
-                
-            if isinstance(v, (str, int, float, bool)):
-                safe_props[key_name] = v
-            else:
-                try:
-                    safe_props[key_name] = json.dumps(v)
-                except Exception as e:
-                    safe_props[key_name] = str(v)
-                    
-        # 1. Update Graph
+            key_name = self._resolve_key_name(k)
+            safe_props[key_name] = self._serialize_value(v)
+        return safe_props
+
+    def _resolve_key_name(self, key: str) -> str:
+        """Resolve conflicting key names for GML."""
+        if key == "type":
+            return "element_type"
+        elif key == "label":
+            return "node_label"
+        elif key == "created_at":
+            return "original_created_at"
+        return key
+
+    def _serialize_value(self, value: Any) -> Any:
+        """Serialize value for GML storage."""
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        try:
+            return json.dumps(value)
+        except Exception:
+            return str(value)
+
+    def _update_graph_node(self, node_id: str, node_type: str, label: str, safe_props: Dict):
+        """Update or create node in knowledge graph."""
         if not self.graph.has_node(node_id):
             self.graph.add_node(
-                node_id, 
-                type=node_type, 
-                label=label, 
-                **safe_props, 
+                node_id,
+                type=node_type,
+                label=label,
+                **safe_props,
                 created_at=datetime.now().isoformat()
             )
-            self._save_graph()
         else:
-            # Update existing properties
-            attrs = {k: v for k, v in safe_props.items()}
-            nx.set_node_attributes(self.graph, {node_id: attrs})
-            self._save_graph()
+            nx.set_node_attributes(self.graph, {node_id: safe_props})
+        self._save_graph()
 
-        # 2. Update Vector DB (Only for interesting nodes like Findings or Inputs)
-        if node_type in ["Finding", "FindingCandidate", "Vulnerability"]:
-            description = f"{node_type} {label} {properties.get('details', '')}"
-            vector = self._get_embedding(description)
-            
-            data = [{
-                "vector": vector,
-                "text": description,
-                "type": node_type,
-                "metadata": json.dumps(properties),
-                "timestamp": datetime.now().isoformat()
-            }]
-            
-            if self.obs_table:
-                self.obs_table.add(data) # Append mode by default
+    def _update_vector_db(self, node_type: str, label: str, properties: Dict):
+        """Update vector database for semantic search."""
+        if node_type not in ["Finding", "FindingCandidate", "Vulnerability"]:
+            return
+
+        description = f"{node_type} {label} {properties.get('details', '')}"
+        vector = self._get_embedding(description)
+
+        data = [{
+            "vector": vector,
+            "text": description,
+            "type": node_type,
+            "metadata": json.dumps(properties),
+            "timestamp": datetime.now().isoformat()
+        }]
+
+        if self.obs_table:
+            self.obs_table.add(data)
 
     def add_edge(self, source_type: str, source_label: str, target_type: str, target_label: str, relation: str):
         """Adds a relationship edge to the Knowledge Graph."""
