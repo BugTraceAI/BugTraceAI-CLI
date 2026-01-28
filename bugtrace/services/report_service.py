@@ -279,31 +279,44 @@ class ReportService:
             Path to report file or directory, or None if not found
         """
         format = format.lower()
-
-        # Standard report location
         report_dir = settings.REPORT_DIR / f"scan_{scan_id}"
 
         if not report_dir.exists():
             return None
 
-        # Check for specific format files
+        return self._find_report_by_format(scan_id, format, report_dir)
+
+    def _find_report_by_format(
+        self, scan_id: int, format: str, report_dir: Path
+    ) -> Optional[str]:
+        """Find report file by format type."""
         if format == "html":
-            html_file = report_dir / "report.html"
-            if html_file.exists():
-                return str(html_file)
+            return self._find_html_report(report_dir)
+        if format == "json":
+            return self._find_json_report(report_dir)
+        if format == "markdown":
+            return self._find_markdown_report(scan_id)
+        return None
 
-        elif format == "json":
-            json_file = report_dir / "engagement_data.json"
-            if json_file.exists():
-                return str(json_file)
+    def _find_html_report(self, report_dir: Path) -> Optional[str]:
+        """Find HTML report file."""
+        html_file = report_dir / "report.html"
+        if html_file.exists():
+            return str(html_file)
+        return None
 
-        elif format == "markdown":
-            # Markdown generates a separate directory structure
-            # Look for technical_report.md or executive_summary.md
-            for md_dir in settings.REPORT_DIR.glob(f"report_*_{scan_id}_*"):
-                if (md_dir / "technical_report.md").exists():
-                    return str(md_dir)
+    def _find_json_report(self, report_dir: Path) -> Optional[str]:
+        """Find JSON report file."""
+        json_file = report_dir / "engagement_data.json"
+        if json_file.exists():
+            return str(json_file)
+        return None
 
+    def _find_markdown_report(self, scan_id: int) -> Optional[str]:
+        """Find markdown report directory."""
+        for md_dir in settings.REPORT_DIR.glob(f"report_*_{scan_id}_*"):
+            if (md_dir / "technical_report.md").exists():
+                return str(md_dir)
         return None
 
     def list_reports(self, scan_id: int) -> Dict[str, Any]:

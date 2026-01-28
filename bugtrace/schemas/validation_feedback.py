@@ -411,11 +411,11 @@ def _identify_waf(log_lower: str) -> Optional[str]:
     """Identify WAF from log text."""
     if 'cloudflare' in log_lower:
         return "Cloudflare"
-    elif 'akamai' in log_lower:
+    if 'akamai' in log_lower:
         return "Akamai"
-    elif 'aws' in log_lower:
+    if 'aws' in log_lower:
         return "AWS WAF"
-    elif 'modsecurity' in log_lower:
+    if 'modsecurity' in log_lower:
         return "ModSecurity"
     return None
 

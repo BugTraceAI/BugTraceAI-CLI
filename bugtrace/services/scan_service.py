@@ -521,21 +521,49 @@ class ScanService:
             return True
 
         # Pattern 2: Pipeline-generated ({domain}_{timestamp}/)
-        if target_url:
-            hostname = urlparse(target_url).hostname or ""
-            if hostname:
-                if scan_timestamp:
-                    # Precise match using scan timestamp (minute-level)
-                    ts_prefix = scan_timestamp.strftime("%Y%m%d_%H%M")
-                    for match in report_base.glob(f"{hostname}_{ts_prefix}*"):
-                        if _has_files(match):
-                            return True
-                # Fallback: any dir for this domain that contains report files.
-                # Needed because report dir timestamp = generation time (post-scan),
-                # which differs from scan creation timestamp stored in DB.
-                for match in report_base.glob(f"{hostname}_*"):
-                    if _has_files(match):
-                        return True
+        return ScanService._check_pipeline_report_dir(
+            report_base, target_url, scan_timestamp, _has_files
+        )
+
+    @staticmethod
+    def _check_pipeline_report_dir(
+        report_base: Path,
+        target_url: Optional[str],
+        scan_timestamp: Optional[datetime],
+        has_files_check
+    ) -> bool:
+        """Check for pipeline-generated report directories."""
+        if not target_url:
+            return False
+
+        hostname = urlparse(target_url).hostname or ""
+        if not hostname:
+            return False
+
+        return ScanService._check_hostname_reports(
+            report_base, hostname, scan_timestamp, has_files_check
+        )
+
+    @staticmethod
+    def _check_hostname_reports(
+        report_base: Path,
+        hostname: str,
+        scan_timestamp: Optional[datetime],
+        has_files_check
+    ) -> bool:
+        """Check for report directories matching hostname."""
+        # Precise match using scan timestamp (minute-level)
+        if scan_timestamp:
+            ts_prefix = scan_timestamp.strftime("%Y%m%d_%H%M")
+            for match in report_base.glob(f"{hostname}_{ts_prefix}*"):
+                if has_files_check(match):
+                    return True
+
+        # Fallback: any dir for this domain that contains report files
+        for match in report_base.glob(f"{hostname}_*"):
+            if has_files_check(match):
+                return True
+
         return False
 
     def _delete_report_dirs(
