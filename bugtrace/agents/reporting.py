@@ -271,30 +271,31 @@ class ReportingAgent(BaseAgent):
             logger.debug(f"[{self.name}] No tech_profile.json found")
             return [], {}
 
-        try:
-            with open(tech_profile_path, "r") as f:
-                tech_profile = json.load(f)
-        except Exception as e:
-            logger.warning(f"[{self.name}] Failed to load tech_profile.json: {e}")
+        tech_profile = self._nuclei_load_file(tech_profile_path)
+        if not tech_profile:
             return [], {}
 
+        nuclei_findings = self._nuclei_parse_findings(tech_profile)
+        tech_stack = self._nuclei_extract_tech_stack(tech_profile)
+
+        logger.info(f"[{self.name}] Loaded {len(nuclei_findings)} Nuclei findings, tech stack: {tech_stack}")
+        return nuclei_findings, tech_stack
+
+    def _nuclei_load_file(self, path: Path) -> Optional[Dict]:
+        """Load and parse tech_profile.json file."""
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to load tech_profile.json: {e}")
+            return None
+
+    def _nuclei_parse_findings(self, tech_profile: Dict) -> List[Dict]:
+        """Parse Nuclei findings from tech profile."""
         nuclei_findings = []
         for finding in tech_profile.get("raw_findings", []):
             info = finding.get("info", {})
-
-            # Map Nuclei severity to our severity scale
-            nuclei_sev = (info.get("severity") or "info").upper()
-            severity_map = {
-                "CRITICAL": "CRITICAL",
-                "HIGH": "HIGH",
-                "MEDIUM": "MEDIUM",
-                "LOW": "LOW",
-                "INFO": "INFO"
-            }
-            severity = severity_map.get(nuclei_sev, "INFO")
-
-            # Determine status based on severity
-            # Critical/High Nuclei findings are typically reliable
+            severity = self._nuclei_map_severity(info.get("severity"))
             status = "VALIDATED_CONFIRMED" if severity in ["CRITICAL", "HIGH"] else "PENDING_VALIDATION"
 
             nuclei_findings.append({
@@ -313,16 +314,27 @@ class ReportingAgent(BaseAgent):
                 "nuclei_template": finding.get("template_id"),
                 "nuclei_tags": info.get("tags", [])
             })
+        return nuclei_findings
 
-        # Extract tech stack info
-        tech_stack = {
+    def _nuclei_map_severity(self, nuclei_sev: Optional[str]) -> str:
+        """Map Nuclei severity to our severity scale."""
+        nuclei_sev = (nuclei_sev or "info").upper()
+        severity_map = {
+            "CRITICAL": "CRITICAL",
+            "HIGH": "HIGH",
+            "MEDIUM": "MEDIUM",
+            "LOW": "LOW",
+            "INFO": "INFO"
+        }
+        return severity_map.get(nuclei_sev, "INFO")
+
+    def _nuclei_extract_tech_stack(self, tech_profile: Dict) -> Dict:
+        """Extract tech stack info from tech profile."""
+        return {
             "frameworks": tech_profile.get("frameworks", []),
             "languages": tech_profile.get("languages", []),
             "servers": tech_profile.get("servers", [])
         }
-
-        logger.info(f"[{self.name}] Loaded {len(nuclei_findings)} Nuclei findings, tech stack: {tech_stack}")
-        return nuclei_findings, tech_stack
 
     def _write_json(self, findings: List[Dict], filename: str, description: str) -> Path:
         """Write findings to a JSON file."""
@@ -544,11 +556,9 @@ class ReportingAgent(BaseAgent):
         stats = stats or {"urls_scanned": 0, "duration": "0s"}
         tech_stack = tech_stack or {}
 
-        # Deduplicate findings
+        # Deduplicate and process findings
         validated = self._deduplicate_findings(validated)
         manual_review = self._deduplicate_findings(manual_review)
-
-        # Count by severity
         by_severity = self._count_by_severity(validated)
 
         # Build and sort findings
@@ -557,32 +567,51 @@ class ReportingAgent(BaseAgent):
         nuclei_infra = self._sort_findings_by_cvss(nuclei_infra)
 
         return {
-            "meta": {
-                "scan_id": self.scan_id,
-                "target": self.target_url,
-                "scan_date": datetime.now().isoformat(),
-                "tool_version": settings.VERSION,
-                "validation_engine": "AgenticValidator + CDP + Vision AI",
-                "report_signature": "BUGTRACE_AI_REPORT_V5"
-            },
-            "stats": {
-                "urls_scanned": stats.get("urls_scanned", 0),
-                "duration": stats.get("duration", "N/A"),
-                "duration_seconds": stats.get("duration_seconds", 0),
-                "validation_coverage": "100%"
-            },
-            "summary": {
-                "total_findings": len(all_findings),
-                "validated": len(validated),
-                "false_positives": len(false_positives),
-                "manual_review": len(manual_review),
-                "by_severity": by_severity
-            },
+            "meta": self._engagement_build_meta(),
+            "stats": self._engagement_build_stats(stats),
+            "summary": self._engagement_build_summary(all_findings, validated, false_positives, manual_review, by_severity),
             "findings": vuln_findings,
             "infrastructure": {
                 "tech_stack": tech_stack,
                 "nuclei_findings": nuclei_infra
             }
+        }
+
+    def _engagement_build_meta(self) -> Dict:
+        """Build engagement metadata section."""
+        return {
+            "scan_id": self.scan_id,
+            "target": self.target_url,
+            "scan_date": datetime.now().isoformat(),
+            "tool_version": settings.VERSION,
+            "validation_engine": "AgenticValidator + CDP + Vision AI",
+            "report_signature": "BUGTRACE_AI_REPORT_V5"
+        }
+
+    def _engagement_build_stats(self, stats: Dict) -> Dict:
+        """Build engagement statistics section."""
+        return {
+            "urls_scanned": stats.get("urls_scanned", 0),
+            "duration": stats.get("duration", "N/A"),
+            "duration_seconds": stats.get("duration_seconds", 0),
+            "validation_coverage": "100%"
+        }
+
+    def _engagement_build_summary(
+        self,
+        all_findings: List[Dict],
+        validated: List[Dict],
+        false_positives: List[Dict],
+        manual_review: List[Dict],
+        by_severity: Dict
+    ) -> Dict:
+        """Build engagement summary section."""
+        return {
+            "total_findings": len(all_findings),
+            "validated": len(validated),
+            "false_positives": len(false_positives),
+            "manual_review": len(manual_review),
+            "by_severity": by_severity
         }
 
     def _count_by_severity(self, validated: List[Dict]) -> Dict[str, int]:
@@ -604,6 +633,19 @@ class ReportingAgent(BaseAgent):
         path = self.output_dir / "final_report.md"
 
         lines = []
+        self._md_build_header(lines, validated, manual_review, pending)
+        self._md_build_validated_findings(lines, validated)
+        self._md_build_manual_review(lines, manual_review)
+
+        # Write file
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+
+        logger.info(f"[{self.name}] Wrote final_report.md")
+        return path
+
+    def _md_build_header(self, lines: List[str], validated: List[Dict], manual_review: List[Dict], pending: List[Dict]):
+        """Build markdown report header and summary."""
         lines.append(f"# Security Assessment: {self.target_url}\n")
         lines.append(f"**Scan ID:** {self.scan_id}")
         lines.append(f"**Date:** {datetime.now().strftime('%d %b %Y %H:%M')}")
@@ -618,77 +660,79 @@ class ReportingAgent(BaseAgent):
         lines.append(f"| **Pending Validation** | {len(pending)} |")
         lines.append("")
 
-        # Section 1: Confirmed Findings (Triager Ready)
+    def _md_build_validated_findings(self, lines: List[str], validated: List[Dict]):
+        """Build validated findings section of markdown report."""
         lines.append("---\n")
         lines.append("## Confirmed Vulnerabilities (Triager Ready)\n")
 
         if not validated:
             lines.append("*No confirmed vulnerabilities found.*\n")
-        else:
-            # Sort by severity
-            severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
-            validated_sorted = sorted(validated, key=lambda x: severity_order.get((x.get("severity") or "MEDIUM").upper(), 5))
+            return
 
-            for i, f in enumerate(validated_sorted, 1):
-                lines.append(f"### {i}. {f.get('type', 'Unknown Vulnerability')}\n")
-                lines.append(f"| Field | Value |")
-                lines.append(f"|-------|-------|")
-                lines.append(f"| **Severity** | {f.get('severity', 'MEDIUM')} |")
-                lines.append(f"| **Status** | ✅ CONFIRMED |")
-                lines.append(f"| **URL** | `{f.get('url', '')}` |")
-                lines.append(f"| **Parameter** | `{f.get('parameter', '')}` |")
-                if f.get("db_type"):
-                    lines.append(f"| **DB Type** | {f.get('db_type')} |")
-                if f.get("tamper_used"):
-                    lines.append(f"| **Tamper Script** | {f.get('tamper_used')} |")
-                lines.append("")
+        # Sort by severity
+        severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        validated_sorted = sorted(validated, key=lambda x: severity_order.get((x.get("severity") or "MEDIUM").upper(), 5))
 
-                # Steps to Reproduce (type-specific)
-                lines.append("#### Steps to Reproduce\n")
-                for step in self._generate_reproduction_steps(f):
-                    lines.append(step)
-                lines.append("")
+        for i, f in enumerate(validated_sorted, 1):
+            self._md_build_finding_entry(lines, f, i)
 
-                # PoC (Only for SQLi where we have SQLMap command)
-                if "SQL" in f.get("type", "").upper() and not self._generate_curl(f).startswith("#"):
-                    lines.append("#### Proof of Concept\n")
-                    lines.append("```bash")
-                    lines.append(self._generate_curl(f))
-                    lines.append("```\n")
+    def _md_build_finding_entry(self, lines: List[str], f: Dict, index: int):
+        """Build a single finding entry in markdown report."""
+        lines.append(f"### {index}. {f.get('type', 'Unknown Vulnerability')}\n")
+        lines.append(f"| Field | Value |")
+        lines.append(f"|-------|-------|")
+        lines.append(f"| **Severity** | {f.get('severity', 'MEDIUM')} |")
+        lines.append(f"| **Status** | ✅ CONFIRMED |")
+        lines.append(f"| **URL** | `{f.get('url', '')}` |")
+        lines.append(f"| **Parameter** | `{f.get('parameter', '')}` |")
+        if f.get("db_type"):
+            lines.append(f"| **DB Type** | {f.get('db_type')} |")
+        if f.get("tamper_used"):
+            lines.append(f"| **Tamper Script** | {f.get('tamper_used')} |")
+        lines.append("")
 
-                # Validator Notes
-                if f.get("validator_notes"):
-                    lines.append("#### Validation Notes\n")
-                    lines.append(f"> {f.get('validator_notes')}\n")
+        # Steps to Reproduce (type-specific)
+        lines.append("#### Steps to Reproduce\n")
+        for step in self._generate_reproduction_steps(f):
+            lines.append(step)
+        lines.append("")
 
-                # Screenshot
-                if f.get("screenshot_path"):
-                    img_name = Path(f.get("screenshot_path")).name
-                    lines.append(f"#### Screenshot\n")
-                    lines.append(f"![Evidence](captures/{img_name})\n")
+        # PoC (Only for SQLi where we have SQLMap command)
+        if "SQL" in f.get("type", "").upper() and not self._generate_curl(f).startswith("#"):
+            lines.append("#### Proof of Concept\n")
+            lines.append("```bash")
+            lines.append(self._generate_curl(f))
+            lines.append("```\n")
 
-                lines.append("---\n")
+        # Validator Notes
+        if f.get("validator_notes"):
+            lines.append("#### Validation Notes\n")
+            lines.append(f"> {f.get('validator_notes')}\n")
 
-        # Section 2: Manual Review Needed
-        if manual_review:
-            lines.append("## Needs Manual Review\n")
-            lines.append("> These findings have high AI confidence but could not be confirmed via browser automation.\n")
+        # Screenshot
+        if f.get("screenshot_path"):
+            img_name = Path(f.get("screenshot_path")).name
+            lines.append(f"#### Screenshot\n")
+            lines.append(f"![Evidence](captures/{img_name})\n")
 
-            for i, f in enumerate(manual_review, 1):
-                lines.append(f"### MR-{i}. {f.get('type', 'Unknown')}\n")
-                lines.append(f"- **URL:** `{f.get('url', '')}`")
-                lines.append(f"- **Parameter:** `{f.get('parameter', '')}`")
-                lines.append(f"- **Payload:** `{f.get('payload', '')}`")
-                if f.get("validator_notes"):
-                    lines.append(f"- **AI Notes:** {f.get('validator_notes')}")
-                lines.append("")
+        lines.append("---\n")
 
-        # Write file
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+    def _md_build_manual_review(self, lines: List[str], manual_review: List[Dict]):
+        """Build manual review section of markdown report."""
+        if not manual_review:
+            return
 
-        logger.info(f"[{self.name}] Wrote final_report.md")
-        return path
+        lines.append("## Needs Manual Review\n")
+        lines.append("> These findings have high AI confidence but could not be confirmed via browser automation.\n")
+
+        for i, f in enumerate(manual_review, 1):
+            lines.append(f"### MR-{i}. {f.get('type', 'Unknown')}\n")
+            lines.append(f"- **URL:** `{f.get('url', '')}`")
+            lines.append(f"- **Parameter:** `{f.get('parameter', '')}`")
+            lines.append(f"- **Payload:** `{f.get('payload', '')}`")
+            if f.get("validator_notes"):
+                lines.append(f"- **AI Notes:** {f.get('validator_notes')}")
+            lines.append("")
 
     def _copy_html_template(self) -> Path:
         """Copy the static HTML template that loads engagement_data.json."""
@@ -846,67 +890,84 @@ class ReportingAgent(BaseAgent):
         Generate reproduction command for the finding.
         2026-01-24 FIX: Generate useful curl commands for ALL vuln types.
         """
-        vuln_type = (finding.get("type") or "").upper()
-        url = finding.get("url", "")
-        param = finding.get("parameter", "")
-        payload = finding.get("payload", "")
-
         # Priority 1: Use specialist-provided reproduction command
         if finding.get("reproduction"):
             return finding.get("reproduction")
 
         # Priority 2: Generate command based on vuln type
+        vuln_type = (finding.get("type") or "").upper()
+        url = finding.get("url", "")
+        param = finding.get("parameter", "")
+        payload = finding.get("payload", "")
+
         if vuln_type in ["SQLI", "SQL"]:
-            if param:
-                return f"sqlmap -u \"{url}\" -p {param} --batch --dbs"
-            return f"sqlmap -u \"{url}\" --batch --dbs"
-
+            return self._curl_build_sqli(url, param)
         elif vuln_type in ["CSTI", "SSTI"]:
-            default_payload = "{{7*7}}"
-            test_payload = payload if payload else default_payload
-            # Check if it's a header injection
-            if param and param.startswith("HEADER:"):
-                header_name = param.replace("HEADER:", "")
-                return f"curl -H '{header_name}: {test_payload}' '{url}' | grep 49"
-            elif param and param.startswith("POST:"):
-                param_name = param.replace("POST:", "")
-                return f"curl -X POST '{url}' -d '{param_name}={test_payload}' | grep 49"
-            elif param and payload:
-                # URL param injection
-                from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-                parsed = urlparse(url)
-                qs = parse_qs(parsed.query)
-                qs[param] = [payload]
-                new_query = urlencode(qs, doseq=True)
-                test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
-                return f"curl '{test_url}' | grep 49"
-            return f"# CSTI on {url} - inject {{{{7*7}}}} in parameter {param}"
-
+            return self._curl_build_csti(url, param, payload)
         elif vuln_type == "XSS":
-            if param and payload:
-                from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-                parsed = urlparse(url)
-                qs = parse_qs(parsed.query)
-                qs[param] = [payload]
-                new_query = urlencode(qs, doseq=True)
-                test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
-                return f"# Open in browser to trigger XSS:\n{test_url}"
-            elif payload:
-                return f"# XSS Payload: {payload}\n# Inject in parameter: {param or 'unknown'}"
-            return f"# XSS on {url} - test with <script>alert(1)</script> in {param or 'input fields'}"
-
+            return self._curl_build_xss(url, param, payload)
         elif vuln_type == "SSRF":
             return f"# SSRF: Use Burp Collaborator or webhook.site to test OOB callbacks\ncurl '{url}'"
-
         elif vuln_type == "LFI":
-            if param:
-                return f"curl '{url}' --data-urlencode '{param}=../../../etc/passwd'"
-            return f"# LFI on {url} - test with ../../etc/passwd"
-
+            return self._curl_build_lfi(url, param)
         elif vuln_type == "IDOR":
             return f"# IDOR: Test with different user IDs/values\ncurl '{url}'"
+        else:
+            return self._curl_build_fallback(url, param, payload)
 
-        # Fallback: Show URL and parameter info
+    def _curl_build_sqli(self, url: str, param: str) -> str:
+        """Build SQLi reproduction command."""
+        if param:
+            return f"sqlmap -u \"{url}\" -p {param} --batch --dbs"
+        return f"sqlmap -u \"{url}\" --batch --dbs"
+
+    def _curl_build_csti(self, url: str, param: str, payload: str) -> str:
+        """Build CSTI/SSTI reproduction command."""
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        default_payload = "{{7*7}}"
+        test_payload = payload if payload else default_payload
+
+        # Check if it's a header injection
+        if param and param.startswith("HEADER:"):
+            header_name = param.replace("HEADER:", "")
+            return f"curl -H '{header_name}: {test_payload}' '{url}' | grep 49"
+        elif param and param.startswith("POST:"):
+            param_name = param.replace("POST:", "")
+            return f"curl -X POST '{url}' -d '{param_name}={test_payload}' | grep 49"
+        elif param and payload:
+            # URL param injection
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            qs[param] = [payload]
+            new_query = urlencode(qs, doseq=True)
+            test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
+            return f"curl '{test_url}' | grep 49"
+        return f"# CSTI on {url} - inject {{{{7*7}}}} in parameter {param}"
+
+    def _curl_build_xss(self, url: str, param: str, payload: str) -> str:
+        """Build XSS reproduction command."""
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        if param and payload:
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query)
+            qs[param] = [payload]
+            new_query = urlencode(qs, doseq=True)
+            test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
+            return f"# Open in browser to trigger XSS:\n{test_url}"
+        elif payload:
+            return f"# XSS Payload: {payload}\n# Inject in parameter: {param or 'unknown'}"
+        return f"# XSS on {url} - test with <script>alert(1)</script> in {param or 'input fields'}"
+
+    def _curl_build_lfi(self, url: str, param: str) -> str:
+        """Build LFI reproduction command."""
+        if param:
+            return f"curl '{url}' --data-urlencode '{param}=../../../etc/passwd'"
+        return f"# LFI on {url} - test with ../../etc/passwd"
+
+    def _curl_build_fallback(self, url: str, param: str, payload: str) -> str:
+        """Build fallback reproduction command."""
         if url and param:
             return f"# Vulnerable endpoint: {url}\n# Parameter: {param}\n# Payload: {payload or 'N/A'}"
         elif url:
@@ -1134,33 +1195,46 @@ class ReportingAgent(BaseAgent):
         This adds detailed context that makes reports stand out on bug bounty platforms.
         """
         try:
-            vuln_type = finding.get("type", "Unknown")
-            url = finding.get("url", "")
-            param = finding.get("parameter", "")
-            payload = finding.get("payload", "")
-            description = finding.get("description", "")
-            
-            # Format validator notes for context if available
-            validator_notes = finding.get("validator_notes", "")
-            extra_evidence = ""
-            if validator_notes:
-                extra_evidence = f"- Validation Evidence: {validator_notes}"
+            context = self._poc_prepare_context(finding)
+            prompt = self._poc_build_prompt(context)
+            response = await self._poc_execute_llm(prompt)
 
-            # Get type-specific context
-            type_context = self._get_type_specific_context(vuln_type)
+            if response:
+                self._poc_parse_response(finding, response)
 
-            prompt = f"""You are a senior bug bounty hunter writing a FINAL report for a HackerOne/Bugcrowd triager or a non-technical stakeholder.
+        except Exception as e:
+            logger.debug(f"[{self.name}] Exploitation enrichment skipped for {finding.get('id')}: {e}")
+
+    def _poc_prepare_context(self, finding: Dict) -> Dict:
+        """Prepare context for PoC enrichment prompt."""
+        vuln_type = finding.get("type", "Unknown")
+        validator_notes = finding.get("validator_notes", "")
+        extra_evidence = f"- Validation Evidence: {validator_notes}" if validator_notes else ""
+
+        return {
+            "vuln_type": vuln_type,
+            "url": finding.get("url", ""),
+            "param": finding.get("parameter", ""),
+            "payload": finding.get("payload", ""),
+            "description": finding.get("description", ""),
+            "extra_evidence": extra_evidence,
+            "type_context": self._get_type_specific_context(vuln_type)
+        }
+
+    def _poc_build_prompt(self, context: Dict) -> str:
+        """Build PoC enrichment prompt."""
+        return f"""You are a senior bug bounty hunter writing a FINAL report for a HackerOne/Bugcrowd triager or a non-technical stakeholder.
 The goal is to provide a COMPLETE, STEP-BY-STEP guide that anyone can follow to reproduce the issue blindly.
 
 **Confirmed Vulnerability:**
-- Type: {vuln_type}
-- URL: {url}
-- Vulnerable Parameter: {param}
-- Payload Used: {payload}
-- Detection Notes: {description}
-{extra_evidence}
+- Type: {context['vuln_type']}
+- URL: {context['url']}
+- Vulnerable Parameter: {context['param']}
+- Payload Used: {context['payload']}
+- Detection Notes: {context['description']}
+{context['extra_evidence']}
 
-{type_context}
+{context['type_context']}
 
 **Your Task: Write a comprehensive exploitation report covering:**
 
@@ -1200,29 +1274,28 @@ The goal is to provide a COMPLETE, STEP-BY-STEP guide that anyone can follow to 
 
 Be PRECISE. Imagine the reader has no context about the scan tool."""
 
-            response = await llm_client.generate(
-                prompt,
-                module_name="Reporting-Exploitation",
-                model_override="deepseek/deepseek-chat",
-                temperature=0.4 # Slightly higher for more descriptive steps
-            )
+    async def _poc_execute_llm(self, prompt: str) -> Optional[str]:
+        """Execute LLM call for PoC enrichment."""
+        return await llm_client.generate(
+            prompt,
+            module_name="Reporting-Exploitation",
+            model_override="deepseek/deepseek-chat",
+            temperature=0.4  # Slightly higher for more descriptive steps
+        )
 
-            if response:
-                content = response.strip()
-                finding["exploitation_details"] = content
-                
-                # Extract Reproduction Steps for structured usage
-                import re
-                steps_match = re.search(r"## Reproduction Steps\s*(.*?)(?:$|##)", content, re.DOTALL)
-                if steps_match:
-                    raw_steps = steps_match.group(1).strip()
-                    # Split by lines starting with numbers or bullet points
-                    steps_list = [line.strip() for line in raw_steps.split('\n') if line.strip()]
-                    if steps_list:
-                        finding["llm_reproduction_steps"] = steps_list
+    def _poc_parse_response(self, finding: Dict, response: str):
+        """Parse PoC enrichment response and update finding."""
+        content = response.strip()
+        finding["exploitation_details"] = content
 
-        except Exception as e:
-            logger.debug(f"[{self.name}] Exploitation enrichment skipped for {finding.get('id')}: {e}")
+        # Extract Reproduction Steps for structured usage
+        steps_match = re.search(r"## Reproduction Steps\s*(.*?)(?:$|##)", content, re.DOTALL)
+        if steps_match:
+            raw_steps = steps_match.group(1).strip()
+            # Split by lines starting with numbers or bullet points
+            steps_list = [line.strip() for line in raw_steps.split('\n') if line.strip()]
+            if steps_list:
+                finding["llm_reproduction_steps"] = steps_list
 
     def _get_type_specific_context(self, vuln_type: str) -> str:
         """Get type-specific context for LLM prompt."""
