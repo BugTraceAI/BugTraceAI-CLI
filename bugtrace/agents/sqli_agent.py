@@ -555,26 +555,8 @@ class SQLiAgent(BaseAgent):
         base_url = self._get_base_url()
 
         for char in test_chars:
-            try:
-                test_value = f"test{char}test"
-                test_url = self._build_url_with_param(base_url, param, test_value)
-
-                async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    # Check for WAF block indicators
-                    if resp.status in [403, 406, 429, 503]:
-                        filtered.add(char)
-                        continue
-
-                    content = await resp.text()
-                    block_indicators = [
-                        "blocked", "forbidden", "not allowed", "waf", "firewall",
-                        "security", "illegal", "invalid character", "attack detected"
-                    ]
-
-                    if any(ind in content.lower() for ind in block_indicators):
-                        filtered.add(char)
-            except Exception as e:
-                logger.debug(f"operation failed: {e}")
+            if await self._is_char_filtered(session, base_url, param, char):
+                filtered.add(char)
 
         if filtered:
             self._detected_filters = filtered
@@ -582,6 +564,32 @@ class SQLiAgent(BaseAgent):
             logger.info(f"[{self.name}] 🛡️ Filtered chars detected: {filtered}")
 
         return filtered
+
+    async def _is_char_filtered(self, session: aiohttp.ClientSession, base_url: str,
+                                param: str, char: str) -> bool:
+        """Check if a single character is filtered."""
+        try:
+            test_value = f"test{char}test"
+            test_url = self._build_url_with_param(base_url, param, test_value)
+
+            async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                # Check for WAF block indicators
+                if resp.status in [403, 406, 429, 503]:
+                    return True
+
+                content = await resp.text()
+                return self._has_block_indicators(content)
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
+            return False
+
+    def _has_block_indicators(self, content: str) -> bool:
+        """Check if response content contains WAF block indicators."""
+        block_indicators = [
+            "blocked", "forbidden", "not allowed", "waf", "firewall",
+            "security", "illegal", "invalid character", "attack detected"
+        ]
+        return any(ind in content.lower() for ind in block_indicators)
 
     def _mutate_payload_for_filters(self, payload: str) -> List[str]:
         """
@@ -593,13 +601,19 @@ class SQLiAgent(BaseAgent):
         variants = [payload]
 
         for filtered_char in self._detected_filters:
-            if filtered_char in FILTER_MUTATIONS:
-                for mutation in FILTER_MUTATIONS[filtered_char]:
-                    new_variant = payload.replace(filtered_char, mutation)
-                    if new_variant not in variants:
-                        variants.append(new_variant)
+            self._add_mutations_for_char(variants, payload, filtered_char)
 
         return variants[:10]  # Limit to 10 variants
+
+    def _add_mutations_for_char(self, variants: List[str], payload: str, filtered_char: str):
+        """Add mutations for a filtered character to variants list."""
+        if filtered_char not in FILTER_MUTATIONS:
+            return
+
+        for mutation in FILTER_MUTATIONS[filtered_char]:
+            new_variant = payload.replace(filtered_char, mutation)
+            if new_variant not in variants:
+                variants.append(new_variant)
 
     # =========================================================================
     # ERROR INFO EXTRACTION
@@ -751,13 +765,20 @@ class SQLiAgent(BaseAgent):
             await asyncio.sleep(2)
 
             interactions = await self._interactsh.poll()
-            if interactions:
-                for interaction in interactions:
-                    if "sqli" in interaction.get("full-id", ""):
-                        return self._create_oob_finding(param, variant, db_type, interaction)
+            if not interactions:
+                return None
+
+            return self._check_oob_interactions(interactions, param, variant, db_type)
         except Exception as e:
             logger.debug(f"OOB test failed: {e}")
+            return None
 
+    def _check_oob_interactions(self, interactions: List[Dict], param: str,
+                                variant: str, db_type: str) -> Optional[SQLiFinding]:
+        """Check OOB interactions for SQLi evidence."""
+        for interaction in interactions:
+            if "sqli" in interaction.get("full-id", ""):
+                return self._create_oob_finding(param, variant, db_type, interaction)
         return None
 
     def _create_oob_finding(self, param: str, variant: str, db_type: str, interaction: Dict) -> SQLiFinding:
@@ -904,21 +925,32 @@ class SQLiAgent(BaseAgent):
 
     def _flatten_json(self, obj, prefix=""):
         """Flatten nested JSON to dot-notation keys."""
-        items = {}
         if isinstance(obj, dict):
-            for k, v in obj.items():
-                new_key = f"{prefix}.{k}" if prefix else k
-                if isinstance(v, (dict, list)):
-                    items.update(self._flatten_json(v, new_key))
-                else:
-                    items[new_key] = v
-        elif isinstance(obj, list):
-            for i, v in enumerate(obj):
-                new_key = f"{prefix}[{i}]"
-                if isinstance(v, (dict, list)):
-                    items.update(self._flatten_json(v, new_key))
-                else:
-                    items[new_key] = v
+            return self._flatten_dict(obj, prefix)
+        if isinstance(obj, list):
+            return self._flatten_list(obj, prefix)
+        return {}
+
+    def _flatten_dict(self, obj: Dict, prefix: str) -> Dict:
+        """Flatten dictionary to dot-notation keys."""
+        items = {}
+        for k, v in obj.items():
+            new_key = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, (dict, list)):
+                items.update(self._flatten_json(v, new_key))
+            else:
+                items[new_key] = v
+        return items
+
+    def _flatten_list(self, obj: List, prefix: str) -> Dict:
+        """Flatten list to bracket-notation keys."""
+        items = {}
+        for i, v in enumerate(obj):
+            new_key = f"{prefix}[{i}]"
+            if isinstance(v, (dict, list)):
+                items.update(self._flatten_json(v, new_key))
+            else:
+                items[new_key] = v
         return items
 
     def _set_nested_value(self, obj, key_path, value):
@@ -950,26 +982,35 @@ class SQLiAgent(BaseAgent):
         ]
 
         for payload in test_payloads:
-            try:
-                test_body = self._set_nested_value(json_body, key, payload)
+            finding = await self._test_single_json_payload(session, url, json_body, key, payload)
+            if finding:
+                return finding
 
-                headers = {"Content-Type": "application/json"}
-                headers.update(self.headers)
+        return None
 
-                async with session.post(
-                    url,
-                    json=test_body,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    content = await resp.text()
+    async def _test_single_json_payload(self, session: aiohttp.ClientSession, url: str,
+                                        json_body: Dict, key: str, payload: str) -> Optional[SQLiFinding]:
+        """Test a single JSON payload for SQL injection."""
+        try:
+            test_body = self._set_nested_value(json_body, key, payload)
 
-                    error_info = self._extract_info_from_error(content)
+            headers = {"Content-Type": "application/json"}
+            headers.update(self.headers)
 
-                    if error_info.get("db_type") or error_info.get("tables_leaked"):
-                        return self._create_json_finding(url, key, payload, json_body, test_body, error_info)
-            except Exception as e:
-                logger.debug(f"JSON injection test failed: {e}")
+            async with session.post(
+                url,
+                json=test_body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                content = await resp.text()
+
+                error_info = self._extract_info_from_error(content)
+
+                if error_info.get("db_type") or error_info.get("tables_leaked"):
+                    return self._create_json_finding(url, key, payload, json_body, test_body, error_info)
+        except Exception as e:
+            logger.debug(f"JSON injection test failed: {e}")
 
         return None
 

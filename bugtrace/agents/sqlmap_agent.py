@@ -375,28 +375,39 @@ class WAFBypassStrategy:
             waf_name, strategies = await strategy_router.get_strategies_for_target(url, max_strategies)
 
             # Convert encoding technique names to SQLMap tamper scripts
-            tampers = []
-            for strat in strategies:
-                if strat in cls.ENCODING_TO_TAMPER_MAP:
-                    tampers.append(cls.ENCODING_TO_TAMPER_MAP[strat])
-                else:
-                    # Some strategy names might already be tamper names
-                    tampers.append(strat)
+            tampers = cls._convert_strategies_to_tampers(strategies)
 
             # Add fallback tampers if we didn't get enough
             if len(tampers) < 3:
-                fallback = cls.WAF_TAMPER_FALLBACK.get(waf_name, cls.WAF_TAMPER_FALLBACK["generic"])
-                for t in fallback:
-                    if t not in tampers:
-                        tampers.append(t)
-                        if len(tampers) >= max_strategies:
-                            break
+                cls._add_fallback_tampers(tampers, waf_name, max_strategies)
 
             return waf_name, tampers[:max_strategies]
 
         except Exception as e:
             logger.warning(f"Strategy router failed: {e}, using fallback")
             return "unknown", cls.WAF_TAMPER_FALLBACK["generic"]
+
+    @classmethod
+    def _convert_strategies_to_tampers(cls, strategies: List[str]) -> List[str]:
+        """Convert encoding technique names to SQLMap tamper scripts."""
+        tampers = []
+        for strat in strategies:
+            if strat in cls.ENCODING_TO_TAMPER_MAP:
+                tampers.append(cls.ENCODING_TO_TAMPER_MAP[strat])
+            else:
+                # Some strategy names might already be tamper names
+                tampers.append(strat)
+        return tampers
+
+    @classmethod
+    def _add_fallback_tampers(cls, tampers: List[str], waf_name: str, max_strategies: int):
+        """Add fallback tampers to reach minimum count."""
+        fallback = cls.WAF_TAMPER_FALLBACK.get(waf_name, cls.WAF_TAMPER_FALLBACK["generic"])
+        for t in fallback:
+            if t not in tampers:
+                tampers.append(t)
+                if len(tampers) >= max_strategies:
+                    break
 
     @classmethod
     def record_bypass_result(cls, waf_name: str, strategy_name: str, success: bool):
@@ -1062,13 +1073,20 @@ class SQLMapAgent(BaseAgent):
             finding = await self._test_single_parameter(docker_url, param)
             if finding:
                 findings.append(finding)
-                if settings.EARLY_EXIT_ON_FINDING:
-                    remaining = len(params_to_test) - len(self._tested_params)
-                    if remaining > 0:
-                        dashboard.log(f"[{self.name}] ⚡ Early exit: Skipping {remaining} params", "INFO")
+                if self._should_early_exit(params_to_test):
                     break
 
         return findings
+
+    def _should_early_exit(self, params_to_test: List[str]) -> bool:
+        """Check if we should exit early after finding a vulnerability."""
+        if not settings.EARLY_EXIT_ON_FINDING:
+            return False
+
+        remaining = len(params_to_test) - len(self._tested_params)
+        if remaining > 0:
+            dashboard.log(f"[{self.name}] ⚡ Early exit: Skipping {remaining} params", "INFO")
+        return True
 
     async def _test_single_parameter(self, docker_url: str, param: str) -> Optional[Dict]:
         """Test a single parameter for SQLi."""
@@ -1486,17 +1504,22 @@ class SQLMapAgent(BaseAgent):
 
             async with aiohttp.ClientSession() as session:
                 req_headers = self._build_error_detection_headers()
-
-                for payload in payloads_to_test:
-                    finding = await self._test_payload_for_error(
-                        session, base_url, existing_params, param, payload, req_headers
-                    )
-                    if finding:
-                        return finding
+                return await self._test_error_payloads(session, base_url, existing_params, param,
+                                                       payloads_to_test, req_headers)
 
         except Exception as e:
             logger.debug(f"SQL error detection failed: {e}")
+            return None
 
+    async def _test_error_payloads(self, session, base_url: str, existing_params: Dict,
+                                   param: str, payloads: List[str], req_headers: Dict) -> Optional[Dict]:
+        """Test all error payloads for SQL errors."""
+        for payload in payloads:
+            finding = await self._test_payload_for_error(
+                session, base_url, existing_params, param, payload, req_headers
+            )
+            if finding:
+                return finding
         return None
 
     def _parse_target_url(self, parsed: urlparse) -> Tuple[str, Dict]:
