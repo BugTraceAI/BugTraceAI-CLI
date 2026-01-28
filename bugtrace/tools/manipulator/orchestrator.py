@@ -48,12 +48,72 @@ class ManipulatorOrchestrator:
         logger.info("Manipulator: Campaign finished without confirmation.")
         return False, None
 
+    def _extract_potential_payloads(self, request: MutableRequest) -> List[str]:
+        """Extract all potential payloads from request params, data, and JSON."""
+        potential_payloads = list(request.params.values())
+
+        if isinstance(request.data, dict):
+            potential_payloads.extend(request.data.values())
+        elif isinstance(request.data, str):
+            potential_payloads.append(request.data)
+
+        if request.json_payload:
+            potential_payloads.extend(self._get_json_values(request.json_payload))
+
+        return potential_payloads
+
+    def _get_json_values(self, data):
+        """Recursively extract all values from JSON structure."""
+        vals = []
+        if isinstance(data, dict):
+            for v in data.values():
+                vals.extend(self._get_json_values(v))
+        elif isinstance(data, list):
+            for item in data:
+                vals.extend(self._get_json_values(item))
+        else:
+            vals.append(data)
+        return vals
+
+    def _check_xss_indicators(self, body: str, potential_payloads: List[str]) -> bool:
+        """Check for XSS indicators in response body."""
+        if "BUGTRACE-XSS-CONFIRMED" in body:
+            return True
+
+        if any(indicator in body for indicator in [
+            "BUGTRACE-XSS",
+            "<script>document.write",
+            "document.body.innerHTML"
+        ]):
+            return True
+
+        for val in potential_payloads:
+            str_val = str(val)
+            if "alert(" in str_val and str_val in body:
+                return True
+
+        return False
+
+    def _check_lfi_indicators(self, body: str) -> bool:
+        """Check for LFI/RCE indicators in response body."""
+        return any(indicator in body for indicator in ["root:x:0:0", "/bin/bash", "[font]"])
+
+    def _check_sqli_indicators(self, body: str) -> bool:
+        """Check for SQL injection error indicators in response body."""
+        sql_errors = [
+            "SQL syntax", "mysql_fetch", "Warning: mysql",
+            "Unclosed quotation mark", "quoted string not properly terminated",
+            "PostgreSQL query failed", "ODBC SQL Server Driver",
+            "Microsoft OLE DB Provider for SQL Server", "java.sql.SQLException",
+            "SQLite/JDBCDriver", "System.Data.SqlClient.SqlException"
+        ]
+        return any(error.lower() in body.lower() for error in sql_errors)
+
     async def _try_mutation(self, request: MutableRequest) -> bool:
         """
         Requests execution of a single mutation and analyzes the result.
         Returns True if successful exploit detected.
         """
-        # Update Dashboard
         try:
             payload_sample = str(request.params)[:80]
             dashboard.set_current_payload(payload=payload_sample, vector="HTTP Mutation", status="Testing")
@@ -61,76 +121,17 @@ class ManipulatorOrchestrator:
             logger.debug(f"Dashboard update failed: {e}")
 
         status_code, body, duration = await self.controller.execute(request)
-        
-        # 1. Check for WAF 
-        if status_code == 403 or status_code == 406:
+
+        if status_code in (403, 406):
             self.encoding_agent.record_failure(request)
             return False
-            
-        # 2. Check for XSS reflection
-        success_detected = False
-        # Collect all possible injected values from params, data, and json_payload
-        potential_payloads = list(request.params.values())
-        if isinstance(request.data, dict):
-            potential_payloads.extend(request.data.values())
-        elif isinstance(request.data, str):
-            potential_payloads.append(request.data)
-        
-        if request.json_payload:
-            # Simple recursive search for values in JSON
-            def get_json_values(data):
-                vals = []
-                if isinstance(data, dict):
-                    for v in data.values():
-                        vals.extend(get_json_values(v))
-                elif isinstance(data, list):
-                    for item in data:
-                        vals.extend(get_json_values(item))
-                else:
-                    vals.append(data)
-                return vals
-            potential_payloads.extend(get_json_values(request.json_payload))
 
-        for val in potential_payloads:
-            str_val = str(val)
-            
-            # Primary: Look for BUGTRACE marker (reliable vision validation)
-            if "BUGTRACE-XSS-CONFIRMED" in body:
-                success_detected = True
-                break
-            
-            # Secondary: XSS payload reflected (various detection methods)
-            if any(indicator in body for indicator in [
-                "BUGTRACE-XSS",           # Our marker
-                "<script>document.write",  # Our visible injection
-                "document.body.innerHTML", # DOM manipulation
-            ]):
-                success_detected = True
-                break
-            
-            # Tertiary: Traditional alert detection (backup)
-            if "alert(" in str_val and str_val in body:
-                success_detected = True
-                break
-            
-        # 3. Check for LFI/RCE indicator
-        if not success_detected:
-            if "root:x:0:0" in body or "/bin/bash" in body or "[font]" in body:
-                success_detected = True
-            
-        # 4. Check for SQLi Errors (expanded list)
-        if not success_detected:
-            sql_errors = [
-                "SQL syntax", "mysql_fetch", "Warning: mysql", 
-                "Unclosed quotation mark", "quoted string not properly terminated",
-                "PostgreSQL query failed", "ODBC SQL Server Driver",
-                "Microsoft OLE DB Provider for SQL Server", "java.sql.SQLException",
-                "SQLite/JDBCDriver", "System.Data.SqlClient.SqlException"
-            ]
-            for error in sql_errors:
-                if error.lower() in body.lower():
-                    success_detected = True
-                    break
+        potential_payloads = self._extract_potential_payloads(request)
+        success_detected = (
+            self._check_xss_indicators(body, potential_payloads) or
+            self._check_lfi_indicators(body) or
+            self._check_sqli_indicators(body)
+        )
 
         if success_detected:
             self.encoding_agent.record_success(request)
