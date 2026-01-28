@@ -220,46 +220,57 @@ class ReportingAgent(BaseAgent):
 
     def _get_findings_from_db(self) -> List[Dict]:
         """Pull findings from database for this scan_id."""
-        import json
         db_findings = self.db.get_findings_for_scan(self.scan_id)
 
         findings = []
         for f in db_findings:
-            finding = {
-                "id": f.id,
-                "type": str(f.type.value if hasattr(f.type, 'value') else f.type),
-                "severity": f.severity,
-                "url": f.attack_url,
-                "parameter": f.vuln_parameter,
-                "payload": f.payload_used,
-                "description": f.details,
-                "status": f.status,
-                "validator_notes": f.validator_notes,
-                "screenshot_path": f.proof_screenshot_path,
-                "reproduction": getattr(f, 'reproduction_command', None),
-                "created_at": None
-            }
-            
-            # Parse SQLMap metadata from details if it's JSON
-            if finding["type"] in ["SQLI", "SQLi"] and f.details:
-                try:
-                    details_json = json.loads(f.details)
-                    # Extract SQLMap-specific fields
-                    finding["db_type"] = details_json.get("db_type")
-                    finding["tamper_used"] = details_json.get("tamper_used")
-                    finding["confidence"] = details_json.get("confidence")
-                    finding["evidence"] = details_json.get("evidence")
-                    finding["description"] = details_json.get("description", f.details)
-                    # Extract reproduction command if present in details
-                    if details_json.get("reproduction_command"):
-                        finding["reproduction"] = details_json.get("reproduction_command")
-                except (json.JSONDecodeError, TypeError):
-                    # Not JSON, use as-is
-                    pass
-            
+            finding = self._db_build_finding_dict(f)
+            self._db_enrich_sqli_metadata(finding, f)
             findings.append(finding)
 
         return findings
+
+    def _db_build_finding_dict(self, f) -> Dict:
+        """Build finding dictionary from database record."""
+        return {
+            "id": f.id,
+            "type": str(f.type.value if hasattr(f.type, 'value') else f.type),
+            "severity": f.severity,
+            "url": f.attack_url,
+            "parameter": f.vuln_parameter,
+            "payload": f.payload_used,
+            "description": f.details,
+            "status": f.status,
+            "validator_notes": f.validator_notes,
+            "screenshot_path": f.proof_screenshot_path,
+            "reproduction": getattr(f, 'reproduction_command', None),
+            "created_at": None
+        }
+
+    def _db_enrich_sqli_metadata(self, finding: Dict, f) -> None:
+        """Parse and enrich SQLMap metadata from details JSON."""
+        import json
+
+        # Only process SQLi findings with details
+        if finding["type"] not in ["SQLI", "SQLi"]:
+            return
+        if not f.details:
+            return
+
+        try:
+            details_json = json.loads(f.details)
+            # Extract SQLMap-specific fields
+            finding["db_type"] = details_json.get("db_type")
+            finding["tamper_used"] = details_json.get("tamper_used")
+            finding["confidence"] = details_json.get("confidence")
+            finding["evidence"] = details_json.get("evidence")
+            finding["description"] = details_json.get("description", f.details)
+            # Extract reproduction command if present in details
+            if details_json.get("reproduction_command"):
+                finding["reproduction"] = details_json.get("reproduction_command")
+        except (json.JSONDecodeError, TypeError):
+            # Not JSON, use as-is
+            pass
 
     def _load_nuclei_findings(self) -> tuple[List[Dict], Dict]:
         """
@@ -878,12 +889,20 @@ class ReportingAgent(BaseAgent):
     def _copy_screenshots(self, findings: List[Dict], captures_dir: Path):
         """Copy all screenshots to the captures folder."""
         for f in findings:
-            src = f.get("screenshot_path")
-            if src and Path(src).exists():
-                try:
-                    shutil.copy(src, captures_dir / Path(src).name)
-                except Exception as e:
-                    logger.debug(f"Could not copy screenshot {src}: {e}")
+            self._copy_single_screenshot(f, captures_dir)
+
+    def _copy_single_screenshot(self, finding: Dict, captures_dir: Path):
+        """Copy a single screenshot to captures directory."""
+        src = finding.get("screenshot_path")
+        if not src:
+            return
+        if not Path(src).exists():
+            return
+
+        try:
+            shutil.copy(src, captures_dir / Path(src).name)
+        except Exception as e:
+            logger.debug(f"Could not copy screenshot {src}: {e}")
 
     def _generate_curl(self, finding: Dict) -> str:
         """
@@ -902,18 +921,23 @@ class ReportingAgent(BaseAgent):
 
         if vuln_type in ["SQLI", "SQL"]:
             return self._curl_build_sqli(url, param)
-        elif vuln_type in ["CSTI", "SSTI"]:
+
+        if vuln_type in ["CSTI", "SSTI"]:
             return self._curl_build_csti(url, param, payload)
-        elif vuln_type == "XSS":
+
+        if vuln_type == "XSS":
             return self._curl_build_xss(url, param, payload)
-        elif vuln_type == "SSRF":
+
+        if vuln_type == "SSRF":
             return f"# SSRF: Use Burp Collaborator or webhook.site to test OOB callbacks\ncurl '{url}'"
-        elif vuln_type == "LFI":
+
+        if vuln_type == "LFI":
             return self._curl_build_lfi(url, param)
-        elif vuln_type == "IDOR":
+
+        if vuln_type == "IDOR":
             return f"# IDOR: Test with different user IDs/values\ncurl '{url}'"
-        else:
-            return self._curl_build_fallback(url, param, payload)
+
+        return self._curl_build_fallback(url, param, payload)
 
     def _curl_build_sqli(self, url: str, param: str) -> str:
         """Build SQLi reproduction command."""
@@ -1024,18 +1048,23 @@ class ReportingAgent(BaseAgent):
 
         if vuln_type == "XXE":
             return self._build_xxe_steps(finding)
-        elif vuln_type in ["SQLI", "SQL_INJECTION"]:
+
+        if vuln_type in ["SQLI", "SQL_INJECTION"]:
             return self._build_sqli_steps(finding)
-        elif vuln_type in ["XSS", "STORED_XSS", "REFLECTED_XSS"]:
+
+        if vuln_type in ["XSS", "STORED_XSS", "REFLECTED_XSS"]:
             return self._build_xss_steps(finding)
-        elif vuln_type == "SSRF":
+
+        if vuln_type == "SSRF":
             return self._build_ssrf_steps(finding)
-        elif vuln_type in ["CSRF", "SECURITY_MISCONFIGURATION"]:
+
+        if vuln_type in ["CSRF", "SECURITY_MISCONFIGURATION"]:
             return self._build_csrf_steps(finding)
-        elif vuln_type == "OPEN_REDIRECT":
+
+        if vuln_type == "OPEN_REDIRECT":
             return self._build_open_redirect_steps(finding)
-        else:
-            return self._build_generic_steps(finding)
+
+        return self._build_generic_steps(finding)
 
     def _build_xxe_steps(self, finding: Dict) -> List[str]:
         """Build reproduction steps for XXE vulnerabilities."""
