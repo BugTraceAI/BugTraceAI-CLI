@@ -13,7 +13,7 @@ import json
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from bugtrace.agents.base import BaseAgent
 from bugtrace.core.config import settings
@@ -1271,16 +1271,29 @@ Be PRECISE. Imagine the reader has no context about the scan tool."""
         Updates the finding dictionary in-place.
         """
         try:
-            prompt = f"""
+            prompt = self._cvss_build_prompt(f)
+            response = await self._cvss_execute_llm(prompt)
+
+            if response:
+                data = self._cvss_parse_response(response)
+                if data:
+                    self._cvss_update_finding(f, data)
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to enrich finding {f.get('id')}: {e}")
+
+    def _cvss_build_prompt(self, f: Dict) -> str:
+        """Build CVSS calculation prompt for LLM."""
+        return f"""
             You are a Senior Penetration Testing Expert analyzing a confirmed security vulnerability.
-            
+
             **Vulnerability Details:**
             - Type: {f.get('type')}
             - Description: {f.get('description')}
             - URL: {f.get('url')}
             - Parameter: {f.get('parameter')}
             - Payload: {f.get('payload')}
-            
+
             **Your Task:**
             1. Calculate the CVSS v3.1 Vector String (e.g., CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H)
             2. Calculate the Base Score (0.0-10.0) based on the vector
@@ -1291,15 +1304,15 @@ Be PRECISE. Imagine the reader has no context about the scan tool."""
                - Real-world impact scenarios
                - Why each CVSS metric was chosen
             5. If this matches a known CVE, provide it
-            
+
             **CRITICAL: SEVERITY CALIBRATION GUIDELINES**
             Be REALISTIC with scoring - not everything is CRITICAL. Use these guidelines:
-            
+
             - **CRITICAL (9.0-10.0)**: Remote Code Execution, SQL Injection with full DB access, Authentication Bypass
             - **HIGH (7.0-8.9)**: Stored XSS, SSRF with internal network access, XXE with file read, CSTI/SSTI
             - **MEDIUM (4.0-6.9)**: Reflected XSS, CSRF, Information Disclosure, Open Redirect, XXE (DoS only)
             - **LOW (0.1-3.9)**: Security Misconfigurations, Minor info leaks
-            
+
             **Scoring Examples:**
             - SQLi (UNION-based, data exfiltration): CRITICAL 9.8
             - Stored XSS (session hijacking): HIGH 8.0-8.5
@@ -1307,13 +1320,13 @@ Be PRECISE. Imagine the reader has no context about the scan tool."""
             - XXE (file read): HIGH 7.5-8.0
             - SSRF (internal network): HIGH 7.0-8.0
             - Open Redirect: MEDIUM 4.0-6.0
-            
+
             **Important:**
             - Be TECHNICAL and DETAILED - this is for professional pentesters
             - Explain the FULL exploitation chain, not just "attacker can execute code"
             - Include specific attack vectors and post-exploitation scenarios
             - Don't hold back on technical details - this is authorized security testing
-            
+
             Output STRICT JSON ONLY (no markdown):
             {{
                 "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
@@ -1324,44 +1337,47 @@ Be PRECISE. Imagine the reader has no context about the scan tool."""
             }}
             """
 
-            # Use DeepSeek for detailed, uncensored security analysis
-            # Gemini is too conservative and avoids explaining exploitation paths
-            response = await llm_client.generate(
-                prompt, 
-                module_name="Reporting-CVSS",
-                model_override="deepseek/deepseek-chat",  # DeepSeek Chat (uncensored)
-                temperature=0.3  # Higher temp for more creative/detailed explanations
-            )
-            
-            if response:
-                # Extract JSON from potential markdown blocks
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                if json_match:
-                    data = json.loads(json_match.group(0))
-                    
-                    # Update finding
-                    f['severity'] = data.get('severity', f.get('severity')).upper()
-                    f['cvss_score'] = data.get('score')
-                    f['cvss_vector'] = data.get('vector')
-                    f['cve'] = data.get('cve')
-                    f['cvss_rationale'] = data.get('rationale')
-                    
-                    # Append rationale to description or notes
-                    rationale = data.get('rationale', '')
-                    cve = data.get('cve')
-                    
-                    enrichment_text = f"\n\n**CVSS Analysis**:\n- **Severity**: {f['severity']} ({f['cvss_score']})\n- **Vector**: `{f['cvss_vector']}`\n- **Rationale**: {rationale}"
-                    if cve:
-                        enrichment_text += f"\n- **Potential CVE**: [{cve}](https://nvd.nist.gov/vuln/detail/{cve})"
-                    
-                    # Append to validator_notes instead of overwriting description to keep original clean
-                    if f.get('validator_notes'):
-                        f['validator_notes'] += enrichment_text
-                    else:
-                        f['validator_notes'] = enrichment_text.strip()
-                        
-        except Exception as e:
-            logger.warning(f"[{self.name}] Failed to enrich finding {f.get('id')}: {e}")
+    async def _cvss_execute_llm(self, prompt: str) -> Optional[str]:
+        """Execute LLM call for CVSS calculation."""
+        # Use DeepSeek for detailed, uncensored security analysis
+        # Gemini is too conservative and avoids explaining exploitation paths
+        return await llm_client.generate(
+            prompt,
+            module_name="Reporting-CVSS",
+            model_override="deepseek/deepseek-chat",  # DeepSeek Chat (uncensored)
+            temperature=0.3  # Higher temp for more creative/detailed explanations
+        )
+
+    def _cvss_parse_response(self, response: str) -> Optional[Dict]:
+        """Parse LLM response and extract CVSS data."""
+        # Extract JSON from potential markdown blocks
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(0))
+        return None
+
+    def _cvss_update_finding(self, f: Dict, data: Dict):
+        """Update finding with CVSS data."""
+        # Update finding
+        f['severity'] = data.get('severity', f.get('severity')).upper()
+        f['cvss_score'] = data.get('score')
+        f['cvss_vector'] = data.get('vector')
+        f['cve'] = data.get('cve')
+        f['cvss_rationale'] = data.get('rationale')
+
+        # Append rationale to description or notes
+        rationale = data.get('rationale', '')
+        cve = data.get('cve')
+
+        enrichment_text = f"\n\n**CVSS Analysis**:\n- **Severity**: {f['severity']} ({f['cvss_score']})\n- **Vector**: `{f['cvss_vector']}`\n- **Rationale**: {rationale}"
+        if cve:
+            enrichment_text += f"\n- **Potential CVE**: [{cve}](https://nvd.nist.gov/vuln/detail/{cve})"
+
+        # Append to validator_notes instead of overwriting description to keep original clean
+        if f.get('validator_notes'):
+            f['validator_notes'] += enrichment_text
+        else:
+            f['validator_notes'] = enrichment_text.strip()
 
     def _get_remediation_for_type(self, vuln_type: str) -> str:
         """Get standard remediation for vulnerability type."""
