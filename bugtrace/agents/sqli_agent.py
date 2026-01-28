@@ -1541,7 +1541,7 @@ Write the exploitation explanation section for the report."""
                 }
 
             except Exception as e:
-                logger.error(f"[{self.name}] Error: {e}")
+                logger.error(f"[{self.name}] SQLi scan failed: {e}", exc_info=True)
                 return {"vulnerable": False, "findings": [], "error": str(e)}
 
     # =========================================================================

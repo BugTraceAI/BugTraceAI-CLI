@@ -221,7 +221,7 @@ class DASTySASTAgent(BaseAgent):
                 }
             return {"vulnerabilities": []}
         except Exception as e:
-            logger.error(f"Header injection check failed: {e}")
+            logger.error(f"Header injection check failed: {e}", exc_info=True)
             return {"vulnerabilities": []}
 
     async def _analyze_with_approach(self, context: Dict, approach: str) -> Dict:
@@ -314,7 +314,7 @@ Return ONLY valid XML tags. Do not add markdown code blocks.
             return {"vulnerabilities": vulnerabilities}
             
         except Exception as e:
-            logger.error(f"Error in _analyze_with_approach for {approach}: {e}")
+            logger.error(f"Failed to analyze with approach {approach}: {e}", exc_info=True)
             return {"vulnerabilities": []}
 
     def _get_system_prompt(self, approach: str) -> str:
@@ -477,7 +477,7 @@ Return XML:
             return approved
             
         except Exception as e:
-            logger.error(f"[{self.name}] Skeptical review failed: {e}")
+            logger.error(f"[{self.name}] Skeptical review failed: {e}", exc_info=True)
             return vulnerabilities
 
     def _save_markdown_report(self, path: Path, vulnerabilities: List[Dict]):

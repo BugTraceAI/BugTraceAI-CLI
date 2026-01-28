@@ -230,7 +230,7 @@ class URLMasterAgent(BaseAgent):
                     logger.warning(f"[{self.name}] Unknown action type: {action['type']}")
                 
             except Exception as e:
-                logger.error(f"[{self.name}] Iteration {self.iteration} error: {e}")
+                logger.error(f"[{self.name}] Iteration {self.iteration} error: {e}", exc_info=True)
                 self.thread.add_message("system", f"Error occurred: {str(e)}")
             
             await asyncio.sleep(0.5)  # Prevent tight loop
@@ -539,7 +539,7 @@ Response format:
             return result
             
         except Exception as e:
-            logger.error(f"[{self.name}] Skill {skill_name} failed: {e}")
+            logger.error(f"[{self.name}] Skill {skill_name} failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
     
     def _generate_summary(self) -> Dict:
@@ -642,7 +642,7 @@ Response format:
                 summary['url_report_path'] = str(report_path)
                 
             except Exception as e:
-                logger.error(f"[{self.name}] Failed to create URL report: {e}")
+                logger.error(f"[{self.name}] Failed to create URL report: {e}", exc_info=True)
         
         # =====================================================================
         # DATABASE PERSISTENCE: Save individual URL scan to database
@@ -691,7 +691,7 @@ Response format:
 
                 
             except Exception as e:
-                logger.error(f"[{self.name}] Failed to save to database: {e}")
+                logger.error(f"[{self.name}] Failed to save to database: {e}", exc_info=True)
                 import traceback
                 logger.debug(traceback.format_exc())
         

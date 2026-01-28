@@ -614,7 +614,7 @@ class JWTAgent(BaseAgent):
                         await self._attack_key_confusion(token, url, location)
             
         except Exception as e:
-            logger.error(f"[{self.name}] Error analyzing token: {e}")
+            logger.error(f"[{self.name}] Token analysis failed: {e}", exc_info=True)
 
 async def run_jwt_analysis(token: str, url: str) -> Dict:
     """Convenience function for standalone analysis."""

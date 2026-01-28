@@ -499,7 +499,7 @@ class EnhancedSQLMapRunner:
             logger.error("Docker/SQLMap not found in PATH")
             return False
         except Exception as e:
-            logger.error(f"SQLMap verification error: {e}")
+            logger.error(f"SQLMap verification error: {e}", exc_info=True)
             return False
 
     @classmethod
@@ -766,7 +766,7 @@ class EnhancedSQLMapRunner:
             logger.warning(f"SQLMap execution timed out ({timeout_seconds}s)")
             return ""
         except ConnectionError as e:
-            logger.error(f"SQLMap connection error: {e}")
+            logger.warning(f"SQLMap connection error: {e}", exc_info=True)
             return ""
         except Exception as e:
             logger.error(f"SQLMap execution error: {e}", exc_info=True)

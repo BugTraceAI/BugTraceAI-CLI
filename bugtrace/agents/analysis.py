@@ -361,7 +361,7 @@ class AnalysisAgent(BaseAgent):
             return analysis
             
         except Exception as e:
-            logger.error(f"[{self.name}] Analysis failed with {approach}: {e}")
+            logger.error(f"[{self.name}] Analysis failed with {approach}: {e}", exc_info=True)
             logger.debug(f"[{self.name}] Failed response: {response if 'response' in locals() else 'None'}")
             return {
                 "likely_vulnerabilities": [],
@@ -652,5 +652,5 @@ Return valid XML-like tags. Do NOT use markdown code blocks.
             logger.info(f"[{self.name}] 💾 Report saved to {report_dir}")
             
         except Exception as e:
-            logger.error(f"[{self.name}] Failed to save report: {e}")
+            logger.error(f"[{self.name}] Failed to save report: {e}", exc_info=True)
 

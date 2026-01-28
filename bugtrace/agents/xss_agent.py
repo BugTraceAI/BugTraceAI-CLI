@@ -835,7 +835,7 @@ class XSSAgent(BaseAgent):
                     dashboard.log(f"[{self.name}] 🎯 DOM XSS CONFIRMED ({len(dom_findings)} hits)!", "SUCCESS")
                     logger.info(f"[{self.name}] DOM XSS Headless Scan found {len(dom_findings)} vulnerabilities")
             except Exception as e:
-                logger.error(f"[{self.name}] DOM XSS Headless Scan failed: {e}")
+                logger.error(f"[{self.name}] DOM XSS Headless Scan failed: {e}", exc_info=True)
                 dashboard.log(f"[{self.name}] ⚠️ DOM XSS Scan skipped: Headless error", "WARN")
 
             # Phase 4: Additional Attack Vectors (POST, Headers)
@@ -1936,7 +1936,7 @@ Response format (XML):
             return payloads
 
         except Exception as e:
-            logger.error(f"[{self.name}] LLM Smart Analysis failed: {e}")
+            logger.error(f"[{self.name}] LLM Smart Analysis failed: {e}", exc_info=True)
             return []
 
     def _extract_dom_around_reflection(self, html: str, probe: str, context_chars: int = 500) -> str:
@@ -2115,7 +2115,7 @@ Generate the OPTIMAL XSS payload based on the metadata and HTML.
             return None
             
         except Exception as e:
-            logger.error(f"LLM analysis failed: {e}")
+            logger.error(f"LLM analysis failed: {e}", exc_info=True)
             return None
     
     async def _llm_generate_bypass(self, previous_payload: str, response_snippet: str, interactsh_url: str) -> Optional[Dict]:
@@ -2156,7 +2156,7 @@ Response Format (XML-Like):
             return None
             
         except Exception as e:
-            logger.error(f"LLM bypass generation failed: {e}")
+            logger.error(f"LLM bypass generation failed: {e}", exc_info=True)
             return None
     
     async def _send_payload(self, param: str, payload: str) -> str:
@@ -2402,7 +2402,7 @@ Return JSON:
                             "WARNING"
                         )
                 except Exception as e:
-                    logger.error(f"[{self.name}] Vision AI validation failed: {e}")
+                    logger.error(f"[{self.name}] Vision AI validation failed: {e}", exc_info=True)
                     evidence["vision_error"] = str(e)
             
             dashboard.log(f"[{self.name}] 👁️ Confirmed via Playwright", "SUCCESS")

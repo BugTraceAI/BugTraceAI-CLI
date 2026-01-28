@@ -316,7 +316,7 @@ Respond in JSON format:
                 self.think(f"❌ Could not confirm via vision: {finding.get('url')}")
                 
         except Exception as e:
-            logger.error(f"Vision validation failed: {e}")
+            logger.error(f"Vision validation failed: {e}", exc_info=True)
             finding["validated"] = False
             finding["reasoning"] = f"Vision validation error: {str(e)}"
             
@@ -605,7 +605,7 @@ Respond in JSON format:
                         
             except Exception as e:
                 logs.append(f"Capture error: {e}")
-                logger.error(f"Generic capture failed: {e}")
+                logger.error(f"Generic capture failed: {e}", exc_info=True)
                 
         return screenshot_path, logs, False
     
@@ -757,7 +757,7 @@ Respond in JSON format:
                 )
                 return await self.validate_finding_agentically(finding)
             except Exception as e:
-                logger.error(f"Validation failed for {finding.get('url', 'unknown')}: {e}")
+                logger.error(f"Validation failed for {finding.get('url', 'unknown')}: {e}", exc_info=True)
                 finding["validated"] = False
                 finding["reasoning"] = f"Validation error: {str(e)}"
                 return finding
@@ -801,7 +801,7 @@ Respond in JSON format:
                     validated_results[idx] = RuntimeError("Validation Timeout")
 
         except Exception as e:
-            logger.error(f"Batch validation failed: {e}")
+            logger.error(f"Batch validation failed: {e}", exc_info=True)
             # Fill remaining with errors
             for i, r in enumerate(validated_results):
                 if r is None:

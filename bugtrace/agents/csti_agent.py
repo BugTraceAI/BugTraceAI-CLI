@@ -688,7 +688,7 @@ Response format (XML):
 
             return self._parse_llm_payloads(response, interactsh_url)
         except Exception as e:
-            logger.error(f"LLM Smart Analysis failed: {e}")
+            logger.error(f"LLM Smart Analysis failed: {e}", exc_info=True)
             return []
 
     def _parse_llm_payloads(self, content: str, interactsh_url: str) -> List[Dict]:
@@ -828,7 +828,7 @@ Response format (XML):
                 await self.interactsh.deregister()
 
         except Exception as e:
-            logger.error(f"CSTIAgent error: {e}")
+            logger.error(f"CSTIAgent error: {e}", exc_info=True)
 
         dashboard.log(f"[{self.name}] ✅ Complete. Findings: {len(all_findings)}", "SUCCESS")
         return {"findings": all_findings, "status": JobStatus.COMPLETED}
@@ -936,7 +936,7 @@ Response format (XML):
                 if content:
                     return self._create_finding(param, ap, "ai_bypass", verified_url=verified_url)
         except Exception as e:
-            logger.error(f"CSTI LLM check failed: {e}")
+            logger.error(f"CSTI LLM check failed: {e}", exc_info=True)
             
         return None
 
