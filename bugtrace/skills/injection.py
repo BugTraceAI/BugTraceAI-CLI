@@ -28,20 +28,42 @@ class XSSSkill(BaseSkill):
         from bugtrace.tools.manipulator.models import MutableRequest, MutationStrategy
         from bugtrace.tools.visual.browser import browser_manager
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        
+
         findings = []
+        test_cases = self._build_test_cases(url)
+        logger.info(f"[{self.master.name}] Testing {len(test_cases)} XSS possible injection points")
+
+        manipulator = ManipulatorOrchestrator(rate_limit=0.3)
+
+        try:
+            for case in test_cases:
+                finding = await self._test_single_param(case, url, manipulator)
+                if finding:
+                    findings.append(finding)
+            await manipulator.shutdown()
+        except Exception as e:
+            logger.error(f"XSS skill failed: {e}")
+
+        return {
+            "success": True,
+            "payloads_tested": len(test_cases),
+            "findings": findings,
+            "xss_found": len(findings) > 0
+        }
+
+    def _build_test_cases(self, url: str) -> list:
+        """Build list of test cases from URL params and form inputs."""
+        from urllib.parse import urlparse, parse_qs
+
         parsed = urlparse(url)
         url_params = parse_qs(parsed.query)
-        
-        # Smart adaptation: Use inputs found by recon if no URL params
         recon_inputs = self.master.thread.metadata.get("inputs_found", [])
         test_cases = []
-        
+
         if url_params:
             for p, v in url_params.items():
                 test_cases.append({"param": p, "value": v[0], "source": "url"})
-        
-        # Add form inputs (names only for now)
+
         for inp in recon_inputs:
             details = inp.get("details", {})
             if details.get("name") and details.get("type") not in ["submit", "button", "hidden"]:
@@ -49,156 +71,175 @@ class XSSSkill(BaseSkill):
                     test_cases.append({"param": details["name"], "value": details.get("value", "test"), "source": "form"})
 
         if not test_cases:
-            # Final fallback
             test_cases = [{"param": "search", "value": "test", "source": "url"}]
 
-        logger.info(f"[{self.master.name}] Testing {len(test_cases)} XSS possible injection points")
-        
-        # Initialize ManipulatorOrchestrator
-        manipulator = ManipulatorOrchestrator(rate_limit=0.3)
-        
-        try:
-            for case in test_cases:
-                param_name = case["param"]
-                original_value = case["value"]
-                
-                # Build request for Manipulator
-                request = MutableRequest(
-                    method="GET" if case["source"] == "url" else "POST",
-                    url=url,
-                    params={param_name: original_value} if case["source"] == "url" else {},
-                    data={param_name: original_value} if case["source"] == "form" else {}
-                )
-                
-                # Use Manipulator for XSS testing (includes WAF bypass)
-                success, successful_mutation = await manipulator.process_finding(
-                    request,
-                    strategies=[
-                        MutationStrategy.PAYLOAD_INJECTION,
-                        MutationStrategy.BYPASS_WAF
-                    ]
-                )
-                
-                if success and successful_mutation:
-                    working_payload = successful_mutation.params.get(param_name, "<script>alert(1)</script>")
-                    self.master.thread.record_payload_attempt("XSS", f"via Manipulator on {param_name}", success=True)
-                    
-                    # Browser verification for screenshot proof using the WORKING payload
-                    try:
-                        async with browser_manager.get_page() as page:
-                            alert_detected = False
-                            async def handle_dialog(dialog):
-                                nonlocal alert_detected
-                                alert_detected = True
-                                await dialog.dismiss()
-                            
-                            page.on("dialog", handle_dialog)
-                            
-                            # Build exact URL that worked
-                            parsed_url = urlparse(url)
-                            
-                            if successful_mutation.method == "POST":
-                                logger.info(f"[{self.master.name}] Verifying working POST payload via auto-submit form")
-                                # Create a simple auto-submitting form for POST XSS verification
-                                form_html = f"""
-                                <html>
-                                <body onload="document.forms[0].submit()">
-                                    <form method="POST" action="{url}">
-                                """
-                                if isinstance(successful_mutation.data, dict):
-                                    for k, v in successful_mutation.data.items():
-                                        form_html += f'<input type="hidden" name="{k}" value=\'{v}\'>\n'
-                                form_html += """
-                                    </form>
-                                </body>
-                                </html>
-                                """
-                                await page.set_content(form_html)
-                            else:
-                                test_params = successful_mutation.params
-                                test_url = urlunparse((parsed_url.scheme, parsed_url.netloc, parsed_url.path, parsed_url.params, urlencode(test_params), parsed_url.fragment))
-                                logger.info(f"[{self.master.name}] Verifying working GET payload: {test_url}")
-                                await page.goto(test_url, wait_until="networkidle", timeout=10000)
-                            
-                            await asyncio.sleep(2)  # Wait for alert to fire
-                            
-                            from bugtrace.core.config import settings
-                            screenshot_path = str(settings.LOG_DIR / f"{self.master.thread.thread_id}_xss_{param_name}.png")
-                            await page.screenshot(path=screenshot_path)
-                            
-                            # VISION VALIDATION (The Missing Piece)
-                            from bugtrace.core.llm_client import llm_client
-                            
-                            vision_confirmed = False
-                            if not alert_detected:
-                                logger.info(f"[{self.master.name}] Alert NOT detected via event, trying Vision Model validation...")
-                                
-                                system_prompt = conductor.get_full_system_prompt("xss_skill")
-                                if system_prompt:
-                                    xss_prompt = system_prompt.split("## XSS Vision Validation Prompt")[-1].strip()
-                                else:
-                                    xss_prompt = (
-                                        "This is a browser screenshot. Look carefully at the page content. "
-                                        "Is there ANY of the following visible on this page? "
-                                        "1) Text containing 'BUGTRACE-XSS-CONFIRMED' or 'BUGTRACE-XSS' "
-                                        "2) A JavaScript alert popup/dialog box "
-                                        "3) Red colored text showing a domain name (like 'example.com') "
-                                        "4) Any text that looks like it was injected (unusual formatting, yellow background). "
-                                        "Answer ONLY: YES or NO"
-                                    )
-                                
-                                try:
-                                    vision_result = await llm_client.generate_with_image(
-                                        prompt=xss_prompt,
-                                        image_path=screenshot_path,
-                                        module_name="XSS-Vision-Validator"
-                                    )
-                                    vision_confirmed = vision_result.strip().upper().startswith("YES")
-                                    logger.info(f"[{self.master.name}] Vision XSS Validation: {vision_confirmed}")
-                                except Exception as ve:
-                                    logger.error(f"[{self.master.name}] Vision validation failed: {ve}")
-                            
-                            findings.append({
-                                "type": "XSS",
-                                "url": url,
-                                "parameter": param_name,
-                                "param": param_name,
-                                "payload": working_payload,
-                                "screenshot": screenshot_path,
-                                "validated": True,
-                                "alert_triggered": alert_detected,
-                                "vision_confirmed": vision_confirmed,
-                                "severity": "HIGH" if (alert_detected or vision_confirmed) else "MEDIUM",
-                                "description": f"Cross-Site Scripting (XSS) confirmed on parameter '{param_name}'. Alert triggered: {alert_detected}. Vision AI confirmed: {vision_confirmed}.",
-                                "reproduction": f"# Open in browser with payload:\n{test_url}"
-                            })
+        return test_cases
 
-                            logger.info(f"[{self.master.name}] ✅ XSS confirmed on param: {param_name}")
-                    except Exception as e:
-                        logger.debug(f"Browser verification failed: {e}")
-                        findings.append({
-                            "type": "XSS",
-                            "url": url,
-                            "parameter": param_name,
-                            "param": param_name,
-                            "payload": working_payload,
-                            "validated": True,
-                            "severity": "MEDIUM",
-                            "note": f"Manipulator confirmed, browser verification error: {e}",
-                            "description": f"Cross-Site Scripting (XSS) detected on parameter '{param_name}'. Payload reflection confirmed but browser verification failed.",
-                            "reproduction": f"# Inject payload into parameter '{param_name}':\n{working_payload}"
-                        })
-            
-            await manipulator.shutdown()
-            
+    async def _test_single_param(self, case: dict, url: str, manipulator) -> Dict[str, Any]:
+        """Test a single parameter for XSS."""
+        from bugtrace.tools.manipulator.models import MutableRequest, MutationStrategy
+
+        param_name = case["param"]
+        original_value = case["value"]
+
+        request = MutableRequest(
+            method="GET" if case["source"] == "url" else "POST",
+            url=url,
+            params={param_name: original_value} if case["source"] == "url" else {},
+            data={param_name: original_value} if case["source"] == "form" else {}
+        )
+
+        success, successful_mutation = await manipulator.process_finding(
+            request,
+            strategies=[MutationStrategy.PAYLOAD_INJECTION, MutationStrategy.BYPASS_WAF]
+        )
+
+        if not success or not successful_mutation:
+            return None
+
+        working_payload = successful_mutation.params.get(param_name, "<script>alert(1)</script>")
+        self.master.thread.record_payload_attempt("XSS", f"via Manipulator on {param_name}", success=True)
+
+        return await self._verify_xss_with_browser(url, param_name, working_payload, successful_mutation)
+
+    async def _verify_xss_with_browser(self, url: str, param_name: str, working_payload: str, mutation) -> Dict[str, Any]:
+        """Verify XSS with browser and optionally vision validation."""
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, urlencode, urlunparse
+
+        try:
+            async with browser_manager.get_page() as page:
+                alert_detected, test_url = await self._load_xss_page(page, url, mutation, param_name)
+                screenshot_path = await self._capture_screenshot(page, param_name)
+                vision_confirmed = await self._vision_validate(screenshot_path, alert_detected)
+
+                return self._build_xss_finding(
+                    url, param_name, working_payload, screenshot_path,
+                    alert_detected, vision_confirmed, test_url
+                )
         except Exception as e:
-            logger.error(f"XSS skill failed: {e}")
-        
+            logger.debug(f"Browser verification failed: {e}")
+            return self._build_fallback_finding(url, param_name, working_payload, e)
+
+    async def _load_xss_page(self, page, url: str, mutation, param_name: str) -> tuple:
+        """Load page with XSS payload and detect alert."""
+        from urllib.parse import urlparse, urlencode, urlunparse
+
+        alert_detected = False
+
+        async def handle_dialog(dialog):
+            nonlocal alert_detected
+            alert_detected = True
+            await dialog.dismiss()
+
+        page.on("dialog", handle_dialog)
+        parsed_url = urlparse(url)
+
+        if mutation.method == "POST":
+            logger.info(f"[{self.master.name}] Verifying working POST payload via auto-submit form")
+            form_html = self._build_post_form(url, mutation)
+            await page.set_content(form_html)
+            test_url = url
+        else:
+            test_params = mutation.params
+            test_url = urlunparse((parsed_url.scheme, parsed_url.netloc, parsed_url.path, parsed_url.params, urlencode(test_params), parsed_url.fragment))
+            logger.info(f"[{self.master.name}] Verifying working GET payload: {test_url}")
+            await page.goto(test_url, wait_until="networkidle", timeout=10000)
+
+        await asyncio.sleep(2)
+        return alert_detected, test_url
+
+    def _build_post_form(self, url: str, mutation) -> str:
+        """Build auto-submitting POST form for verification."""
+        form_html = f"""<html><body onload="document.forms[0].submit()">
+            <form method="POST" action="{url}">"""
+
+        if isinstance(mutation.data, dict):
+            for k, v in mutation.data.items():
+                form_html += f'<input type="hidden" name="{k}" value=\'{v}\'>\n'
+
+        form_html += "</form></body></html>"
+        return form_html
+
+    async def _capture_screenshot(self, page, param_name: str) -> str:
+        """Capture screenshot of XSS verification."""
+        from bugtrace.core.config import settings
+        screenshot_path = str(settings.LOG_DIR / f"{self.master.thread.thread_id}_xss_{param_name}.png")
+        await page.screenshot(path=screenshot_path)
+        return screenshot_path
+
+    async def _vision_validate(self, screenshot_path: str, alert_detected: bool) -> bool:
+        """Validate XSS using vision model if alert not detected."""
+        if alert_detected:
+            return False
+
+        logger.info(f"[{self.master.name}] Alert NOT detected via event, trying Vision Model validation...")
+
+        from bugtrace.core.llm_client import llm_client
+        xss_prompt = self._get_vision_prompt()
+
+        try:
+            vision_result = await llm_client.generate_with_image(
+                prompt=xss_prompt,
+                image_path=screenshot_path,
+                module_name="XSS-Vision-Validator"
+            )
+            vision_confirmed = vision_result.strip().upper().startswith("YES")
+            logger.info(f"[{self.master.name}] Vision XSS Validation: {vision_confirmed}")
+            return vision_confirmed
+        except Exception as ve:
+            logger.error(f"[{self.master.name}] Vision validation failed: {ve}")
+            return False
+
+    def _get_vision_prompt(self) -> str:
+        """Get vision validation prompt."""
+        system_prompt = conductor.get_full_system_prompt("xss_skill")
+        if system_prompt:
+            return system_prompt.split("## XSS Vision Validation Prompt")[-1].strip()
+
+        return (
+            "This is a browser screenshot. Look carefully at the page content. "
+            "Is there ANY of the following visible on this page? "
+            "1) Text containing 'BUGTRACE-XSS-CONFIRMED' or 'BUGTRACE-XSS' "
+            "2) A JavaScript alert popup/dialog box "
+            "3) Red colored text showing a domain name (like 'example.com') "
+            "4) Any text that looks like it was injected (unusual formatting, yellow background). "
+            "Answer ONLY: YES or NO"
+        )
+
+    def _build_xss_finding(self, url: str, param_name: str, payload: str,
+                           screenshot_path: str, alert_detected: bool,
+                           vision_confirmed: bool, test_url: str) -> dict:
+        """Build XSS finding dictionary."""
+        logger.info(f"[{self.master.name}] ✅ XSS confirmed on param: {param_name}")
         return {
-            "success": True,
-            "payloads_tested": len(test_cases),
-            "findings": findings,
-            "xss_found": len(findings) > 0
+            "type": "XSS",
+            "url": url,
+            "parameter": param_name,
+            "param": param_name,
+            "payload": payload,
+            "screenshot": screenshot_path,
+            "validated": True,
+            "alert_triggered": alert_detected,
+            "vision_confirmed": vision_confirmed,
+            "severity": "HIGH" if (alert_detected or vision_confirmed) else "MEDIUM",
+            "description": f"Cross-Site Scripting (XSS) confirmed on parameter '{param_name}'. Alert triggered: {alert_detected}. Vision AI confirmed: {vision_confirmed}.",
+            "reproduction": f"# Open in browser with payload:\n{test_url}"
+        }
+
+    def _build_fallback_finding(self, url: str, param_name: str, payload: str, error: Exception) -> dict:
+        """Build fallback finding when browser verification fails."""
+        return {
+            "type": "XSS",
+            "url": url,
+            "parameter": param_name,
+            "param": param_name,
+            "payload": payload,
+            "validated": True,
+            "severity": "MEDIUM",
+            "note": f"Manipulator confirmed, browser verification error: {error}",
+            "description": f"Cross-Site Scripting (XSS) detected on parameter '{param_name}'. Payload reflection confirmed but browser verification failed.",
+            "reproduction": f"# Inject payload into parameter '{param_name}':\n{payload}"
         }
 
 
