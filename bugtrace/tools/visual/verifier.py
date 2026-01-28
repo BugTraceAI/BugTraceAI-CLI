@@ -186,16 +186,9 @@ class XSSVerifier:
                 impact_data = await self._extract_impact_data(page, url, xss_confirmed)
                 screenshot_path = await self._capture_screenshot(page, screenshot_dir, xss_confirmed)
 
-                return VerificationResult(
-                    success=xss_confirmed,
-                    method="playwright",
-                    screenshot_path=screenshot_path,
-                    console_logs=console_logs,
-                    details={
-                        "dialog_detected": dialog_detected[0],
-                        "marker_found": evaluation_data.get("marker_found", False),
-                        "impact_data": impact_data
-                    }
+                return self._build_verification_result(
+                    xss_confirmed, screenshot_path, console_logs,
+                    dialog_detected[0], evaluation_data, impact_data
                 )
 
         except Exception as e:
@@ -203,6 +196,21 @@ class XSSVerifier:
             return VerificationResult(success=False, method="playwright", error=str(e))
         finally:
             await self._cleanup_browser(page, context, browser)
+
+    def _build_verification_result(self, xss_confirmed, screenshot_path, console_logs,
+                                   dialog_detected, evaluation_data, impact_data) -> VerificationResult:
+        """Build final verification result."""
+        return VerificationResult(
+            success=xss_confirmed,
+            method="playwright",
+            screenshot_path=screenshot_path,
+            console_logs=console_logs,
+            details={
+                "dialog_detected": dialog_detected,
+                "marker_found": evaluation_data.get("marker_found", False),
+                "impact_data": impact_data
+            }
+        )
 
     async def _setup_browser(self, p, url: str):
         """Setup browser, context and page."""
