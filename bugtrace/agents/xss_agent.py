@@ -186,88 +186,56 @@ class XSSAgent(BaseAgent):
         # Victory Hierarchy: Track if we achieved maximum impact
         self._max_impact_achieved = False
 
+    def _get_snippet(self, text: str, target: str, max_len: int = 200) -> str:
+        """Extract snippet around the target string."""
+        idx = text.find(target)
+        if idx == -1:
+            return ""
+        start = max(0, idx - 50)
+        end = min(len(text), idx + len(target) + 100)
+        return text[start:end].strip()
+
+    def _check_contexts(self, html: str, probe: str, escaped_probe: str) -> list:
+        """Check all contexts and return found ones."""
+        contexts = []
+        if re.search(r'<script[^>]*>.*?' + escaped_probe + r'.*?</script>', html, re.DOTALL | re.IGNORECASE):
+            contexts.append(("script", self._get_snippet(html, probe)))
+        if re.search(r"['`\"][^'`\"]*" + escaped_probe + r"[^'`\"]*['`\"]", html):
+            contexts.append(("javascript_string", self._get_snippet(html, probe)))
+        if re.search(r'<[^>]+\s\w+=["\']?[^"\']*' + escaped_probe, html):
+            contexts.append(("html_attribute", self._get_snippet(html, probe)))
+        if re.search(r'href=["\']?[^"\']*' + escaped_probe, html, re.IGNORECASE):
+            contexts.append(("url_href", self._get_snippet(html, probe)))
+        if re.search(r'src=["\']?[^"\']*' + escaped_probe, html, re.IGNORECASE):
+            contexts.append(("url_src", self._get_snippet(html, probe)))
+        if re.search(r'on\w+=["\'][^"\']*' + escaped_probe, html, re.IGNORECASE):
+            contexts.append(("event_handler", self._get_snippet(html, probe)))
+        if re.search(r'>[^<]*' + escaped_probe + r'[^<]*<', html):
+            contexts.append(("html_body", self._get_snippet(html, probe)))
+        if re.search(r'<!--[^>]*' + escaped_probe + r'[^>]*-->', html):
+            contexts.append(("html_comment", self._get_snippet(html, probe)))
+        return contexts
+
+    def _prioritize_contexts(self, contexts: list) -> InjectionContext:
+        """Select most dangerous context."""
+        if not contexts:
+            return InjectionContext(type="unknown", code_snippet="Context could not be automatically determined.")
+        priority = ["script", "event_handler", "javascript_string", "url_href", "url_src",
+                    "html_attribute", "html_body", "html_comment"]
+        for p_ctx in priority:
+            for ctx_type, snippet in contexts:
+                if ctx_type == p_ctx:
+                    return InjectionContext(type=ctx_type, code_snippet=snippet)
+        return InjectionContext(type=contexts[0][0], code_snippet=contexts[0][1])
+
     def detect_injection_context(self, html: str, probe: str = "USER_INPUT") -> InjectionContext:
         """
         TASK-52: Enhanced context detection with multiple context support.
         Detects where the user input is reflected in multiple possible contexts.
         """
         escaped_probe = re.escape(probe)
-        contexts_found = []
-
-        def get_snippet(text: str, target: str, max_len: int = 200) -> str:
-            """Extract snippet around the target string."""
-            idx = text.find(target)
-            if idx == -1:
-                return ""
-            start = max(0, idx - 50)
-            end = min(len(text), idx + len(target) + 100)
-            return text[start:end].strip()
-
-        # 1. Script context - Inside <script> tags
-        script_pattern = r'<script[^>]*>.*?' + escaped_probe + r'.*?</script>'
-        if re.search(script_pattern, html, re.DOTALL | re.IGNORECASE):
-            snippet = get_snippet(html, probe)
-            contexts_found.append(("script", snippet))
-
-        # 2. Javascript String context - var x = 'PROBE'
-        js_string_pattern = r"['\"`][^'\"`]*" + escaped_probe + r"[^'\"`]*['\"`]"
-        if re.search(js_string_pattern, html):
-            snippet = get_snippet(html, probe)
-            contexts_found.append(("javascript_string", snippet))
-
-        # 3. HTML Attribute context - <div class="PROBE">
-        attr_pattern = r'<[^>]+\s\w+=["\']?[^"\']*' + escaped_probe
-        if re.search(attr_pattern, html):
-            snippet = get_snippet(html, probe)
-            contexts_found.append(("html_attribute", snippet))
-
-        # 4. URL/href context - <a href="...PROBE...">
-        url_pattern = r'href=["\']?[^"\']*' + escaped_probe
-        if re.search(url_pattern, html, re.IGNORECASE):
-            snippet = get_snippet(html, probe)
-            contexts_found.append(("url_href", snippet))
-
-        # 5. src context - <img src="...PROBE...">
-        src_pattern = r'src=["\']?[^"\']*' + escaped_probe
-        if re.search(src_pattern, html, re.IGNORECASE):
-            snippet = get_snippet(html, probe)
-            contexts_found.append(("url_src", snippet))
-
-        # 6. Event handler context - onclick="...PROBE..."
-        event_pattern = r'on\w+=["\'][^"\']*' + escaped_probe
-        if re.search(event_pattern, html, re.IGNORECASE):
-            snippet = get_snippet(html, probe)
-            contexts_found.append(("event_handler", snippet))
-
-        # 7. HTML Body context - <div>PROBE</div>
-        body_pattern = r'>[^<]*' + escaped_probe + r'[^<]*<'
-        if re.search(body_pattern, html):
-            snippet = get_snippet(html, probe)
-            contexts_found.append(("html_body", snippet))
-
-        # 8. Comment context - <!-- PROBE -->
-        comment_pattern = r'<!--[^>]*' + escaped_probe + r'[^>]*-->'
-        if re.search(comment_pattern, html):
-            snippet = get_snippet(html, probe)
-            contexts_found.append(("html_comment", snippet))
-
-        # Return the most dangerous context found (priority order)
-        context_priority = [
-            "script", "event_handler", "javascript_string",
-            "url_href", "url_src", "html_attribute", "html_body", "html_comment"
-        ]
-
-        for priority_ctx in context_priority:
-            for ctx_type, snippet in contexts_found:
-                if ctx_type == priority_ctx:
-                    return InjectionContext(type=ctx_type, code_snippet=snippet)
-
-        # If contexts found but not in priority list, return first
-        if contexts_found:
-            return InjectionContext(type=contexts_found[0][0], code_snippet=contexts_found[0][1])
-
-        # Default
-        return InjectionContext(type="unknown", code_snippet="Context could not be automatically determined.")
+        contexts = self._check_contexts(html, probe, escaped_probe)
+        return self._prioritize_contexts(contexts)
 
     def prepare_payload(self, payload: str, context: str) -> str:
         """
@@ -537,55 +505,89 @@ class XSSAgent(BaseAgent):
         """
         Determine if finding should be marked VALIDATED_CONFIRMED or sent to AgenticValidator.
         More authoritative: Reduces load on AgenticValidator by confirming clear wins here.
-        
+
         Returns:
             Tuple of (status_string, validated_bool)
             - ("VALIDATED_CONFIRMED", True) if high confidence
             - ("PENDING_VALIDATION", False) if needs AgenticValidator
         """
         evidence = finding_data.get("evidence", {})
-        
+
         # TIER 1: VALIDATED_CONFIRMED (High confidence / Definitive proof)
-        
-        # 1. Interactsh Hit (OOB) - Definitive
-        if evidence.get("interactsh_hit"):
-            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Interactsh OOB interaction)")
+        if self._has_interactsh_hit(evidence):
             return "VALIDATED_CONFIRMED", True
-            
-        # 2. Dialog Detected (CDP Alert) - Definitive
-        if evidence.get("dialog_detected"):
-            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (CDP detected alert dialog)")
+
+        if self._has_dialog_detected(evidence):
             return "VALIDATED_CONFIRMED", True
-            
-        # 3. Vision Confirmed + Screenshot - Strong
-        if evidence.get("vision_confirmed") and finding_data.get("screenshot_path"):
-            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Vision + Screenshot proof)")
+
+        if self._has_vision_proof(evidence, finding_data):
             return "VALIDATED_CONFIRMED", True
-        
-        # 4. Marker Found in Response (DOM mutation proof)
-        if evidence.get("marker_found") or evidence.get("dom_mutation"):
-            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (DOM marker/mutation detected)")
+
+        if self._has_dom_mutation_proof(evidence):
             return "VALIDATED_CONFIRMED", True
-            
-        # 5. Console Output with Execution Proof
-        if evidence.get("console_output") and "executed" in str(evidence.get("console_output", "")).lower():
-            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Console execution proof)")
+
+        if self._has_console_execution_proof(evidence):
             return "VALIDATED_CONFIRMED", True
-        
-        # 6. Unencoded Reflection in Dangerous Context (html_text, script, attribute_unquoted)
-        dangerous_contexts = ["html_text", "script", "attribute_unquoted", "tag_name"]
-        if (evidence.get("unencoded_reflection", False) and 
-            finding_data.get("reflection_context") in dangerous_contexts):
-            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Unencoded payload in {finding_data.get('reflection_context')})")
+
+        if self._has_dangerous_unencoded_reflection(evidence, finding_data):
             return "VALIDATED_CONFIRMED", True
-        
-        # 7. Fragment XSS with Screenshot
-        if finding_data.get("context") == "dom_xss_fragment" and finding_data.get("screenshot_path"):
-             logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Fragment XSS w/ screenshot)")
-             return "VALIDATED_CONFIRMED", True
+
+        if self._has_fragment_xss_with_screenshot(finding_data):
+            return "VALIDATED_CONFIRMED", True
 
         # TIER 2: PENDING_VALIDATION (Needs AgenticValidator)
         return "PENDING_VALIDATION", False
+
+    def _has_interactsh_hit(self, evidence: Dict) -> bool:
+        """Check for Interactsh OOB interaction."""
+        if evidence.get("interactsh_hit"):
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Interactsh OOB interaction)")
+            return True
+        return False
+
+    def _has_dialog_detected(self, evidence: Dict) -> bool:
+        """Check for CDP detected alert dialog."""
+        if evidence.get("dialog_detected"):
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (CDP detected alert dialog)")
+            return True
+        return False
+
+    def _has_vision_proof(self, evidence: Dict, finding_data: Dict) -> bool:
+        """Check for vision confirmation with screenshot."""
+        if evidence.get("vision_confirmed") and finding_data.get("screenshot_path"):
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Vision + Screenshot proof)")
+            return True
+        return False
+
+    def _has_dom_mutation_proof(self, evidence: Dict) -> bool:
+        """Check for DOM marker or mutation detection."""
+        if evidence.get("marker_found") or evidence.get("dom_mutation"):
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (DOM marker/mutation detected)")
+            return True
+        return False
+
+    def _has_console_execution_proof(self, evidence: Dict) -> bool:
+        """Check for console output with execution proof."""
+        if evidence.get("console_output") and "executed" in str(evidence.get("console_output", "")).lower():
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Console execution proof)")
+            return True
+        return False
+
+    def _has_dangerous_unencoded_reflection(self, evidence: Dict, finding_data: Dict) -> bool:
+        """Check for unencoded reflection in dangerous context."""
+        dangerous_contexts = ["html_text", "script", "attribute_unquoted", "tag_name"]
+        if (evidence.get("unencoded_reflection", False) and
+            finding_data.get("reflection_context") in dangerous_contexts):
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Unencoded payload in {finding_data.get('reflection_context')})")
+            return True
+        return False
+
+    def _has_fragment_xss_with_screenshot(self, finding_data: Dict) -> bool:
+        """Check for fragment XSS with screenshot proof."""
+        if finding_data.get("context") == "dom_xss_fragment" and finding_data.get("screenshot_path"):
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Fragment XSS w/ screenshot)")
+            return True
+        return False
 
     def _should_create_finding(self, test_result: Dict) -> bool:
         """
@@ -1655,53 +1657,23 @@ class XSSAgent(BaseAgent):
         Analyze the reflection point of the probe.
         Advanced context analysis technique.
         """
-        from bs4 import BeautifulSoup
-        
         prefix = "BT7331"
-        
-        # Identify WAF signatures or "Blocked" responses
-        lower_html = html.lower()
-        is_blocked = any(sig in lower_html for sig in ["blocked:", "waf block", "security violation", "forbidden", "not acceptable", "access denied"])
-        
+        is_blocked = self._is_waf_blocked(html)
+
+        # Early return if probe not reflected
         if prefix not in html:
             return {
                 "reflected": False,
                 "is_blocked": is_blocked,
                 "context": "blocked" if is_blocked else "none"
             }
-            
+
         # Detect surviving characters
-        test_chars = ["'", "\"", "<", ">", "&", "{", "}", "\\"]
-        surviving = ""
-        for char in test_chars:
-            if f"{prefix}{char}" in html:
-                surviving += char
-            elif char in html and prefix in html:
-                 surviving += char
-        
+        surviving = self._detect_surviving_chars(html, prefix)
+
         # Find context via BeautifulSoup
-        context = "unknown"
-        try:
-            soup = BeautifulSoup(html, 'html.parser')
-            # Search in text nodes
-            text_node = soup.find(string=lambda t: t and prefix in t)
-            if text_node:
-                parent = text_node.parent.name
-                if parent in ['script', 'style']:
-                    context = parent
-                else:
-                    context = "html_text"
-            else:
-                # Search in attributes (Heuristic)
-                if f"={prefix}" in html or f"=\"{prefix}" in html or f"='{prefix}" in html:
-                    context = "attribute_value"
-                elif f"<!-- {prefix}" in html or f"<!--{prefix}" in html:
-                    context = "comment"
-                elif f"<{prefix}" in html:
-                    context = "tag_name"
-        except Exception as e:
-             logger.debug(f"operation failed: {e}")
-        
+        context = self._find_reflection_context(html, prefix)
+
         return {
             "reflected": True,
             "context": context,
@@ -1709,68 +1681,113 @@ class XSSAgent(BaseAgent):
             "surviving_chars": surviving,
             "is_blocked": is_blocked
         }
+
+    def _is_waf_blocked(self, html: str) -> bool:
+        """Check if response contains WAF block signatures."""
+        lower_html = html.lower()
+        block_signatures = ["blocked:", "waf block", "security violation", "forbidden", "not acceptable", "access denied"]
+        return any(sig in lower_html for sig in block_signatures)
+
+    def _detect_surviving_chars(self, html: str, prefix: str) -> str:
+        """Detect which special characters survived reflection."""
+        test_chars = ["'", "\"", "<", ">", "&", "{", "}", "\\"]
+        surviving = ""
+        for char in test_chars:
+            if f"{prefix}{char}" in html or (char in html and prefix in html):
+                surviving += char
+        return surviving
+
+    def _find_reflection_context(self, html: str, prefix: str) -> str:
+        """Find the HTML context where the probe was reflected."""
+        from bs4 import BeautifulSoup
+
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            text_node = soup.find(string=lambda t: t and prefix in t)
+
+            if text_node:
+                return self._context_from_text_node(text_node)
+            else:
+                return self._context_from_attributes(html, prefix)
+
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
+            return "unknown"
+
+    def _context_from_text_node(self, text_node) -> str:
+        """Determine context from text node parent."""
+        parent = text_node.parent.name
+        if parent in ['script', 'style']:
+            return parent
+        return "html_text"
+
+    def _context_from_attributes(self, html: str, prefix: str) -> str:
+        """Determine context from attribute heuristics."""
+        if f"={prefix}" in html or f'="{prefix}' in html or f"='{prefix}" in html:
+            return "attribute_value"
+        elif f"<!-- {prefix}" in html or f"<!--{prefix}" in html:
+            return "comment"
+        elif f"<{prefix}" in html:
+            return "tag_name"
+        return "unknown"
     def _filter_payloads_by_context(self, payloads: List[str], context: str) -> List[str]:
         """
         Filters and prioritizes payloads based on the detected reflection context.
         This prevents testing 800+ payloads when only ~50 are relevant.
         """
+        # For unknown/blocked contexts, use broader set
         if context.startswith("unknown") or context in ["waf_blocked", "blocked"]:
-            # For unknown/blocked contexts, we want to try a broader set of elite payloads
             return payloads[:100]
 
-        filtered = []
-        
-        for p in payloads:
-            p_lower = p.lower()
-            relevant = False
-            
-            if context == "script":
-                # Must breakout of JS string or close tag
-                # Also include "Killer Payloads" that might work (like escapes)
-                if any(x in p for x in ["'", "\"", "</script>", ";", "-", "+", "*", "\\"]):
-                    relevant = True
-                # Exclude pure HTML tags like <marquee> if they don't have a leading quote/tag-close
-                if p.startswith("<") and not p.lower().startswith("</script>"):
-                    relevant = False
-                # Re-allow if it has a quote before the tag (breakout)
-                if any(p.startswith(q) for q in ["'", "\"", "'; ", "\"; "]):
-                    relevant = True
-                    
-            
-            elif context == "html_text":
-                # Needs tags or breakout
-                if any(p.startswith(x) for x in ["<", "\">", "'>", "{{", "[["]):
-                    relevant = True
-            
-            elif context == "attribute_value":
-                # Event handlers or breakout
-                if any(p_lower.startswith(x) for x in ["on", "\"", "'", " javascript:", "data:"]):
-                    relevant = True
-            
-            elif context == "comment":
-                if "-->" in p or "--!>" in p:
-                    relevant = True
-            
-            elif context == "style":
-                if any(x in p for x in ["</style>", "expression", "url", "'", "\""]):
-                    relevant = True
-            
-            elif context == "tag_name":
-                if any(x in p for x in [" ", ">", "/"]):
-                    relevant = True
-            
-            if relevant:
-                filtered.append(p)
-        
-        # Always keep the top 10 "Killer Payloads" regardless of context as a safety net
-        # but place them after context-relevant ones if they didn't match
-        safety_net = payloads[:10]
+        # Filter by context relevance
+        filtered = [p for p in payloads if self._is_payload_relevant(p, context)]
+
+        # Add safety net of top killer payloads
+        filtered = self._add_safety_net_payloads(filtered, payloads)
+
+        # Limit to 100 max to keep it fast
+        return filtered[:100]
+
+    def _is_payload_relevant(self, payload: str, context: str) -> bool:
+        """Check if payload is relevant for the given context."""
+        p_lower = payload.lower()
+
+        if context == "script":
+            return self._is_relevant_for_script_context(payload, p_lower)
+        elif context == "html_text":
+            return any(payload.startswith(x) for x in ["<", "\">", "'>", "{{", "[["])
+        elif context == "attribute_value":
+            return any(p_lower.startswith(x) for x in ["on", "\"", "'", " javascript:", "data:"])
+        elif context == "comment":
+            return "-->" in payload or "--!>" in payload
+        elif context == "style":
+            return any(x in payload for x in ["</style>", "expression", "url", "'", "\""])
+        elif context == "tag_name":
+            return any(x in payload for x in [" ", ">", "/"])
+
+        return False
+
+    def _is_relevant_for_script_context(self, payload: str, p_lower: str) -> bool:
+        """Check if payload is relevant for script context."""
+        # Must breakout of JS string or close tag
+        if not any(x in payload for x in ["'", "\"", "</script>", ";", "-", "+", "*", "\\"]):
+            return False
+
+        # Exclude pure HTML tags without breakout
+        if payload.startswith("<") and not p_lower.startswith("</script>"):
+            # Re-allow if it has a quote before the tag (breakout)
+            if not any(payload.startswith(q) for q in ["'", "\"", "'; ", "\"; "]):
+                return False
+
+        return True
+
+    def _add_safety_net_payloads(self, filtered: List[str], all_payloads: List[str]) -> List[str]:
+        """Add top killer payloads as safety net if not already included."""
+        safety_net = all_payloads[:10]
         for sn in safety_net:
             if sn not in filtered:
                 filtered.append(sn)
-        
-        # Limit to 100 max to keep it fast
-        return filtered[:100]
+        return filtered
 
 
     def _analyze_global_context(self, html: str) -> str:
@@ -1961,62 +1978,86 @@ Response format (XML):
 
     def _parse_smart_analysis_response(self, response: str, interactsh_url: str) -> List[Dict]:
         """Parse the LLM's smart analysis response into payload dicts."""
-        from bugtrace.utils.parsers import XmlParser
         import re
 
-        payloads = []
+        # Try structured parsing first
+        payloads = self._extract_structured_payloads(response, interactsh_url)
 
-        # Try to extract individual payload blocks
+        # Fallback to pattern extraction if structured parsing failed
+        if not payloads:
+            payloads = self._extract_payloads_by_patterns(response)
+
+        # Sort by confidence (highest first) and return top 3
+        payloads.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        return payloads[:3]
+
+    def _extract_structured_payloads(self, response: str, interactsh_url: str) -> List[Dict]:
+        """Extract payloads from structured XML-like tags."""
+        import re
+        payloads = []
         payload_pattern = r'<payload>(.*?)</payload>'
         matches = re.findall(payload_pattern, response, re.DOTALL)
 
         for match in matches:
-            code_match = re.search(r'<code>(.*?)</code>', match, re.DOTALL)
-            reasoning_match = re.search(r'<reasoning>(.*?)</reasoning>', match, re.DOTALL)
-            impact_match = re.search(r'<impact>(.*?)</impact>', match, re.DOTALL)
-            confidence_match = re.search(r'<confidence>(.*?)</confidence>', match, re.DOTALL)
+            payload_dict = self._parse_payload_block(match, interactsh_url)
+            if payload_dict:
+                payloads.append(payload_dict)
 
-            if code_match:
-                code = code_match.group(1).strip()
-                # Clean up the payload
-                code = self._clean_payload(code, "")
+        return payloads
 
-                # Replace interactsh placeholder if needed
-                if "{{interactsh_url}}" in code:
-                    code = code.replace("{{interactsh_url}}", interactsh_url)
-                elif "CALLBACK_URL" in code or "callback_url" in code.lower():
-                    code = re.sub(r'(?i)callback_url', interactsh_url, code)
+    def _parse_payload_block(self, block: str, interactsh_url: str) -> Optional[Dict]:
+        """Parse a single payload block with code, reasoning, impact, confidence."""
+        import re
 
-                payloads.append({
-                    "payload": code,
-                    "reasoning": reasoning_match.group(1).strip() if reasoning_match else "",
-                    "impact": impact_match.group(1).strip() if impact_match else "execution",
-                    "confidence": float(confidence_match.group(1).strip()) if confidence_match else 0.7
-                })
+        code_match = re.search(r'<code>(.*?)</code>', block, re.DOTALL)
+        if not code_match:
+            return None
 
-        # Fallback: try to extract any code-like content if structured parsing failed
-        if not payloads:
-            # Look for common XSS patterns
-            code_patterns = [
-                r'`([^`]+(?:alert|fetch|document\.|onerror|onload)[^`]+)`',
-                r'Payload[:\s]+([^\n]+)',
-            ]
-            for pattern in code_patterns:
-                matches = re.findall(pattern, response, re.IGNORECASE)
-                for m in matches[:3]:  # Limit to 3
-                    cleaned = self._clean_payload(m.strip(), "")
-                    if len(cleaned) > 5 and any(x in cleaned.lower() for x in ['<', 'alert', 'fetch', 'document']):
-                        payloads.append({
-                            "payload": cleaned,
-                            "reasoning": "Extracted from LLM response",
-                            "impact": "execution",
-                            "confidence": 0.5
-                        })
+        code = self._clean_payload(code_match.group(1).strip(), "")
+        code = self._replace_callback_urls(code, interactsh_url)
 
-        # Sort by confidence (highest first)
-        payloads.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        reasoning_match = re.search(r'<reasoning>(.*?)</reasoning>', block, re.DOTALL)
+        impact_match = re.search(r'<impact>(.*?)</impact>', block, re.DOTALL)
+        confidence_match = re.search(r'<confidence>(.*?)</confidence>', block, re.DOTALL)
 
-        return payloads[:3]  # Return top 3
+        return {
+            "payload": code,
+            "reasoning": reasoning_match.group(1).strip() if reasoning_match else "",
+            "impact": impact_match.group(1).strip() if impact_match else "execution",
+            "confidence": float(confidence_match.group(1).strip()) if confidence_match else 0.7
+        }
+
+    def _replace_callback_urls(self, code: str, interactsh_url: str) -> str:
+        """Replace callback URL placeholders with actual interactsh URL."""
+        import re
+        if "{{interactsh_url}}" in code:
+            return code.replace("{{interactsh_url}}", interactsh_url)
+        elif "CALLBACK_URL" in code or "callback_url" in code.lower():
+            return re.sub(r'(?i)callback_url', interactsh_url, code)
+        return code
+
+    def _extract_payloads_by_patterns(self, response: str) -> List[Dict]:
+        """Extract payloads using regex patterns for common XSS indicators."""
+        import re
+        payloads = []
+        code_patterns = [
+            r'`([^`]+(?:alert|fetch|document\.|onerror|onload)[^`]+)`',
+            r'Payload[:\s]+([^\n]+)',
+        ]
+
+        for pattern in code_patterns:
+            matches = re.findall(pattern, response, re.IGNORECASE)
+            for m in matches[:3]:  # Limit to 3
+                cleaned = self._clean_payload(m.strip(), "")
+                if len(cleaned) > 5 and any(x in cleaned.lower() for x in ['<', 'alert', 'fetch', 'document']):
+                    payloads.append({
+                        "payload": cleaned,
+                        "reasoning": "Extracted from LLM response",
+                        "impact": "execution",
+                        "confidence": 0.5
+                    })
+
+        return payloads
 
     async def _llm_analyze(self, html: str, param: str, interactsh_url: str, context_data: Dict = None) -> Optional[Dict]:
         """Ask LLM to analyze HTML and generate payload."""
