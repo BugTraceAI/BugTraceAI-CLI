@@ -352,150 +352,178 @@ Respond in JSON format:
             
         return finding
     
+    def _agentic_prepare_context(self, finding: Dict[str, Any]) -> Tuple[str, Optional[str], str]:
+        """Prepare validation context from finding."""
+        url = finding.get("url")
+        payload = finding.get("payload")
+        vuln_type = self._detect_vuln_type(finding)
+
+        # Select best verification URL from specialist methods if available
+        if finding.get("verification_methods"):
+            url, payload = self._select_best_verification_method(finding, url)
+
+        return url, payload, vuln_type
+
+    def _select_best_verification_method(self, finding: Dict, url: str) -> Tuple[str, Optional[str]]:
+        """Select best verification method from specialist options."""
+        preferred = ["console_log", "window_variable", "dom_modification"]
+        for p_type in preferred:
+            for m in finding.get("verification_methods", []):
+                if m.get("type") == p_type and m.get("url_encoded"):
+                    logger.info(f"Using specialized verification method: {p_type}")
+                    return m.get("url_encoded"), None
+        return url, finding.get("payload")
+
+    async def _agentic_execute_validation(
+        self, url: str, payload: Optional[str], vuln_type: str
+    ) -> Tuple[Optional[str], List[str], bool]:
+        """Execute payload with timeout and return results."""
+        try:
+            return await asyncio.wait_for(
+                self._execute_payload_optimized(url, payload, vuln_type),
+                timeout=self.FAST_VALIDATION_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Validation timeout for {url[:50]}...")
+            return None, ["TIMEOUT"], False
+
+    def _agentic_build_cdp_result(
+        self, logs: List[str], url: str, payload: Optional[str], start_time: float
+    ) -> Dict[str, Any]:
+        """Build result dict for CDP confirmation."""
+        self._stats["cdp_confirmed"] += 1
+        result = {
+            "validated": True,
+            "status": "VALIDATED_CONFIRMED",
+            "reasoning": f"Execution CONFIRMED: Low-level event (alert/dialog) triggered. Logs: {logs}",
+            "screenshot_path": None,
+            "logs": logs
+        }
+
+        if self.ENABLE_CACHE:
+            self._cache.set(url, payload, result)
+
+        elapsed = (time.time() - start_time) * 1000
+        self._update_stats(elapsed)
+        logger.info(f"⚡ CDP confirmed in {elapsed:.0f}ms (skipped vision API)")
+        return result
+
+    async def _agentic_analyze_with_vision(
+        self, finding: Dict, screenshot_path: str, logs: List[str]
+    ) -> Dict[str, Any]:
+        """Analyze screenshot with vision and build result."""
+        self.think("CDP silent. Invoking Vision Analysis...")
+        self._stats["vision_analyzed"] += 1
+
+        vision_result = await self.validate_with_vision(finding, screenshot_path)
+        confidence = vision_result.get("confidence", 0.0)
+        validated = vision_result.get("validated", False)
+
+        result = {"validated": False, "screenshot_path": screenshot_path, "logs": logs}
+
+        if validated:
+            result["validated"] = True
+            result["status"] = "VALIDATED_CONFIRMED"
+            result["reasoning"] = vision_result.get("reasoning", "Validated via vision analysis.")
+        elif confidence >= 0.7:
+            result["status"] = "MANUAL_REVIEW_RECOMMENDED"
+            result["needs_manual_review"] = True
+            result["reasoning"] = self._generate_manual_review_brief(finding, vision_result, logs)
+            self.think(f"⚠️ SUSPICIOUS ({confidence:.0%}) - flagging for manual review")
+        else:
+            result["status"] = "VALIDATED_FALSE_POSITIVE"
+            result["reasoning"] = vision_result.get("reasoning", "No evidence of execution found.")
+
+        return result
+
+    def _agentic_check_cache(self, url: str, payload: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Check cache for existing result."""
+        if not self.ENABLE_CACHE:
+            return None
+        cached = self._cache.get(url, payload)
+        if cached:
+            self._stats["cache_hits"] += 1
+            logger.info(f"🚀 Cache hit for {url[:50]}... (skipping validation)")
+        return cached
+
+    async def _agentic_process_validation_result(
+        self, screenshot_path: Optional[str], logs: List[str], basic_triggered: bool,
+        finding: Dict, url: str, payload: Optional[str], start_time: float
+    ) -> Dict[str, Any]:
+        """Process validation result and build final response."""
+        # Handle timeout
+        if screenshot_path is None and logs == ["TIMEOUT"]:
+            return {
+                "validated": False,
+                "reasoning": f"Validation timed out after {self.FAST_VALIDATION_TIMEOUT}s",
+                "screenshot_path": None,
+                "logs": ["TIMEOUT"]
+            }
+
+        # Early exit on CDP confirmation
+        if basic_triggered:
+            return self._agentic_build_cdp_result(logs, url, payload, start_time)
+
+        # Visual analysis
+        if screenshot_path and Path(screenshot_path).exists():
+            result = await self._agentic_analyze_with_vision(finding, screenshot_path, logs)
+        else:
+            result = {
+                "validated": False,
+                "status": "VALIDATED_FALSE_POSITIVE",
+                "reasoning": "Audit failed: Could not capture screenshot.",
+                "screenshot_path": None,
+                "logs": logs
+            }
+
+        # Cache and update stats
+        if self.ENABLE_CACHE:
+            self._cache.set(url, payload, result)
+        elapsed = (time.time() - start_time) * 1000
+        self._update_stats(elapsed)
+
+        return result
+
     async def validate_finding_agentically(
         self,
         finding: Dict[str, Any],
         _recursion_depth: int = 0
     ) -> Dict[str, Any]:
         """
-        V3 Reproduction Flow (Auditor Role) - OPTIMIZED:
-        1. Check cache for previous result
-        2. Construct exploitation URL
-        3. Navigate with CDP-enabled session (pooled)
-        4. Listen for low-level execution events
-        5. EARLY EXIT if CDP confirms (skip vision)
-        6. Analyze with Vision only if events are silent
-        7. Cache result for future use
+        V3 Reproduction Flow (Auditor Role) - OPTIMIZED.
+        Validates findings using CDP events and vision analysis.
         """
         # Check for cancellation
         if self._cancellation_token.get("cancelled", False):
             return {"validated": False, "reasoning": "Validation cancelled by user"}
-        
+
         # Prevent infinite recursion
         if _recursion_depth >= self.MAX_FEEDBACK_DEPTH:
             logger.warning(f"Max feedback depth ({self.MAX_FEEDBACK_DEPTH}) reached, stopping recursion")
             return {"validated": False, "reasoning": "Max feedback retries exceeded"}
-        
+
         start_time = time.time()
-        url = finding.get("url")
-        payload = finding.get("payload")
-        vuln_type = self._detect_vuln_type(finding)
-        
-        # Select best verification URL from specialist methods if available
-        if finding.get("verification_methods"):
-            # Prefer console_log or window_variable method (more reliable than alert)
-            preferred = ["console_log", "window_variable", "dom_modification"]
-            found_better = False
-            for p_type in preferred:
-                 for m in finding.get("verification_methods", []):
-                     if m.get("type") == p_type and m.get("url_encoded"):
-                         url = m.get("url_encoded")
-                         payload = None # URL already has payload
-                         logger.info(f"Using specialized verification method: {p_type}")
-                         found_better = True
-                         break
-                 if found_better: break
+        url, payload, vuln_type = self._agentic_prepare_context(finding)
 
         if not url:
             return {"validated": False, "reasoning": "Missing target URL"}
 
-        # =====================================================================
-        # OPTIMIZATION: Check cache first
-        # =====================================================================
-        if self.ENABLE_CACHE:
-            cached = self._cache.get(url, payload)
-            if cached:
-                self._stats["cache_hits"] += 1
-                logger.info(f"🚀 Cache hit for {url[:50]}... (skipping validation)")
-                return cached
+        # Check cache
+        cached = self._agentic_check_cache(url, payload)
+        if cached:
+            return cached
 
         self.think(f"Auditing {vuln_type} on {url}")
 
-        # =====================================================================
-        # OPTIMIZATION: Use semaphore for controlled concurrency
-        # =====================================================================
+        # Execute validation with semaphore
         async with self._validation_semaphore:
-            # Step 1: Execute in browser with timeout
-            try:
-                screenshot_path, logs, basic_triggered = await asyncio.wait_for(
-                    self._execute_payload_optimized(url, payload, vuln_type),
-                    timeout=self.FAST_VALIDATION_TIMEOUT
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"Validation timeout for {url[:50]}...")
-                return {
-                    "validated": False,
-                    "reasoning": f"Validation timed out after {self.FAST_VALIDATION_TIMEOUT}s",
-                    "screenshot_path": None,
-                    "logs": ["TIMEOUT"]
-                }
+            screenshot_path, logs, basic_triggered = await self._agentic_execute_validation(
+                url, payload, vuln_type
+            )
 
-            result = {
-                "validated": False,
-                "status": "VALIDATED_FALSE_POSITIVE",  # Default, will be updated if confirmed
-                "reasoning": "",
-                "screenshot_path": screenshot_path,
-                "logs": logs
-            }
-
-            # =================================================================
-            # OPTIMIZATION: Early exit on CDP confirmation (skip vision API)
-            # =================================================================
-            if basic_triggered:
-                self._stats["cdp_confirmed"] += 1
-                result["validated"] = True
-                result["status"] = "VALIDATED_CONFIRMED"
-                result["reasoning"] = f"Execution CONFIRMED: Low-level event (alert/dialog) triggered. Logs: {logs}"
-
-                # Cache successful result
-                if self.ENABLE_CACHE:
-                    self._cache.set(url, payload, result)
-
-                elapsed = (time.time() - start_time) * 1000
-                self._update_stats(elapsed)
-                logger.info(f"⚡ CDP confirmed in {elapsed:.0f}ms (skipped vision API)")
-                return result
-
-            # =================================================================
-            # Step 3: Visual/Vision Analysis (only if CDP silent)
-            # =================================================================
-            if screenshot_path and Path(screenshot_path).exists():
-                self.think("CDP silent. Invoking Vision Analysis...")
-                self._stats["vision_analyzed"] += 1
-
-                vision_result = await self.validate_with_vision(finding, screenshot_path)
-
-                confidence = vision_result.get("confidence", 0.0)
-                validated = vision_result.get("validated", False)
-
-                if validated:
-                    result["validated"] = True
-                    result["status"] = "VALIDATED_CONFIRMED"
-                    result["reasoning"] = vision_result.get("reasoning", "Validated via vision analysis.")
-                elif confidence >= 0.7:
-                    result["validated"] = False
-                    result["status"] = "MANUAL_REVIEW_RECOMMENDED"
-                    result["needs_manual_review"] = True
-                    result["reasoning"] = self._generate_manual_review_brief(finding, vision_result, logs)
-                    self.think(f"⚠️ SUSPICIOUS ({confidence:.0%}) - flagging for manual review")
-                else:
-                    result["validated"] = False
-                    result["status"] = "VALIDATED_FALSE_POSITIVE"
-                    result["reasoning"] = vision_result.get("reasoning", "No evidence of execution found.")
-            else:
-                result["reasoning"] = "Audit failed: Could not capture screenshot."
-
-            # Cache result (both positive and negative)
-            if self.ENABLE_CACHE:
-                self._cache.set(url, payload, result)
-
-            # NOTE: Feedback loop removed - AgenticValidator is now linear CDP-only
-            # No recursion to specialist agents. Single-attempt validation.
-
-            elapsed = (time.time() - start_time) * 1000
-            self._update_stats(elapsed)
-
-            return result
+            return await self._agentic_process_validation_result(
+                screenshot_path, logs, basic_triggered, finding, url, payload, start_time
+            )
 
     def _update_stats(self, elapsed_ms: float):
         """Update validation statistics."""
@@ -733,78 +761,70 @@ Respond in JSON format:
             "evidence": response[:500]
         }
     
-    async def validate_batch(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        OPTIMIZED: Validate a batch of findings using parallel processing.
-
-        Improvements over v1:
-        - Parallel validation (up to MAX_CONCURRENT_VALIDATIONS simultaneous)
-        - Smart filtering (skip pre-validated, low-severity)
-        - No fixed sleep delays
-        - Progress tracking via dashboard
-        """
-        start_time = time.time()
-        total = len(findings)
-        self.think(f"🚀 Starting PARALLEL validation for {total} findings (concurrency={self.MAX_CONCURRENT_VALIDATIONS})")
-
-        # =====================================================================
-        # PHASE 1: Smart filtering - separate what needs validation
-        # =====================================================================
+    def _batch_filter_findings(self, findings: List[Dict[str, Any]]) -> Tuple[List, List, List]:
+        """Filter findings into pre-validated, skipped, and needs validation."""
         pre_validated = []
         needs_validation = []
         skipped = []
 
         for finding in findings:
-            # Already validated by specialist agent (defensive check)
-            # NOTE: ValidationEngine should filter these, but double-check here
+            # Already validated
             if finding.get("validated") or finding.get("status") == "VALIDATED_CONFIRMED":
                 pre_validated.append(finding)
                 self._stats["skipped_prevalidated"] += 1
                 continue
 
-            # Low severity - skip validation
+            # Low severity
             severity = finding.get("severity", "").upper()
             if severity in ["INFO", "SAFE", "INFORMATIONAL"]:
                 skipped.append(finding)
                 continue
 
-            # All remaining findings need CDP validation
-            # NOTE: Filtering by vuln type now happens at ValidationEngine level
             needs_validation.append(finding)
 
-        logger.info(f"Batch breakdown: {len(pre_validated)} pre-validated, {len(skipped)} skipped, {len(needs_validation)} to validate")
-        dashboard.log(f"⚡ Fast-path: {len(pre_validated)} already validated, {len(needs_validation)} queued for audit", "INFO")
+        return pre_validated, needs_validation, skipped
 
-        # =====================================================================
-        # PHASE 2: Parallel validation of remaining findings
-        # =====================================================================
-        async def validate_single(finding: Dict, index: int) -> Dict:
-            """Wrapper for single validation with error handling."""
+    async def _batch_validate_single(self, finding: Dict, index: int, total: int) -> Dict:
+        """Wrapper for single validation with error handling."""
+        try:
+            dashboard.update_task(
+                "AgenticValidator",
+                status=f"Validating {index+1}/{total}: {finding.get('type', 'unknown')}"
+            )
+            return await self.validate_finding_agentically(finding)
+        except Exception as e:
+            logger.error(f"Validation failed for {finding.get('url', 'unknown')}: {e}", exc_info=True)
+            finding["validated"] = False
+            finding["reasoning"] = f"Validation error: {str(e)}"
+            return finding
+
+    def _batch_collect_results(self, done: set, validated_results: List[Any]):
+        """Collect completed task results."""
+        for task in done:
+            idx = int(task.get_name().split("_")[1])
             try:
-                dashboard.update_task(
-                    "AgenticValidator",
-                    status=f"Validating {index+1}/{len(needs_validation)}: {finding.get('type', 'unknown')}"
-                )
-                return await self.validate_finding_agentically(finding)
+                validated_results[idx] = task.result()
             except Exception as e:
-                logger.error(f"Validation failed for {finding.get('url', 'unknown')}: {e}", exc_info=True)
-                finding["validated"] = False
-                finding["reasoning"] = f"Validation error: {str(e)}"
-                return finding
+                validated_results[idx] = e
 
-        # Check for cancellation before starting batch
-        if self._cancellation_token.get("cancelled", False):
-            logger.info("Batch validation cancelled by user")
-            return pre_validated + skipped
-        
-        # Create validation tasks with index tracking for partial result handling
+    def _batch_handle_pending(self, pending: set, validated_results: List[Any]):
+        """Handle pending tasks on timeout."""
+        logger.warning(f"Batch validation timed out. {len(pending)} tasks pending.")
+        for task in pending:
+            idx = int(task.get_name().split("_")[1])
+            task.cancel()
+            validated_results[idx] = RuntimeError("Validation Timeout")
+
+    async def _batch_execute_parallel(self, needs_validation: List[Dict[str, Any]]) -> List[Any]:
+        """Execute parallel validation with timeout handling."""
         tasks = [
-            asyncio.create_task(validate_single(finding, i), name=f"validate_{i}")
+            asyncio.create_task(
+                self._batch_validate_single(finding, i, len(needs_validation)),
+                name=f"validate_{i}"
+            )
             for i, finding in enumerate(needs_validation)
         ]
 
-        # Execute with timeout but PRESERVE PARTIAL RESULTS
-        # Using asyncio.wait instead of gather to get completed tasks on timeout
         validated_results = [None] * len(needs_validation)
         try:
             done, pending = await asyncio.wait(
@@ -813,31 +833,23 @@ Respond in JSON format:
                 return_when=asyncio.ALL_COMPLETED
             )
 
-            # Collect completed results
-            for task in done:
-                # Extract index from task name
-                idx = int(task.get_name().split("_")[1])
-                try:
-                    validated_results[idx] = task.result()
-                except Exception as e:
-                    validated_results[idx] = e
+            self._batch_collect_results(done, validated_results)
 
-            # Mark pending tasks as timeout (don't lose them!)
             if pending:
-                logger.warning(f"Batch validation timed out. {len(done)} completed, {len(pending)} timed out.")
-                for task in pending:
-                    idx = int(task.get_name().split("_")[1])
-                    task.cancel()
-                    validated_results[idx] = RuntimeError("Validation Timeout")
+                self._batch_handle_pending(pending, validated_results)
 
         except Exception as e:
             logger.error(f"Batch validation failed: {e}", exc_info=True)
-            # Fill remaining with errors
             for i, r in enumerate(validated_results):
                 if r is None:
                     validated_results[i] = RuntimeError(f"Batch Error: {e}")
 
-        # Process results, handling any exceptions
+        return validated_results
+
+    def _batch_process_results(
+        self, validated_results: List[Any], needs_validation: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Process validation results and handle exceptions."""
         validated_findings = []
         for i, result in enumerate(validated_results):
             if result is None or isinstance(result, Exception):
@@ -850,14 +862,12 @@ Respond in JSON format:
                 validated_findings.append(original)
             else:
                 validated_findings.append(result)
+        return validated_findings
 
-        # =====================================================================
-        # PHASE 3: Combine all results
-        # =====================================================================
-        all_results = pre_validated + skipped + validated_findings
-
-        # Log statistics
-        elapsed = time.time() - start_time
+    def _batch_log_stats(
+        self, total: int, pre_validated: List, validated_findings: List, elapsed: float
+    ):
+        """Log batch validation statistics."""
         stats = self.get_stats()
         logger.info(f"""
 ╔══════════════════════════════════════════════════════════════╗
@@ -873,8 +883,43 @@ Respond in JSON format:
 ║ Total Time:         {elapsed:.1f}s                                   ║
 ╚══════════════════════════════════════════════════════════════╝
         """)
-
         dashboard.log(f"✅ Batch validation complete: {elapsed:.1f}s total, {stats['avg_time_ms']:.0f}ms avg", "SUCCESS")
+
+    async def validate_batch(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        OPTIMIZED: Validate a batch of findings using parallel processing.
+
+        Improvements over v1:
+        - Parallel validation (up to MAX_CONCURRENT_VALIDATIONS simultaneous)
+        - Smart filtering (skip pre-validated, low-severity)
+        - No fixed sleep delays
+        - Progress tracking via dashboard
+        """
+        start_time = time.time()
+        total = len(findings)
+        self.think(f"🚀 Starting PARALLEL validation for {total} findings (concurrency={self.MAX_CONCURRENT_VALIDATIONS})")
+
+        # Phase 1: Smart filtering
+        pre_validated, needs_validation, skipped = self._batch_filter_findings(findings)
+
+        logger.info(f"Batch breakdown: {len(pre_validated)} pre-validated, {len(skipped)} skipped, {len(needs_validation)} to validate")
+        dashboard.log(f"⚡ Fast-path: {len(pre_validated)} already validated, {len(needs_validation)} queued for audit", "INFO")
+
+        # Check for cancellation
+        if self._cancellation_token.get("cancelled", False):
+            logger.info("Batch validation cancelled by user")
+            return pre_validated + skipped
+
+        # Phase 2: Parallel validation
+        validated_results = await self._batch_execute_parallel(needs_validation)
+
+        # Phase 3: Process results
+        validated_findings = self._batch_process_results(validated_results, needs_validation)
+
+        # Phase 4: Combine and log
+        all_results = pre_validated + skipped + validated_findings
+        elapsed = time.time() - start_time
+        self._batch_log_stats(total, pre_validated, validated_findings, elapsed)
 
         return all_results
 
