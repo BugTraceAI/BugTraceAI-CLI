@@ -56,64 +56,53 @@ class SkepticalAgent(BaseAgent):
         """
         EVENT HANDLER: Triggered when ExploitAgent finds potential vulnerability.
         Executes IMMEDIATELY (~50ms) instead of polling (~5s).
-        
+
         Args:
-            data (dict): Event payload from ExploitAgent:
-                {
-                    "finding_id": "xss_search",
-                    "type": "XSS|SQLi|...",
-                    "url": "https://example.com/search?q=...",
-                    "payload": "<script>alert(1)</script>",
-                    "confidence": 0.7,
-                    "detected_by": "Exploit-1",
-                    "timestamp": "2026-01-01T..."
-                }
+            data (dict): Event payload from ExploitAgent with finding details
         """
         finding_id = data.get('finding_id', 'unknown')
         vuln_type = data.get('type', 'XSS')
-        url = data.get('url', '')
-        payload = data.get('payload', '')
-        confidence = data.get('confidence', 0.5)
-        
+
         logger.info(
             f"[{self.name}] 🔥 EVENT: vulnerability_detected | "
-            f"Type: {vuln_type}, ID: {finding_id}, Confidence: {confidence}"
+            f"Type: {vuln_type}, ID: {finding_id}, Confidence: {data.get('confidence', 0.5)}"
         )
-        
-        # Deduplication check
+
+        # Check deduplication
         if finding_id in self.verified_findings:
             logger.debug(f"[{self.name}] Finding already verified, skipping")
             return
-        
-        # Mark as processing
+
         self.verified_findings.add(finding_id)
-        
-        # Update dashboard
         dashboard.update_task(self.name, status=f"Event: Verifying {vuln_type}")
-        
+
         try:
-            # Only XSS needs visual verification (expensive)
+            # Route based on type
             if vuln_type.upper() != "XSS":
-                logger.info(f"[{self.name}] {vuln_type} auto-approved (no visual verification needed)")
-                
-                # Auto-approve non-XSS findings
-                await self._auto_approve_finding(data)
-                return
-            
-            # XSS: Visual verification required
-            logger.info(f"[{self.name}] Starting visual verification for {finding_id}")
-            await self.verify_vulnerability({
-                "url": url,
-                "type": vuln_type,
-                "payload": payload,
-                "finding_id": finding_id,
-                "status": "FIRED"
-            })
-            
+                await self._candidate_auto_approve(data)
+            else:
+                await self._candidate_verify_xss(data)
+
             logger.info(f"[{self.name}] ✅ Completed verification of {finding_id}")
-            
+
         except Exception as e:
             logger.error(f"[{self.name}] Handler error for {finding_id}: {e}", exc_info=True)
+
+    async def _candidate_auto_approve(self, data: Dict[str, Any]):
+        """Auto-approve non-XSS findings (no visual verification needed)."""
+        logger.info(f"[{self.name}] {data.get('type')} auto-approved (no visual verification needed)")
+        await self._auto_approve_finding(data)
+
+    async def _candidate_verify_xss(self, data: Dict[str, Any]):
+        """Verify XSS finding with visual verification."""
+        logger.info(f"[{self.name}] Starting visual verification for {data.get('finding_id')}")
+        await self.verify_vulnerability({
+            "url": data.get('url', ''),
+            "type": data.get('type', 'XSS'),
+            "payload": data.get('payload', ''),
+            "finding_id": data.get('finding_id'),
+            "status": "FIRED"
+        })
     
     async def _auto_approve_finding(self, data: Dict[str, Any]):
         """
@@ -211,100 +200,109 @@ class SkepticalAgent(BaseAgent):
         url = finding_data.get("url")
         vuln_type = finding_data.get("type", "XSS")
         finding_id = finding_data.get("finding_id", f"unknown_{vuln_type}")
-        
+
         self.think(f"VERIFICATION: {vuln_type} on {url}")
-        
+
         if not url:
             logger.error(f"Cannot verify {vuln_type}: URL is missing")
             return
 
         try:
-            from bugtrace.tools.visual.browser import browser_manager
-            
-            # Trigger XSS and capture screenshot
-            screenshot_path, logs, triggered = await browser_manager.verify_xss(
-                url, 
-                expected_message=None
-            )
-            
+            # Test browser
+            screenshot_path, triggered = await self._verify_test_browser(url, vuln_type)
             if not triggered:
-                logger.warning(f"[{self.name}] Alert NOT triggered, rejecting")
-                self.think("Alert not triggered. Likely false positive.")
-                return
-            
-            # XSS alert triggered - analyze with AI vision
-            self.think("XSS Execution Confirmed. Analyzing with AI vision...")
-            
-            with open(screenshot_path, "rb") as f:
-                image_data = f.read()
-            
-            # Cost optimization: Only for XSS
-            if "XSS" not in vuln_type.upper():
-                self.think(f"Skipping AI analysis for non-XSS: {vuln_type}")
                 return
 
-            # Enhanced Vision Model Prompt
-            from bugtrace.core.llm_client import llm_client
-            
-            # Load system prompt via BaseAgent's self.system_prompt
-            prompt = self.system_prompt if self.system_prompt else ""
-            
-            if not prompt:
-                # Fallback to hardcoded prompt
-                prompt = (
-                    "You are a Senior Security Auditor. Analyze this screenshot of a triggered XSS alert. "
-                    "1. Is the alert dialog clearly visible? "
-                    "2. Does the content prove execution on the target domain? "
-                    "3. Is there evidence of sandboxing? "
-                    "Reply with VERIFIED if valid PoC, otherwise POTENTIAL_SANDBOX or UNRELIABLE."
-                )
-            
-            # Analyze with vision model
-            analysis = await llm_client.analyze_visual(image_data, prompt)
-            
+            # Analyze with vision
+            image_data = self._verify_load_screenshot(screenshot_path)
+            analysis = await self._verify_vision_analysis(image_data, vuln_type)
+
+            # Process result
             if analysis and "VERIFIED" in analysis.upper():
-                # VERIFIED - Add to memory
-                logger.info(f"[{self.name}] VERIFIED: {vuln_type} at {url}")
-                
-                dashboard.log(
-                    f"[{self.name}] AUDIT COMPLETE: {vuln_type} CONFIRMED at {url}", 
-                    "CRITICAL"
-                )
-                
-                dashboard.add_finding(
-                    f"Verified {vuln_type}", 
-                    f"Audit Proof: {analysis[:100]}", 
-                    "CRITICAL"
-                )
-                
-                # Add to memory
-                memory_manager.add_node("Finding", f"Verified_{finding_id}", {
-                    "url": url,
-                    "type": vuln_type,
-                    "severity": "CRITICAL",
-                    "proof": analysis,
-                    "screenshot_path": screenshot_path,
-                    "verified_by": self.name,
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-                # EVENT: Emit finding_verified
-                await self.event_bus.emit("finding_verified", {
-                    "finding_id": finding_id,
-                    "type": vuln_type,
-                    "url": url,
-                    "severity": "CRITICAL",
-                    "proof": screenshot_path,
-                    "verified_by": self.name,
-                    "ai_analysis": analysis[:200],
-                    "timestamp": datetime.now().isoformat()
-                })
-                
-                logger.info(f"[{self.name}] 📢 EVENT EMITTED: finding_verified (XSS)")
-                
+                await self._verify_mark_confirmed(url, vuln_type, finding_id, screenshot_path, analysis)
             else:
-                logger.warning(f"[{self.name}] REJECTED: AI evaluation unreliable: {analysis[:50]}")
-                self.think(f"AUDIT WARNING: Unreliable PoC - {analysis[:50]}")
-                
+                self._verify_mark_rejected(analysis)
+
         except Exception as e:
             logger.error(f"[{self.name}] Verification error: {e}", exc_info=True)
+
+    async def _verify_test_browser(self, url: str, vuln_type: str) -> tuple:
+        """Test vulnerability in browser and capture screenshot."""
+        from bugtrace.tools.visual.browser import browser_manager
+
+        screenshot_path, logs, triggered = await browser_manager.verify_xss(url, expected_message=None)
+
+        if not triggered:
+            logger.warning(f"[{self.name}] Alert NOT triggered, rejecting")
+            self.think("Alert not triggered. Likely false positive.")
+            return None, False
+
+        self.think("XSS Execution Confirmed. Analyzing with AI vision...")
+        return screenshot_path, True
+
+    def _verify_load_screenshot(self, screenshot_path: str) -> bytes:
+        """Load screenshot image data."""
+        with open(screenshot_path, "rb") as f:
+            return f.read()
+
+    async def _verify_vision_analysis(self, image_data: bytes, vuln_type: str) -> str:
+        """Analyze screenshot with vision model."""
+        if "XSS" not in vuln_type.upper():
+            self.think(f"Skipping AI analysis for non-XSS: {vuln_type}")
+            return ""
+
+        from bugtrace.core.llm_client import llm_client
+
+        prompt = self.system_prompt if self.system_prompt else (
+            "You are a Senior Security Auditor. Analyze this screenshot of a triggered XSS alert. "
+            "1. Is the alert dialog clearly visible? "
+            "2. Does the content prove execution on the target domain? "
+            "3. Is there evidence of sandboxing? "
+            "Reply with VERIFIED if valid PoC, otherwise POTENTIAL_SANDBOX or UNRELIABLE."
+        )
+
+        return await llm_client.analyze_visual(image_data, prompt)
+
+    async def _verify_mark_confirmed(
+        self,
+        url: str,
+        vuln_type: str,
+        finding_id: str,
+        screenshot_path: str,
+        analysis: str
+    ):
+        """Mark finding as verified and emit event."""
+        logger.info(f"[{self.name}] VERIFIED: {vuln_type} at {url}")
+
+        dashboard.log(f"[{self.name}] AUDIT COMPLETE: {vuln_type} CONFIRMED at {url}", "CRITICAL")
+        dashboard.add_finding(f"Verified {vuln_type}", f"Audit Proof: {analysis[:100]}", "CRITICAL")
+
+        # Add to memory
+        memory_manager.add_node("Finding", f"Verified_{finding_id}", {
+            "url": url,
+            "type": vuln_type,
+            "severity": "CRITICAL",
+            "proof": analysis,
+            "screenshot_path": screenshot_path,
+            "verified_by": self.name,
+            "timestamp": datetime.now().isoformat()
+        })
+
+        # Emit event
+        await self.event_bus.emit("finding_verified", {
+            "finding_id": finding_id,
+            "type": vuln_type,
+            "url": url,
+            "severity": "CRITICAL",
+            "proof": screenshot_path,
+            "verified_by": self.name,
+            "ai_analysis": analysis[:200],
+            "timestamp": datetime.now().isoformat()
+        })
+
+        logger.info(f"[{self.name}] 📢 EVENT EMITTED: finding_verified (XSS)")
+
+    def _verify_mark_rejected(self, analysis: str):
+        """Mark finding as rejected."""
+        logger.warning(f"[{self.name}] REJECTED: AI evaluation unreliable: {analysis[:50] if analysis else 'N/A'}")
+        self.think(f"AUDIT WARNING: Unreliable PoC - {analysis[:50] if analysis else 'N/A'}")
