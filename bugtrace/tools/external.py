@@ -170,6 +170,81 @@ class ExternalToolManager:
         self._tool_last_run[tool_name] = time_module.time()
         logger.debug(f"Tool '{tool_name}' run #{self._tool_run_counts[tool_name]}")
 
+    def _build_docker_command(
+        self,
+        image: str,
+        command: List[str],
+        memory_limit: str,
+        cpu_limit: str,
+        network_mode: str
+    ) -> List[str]:
+        """Build Docker command with security constraints."""
+        full_cmd = [
+            self.docker_cmd, "run", "--rm",
+            # Resource limits (TASK-108)
+            "--memory", memory_limit,
+            "--cpus", cpu_limit,
+            "--pids-limit", "100",
+            # Security options
+            "--security-opt", "no-new-privileges",
+            "--read-only",
+            "--tmpfs", "/tmp:size=100m,mode=1777",
+            # Network isolation (TASK-114)
+            "--network", network_mode,
+        ]
+        full_cmd.append(image)
+        full_cmd.extend(command)
+        return full_cmd
+
+    async def _execute_docker_process(
+        self,
+        cmd: List[str],
+        timeout: int
+    ) -> tuple[asyncio.subprocess.Process, bytes, bytes]:
+        """Execute Docker process with timeout handling."""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout
+            )
+            return proc, stdout, stderr
+        except asyncio.TimeoutError:
+            if proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            raise
+
+    def _handle_docker_exit_code(self, returncode: int, stderr: bytes, image: str) -> bool:
+        """
+        Check if Docker exit code indicates failure.
+        Returns True if execution should continue, False if should abort.
+        """
+        if returncode == 0:
+            return True
+
+        err = stderr.decode().strip()
+        # SQLMap sometimes exits with non-zero on minor errors but still outputs findings
+        if "sqlmap" not in image:
+            logger.error(f"Docker command failed (Code {returncode}): {err if err else 'No stderr output'}")
+            return False
+        return True
+
+    async def _cleanup_docker_process(self, proc: asyncio.subprocess.Process) -> None:
+        """Ensure Docker subprocess is properly cleaned up."""
+        if proc is not None:
+            try:
+                if proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
+            except Exception as e:
+                logger.debug(f"Process cleanup failed: {e}")
+
     async def _run_container(
         self,
         image: str,
@@ -198,66 +273,25 @@ class ExternalToolManager:
             logger.error(f"Blocked execution of untrusted image: {image}")
             return ""
 
-        full_cmd = [
-            self.docker_cmd, "run", "--rm",
-            # Resource limits (TASK-108)
-            "--memory", memory_limit,
-            "--cpus", cpu_limit,
-            "--pids-limit", "100",
-            # Security options
-            "--security-opt", "no-new-privileges",
-            "--read-only",
-            "--tmpfs", "/tmp:size=100m,mode=1777",
-            # Network isolation (TASK-114)
-            "--network", network_mode,
-        ]
-        full_cmd.append(image)
-        full_cmd.extend(command)
-
+        full_cmd = self._build_docker_command(image, command, memory_limit, cpu_limit, network_mode)
         logger.debug(f"Docker Exec: {' '.join(full_cmd)}")
 
         proc = None
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *full_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
+            proc, stdout, stderr = await self._execute_docker_process(full_cmd, timeout)
 
-            # Timeout handling (TASK-109)
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"Docker container timeout after {timeout}s: {image}")
-                if proc.returncode is None:
-                    proc.kill()
-                    await proc.wait()
+            if not self._handle_docker_exit_code(proc.returncode, stderr, image):
                 return ""
 
-            if proc.returncode != 0:
-                err = stderr.decode().strip()
-                # SQLMap sometimes exits with non-zero on minor errors but still outputs findings
-                if "sqlmap" not in image:
-                    logger.error(f"Docker command failed (Code {proc.returncode}): {err if err else 'No stderr output'}")
-                    return ""
-
-            # Sanitize output (TASK-113)
             return _sanitize_output(stdout.decode())
+        except asyncio.TimeoutError:
+            logger.error(f"Docker container timeout after {timeout}s: {image}")
+            return ""
         except Exception as e:
             logger.error(f"Docker subprocess error: {e}")
             return ""
         finally:
-            # Ensure subprocess is properly cleaned up
-            if proc is not None:
-                try:
-                    if proc.returncode is None:
-                        proc.kill()
-                        await proc.wait()
-                except Exception as e:
-                    logger.debug(f"Process cleanup failed: {e}")
+            await self._cleanup_docker_process(proc)
 
     async def run_nuclei(self, target: str, cookies: List[Dict] = None) -> List[Dict]:
         """
@@ -300,22 +334,15 @@ class ExternalToolManager:
             dashboard.log(f"[External] Nuclei found {len(findings)} vulnerabilities.", "SUCCESS")
         return findings
 
-    async def run_sqlmap(self, url: str, cookies: List[Dict] = None, target_param: str = None) -> Optional[Dict]:
-        """
-        Runs SQLMap active scan with session context on specific URL/Param.
-        AVOIDS redundant crawling by targeting specific parameters found by GoSpider.
-        """
-        if not self.docker_cmd: return None
-
-        self._record_tool_run("sqlmap")
-        target_info = f"param '{target_param}' on {url}" if target_param else url
-        logger.info(f"Starting SQLMap Scan on {target_info}...")
-        dashboard.log(f"[External] Launching SQLMap (Sniper Mode) against {target_info}", "INFO")
-        
-        # SQLMap args: -u URL --batch ...
-        # Improved: technique=BEUSTQ (All), level=2, risk=2 (Balanced)
+    def _build_sqlmap_command(
+        self,
+        url: str,
+        target_param: Optional[str],
+        cookies: Optional[List[Dict]]
+    ) -> tuple[List[str], str]:
+        """Build SQLMap command and reproduction command."""
         reproduction_cmd = f"sqlmap -u '{url}' --batch --random-agent --technique=BEUSTQ --level 2 --risk 2"
-        
+
         cmd = [
             "-u", url,
             "--batch",
@@ -323,88 +350,67 @@ class ExternalToolManager:
             "--technique=BEUSTQ",
             "--level", "2",
             "--risk", "2",
-            "--parse-errors", # Help catch error-based
+            "--parse-errors",
             "--flush-session",
             "--output-dir=/tmp"
         ]
-        
+
         if target_param:
             cmd.extend(["-p", target_param])
             reproduction_cmd += f" -p {target_param}"
-            # Disable forms searching if we target a param (strict mode)
             cmd.append("--skip-urlencoding")
         else:
-            # Only if no param is known do we enable forms
             cmd.append("--forms")
             reproduction_cmd += " --forms"
-        
+
         if cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             cmd.append(f"--cookie={cookie_str}")
             reproduction_cmd += f" --cookie='{cookie_str}'"
-        
-        # Use googlesky/sqlmap image (community maintained)
-        output = await self._run_container("googlesky/sqlmap:latest", cmd)
-        
-        # Robust Parsing using Regex
+
+        return cmd, reproduction_cmd
+
+    def _parse_sqlmap_output(self, output: str) -> Optional[tuple[str, str]]:
+        """Parse SQLMap output for vulnerability detection."""
         param_match = re.search(r"Parameter:\s+(.+?)\s+\(", output)
         type_match = re.search(r"Type:\s+(.+?)\s", output)
-        
-        is_vulnerable = bool(param_match and type_match)
-        
-        if is_vulnerable:
-            param = param_match.group(1)
-            vuln_type = type_match.group(1)
-            msg = f"SQLMap Confirmed: {vuln_type} on parameter '{param}'"
-            
+
+        if param_match and type_match:
+            return param_match.group(1), type_match.group(1)
+        return None
+
+    async def run_sqlmap(self, url: str, cookies: List[Dict] = None, target_param: str = None) -> Optional[Dict]:
+        """
+        Runs SQLMap active scan with session context on specific URL/Param.
+        AVOIDS redundant crawling by targeting specific parameters found by GoSpider.
+        """
+        if not self.docker_cmd:
+            return None
+
+        self._record_tool_run("sqlmap")
+        target_info = f"param '{target_param}' on {url}" if target_param else url
+        logger.info(f"Starting SQLMap Scan on {target_info}...")
+        dashboard.log(f"[External] Launching SQLMap (Sniper Mode) against {target_info}", "INFO")
+
+        cmd, reproduction_cmd = self._build_sqlmap_command(url, target_param, cookies)
+        output = await self._run_container("googlesky/sqlmap:latest", cmd)
+
+        result = self._parse_sqlmap_output(output)
+        if result:
+            param, vuln_type = result
             return {
                 "vulnerable": True,
                 "parameter": param,
                 "type": vuln_type,
                 "reproduction_command": reproduction_cmd,
-                "output_snippet": output[:1000] # Capture first 1000 chars of output for evidence
+                "output_snippet": output[:1000]
             }
         return None
 
-    async def run_gospider(self, url: str, cookies: List[Dict] = None, depth: int = 3) -> List[str]:
-        """
-        Runs GoSpider to crawl the target with session.
-
-        Args:
-            url: Target URL to crawl
-            cookies: Optional session cookies
-            depth: Crawl depth (default 3 to find parameterized URLs)
-        """
-        if not self.docker_cmd: return []
-
-        self._record_tool_run("gospider")
-        logger.info(f"Starting GoSpider on {url} (depth={depth})...")
-        dashboard.log(f"[External] Launching GoSpider (depth={depth}) against {url}", "INFO")
-        dashboard.update_task("gospider", name="GoSpider", status=f"Crawling: {url}")
-        
-        # GoSpider args: -s URL -d DEPTH -c 10
-        cmd = [
-            "-s", url,
-            "-d", str(depth),
-            "-c", "10"
-        ]
-        
-        if cookies:
-             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-             cmd.extend(["--cookie", cookie_str])
-
-        # Use trickest/gospider image
-        output = await self._run_container("trickest/gospider", cmd)
-        
+    def _parse_gospider_urls(self, output: str, target_domain: str) -> List[str]:
+        """Parse URLs from GoSpider output, filtering to target domain."""
         urls = []
-        target_domain = urlparse(url).hostname.lower()
-        logger.info(f"GoSpider raw output (first 10 lines):\n{chr(10).join(output.splitlines()[:10])}")
-        
         for line in output.splitlines():
-            # GoSpider output can be:
-            # [url] - [200] - [type]
-            # [type] - [url]
-            # or just a URL
             parts = line.replace("[", "").replace("]", "").split(" - ")
             for p in parts:
                 p = p.strip()
@@ -416,59 +422,86 @@ class ExternalToolManager:
                             urls.append(p)
                     except Exception as e:
                         logger.debug(f"URL parsing error in GoSpider output: {e}")
-                        continue
-                    
-        unique_urls = list(set(urls))
+        return list(set(urls))
+
+    async def run_gospider(self, url: str, cookies: List[Dict] = None, depth: int = 3) -> List[str]:
+        """
+        Runs GoSpider to crawl the target with session.
+
+        Args:
+            url: Target URL to crawl
+            cookies: Optional session cookies
+            depth: Crawl depth (default 3 to find parameterized URLs)
+        """
+        if not self.docker_cmd:
+            return []
+
+        self._record_tool_run("gospider")
+        logger.info(f"Starting GoSpider on {url} (depth={depth})...")
+        dashboard.log(f"[External] Launching GoSpider (depth={depth}) against {url}", "INFO")
+        dashboard.update_task("gospider", name="GoSpider", status=f"Crawling: {url}")
+
+        cmd = ["-s", url, "-d", str(depth), "-c", "10"]
+
+        if cookies:
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            cmd.extend(["--cookie", cookie_str])
+
+        output = await self._run_container("trickest/gospider", cmd)
+
+        target_domain = urlparse(url).hostname.lower()
+        logger.info(f"GoSpider raw output (first 10 lines):\n{chr(10).join(output.splitlines()[:10])}")
+
+        unique_urls = self._parse_gospider_urls(output, target_domain)
         logger.info(f"GoSpider found {len(unique_urls)} in-scope URLs out of {len(output.splitlines())} total lines.")
         dashboard.log(f"[External] GoSpider discovered {len(unique_urls)} in-scope endpoints.", "INFO")
         return unique_urls
 
+    def _build_fuzz_url(self, url: str, param: str) -> str:
+        """Build URL with FUZZ marker replacing parameter value."""
+        if f"{param}=" in url:
+            return re.sub(rf"([?&]{re.escape(param)})=([^&]*)", r"\1=FUZZ", url)
+        separator = "&" if "?" in url else "?"
+        return f"{url}{separator}{param}=FUZZ"
+
+    async def _write_payloads_file(self, payloads: List[str]) -> str:
+        """Write payloads to temporary file and return path."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write("\n".join(payloads))
+            return f.name
+
+    async def _cleanup_temp_file(self, filepath: str) -> None:
+        """Clean up temporary file safely."""
+        if filepath and os.path.exists(filepath):
+            try:
+                os.unlink(filepath)
+            except OSError:
+                logger.warning(f"Failed to cleanup temp file: {filepath}")
+
     async def run_go_xss_fuzzer(self, url: str, param: str, payloads: List[str] = None) -> Optional[Dict]:
         """
         Run the Go XSS fuzzer for high-performance payload testing.
-        
+
         Returns:
             {
                 "reflections": [...],
                 "metadata": {...}
             }
         """
-        # Binary is in the root bin/ directory (relative to project root)
         binary_path = settings.BASE_DIR / "bin" / "go-xss-fuzzer"
-        
+
         if not binary_path.exists():
             logger.warning(f"Go XSS fuzzer not found at {binary_path}, falling back to Python")
             return None
-        
-        # Build URL with FUZZ marker
-        # We need to be careful with existing query params. 
-        # The simplest way is to replace 'param=value' with 'param=FUZZ'
-        fuzz_url = url
-        if f"{param}=" in url:
-            # Replace the parameter value with FUZZ
-            # Handle cases like ?q=val&p=val or ?q=val
-            fuzz_url = re.sub(rf"([?&]{re.escape(param)})=([^&]*)", r"\1=FUZZ", url)
-        else:
-            # Fallback: append if not found (though it should be there)
-            separator = "&" if "?" in url else "?"
-            fuzz_url = f"{url}{separator}{param}=FUZZ"
-            
-        cmd = [
-            str(binary_path),
-            "-u", fuzz_url,
-            "-c", "100",       # 100 concurrent goroutines
-            "-t", "5",         # 5 second timeout
-            "--json"
-        ]
-        
+
+        fuzz_url = self._build_fuzz_url(url, param)
+        cmd = [str(binary_path), "-u", fuzz_url, "-c", "100", "-t", "5", "--json"]
+
         payloads_file = None
         try:
             if payloads:
-                # Write payloads to temp file with secure handling
-                import tempfile
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-                    f.write("\n".join(payloads))
-                    payloads_file = f.name
+                payloads_file = await self._write_payloads_file(payloads)
                 cmd.extend(["-p", payloads_file])
                 logger.debug(f"Go XSS Fuzzer using custom payloads file: {payloads_file}")
 
@@ -491,12 +524,7 @@ class ExternalToolManager:
             logger.error(f"Go XSS fuzzer error: {e}")
             return None
         finally:
-            # Secure cleanup - always runs
-            if payloads_file and os.path.exists(payloads_file):
-                try:
-                    os.unlink(payloads_file)
-                except OSError:
-                    logger.warning(f"Failed to cleanup temp file: {payloads_file}")
+            await self._cleanup_temp_file(payloads_file)
 
     async def run_go_ssrf_fuzzer(self, url: str, param: str, oob_url: str = None) -> Optional[Dict]:
         """
@@ -600,59 +628,63 @@ class ExternalToolManager:
             logger.error(f"Go LFI fuzzer error: {e}")
             return None
 
-    async def run_go_idor_fuzzer(self, url: str, param: str, id_range: str = "1-100", 
-                                 baseline_id: str = "1", auth_header: str = None) -> Optional[Dict]:
+    async def _run_go_fuzzer(
+        self,
+        binary_name: str,
+        url: str,
+        param: str,
+        extra_args: List[str],
+        timeout: int = 120
+    ) -> Optional[Dict]:
+        """Generic Go fuzzer execution helper."""
+        binary_path = settings.BASE_DIR / "bin" / binary_name
+
+        if not binary_path.exists():
+            logger.warning(f"{binary_name} not found at {binary_path}")
+            return None
+
+        fuzz_url = self._build_fuzz_url(url, param)
+        cmd = [str(binary_path), "-u", fuzz_url] + extra_args + ["--json"]
+
+        try:
+            logger.info(f"Launching {binary_name} against {param} on {url}")
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+
+            if process.returncode == 0:
+                return _parse_tool_output(stdout.decode())
+            else:
+                logger.error(f"{binary_name} failed: {stderr.decode()}")
+                return None
+        except Exception as e:
+            logger.error(f"{binary_name} error: {e}")
+            return None
+
+    async def run_go_idor_fuzzer(
+        self,
+        url: str,
+        param: str,
+        id_range: str = "1-100",
+        baseline_id: str = "1",
+        auth_header: str = None
+    ) -> Optional[Dict]:
         """
         Run the Go IDOR fuzzer for high-performance ID enumeration.
-        
+
         Returns:
             {
                 "hits": [...],
                 "metadata": {...}
             }
         """
-        binary_path = settings.BASE_DIR / "bin" / "go-idor-fuzzer"
-        
-        if not binary_path.exists():
-            logger.warning(f"Go IDOR fuzzer not found at {binary_path}")
-            return None
-        
-        fuzz_url = url
-        if f"{param}=" in url:
-            fuzz_url = re.sub(rf"([?&]{re.escape(param)})=([^&]*)", r"\1=FUZZ", url)
-        else:
-            separator = "&" if "?" in url else "?"
-            fuzz_url = f"{url}{separator}{param}=FUZZ"
-            
-        cmd = [
-            str(binary_path),
-            "-u", fuzz_url,
-            "-range", id_range,
-            "-baseline", baseline_id,
-            "-c", "200",
-            "-t", "5",
-            "--json"
-        ]
-        
+        extra_args = ["-range", id_range, "-baseline", baseline_id, "-c", "200", "-t", "5"]
         if auth_header:
-            cmd.extend(["-H", auth_header])
-        
-        try:
-            logger.info(f"Launching Go IDOR Fuzzer against {param} on {url} (Range: {id_range})")
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
-            
-            if process.returncode == 0:
-                return _parse_tool_output(stdout.decode())
-            else:
-                logger.error(f"Go IDOR fuzzer failed: {stderr.decode()}")
-                return None
-        except Exception as e:
-            logger.error(f"Go IDOR fuzzer error: {e}")
-            return None
+            extra_args.extend(["-H", auth_header])
+
+        return await self._run_go_fuzzer("go-idor-fuzzer", url, param, extra_args, timeout=300)
 
 external_tools = ExternalToolManager()
