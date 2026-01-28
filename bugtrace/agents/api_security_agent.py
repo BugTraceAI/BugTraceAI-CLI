@@ -86,45 +86,42 @@ class APISecurityAgent(BaseAgent):
 
     # ==================== GRAPHQL TESTING ====================
 
-    async def _test_graphql_endpoint(self, endpoint: str) -> Dict[str, Any]:
-        """
-        Comprehensive GraphQL security testing.
+    def _create_introspection_vuln(self, introspection_result: Dict) -> Dict:
+        """Create vulnerability entry for GraphQL introspection."""
+        return {
+            "type": "GraphQL Introspection Enabled",
+            "severity": "MEDIUM",
+            "description": "Schema can be fully enumerated",
+            "schema": introspection_result.get("schema")
+        }
 
-        Tests:
-        1. Introspection query (schema disclosure)
-        2. Injection in query variables
-        3. Nested query DoS
-        4. Authorization bypass
-        """
+    def _create_injection_vuln(self, injection_result: Dict, endpoint: str) -> Dict:
+        """Create vulnerability entry for GraphQL injection."""
+        return {
+            "type": "GraphQL Injection",
+            "severity": "CRITICAL",
+            "payload": injection_result["payload"],
+            "response": injection_result["response"][:500],
+            "description": f"GraphQL query injection vulnerability detected. Malicious payloads can manipulate query structure to access unauthorized data or execute unintended operations.",
+            "reproduction": f"curl -X POST '{endpoint}' -H 'Content-Type: application/json' -d '{{\"query\": \"{injection_result['payload'][:100]}...\"}}'"
+        }
+
+    async def _test_graphql_endpoint(self, endpoint: str) -> Dict[str, Any]:
+        """Comprehensive GraphQL security testing."""
         self.think(f"Testing GraphQL endpoint: {endpoint}")
         dashboard.log(f"🔍 GraphQL Testing: {endpoint}", "INFO")
 
-        results = {
-            "endpoint": endpoint,
-            "vulnerabilities": []
-        }
+        results = {"endpoint": endpoint, "vulnerabilities": []}
 
         # Test 1: Introspection
         introspection_result = await self._test_graphql_introspection(endpoint)
         if introspection_result["enabled"]:
-            results["vulnerabilities"].append({
-                "type": "GraphQL Introspection Enabled",
-                "severity": "MEDIUM",
-                "description": "Schema can be fully enumerated",
-                "schema": introspection_result.get("schema")
-            })
+            results["vulnerabilities"].append(self._create_introspection_vuln(introspection_result))
 
         # Test 2: Injection in queries
         injection_result = await self._test_graphql_injection(endpoint)
         if injection_result["vulnerable"]:
-            results["vulnerabilities"].append({
-                "type": "GraphQL Injection",
-                "severity": "CRITICAL",
-                "payload": injection_result["payload"],
-                "response": injection_result["response"][:500],
-                "description": f"GraphQL query injection vulnerability detected. Malicious payloads can manipulate query structure to access unauthorized data or execute unintended operations.",
-                "reproduction": f"curl -X POST '{endpoint}' -H 'Content-Type: application/json' -d '{{\"query\": \"{injection_result['payload'][:100]}...\"}}'"
-            })
+            results["vulnerabilities"].append(self._create_injection_vuln(injection_result, endpoint))
 
         # Test 3: Nested query DoS
         dos_result = await self._test_graphql_dos(endpoint)
@@ -361,9 +358,22 @@ class APISecurityAgent(BaseAgent):
 
         return {"vulnerable": False}
 
+    def _create_idor_finding(self, endpoint: str, original_id: int, test_id: int, test_endpoint: str) -> Dict:
+        """Create IDOR vulnerability finding."""
+        return {
+            "vulnerable": True,
+            "type": "IDOR (Insecure Direct Object Reference)",
+            "severity": "CRITICAL",
+            "original_id": original_id,
+            "accessible_id": test_id,
+            "url": endpoint,
+            "parameter": "id",
+            "description": f"Insecure Direct Object Reference (IDOR) vulnerability. Changing ID from {original_id} to {test_id} returns different user data without authorization checks.",
+            "reproduction": f"# Original: curl '{endpoint}'\n# IDOR: curl '{test_endpoint}'"
+        }
+
     async def _test_idor(self, endpoint: str) -> Dict:
         """Test for Insecure Direct Object Reference."""
-        # Extract numeric IDs from endpoint
         id_pattern = r'/(\d+)(?:/|$)'
         match = re.search(id_pattern, endpoint)
 
@@ -371,26 +381,16 @@ class APISecurityAgent(BaseAgent):
             return {"vulnerable": False}
 
         original_id = int(match.group(1))
-
-        # Try accessing other IDs
-        test_ids = [
-            original_id - 1,
-            original_id + 1,
-            1,  # First user
-            999,  # Random user
-        ]
+        test_ids = [original_id - 1, original_id + 1, 1, 999]
 
         try:
             async with httpx.AsyncClient(timeout=5) as client:
-                # Get original resource
                 original_response = await client.get(endpoint, timeout=5)
-
                 if original_response.status_code != 200:
                     return {"vulnerable": False}
 
                 original_data = original_response.text
 
-                # Test other IDs
                 for test_id in test_ids:
                     if test_id == original_id:
                         continue
@@ -398,23 +398,10 @@ class APISecurityAgent(BaseAgent):
                     test_endpoint = re.sub(id_pattern, f'/{test_id}/', endpoint)
                     test_response = await client.get(test_endpoint, timeout=5)
 
-                    # If we get different data with 200 status, IDOR exists
                     if test_response.status_code == 200 and test_response.text != original_data:
-                        dashboard.log(
-                            f"  🚨 IDOR: Can access other user data at {test_endpoint}",
-                            "CRITICAL"
-                        )
-                        return {
-                            "vulnerable": True,
-                            "type": "IDOR (Insecure Direct Object Reference)",
-                            "severity": "CRITICAL",
-                            "original_id": original_id,
-                            "accessible_id": test_id,
-                            "url": endpoint,
-                            "parameter": "id",
-                            "description": f"Insecure Direct Object Reference (IDOR) vulnerability. Changing ID from {original_id} to {test_id} returns different user data without authorization checks.",
-                            "reproduction": f"# Original: curl '{endpoint}'\n# IDOR: curl '{test_endpoint}'"
-                        }
+                        dashboard.log(f"  🚨 IDOR: Can access other user data at {test_endpoint}", "CRITICAL")
+                        return self._create_idor_finding(endpoint, original_id, test_id, test_endpoint)
+
         except Exception as e:
             logger.debug(f"operation failed: {e}")
 
