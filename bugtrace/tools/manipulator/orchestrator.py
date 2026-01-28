@@ -31,22 +31,30 @@ class ManipulatorOrchestrator:
             request_count += 1
             if request_count % 20 == 0:
                 logger.info(f"Manipulator progress: {request_count} mutations tested")
-            
-            success = await self._try_mutation(mutation)
-            if success:
-                logger.info(f"Manipulator: Exploited successfully! URL: {mutation.url} Params: {mutation.params}")
-                return True, mutation
-            
-            # Phase 2: Reactive Encoding (WAF Bypass)
-            if MutationStrategy.BYPASS_WAF in strategies:
-                async for encoded_mutation in self.encoding_agent.generate_mutations(mutation, strategies):
-                    success_enc = await self._try_mutation(encoded_mutation)
-                    if success_enc:
-                        logger.info(f"Manipulator: Exploited with WAF Bypass! URL: {encoded_mutation.url} Params: {encoded_mutation.params}")
-                        return True, encoded_mutation
-        
+
+            result = await self._test_mutation_with_bypass(mutation, strategies)
+            if result:
+                return result
+
         logger.info("Manipulator: Campaign finished without confirmation.")
         return False, None
+
+    async def _test_mutation_with_bypass(self, mutation: MutableRequest, strategies: List[MutationStrategy]):
+        """Test mutation and optionally try WAF bypass encodings."""
+        success = await self._try_mutation(mutation)
+        if success:
+            logger.info(f"Manipulator: Exploited successfully! URL: {mutation.url} Params: {mutation.params}")
+            return True, mutation
+
+        # Phase 2: Reactive Encoding (WAF Bypass)
+        if MutationStrategy.BYPASS_WAF in strategies:
+            async for encoded_mutation in self.encoding_agent.generate_mutations(mutation, strategies):
+                success_enc = await self._try_mutation(encoded_mutation)
+                if success_enc:
+                    logger.info(f"Manipulator: Exploited with WAF Bypass! URL: {encoded_mutation.url} Params: {encoded_mutation.params}")
+                    return True, encoded_mutation
+
+        return None
 
     def _extract_potential_payloads(self, request: MutableRequest) -> List[str]:
         """Extract all potential payloads from request params, data, and JSON."""
