@@ -138,111 +138,104 @@ class URLMasterAgent(BaseAgent):
     async def run(self) -> Dict:
         """
         Main execution loop - LLM decides what to do next.
-        
+
         Returns:
             Summary of findings and actions taken
         """
         self.start_time = datetime.now()
         logger.info(f"[{self.name}] 🚀 Starting analysis of {self.url}")
         dashboard.update_task(self.name, status=f"Analyzing: {self.url[:50]}")
-        
-        # =====================================================================
-        # DEDUPLICATION: Check if URL was recently scanned
-        # =====================================================================
+
+        await self._check_historical_findings()
+
+        if self.exhaustive_mode and self._has_params():
+            logger.info(f"[{self.name}] 🔥 Exhaustive mode: auto-testing SQLi/XSS/LFI")
+            await self._run_exhaustive_tests()
+
+        initial_prompt = self._build_initial_prompt()
+
+        while not self.is_complete and self.iteration < self.MAX_ITERATIONS:
+            self.iteration += 1
+
+            if datetime.now() - self.start_time > self.ITERATION_TIMEOUT:
+                logger.warning(f"[{self.name}] Timeout reached")
+                break
+
+            if not await self._execute_iteration(initial_prompt):
+                break
+
+            await asyncio.sleep(0.5)
+
+        summary = self._generate_summary()
+        self.thread.save()
+
+        logger.info(f"[{self.name}] 🏁 Finished after {self.iteration} iterations, {len(self.findings)} findings")
+        return summary
+
+    async def _check_historical_findings(self):
+        """Check database for previous scan results."""
         try:
             from bugtrace.core.database import get_db_manager
             db = get_db_manager()
-            
-            # Get historical findings
+
             historical_findings = db.get_findings_for_target(self.url)
             scan_count = db.get_scan_count(self.url)
-            
+
             if historical_findings:
                 logger.info(f"[{self.name}] 📚 Found {scan_count} previous scan(s) with {len(historical_findings)} findings")
-                
-                # Store in thread metadata for LLM context
+
                 self.thread.update_metadata("previous_scans", scan_count)
                 self.thread.update_metadata("known_vulnerabilities", [
                     {
                         "type": f.get("type"),
                         "parameter": f.get("parameter"),
                         "severity": f.get("severity")
-                    } for f in historical_findings[:10]  # Limit to avoid token bloat
+                    } for f in historical_findings[:10]
                 ])
-                
-                # Optional: Skip if recently scanned (within 24h) and had findings
-                # This is configurable behavior
+
                 if scan_count > 0 and len(historical_findings) > 0:
                     logger.info(f"[{self.name}] ⚠️ URL has existing findings. Re-scanning anyway (configurable)")
-                    # Could add: if settings.SKIP_RESCANS: return early_summary
         except Exception as e:
             logger.debug(f"[{self.name}] Deduplication check failed (non-critical): {e}")
-        
 
-        # =====================================================================
-        # EXHAUSTIVE MODE: Auto-test SQLi/XSS/LFI if URL has parameters
-        # =====================================================================
-        if self.exhaustive_mode and self._has_params():
-            logger.info(f"[{self.name}] 🔥 Exhaustive mode: auto-testing SQLi/XSS/LFI")
-            await self._run_exhaustive_tests()
-        
-        # Initial prompt to start the analysis (LLM can find additional vulns)
-        initial_prompt = self._build_initial_prompt()
-        
-        while not self.is_complete and self.iteration < self.MAX_ITERATIONS:
-            self.iteration += 1
-            
-            # Check timeout
-            if datetime.now() - self.start_time > self.ITERATION_TIMEOUT:
-                logger.warning(f"[{self.name}] Timeout reached")
-                break
-            
-            try:
-                # Ask LLM what to do next
-                prompt = initial_prompt if self.iteration == 1 else self._build_iteration_prompt()
-                
-                response = await llm_client.generate_with_thread(
-                    prompt=prompt,
-                    thread=self.thread,
-                    module_name=self.name,
-                    temperature=0.3  # Lower temperature for more consistent decisions
-                )
-                
-                if not response:
-                    logger.error(f"[{self.name}] No response from LLM")
-                    break
-                
-                # Parse and execute the action
-                action = self._parse_action(response)
-                
-                if action["type"] == "complete":
-                    self.is_complete = True
-                    logger.info(f"[{self.name}] ✅ Analysis complete")
-                    break
-                
-                elif action["type"] == "skill":
-                    skill_name = action["skill"]
-                    self.skills_used.append(skill_name)
-                    result = await self._execute_skill(skill_name, action["params"])
-                    self.thread.add_tool_result(skill_name, result, success=result.get("success", True))
-                
-                else:
-                    logger.warning(f"[{self.name}] Unknown action type: {action['type']}")
-                
-            except Exception as e:
-                logger.error(f"[{self.name}] Iteration {self.iteration} error: {e}", exc_info=True)
-                self.thread.add_message("system", f"Error occurred: {str(e)}")
-            
-            await asyncio.sleep(0.5)  # Prevent tight loop
-        
-        # Generate final summary
-        summary = self._generate_summary()
-        
-        # Save thread for debugging
-        self.thread.save()
-        
-        logger.info(f"[{self.name}] 🏁 Finished after {self.iteration} iterations, {len(self.findings)} findings")
-        return summary
+    async def _execute_iteration(self, initial_prompt: str) -> bool:
+        """Execute a single iteration. Returns False if should stop."""
+        try:
+            prompt = initial_prompt if self.iteration == 1 else self._build_iteration_prompt()
+
+            response = await llm_client.generate_with_thread(
+                prompt=prompt,
+                thread=self.thread,
+                module_name=self.name,
+                temperature=0.3
+            )
+
+            if not response:
+                logger.error(f"[{self.name}] No response from LLM")
+                return False
+
+            action = self._parse_action(response)
+
+            if action["type"] == "complete":
+                self.is_complete = True
+                logger.info(f"[{self.name}] ✅ Analysis complete")
+                return False
+
+            elif action["type"] == "skill":
+                skill_name = action["skill"]
+                self.skills_used.append(skill_name)
+                result = await self._execute_skill(skill_name, action["params"])
+                self.thread.add_tool_result(skill_name, result, success=result.get("success", True))
+
+            else:
+                logger.warning(f"[{self.name}] Unknown action type: {action['type']}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Iteration {self.iteration} error: {e}", exc_info=True)
+            self.thread.add_message("system", f"Error occurred: {str(e)}")
+            return True
     
     def _build_initial_prompt(self) -> str:
         """Build initial prompt for the analysis."""
@@ -276,35 +269,45 @@ Or to finish:
     def _build_iteration_prompt(self) -> str:
         """Build prompt for subsequent iterations with high-intelligence directives."""
         context = self.thread.get_context_summary()
-        
-        # Show which skills have been used
+
+        used_skills, available_skills = self._get_skills_status()
+
+        prompt_template = self._get_iteration_template()
+
+        return prompt_template.format(
+            context=context,
+            used_skills=used_skills,
+            available_exploit_skills=available_skills
+        )
+
+    def _get_skills_status(self) -> tuple:
+        """Get used and available skills status."""
         used_skills = ', '.join(set(self.skills_used)) if self.skills_used else 'None'
-        available_exploit_skills_list = [s for s in self.skills.keys() 
+        available_exploit_skills_list = [s for s in self.skills.keys()
                                     if s.startswith('exploit_') and s not in self.skills_used]
         available_exploit_skills = ', '.join(available_exploit_skills_list) or 'All tested'
-        
-        prompt_template = """{context}
+        return used_skills, available_exploit_skills
+
+    def _get_iteration_template(self) -> str:
+        """Get iteration prompt template."""
+        default_template = """{context}
 Used Skills: {used_skills}
 Available Skills: {available_exploit_skills}
-Decide the next move. 
+Decide the next move.
 
 Response format:
 <thought>Analysis of findings and decision</thought>
 <action>
   <type>skill</type>
   <skill>skill_name</skill>
-  <params>{"param": "val"}</params>
+  <params>{{"param": "val"}}</params>
 </action>
 """
 
         if self.system_prompt and "# Iteration Directive Prompt" in self.system_prompt:
-             prompt_template = self.system_prompt.split("# Iteration Directive Prompt")[1].strip()
+            return self.system_prompt.split("# Iteration Directive Prompt")[1].strip()
 
-        return prompt_template.format(
-            context=context,
-            used_skills=used_skills,
-            available_exploit_skills=available_exploit_skills
-        )
+        return default_template
     
         from bugtrace.utils.parsers import XmlParser
         
@@ -392,155 +395,146 @@ Response format:
         return {"type": "skill", "skill": "analyze", "params": {}}
     
     async def _execute_skill(self, skill_name: str, params: Dict) -> Dict:
-        """
-        Execute a skill and return results.
-        
-        Args:
-            skill_name: Name of skill to execute
-            params: Parameters for the skill
-        
-        Returns:
-            Result dictionary from skill execution
-        """
+        """Execute a skill and return results."""
         if skill_name not in self.skills:
             return {"success": False, "error": f"Unknown skill: {skill_name}"}
-        
-        # =================================================================
-        # DEDUPLICATION: Skip if we already tested this path+param+vuln combo
-        # =================================================================
-        parsed = urlparse(self.url)
-        path = parsed.path or "/"
-        param = params.get("param") or params.get("parameter") or self._get_first_param()
-        
-        # Map skills to vuln types for better dedup
-        SKILL_TO_VULN = {
-            "exploit_sqli": "sqli",
-            "tool_sqlmap": "sqli",
-            "exploit_xss": "xss",
-            "exploit_lfi": "lfi",
-            "exploit_xxe": "xxe",
-            "exploit_header": "header",
-            "exploit_ssti": "ssti",
-            "exploit_proto": "proto",
-        }
-        
-        vuln_type = SKILL_TO_VULN.get(skill_name, skill_name)
-        combo_key = (path, param, vuln_type)
-        
-        if skill_name.startswith(("exploit_", "tool_")) and combo_key in self.tested_combinations:
-            # Don't skip if param is 'none' but we found new inputs
-            if param == "none" and len(self.thread.metadata.get("inputs_found", [])) > 0:
-                pass # Continue, we might have new things to test
-            else:
-                logger.info(f"[{self.name}] Skipping duplicate: {skill_name} on {path} {param} ({vuln_type} already tested)")
-                return {"success": True, "skipped": True, "reason": "Already tested"}
-        
-        # Mark as tested
-        if skill_name.startswith(("exploit_", "tool_")):
-            self.tested_combinations.add(combo_key)
-        
+
+        if skip_result := self._check_skill_deduplication(skill_name, params):
+            return skip_result
+
         skill = self.skills[skill_name]
         logger.info(f"[{self.name}] Executing skill: {skill_name}")
         dashboard.update_task(self.name, status=f"Skill: {skill_name}")
-        
+
         try:
             result = await skill.execute(self.url, params)
-            
-            # Ensure result is a dictionary to prevent "NoneType is not iterable" errors
+
             if result is None:
                 logger.error(f"[{self.name}] Skill {skill_name} returned None")
                 return {"success": False, "error": "Skill returned no result"}
 
-            # Track findings with Conductor V2 validation + Guardrails
             if isinstance(result, dict) and "findings" in result:
-                from bugtrace.core.conductor import conductor
-                from bugtrace.core.guardrails import guardrails
-                
-                for finding in result["findings"]:
-                    # Build default payload based on type
-                    default_payloads = {
-                        "XSS": "<script>alert(1)</script>",
-                        "SQLi": "' OR '1'='1",
-                        "LFI": "../../etc/passwd",
-                        "XXE": "<!ENTITY xxe SYSTEM 'file:///etc/passwd'>",
-                        "CSTI": "{{7*7}}",
-                        "Header Injection": "%0d%0aX-Injected: true"
-                    }
-                    
-                    vuln_type = finding.get("type", "Unknown")
-                    payload = finding.get("payload") or default_payloads.get(vuln_type, "test")
-                    
-                    # Guardrails check - block destructive payloads
-                    is_safe, guard_reason = guardrails.validate_payload(payload, vuln_type)
-                    if not is_safe:
-                        logger.warning(f"[{self.name}] Guardrails BLOCKED: {guard_reason}")
-                        continue  # Skip this finding
-                    
-                    # Prepare finding for validation
-                    finding_data = {
-                        "type": vuln_type,
-                        "url": finding.get("url", self.url),
-                        "payload": payload,
-                        "confidence": finding.get("confidence", 0.85),
-                        "evidence": {
-                            "alert_triggered": finding.get("alert_triggered", finding.get("validated", False)),
-                            "vision_confirmed": finding.get("vision_confirmed", False),
-                            "screenshot": finding.get("screenshot", ""),
-                            "error_message": finding.get("evidence", finding.get("note", "")),
-                            "validated": finding.get("validated", True),
-                            "template_executed": vuln_type == "CSTI",
-                            "time_delay": finding.get("time_delay", False),
-                            "extracted_data": finding.get("extracted_data", "")
-                        }
-                    }
-                    
-                    # Validate with Conductor V2
-                    is_valid, reason = conductor.validate_finding(finding_data)
-                    
-                    if is_valid:
-                        logger.info(f"[{self.name}] Finding VALIDATED by Conductor: {vuln_type} on {finding.get('url', self.url)}")
-                        finding["conductor_validated"] = True
-                        finding["payload"] = payload
-                        finding["severity"] = finding.get("severity", "HIGH")
-                        
-                        # ==================================================
-                        # MEMORY: Store in MemoryManager for cross-URL dedup
-                        # ==================================================
-                        try:
-                            from bugtrace.memory.manager import memory_manager
-                            search_query = f"{vuln_type} {finding.get('url', self.url)} {payload[:30]}"
-                            similar = memory_manager.vector_search(search_query, limit=1)
-                            
-                            if similar and len(similar) > 0:
-                                logger.info(f"[{self.name}] Similar finding exists in memory, skipping duplicate node")
-                            else:
-                                memory_manager.add_node(
-                                    "Finding",
-                                    f"{vuln_type}_{self.thread.thread_id[-6:]}",
-                                    properties={
-                                        "type": vuln_type,
-                                        "url": finding.get("url", self.url),
-                                        "payload": payload[:100],
-                                        "param": finding.get("parameter", finding.get("param", "")),
-                                        "details": str(finding.get("evidence", ""))[:200]
-                                    }
-                                )
-                        except Exception as mem_err:
-                            logger.debug(f"Memory error (non-critical): {mem_err}")
-                        
-                        self.findings.append(finding)
-                    else:
-                        logger.warning(f"[{self.name}] Finding UNVALIDATED by Conductor: {reason}")
-                        finding["conductor_validated"] = False
-                        finding["conductor_reason"] = reason
-                        finding["severity"] = "LOW"
-                        self.findings.append(finding) # Still add for tracking
-            
+                self._process_skill_findings(result)
+
             return result
-            
+
         except Exception as e:
             logger.error(f"[{self.name}] Skill {skill_name} failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
+
+    def _check_skill_deduplication(self, skill_name: str, params: Dict) -> Optional[Dict]:
+        """Check if skill was already tested. Returns skip result if duplicate."""
+        parsed = urlparse(self.url)
+        path = parsed.path or "/"
+        param = params.get("param") or params.get("parameter") or self._get_first_param()
+
+        SKILL_TO_VULN = {
+            "exploit_sqli": "sqli", "tool_sqlmap": "sqli", "exploit_xss": "xss",
+            "exploit_lfi": "lfi", "exploit_xxe": "xxe", "exploit_header": "header",
+            "exploit_ssti": "ssti", "exploit_proto": "proto",
+        }
+
+        vuln_type = SKILL_TO_VULN.get(skill_name, skill_name)
+        combo_key = (path, param, vuln_type)
+
+        if skill_name.startswith(("exploit_", "tool_")) and combo_key in self.tested_combinations:
+            if not (param == "none" and len(self.thread.metadata.get("inputs_found", [])) > 0):
+                logger.info(f"[{self.name}] Skipping duplicate: {skill_name} on {path} {param}")
+                return {"success": True, "skipped": True, "reason": "Already tested"}
+
+        if skill_name.startswith(("exploit_", "tool_")):
+            self.tested_combinations.add(combo_key)
+
+        return None
+
+    def _process_skill_findings(self, result: Dict):
+        """Process and validate findings from skill execution."""
+        from bugtrace.core.conductor import conductor
+        from bugtrace.core.guardrails import guardrails
+
+        for finding in result["findings"]:
+            vuln_type, payload = self._prepare_finding_payload(finding)
+
+            is_safe, guard_reason = guardrails.validate_payload(payload, vuln_type)
+            if not is_safe:
+                logger.warning(f"[{self.name}] Guardrails BLOCKED: {guard_reason}")
+                continue
+
+            finding_data = self._build_finding_data(finding, vuln_type, payload)
+            is_valid, reason = conductor.validate_finding(finding_data)
+
+            if is_valid:
+                self._handle_valid_finding(finding, vuln_type, payload)
+            else:
+                self._handle_invalid_finding(finding, reason)
+
+    def _prepare_finding_payload(self, finding: Dict) -> tuple:
+        """Extract vulnerability type and payload from finding."""
+        default_payloads = {
+            "XSS": "<script>alert(1)</script>", "SQLi": "' OR '1'='1",
+            "LFI": "../../etc/passwd", "XXE": "<!ENTITY xxe SYSTEM 'file:///etc/passwd'>",
+            "CSTI": "{{7*7}}", "Header Injection": "%0d%0aX-Injected: true"
+        }
+
+        vuln_type = finding.get("type", "Unknown")
+        payload = finding.get("payload") or default_payloads.get(vuln_type, "test")
+        return vuln_type, payload
+
+    def _build_finding_data(self, finding: Dict, vuln_type: str, payload: str) -> Dict:
+        """Build finding data dictionary for validation."""
+        return {
+            "type": vuln_type,
+            "url": finding.get("url", self.url),
+            "payload": payload,
+            "confidence": finding.get("confidence", 0.85),
+            "evidence": {
+                "alert_triggered": finding.get("alert_triggered", finding.get("validated", False)),
+                "vision_confirmed": finding.get("vision_confirmed", False),
+                "screenshot": finding.get("screenshot", ""),
+                "error_message": finding.get("evidence", finding.get("note", "")),
+                "validated": finding.get("validated", True),
+                "template_executed": vuln_type == "CSTI",
+                "time_delay": finding.get("time_delay", False),
+                "extracted_data": finding.get("extracted_data", "")
+            }
+        }
+
+    def _handle_valid_finding(self, finding: Dict, vuln_type: str, payload: str):
+        """Handle validated finding."""
+        logger.info(f"[{self.name}] Finding VALIDATED by Conductor: {vuln_type}")
+        finding["conductor_validated"] = True
+        finding["payload"] = payload
+        finding["severity"] = finding.get("severity", "HIGH")
+
+        try:
+            from bugtrace.memory.manager import memory_manager
+            search_query = f"{vuln_type} {finding.get('url', self.url)} {payload[:30]}"
+            similar = memory_manager.vector_search(search_query, limit=1)
+
+            if not (similar and len(similar) > 0):
+                memory_manager.add_node(
+                    "Finding",
+                    f"{vuln_type}_{self.thread.thread_id[-6:]}",
+                    properties={
+                        "type": vuln_type,
+                        "url": finding.get("url", self.url),
+                        "payload": payload[:100],
+                        "param": finding.get("parameter", finding.get("param", "")),
+                        "details": str(finding.get("evidence", ""))[:200]
+                    }
+                )
+        except Exception as mem_err:
+            logger.debug(f"Memory error (non-critical): {mem_err}")
+
+        self.findings.append(finding)
+
+    def _handle_invalid_finding(self, finding: Dict, reason: str):
+        """Handle unvalidated finding."""
+        logger.warning(f"[{self.name}] Finding UNVALIDATED by Conductor: {reason}")
+        finding["conductor_validated"] = False
+        finding["conductor_reason"] = reason
+        finding["severity"] = "LOW"
+        self.findings.append(finding)
     
     def _generate_summary(self) -> Dict:
         """Generate summary of the analysis and create individual URL report."""
