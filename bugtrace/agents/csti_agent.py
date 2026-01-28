@@ -586,20 +586,45 @@ class CSTIAgent(BaseAgent):
         payloads = PAYLOAD_LIBRARY.get(engines[0], PAYLOAD_LIBRARY["universal"])[:5] if engines and engines[0] != "unknown" else PAYLOAD_LIBRARY["universal"][:5]
 
         for payload in payloads:
-            try:
-                data = {param: payload}
-                async with session.post(self.url, data=data, timeout=5) as resp:
-                    content = await resp.text()
-
-                    if "49" in content and "7*7" in payload and payload not in content:
-                        engine = engines[0] if engines else "unknown"
-                        finding_obj = self._create_finding(f"POST:{param}", payload, "post_injection", verified_url=str(resp.url))
-                        finding_obj.template_engine = engine # Refine engine if known
-                        return self._finding_to_dict(finding_obj)
-            except Exception as e:
-                logger.debug(f"POST test failed: {e}")
+            finding = await self._test_single_post_payload(session, param, payload, engines)
+            if finding:
+                return finding
 
         return None
+
+    async def _test_single_post_payload(
+        self,
+        session: aiohttp.ClientSession,
+        param: str,
+        payload: str,
+        engines: List[str]
+    ) -> Optional[Dict]:
+        """Test a single POST payload."""
+        try:
+            data = {param: payload}
+            async with session.post(self.url, data=data, timeout=5) as resp:
+                content = await resp.text()
+                return self._check_post_injection_success(resp, content, payload, param, engines)
+        except Exception as e:
+            logger.debug(f"POST test failed: {e}")
+            return None
+
+    def _check_post_injection_success(
+        self,
+        resp,
+        content: str,
+        payload: str,
+        param: str,
+        engines: List[str]
+    ) -> Optional[Dict]:
+        """Check if POST injection was successful."""
+        if not ("49" in content and "7*7" in payload and payload not in content):
+            return None
+
+        engine = engines[0] if engines else "unknown"
+        finding_obj = self._create_finding(f"POST:{param}", payload, "post_injection", verified_url=str(resp.url))
+        finding_obj.template_engine = engine
+        return self._finding_to_dict(finding_obj)
 
     async def _test_header_injection(
         self,
@@ -611,18 +636,41 @@ class CSTIAgent(BaseAgent):
         payload = "{{7*7}}"
 
         for header in test_headers:
-            try:
-                headers = {header: payload}
-                async with session.get(self.url, headers=headers, timeout=5) as resp:
-                    content = await resp.text()
-
-                    if "49" in content:
-                        finding_obj = self._create_finding(f"HEADER:{header}", payload, "header_injection", verified_url=str(resp.url))
-                        return self._finding_to_dict(finding_obj)
-            except Exception as e:
-                logger.debug(f"operation failed: {e}")
+            finding = await self._test_single_header(session, header, payload)
+            if finding:
+                return finding
 
         return None
+
+    async def _test_single_header(
+        self,
+        session: aiohttp.ClientSession,
+        header: str,
+        payload: str
+    ) -> Optional[Dict]:
+        """Test a single header for template injection."""
+        try:
+            headers = {header: payload}
+            async with session.get(self.url, headers=headers, timeout=5) as resp:
+                content = await resp.text()
+                return self._check_header_injection_success(resp, content, header, payload)
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
+            return None
+
+    def _check_header_injection_success(
+        self,
+        resp,
+        content: str,
+        header: str,
+        payload: str
+    ) -> Optional[Dict]:
+        """Check if header injection was successful."""
+        if "49" not in content:
+            return None
+
+        finding_obj = self._create_finding(f"HEADER:{header}", payload, "header_injection", verified_url=str(resp.url))
+        return self._finding_to_dict(finding_obj)
 
     def _template_get_system_prompt(self) -> str:
         """Get system prompt for template analysis."""
@@ -831,29 +879,45 @@ Response format (XML):
         all_findings = []
 
         try:
-            self.params = self._prioritize_params(self.params)
-            await self._detect_waf_async()
-            await self._setup_interactsh()
-
-            async with aiohttp.ClientSession() as session:
-                html = await self._fetch_page(session)
-
-                for item in self.params:
-                    if self._max_impact_achieved:
-                        dashboard.log(f"[{self.name}] 🏆 Max impact achieved, skipping remaining params", "SUCCESS")
-                        break
-
-                    param_findings = await self._test_parameter(session, item, html)
-                    all_findings.extend(param_findings)
-
-            if self.interactsh:
-                await self.interactsh.deregister()
-
+            await self._prepare_scan()
+            all_findings = await self._scan_all_parameters()
+            await self._cleanup_scan()
         except Exception as e:
             logger.error(f"CSTIAgent error: {e}", exc_info=True)
 
         dashboard.log(f"[{self.name}] ✅ Complete. Findings: {len(all_findings)}", "SUCCESS")
         return {"findings": all_findings, "status": JobStatus.COMPLETED}
+
+    async def _prepare_scan(self):
+        """Prepare for template injection scan."""
+        self.params = self._prioritize_params(self.params)
+        await self._detect_waf_async()
+        await self._setup_interactsh()
+
+    async def _scan_all_parameters(self) -> List[Dict]:
+        """Scan all parameters for template injection."""
+        all_findings = []
+        async with aiohttp.ClientSession() as session:
+            html = await self._fetch_page(session)
+            all_findings = await self._test_all_params(session, html)
+        return all_findings
+
+    async def _test_all_params(self, session, html: str) -> List[Dict]:
+        """Test all parameters with session and HTML."""
+        all_findings = []
+        for item in self.params:
+            if self._max_impact_achieved:
+                dashboard.log(f"[{self.name}] 🏆 Max impact achieved, skipping remaining params", "SUCCESS")
+                break
+
+            param_findings = await self._test_parameter(session, item, html)
+            all_findings.extend(param_findings)
+        return all_findings
+
+    async def _cleanup_scan(self):
+        """Cleanup after template injection scan."""
+        if self.interactsh:
+            await self.interactsh.deregister()
 
     async def _get_baseline_content(self, session) -> str:
         """Fetch baseline content without injection to check for false positives."""
@@ -1128,16 +1192,20 @@ Response format (XML):
     def _detect_engine_from_payload(self, payload: str) -> str:
         """Detecta el motor de plantillas basándose en la sintaxis."""
         if '{{' in payload and '}}' in payload:
-            if '__class__' in payload or 'config' in payload:
-                return 'jinja2'
-            return 'twig'
-        elif '${' in payload:
+            return self._detect_curly_brace_engine(payload)
+        if '${' in payload:
             return 'freemarker'
-        elif '#set' in payload or '$!' in payload:
+        if '#set' in payload or '$!' in payload:
             return 'velocity'
-        elif '{%' in payload:
+        if '{%' in payload:
             return 'jinja2'
         return 'unknown'
+
+    def _detect_curly_brace_engine(self, payload: str) -> str:
+        """Detect engine for curly brace syntax."""
+        if '__class__' in payload or 'config' in payload:
+            return 'jinja2'
+        return 'twig'
 
     def _try_alternative_engine(self, current_engine: str) -> str:
         """Devuelve un payload para un motor diferente."""

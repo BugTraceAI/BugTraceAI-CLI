@@ -351,21 +351,25 @@ Response format:
 
     def _parse_params(self, params_raw: str) -> Dict:
         """Parse parameters from string (key=value or JSON format)."""
-        params_dict = {}
         if not params_raw:
-            return params_dict
+            return {}
 
         try:
             if "=" in params_raw:
-                for item in params_raw.split(","):
-                    if "=" in item:
-                        k, v = item.split("=", 1)
-                        params_dict[k.strip()] = v.strip()
-            else:
-                params_dict = json.loads(params_raw)
+                return self._parse_key_value_params(params_raw)
+            return json.loads(params_raw)
         except Exception as e:
             logger.debug(f"Param parsing failed: {e}")
+            return {}
 
+    def _parse_key_value_params(self, params_raw: str) -> Dict:
+        """Parse key=value format parameters."""
+        params_dict = {}
+        for item in params_raw.split(","):
+            if "=" not in item:
+                continue
+            k, v = item.split("=", 1)
+            params_dict[k.strip()] = v.strip()
         return params_dict
 
     def _infer_action_from_text(self, response: str) -> Dict:
@@ -726,21 +730,21 @@ Response format:
         """Generate and store vector embeddings for findings."""
         try:
             logger.info(f"[{self.name}] 🔮 Generating embeddings for {len(self.findings)} findings...")
-
-            for idx, finding in enumerate(self.findings):
-                try:
-                    db.store_finding_embedding(finding)
-
-                    if (idx + 1) % 5 == 0:
-                        logger.debug(f"[{self.name}] Embedded {idx + 1}/{len(self.findings)} findings")
-                except Exception as e:
-                    logger.warning(f"[{self.name}] Failed to embed finding #{idx}: {e}")
-
+            self._process_finding_embeddings(db)
             logger.info(f"[{self.name}] ✅ All findings embedded for semantic search")
             summary['embeddings_stored'] = len(self.findings)
-
         except Exception as e:
             logger.warning(f"[{self.name}] Embedding storage failed (non-critical): {e}")
+
+    def _process_finding_embeddings(self, db):
+        """Process embeddings for all findings."""
+        for idx, finding in enumerate(self.findings):
+            try:
+                db.store_finding_embedding(finding)
+                if (idx + 1) % 5 == 0:
+                    logger.debug(f"[{self.name}] Embedded {idx + 1}/{len(self.findings)} findings")
+            except Exception as e:
+                logger.warning(f"[{self.name}] Failed to embed finding #{idx}: {e}")
 
     def _log_historical_findings(self, db, summary: Dict):
         """Check and log historical findings for context."""
