@@ -192,24 +192,28 @@ class ChainDiscoveryAgent(BaseAgent):
 
         # Check each template
         for template in self.chain_templates:
-            # Check if we have vulns matching first 2 steps
+            # Guard: Skip if template steps don't match discovered vulnerabilities
             template_steps = set(template["steps"][:2])
+            if not template_steps.issubset(discovered_types):
+                continue
 
-            if template_steps.issubset(discovered_types):
-                dashboard.log(
-                    f"🔗 CHAIN DETECTED: {template['name']} ({template['severity']})",
-                    "CRITICAL"
-                )
+            dashboard.log(
+                f"🔗 CHAIN DETECTED: {template['name']} ({template['severity']})",
+                "CRITICAL"
+            )
 
-                # Build the chain
-                chain = await self._build_chain(template)
+            # Build the chain
+            chain = await self._build_chain(template)
 
-                if chain:
-                    self.discovered_chains.append(chain)
+            # Guard: Skip if chain building failed
+            if not chain:
+                continue
 
-                    # Attempt automatic exploitation
-                    if template["likelihood"] > 0.6:
-                        await self._attempt_chain_exploitation(chain, template)
+            self.discovered_chains.append(chain)
+
+            # Attempt automatic exploitation if likelihood threshold met
+            if template["likelihood"] > 0.6:
+                await self._attempt_chain_exploitation(chain, template)
 
     async def _build_chain(self, template: Dict) -> Optional[List[Dict]]:
         """
