@@ -18,64 +18,67 @@ logger = get_logger("skills.external_tools")
 
 class SQLMapSkill(BaseSkill):
     """SQLMap skill - heavy SQLi confirmation using SQLMap via Docker."""
-    
+
     description = "Confirm SQL injection using SQLMap (requires Docker)"
-    
+
+    async def _get_session_cookies(self, browser_manager) -> list:
+        """Get session cookies if available."""
+        try:
+            session_data = await browser_manager.get_session_data()
+            return session_data.get("cookies", [])
+        except Exception as e:
+            logger.debug(f"Session data fetch failed: {e}")
+            return None
+
+    def _build_sqlmap_finding(self, result: Dict, url: str) -> Dict[str, Any]:
+        """Build finding dict from SQLMap result."""
+        if isinstance(result, dict):
+            repro_cmd = result.get("reproduction_command", f"sqlmap -u '{url}' --batch --dbs")
+            return {
+                "type": "SQLi",
+                "url": url,
+                "tool": "sqlmap",
+                "parameter": result.get("parameter"),
+                "payload": result.get("type", "SQLi"),
+                "evidence": f"SQLMap Command: {repro_cmd}\n\nEvidence: {result.get('output_snippet', 'Confirmed')}",
+                "validated": True,
+                "reproduction_command": repro_cmd,
+                "severity": "CRITICAL",
+                "description": f"SQL Injection confirmed by SQLMap. Parameter: {result.get('parameter', 'unknown')}. Injection type: {result.get('type', 'unknown')}",
+                "reproduction": repro_cmd
+            }
+        else:
+            return {
+                "type": "SQLi",
+                "url": url,
+                "tool": "sqlmap",
+                "evidence": "SQLMap confirmed SQL Injection",
+                "validated": True,
+                "severity": "CRITICAL",
+                "description": "SQL Injection vulnerability confirmed by SQLMap automated scanner.",
+                "reproduction": f"sqlmap -u '{url}' --batch --dbs"
+            }
+
     async def execute(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         from bugtrace.tools.external import external_tools
         from bugtrace.tools.visual.browser import browser_manager
-        
+
         findings = []
-        
+
         try:
-            # Get session cookies if available
-            cookies = None
-            try:
-                session_data = await browser_manager.get_session_data()
-                cookies = session_data.get("cookies", [])
-            except Exception as e:
-                logger.debug(f"Session data fetch failed: {e}")
-            
+            cookies = await self._get_session_cookies(browser_manager)
             result = await external_tools.run_sqlmap(
-                url, 
-                cookies,
-                target_param=params.get("parameter")
+                url, cookies, target_param=params.get("parameter")
             )
-            
+
             if result:
-                if isinstance(result, dict):
-                    repro_cmd = result.get("reproduction_command", f"sqlmap -u '{url}' --batch --dbs")
-                    findings.append({
-                        "type": "SQLi",
-                        "url": url,
-                        "tool": "sqlmap",
-                        "parameter": result.get("parameter"),
-                        "payload": result.get("type", "SQLi"),
-                        "evidence": f"SQLMap Command: {repro_cmd}\n\nEvidence: {result.get('output_snippet', 'Confirmed')}",
-                        "validated": True,
-                        "reproduction_command": repro_cmd,
-                        "severity": "CRITICAL",
-                        "description": f"SQL Injection confirmed by SQLMap. Parameter: {result.get('parameter', 'unknown')}. Injection type: {result.get('type', 'unknown')}",
-                        "reproduction": repro_cmd
-                    })
-                else:
-                    findings.append({
-                        "type": "SQLi",
-                        "url": url,
-                        "tool": "sqlmap",
-                        "evidence": "SQLMap confirmed SQL Injection",
-                        "validated": True,
-                        "severity": "CRITICAL",
-                        "description": "SQL Injection vulnerability confirmed by SQLMap automated scanner.",
-                        "reproduction": f"sqlmap -u '{url}' --batch --dbs"
-                    })
-                
+                findings.append(self._build_sqlmap_finding(result, url))
                 self.master.thread.record_payload_attempt("SQLi", "sqlmap", success=True)
                 logger.info(f"[{self.master.name}] ✅ SQLMap confirmed SQLi")
-                
+
         except Exception as e:
             logger.error(f"SQLMap skill failed: {e}")
-        
+
         return {
             "success": True,
             "findings": findings,

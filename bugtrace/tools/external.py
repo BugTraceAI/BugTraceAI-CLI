@@ -541,29 +541,13 @@ class ExternalToolManager:
         finally:
             await self._cleanup_temp_file(payloads_file)
 
-    async def run_go_ssrf_fuzzer(self, url: str, param: str, oob_url: str = None) -> Optional[Dict]:
-        """
-        Run the Go SSRF fuzzer for high-performance bypass testing.
-        
-        Returns:
-            {
-                "hits": [...],
-                "metadata": {...}
-            }
-        """
-        binary_path = settings.BASE_DIR / "bin" / "go-ssrf-fuzzer"
-        
-        if not binary_path.exists():
-            logger.warning(f"Go SSRF fuzzer not found at {binary_path}")
-            return None
-        
-        fuzz_url = url
-        if f"{param}=" in url:
-            fuzz_url = re.sub(rf"([?&]{re.escape(param)})=([^&]*)", r"\1=FUZZ", url)
-        else:
-            separator = "&" if "?" in url else "?"
-            fuzz_url = f"{url}{separator}{param}=FUZZ"
-            
+    def _build_ssrf_command(
+        self,
+        binary_path: str,
+        fuzz_url: str,
+        oob_url: Optional[str]
+    ) -> List[str]:
+        """Build command for SSRF fuzzer execution."""
         cmd = [
             str(binary_path),
             "-u", fuzz_url,
@@ -571,10 +555,31 @@ class ExternalToolManager:
             "-t", "5",
             "--json"
         ]
-        
+
         if oob_url:
             cmd.extend(["--oob", oob_url])
-        
+
+        return cmd
+
+    async def run_go_ssrf_fuzzer(self, url: str, param: str, oob_url: str = None) -> Optional[Dict]:
+        """
+        Run the Go SSRF fuzzer for high-performance bypass testing.
+
+        Returns:
+            {
+                "hits": [...],
+                "metadata": {...}
+            }
+        """
+        binary_path = settings.BASE_DIR / "bin" / "go-ssrf-fuzzer"
+
+        if not binary_path.exists():
+            logger.warning(f"Go SSRF fuzzer not found at {binary_path}")
+            return None
+
+        fuzz_url = self._build_fuzz_url(url, param)
+        cmd = self._build_ssrf_command(binary_path, fuzz_url, oob_url)
+
         try:
             logger.info(f"Launching Go SSRF Fuzzer against {param} on {url}")
             process = await asyncio.create_subprocess_exec(
@@ -583,7 +588,7 @@ class ExternalToolManager:
                 stderr=asyncio.subprocess.PIPE
             )
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
-            
+
             if process.returncode == 0:
                 return _parse_tool_output(stdout.decode())
             else:
