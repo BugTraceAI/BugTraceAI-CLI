@@ -15,7 +15,7 @@ Created: 2026-01-02
 import asyncio
 import json
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
 from pathlib import Path
 
@@ -143,56 +143,71 @@ class AnalysisAgent(BaseAgent):
         url = context["url"]
         
         logger.info(f"[{self.name}] Context extracted: {len(context['params'])} params, tech: {context['tech_stack']}")
-        
-        # Analyze with each model in parallel
+        # Analyze with each approach
+        valid_analyses = await self._run_all_analyses(context)
+
+        if not valid_analyses:
+            logger.error(f"[{self.name}] All analyses failed for {url}")
+            return self._empty_report(url)
+
+        logger.info(f"[{self.name}] Completed {len(valid_analyses)}/{len(self.approaches)} analyses")
+
+        # Consolidate and save
+        report = await self._build_and_save_report(valid_analyses, context, url)
+
+        # Update statistics
+        self._update_stats(start_time)
+
+        logger.info(f"[{self.name}] ✅ Analysis complete in {asyncio.get_event_loop().time() - start_time:.2f}s")
+
+        return report
+
+    async def _run_all_analyses(self, context: Dict) -> List[Dict]:
+        """Run analyses with all approaches and filter valid results."""
         tasks = [
             self._analyze_with_approach(context, approach)
             for approach in self.approaches
         ]
-        
         analyses = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Filter out exceptions
-        valid_analyses = [a for a in analyses if isinstance(a, dict) and not a.get("error")]
-        
-        if not valid_analyses:
-            logger.error(f"[{self.name}] All analyses failed for {url}")
-            return self._empty_report(url)
-        
-        logger.info(f"[{self.name}] Completed {len(valid_analyses)}/{len(analyses)} analyses")
-        
-        # Consolidate results
+        return [a for a in analyses if isinstance(a, dict) and not a.get("error")]
+
+    async def _build_and_save_report(self, valid_analyses: List[Dict], context: Dict, url: str) -> Dict:
+        """Consolidate analyses, cache, and save report."""
         report = self._consolidate_analyses(valid_analyses, context)
-        
-        # Cache report
         self.analysis_cache[url] = report
-        
-        # Save report to disk
         await self._save_report(url, report)
-        
-        # Update statistics
+        return report
+
+    def _update_stats(self, start_time: float) -> None:
+        """Update analysis statistics."""
         elapsed = asyncio.get_event_loop().time() - start_time
         self.stats["urls_analyzed"] += 1
         self.stats["avg_analysis_time"] = (
             (self.stats["avg_analysis_time"] * (self.stats["urls_analyzed"] - 1) + elapsed) /
             self.stats["urls_analyzed"]
         )
-        
-        logger.info(f"[{self.name}] ✅ Analysis complete in {elapsed:.2f}s")
-        
-        return report
     
     def _extract_context(self, event_data: Dict) -> Dict[str, Any]:
-        """
-        Extract analysis context from URL discovery event.
-        
-        Returns:
-            Context dictionary with URL, headers, HTML, params, etc.
-        """
+        """Extract analysis context from URL discovery event."""
         url = event_data["url"]
         response = event_data.get("response")
-        
-        context = {
+
+        context = self._build_empty_context(url)
+
+        if response:
+            self._populate_from_response(context, response)
+
+        if not context["html_snippet"] and event_data.get("html"):
+            context["html_snippet"] = event_data.get("html", "")[:5000]
+
+        self._parse_url_params(context, url)
+        context["tech_stack"] = self._detect_tech_stack(context)
+
+        return context
+
+    def _build_empty_context(self, url: str) -> Dict[str, Any]:
+        """Build empty context structure."""
+        return {
             "url": url,
             "method": "GET",
             "status_code": None,
@@ -202,40 +217,30 @@ class AnalysisAgent(BaseAgent):
             "tech_stack": [],
             "path": ""
         }
-        
-        # Extract from response if available
-        if response:
-            context["status_code"] = getattr(response, "status_code", None)
-            context["headers"] = dict(getattr(response, "headers", {}))
-            
-            # Get HTML snippet (first 5KB)
-            try:
-                html_text = getattr(response, "text", "")
-                context["html_snippet"] = html_text[:5000]
-            except Exception as e:
-                context["html_snippet"] = ""
-        
-        # Fallback: Extract HTML directly from event data (from ReconAgent)
-        if not context["html_snippet"] and event_data.get("html"):
-            context["html_snippet"] = event_data.get("html", "")[:5000]
-        
-        # Parse URL
+
+    def _populate_from_response(self, context: Dict, response: Any) -> None:
+        """Populate context from HTTP response."""
+        context["status_code"] = getattr(response, "status_code", None)
+        context["headers"] = dict(getattr(response, "headers", {}))
+
+        try:
+            html_text = getattr(response, "text", "")
+            context["html_snippet"] = html_text[:5000]
+        except Exception:
+            context["html_snippet"] = ""
+
+    def _parse_url_params(self, context: Dict, url: str) -> None:
+        """Parse URL to extract path and parameters."""
         try:
             from urllib.parse import urlparse, parse_qs
             parsed = urlparse(url)
             context["path"] = parsed.path
-            
-            # Extract parameters
+
             if parsed.query:
                 params = parse_qs(parsed.query)
                 context["params"] = list(params.keys())
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to parse URL: {e}")
-        
-        # Detect technology stack
-        context["tech_stack"] = self._detect_tech_stack(context)
-        
-        return context
     
     def _detect_tech_stack(self, context: Dict) -> List[str]:
         """Detect technology stack from headers and URL."""
@@ -277,99 +282,92 @@ class AnalysisAgent(BaseAgent):
         context: Dict,
         approach: str
     ) -> Dict[str, Any]:
-        """
-        Analyze URL with single model using specific approach/methodology.
-        
-        Args:
-            context: Extracted URL context
-            approach: Analysis approach (pentester/bug_bounty/code_auditor/red_team/researcher)
-        
-        Returns:
-            Analysis results with likely vulnerabilities
-        """
+        """Analyze URL with single model using specific approach."""
         logger.info(f"[{self.name}] Analyzing with {approach} approach ({self.model})")
-        
-        # Build prompt
-        prompt = self._build_prompt(context, approach)
-        system_prompt = self._get_system_prompt(approach)
-        
-        try:
-            # Build full prompt (system + user)
-            full_prompt = f"""{system_prompt}
 
-{prompt}"""
-            
-            # Call LLM with correct signature
-            response = await llm_client.generate(
-                prompt=full_prompt,
-                module_name="AnalysisAgent",
-                model_override=self.model,
-                temperature=0.7,
-                max_tokens=2000
-            )
-            
+        try:
+            response = await self._call_llm_for_approach(context, approach)
+
             if not response:
                 raise Exception("Empty response from LLM")
 
-            # Parse XML-Like response
-            # Expected format:
-            # <analysis>
-            #   <vulnerability>...</vulnerability>
-            #   <framework>...</framework>
-            #   <notes>...</notes>
-            # </analysis>
-            
-            parser = XmlParser()
-            
-            # Extract framework
-            framework = parser.extract_tag(response, "framework") or "Unknown"
-            
-            # Extract vulnerabilities
-            # Use extract_list to get all <vulnerability> blocks
-            vuln_contents = parser.extract_list(response, "vulnerability")
-            likely_vulnerabilities = []
-            
-            for vc in vuln_contents:
-                v_type = parser.extract_tag(vc, "type") or "Unknown"
-                v_conf_str = parser.extract_tag(vc, "confidence") or "0.0"
-                v_loc = parser.extract_tag(vc, "location") or "unknown"
-                v_reason = parser.extract_tag(vc, "reasoning") or ""
-                
-                try:
-                    v_conf = float(v_conf_str)
-                except Exception as e:
-                    v_conf = 0.5
-                    
-                if v_type and v_type != "Unknown":
-                    likely_vulnerabilities.append({
-                        "type": v_type,
-                        "confidence": v_conf,
-                        "location": v_loc,
-                        "reasoning": v_reason
-                    })
-            
-            analysis = {
-                "likely_vulnerabilities": likely_vulnerabilities,
-                "framework_detected": framework,
-                "model": self.model,
-                "approach": approach,
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            logger.info(f"[{self.name}] {approach} found {len(likely_vulnerabilities)} potential vulns (XML parsed)")
-            
+            analysis = self._parse_analysis_response(response, approach)
+            logger.info(f"[{self.name}] {approach} found {len(analysis['likely_vulnerabilities'])} potential vulns")
+
             return analysis
-            
+
         except Exception as e:
             logger.error(f"[{self.name}] Analysis failed with {approach}: {e}", exc_info=True)
-            logger.debug(f"[{self.name}] Failed response: {response if 'response' in locals() else 'None'}")
-            return {
-                "likely_vulnerabilities": [],
-                "framework_detected": "Unknown",
-                "model": self.model,
-                "approach": approach,
-                "error": str(e)
-            }
+            return self._build_error_analysis(approach, e)
+
+    async def _call_llm_for_approach(self, context: Dict, approach: str) -> str:
+        """Call LLM with prompts for specific approach."""
+        prompt = self._build_prompt(context, approach)
+        system_prompt = self._get_system_prompt(approach)
+        full_prompt = f"{system_prompt}\n\n{prompt}"
+
+        return await llm_client.generate(
+            prompt=full_prompt,
+            module_name="AnalysisAgent",
+            model_override=self.model,
+            temperature=0.7,
+            max_tokens=2000
+        )
+
+    def _parse_analysis_response(self, response: str, approach: str) -> Dict[str, Any]:
+        """Parse XML response to extract vulnerabilities and framework."""
+        parser = XmlParser()
+
+        framework = parser.extract_tag(response, "framework") or "Unknown"
+        vuln_contents = parser.extract_list(response, "vulnerability")
+
+        likely_vulnerabilities = [
+            self._parse_vulnerability(vc)
+            for vc in vuln_contents
+            if self._parse_vulnerability(vc) is not None
+        ]
+
+        return {
+            "likely_vulnerabilities": likely_vulnerabilities,
+            "framework_detected": framework,
+            "model": self.model,
+            "approach": approach,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    def _parse_vulnerability(self, vuln_content: str) -> Optional[Dict[str, Any]]:
+        """Parse single vulnerability from XML content."""
+        parser = XmlParser()
+
+        v_type = parser.extract_tag(vuln_content, "type") or "Unknown"
+        if v_type == "Unknown":
+            return None
+
+        v_conf_str = parser.extract_tag(vuln_content, "confidence") or "0.0"
+        v_loc = parser.extract_tag(vuln_content, "location") or "unknown"
+        v_reason = parser.extract_tag(vuln_content, "reasoning") or ""
+
+        try:
+            v_conf = float(v_conf_str)
+        except Exception:
+            v_conf = 0.5
+
+        return {
+            "type": v_type,
+            "confidence": v_conf,
+            "location": v_loc,
+            "reasoning": v_reason
+        }
+
+    def _build_error_analysis(self, approach: str, error: Exception) -> Dict[str, Any]:
+        """Build error analysis result."""
+        return {
+            "likely_vulnerabilities": [],
+            "framework_detected": "Unknown",
+            "model": self.model,
+            "approach": approach,
+            "error": str(error)
+        }
     
     def _get_system_prompt(self, approach: str) -> str:
         """Get system prompt for specific analysis approach from external config."""
@@ -452,17 +450,26 @@ Return valid XML-like tags. Do NOT use markdown code blocks.
         return prompt
     
     def _consolidate_analyses(self, analyses: List[Dict], context: Dict) -> Dict[str, Any]:
-        """
-        Consolidate multiple model analyses into single report.
-        
-        Uses consensus voting: vulnerabilities detected by 2+ models
-        are considered high-confidence.
-        """
+        """Consolidate multiple model analyses into single report using consensus voting."""
         logger.info(f"[{self.name}] Consolidating {len(analyses)} analyses")
-        
-        # Group vulnerabilities by type
+
+        vuln_votes = self._group_vulnerabilities_by_type(analyses)
+        consensus_vulns, possible_vulns = self._calculate_consensus(vuln_votes)
+        sorted_vulns = self._sort_by_priority(consensus_vulns + possible_vulns)
+
+        report = self._build_final_report(
+            context, analyses, consensus_vulns, possible_vulns, sorted_vulns
+        )
+
+        logger.info(f"[{self.name}] Consensus: {len(consensus_vulns)}, Possible: {len(possible_vulns)}")
+        logger.info(f"[{self.name}] Attack priority: {report['attack_priority']}")
+
+        return report
+
+    def _group_vulnerabilities_by_type(self, analyses: List[Dict]) -> Dict[str, List[Dict]]:
+        """Group vulnerabilities by type across all analyses."""
         vuln_votes = defaultdict(list)
-        
+
         for analysis in analyses:
             for vuln in analysis.get("likely_vulnerabilities", []):
                 vuln_type = vuln.get("type", "Unknown")
@@ -471,75 +478,74 @@ Return valid XML-like tags. Do NOT use markdown code blocks.
                     "model": analysis.get("model"),
                     "persona": analysis.get("persona")
                 })
-        
-        # Calculate consensus and possible vulns
+
+        return vuln_votes
+
+    def _calculate_consensus(self, vuln_votes: Dict) -> Tuple[List[Dict], List[Dict]]:
+        """Calculate consensus and possible vulnerabilities from votes."""
         consensus_vulns = []
         possible_vulns = []
-        
+
         for vuln_type, votes in vuln_votes.items():
-            # Calculate average confidence
-            avg_confidence = sum(v.get("confidence", 0) for v in votes) / len(votes)
-            
-            # Collect all locations and reasoning
-            locations = list(set(v.get("location", "unknown") for v in votes))
-            reasoning = [v.get("reasoning", "") for v in votes]
-            models = [v.get("model", "") for v in votes]
-            
-            vuln_info = {
-                "type": vuln_type,
-                "confidence": round(avg_confidence, 2),
-                "votes": len(votes),
-                "locations": locations,
-                "reasoning": reasoning,
-                "models": models
-            }
-            
-            # Consensus: 2+ models agree
+            vuln_info = self._build_vuln_info(vuln_type, votes)
+
             if len(votes) >= self.consensus_votes:
                 consensus_vulns.append(vuln_info)
                 self.stats["consensus_count"] += 1
             else:
                 possible_vulns.append(vuln_info)
-        
-        # Prioritize by confidence × severity weight
-        SEVERITY_WEIGHTS = {
-            "SQLi": 10,
-            "RCE": 10,
-            "XXE": 9,
-            "SSTI": 8,
-            "CSTI": 7,
-            "LFI": 7,
-            "SSRF": 7,
-            "XSS": 6,
-            "CSRF": 4,
-            "IDOR": 5
+
+        return consensus_vulns, possible_vulns
+
+    def _build_vuln_info(self, vuln_type: str, votes: List[Dict]) -> Dict[str, Any]:
+        """Build vulnerability info from votes."""
+        avg_confidence = sum(v.get("confidence", 0) for v in votes) / len(votes)
+        locations = list(set(v.get("location", "unknown") for v in votes))
+        reasoning = [v.get("reasoning", "") for v in votes]
+        models = [v.get("model", "") for v in votes]
+
+        return {
+            "type": vuln_type,
+            "confidence": round(avg_confidence, 2),
+            "votes": len(votes),
+            "locations": locations,
+            "reasoning": reasoning,
+            "models": models
         }
-        
-        all_vulns = consensus_vulns + possible_vulns
-        sorted_vulns = sorted(
-            all_vulns,
+
+    def _sort_by_priority(self, vulns: List[Dict]) -> List[Dict]:
+        """Sort vulnerabilities by confidence × severity weight."""
+        SEVERITY_WEIGHTS = {
+            "SQLi": 10, "RCE": 10, "XXE": 9, "SSTI": 8, "CSTI": 7,
+            "LFI": 7, "SSRF": 7, "XSS": 6, "IDOR": 5, "CSRF": 4
+        }
+
+        return sorted(
+            vulns,
             key=lambda v: v["confidence"] * SEVERITY_WEIGHTS.get(v["type"], 1),
             reverse=True
         )
-        
-        # Build attack priority (high confidence only)
+
+    def _build_final_report(
+        self, context: Dict, analyses: List[Dict],
+        consensus_vulns: List[Dict], possible_vulns: List[Dict],
+        sorted_vulns: List[Dict]
+    ) -> Dict[str, Any]:
+        """Build final consolidated report."""
         attack_priority = [
             v["type"] for v in sorted_vulns
             if v["confidence"] >= self.confidence_threshold
         ]
-        
-        # Build skip list (very low confidence)
+
         skip_tests = [
             v["type"] for v in sorted_vulns
             if v["confidence"] < self.skip_threshold
         ]
-        
-        # Detect framework (most common detection)
+
         frameworks = [a.get("framework_detected", "Unknown") for a in analyses]
         framework = max(set(frameworks), key=frameworks.count) if frameworks else "Unknown"
-        
-        # Build final report
-        report = {
+
+        return {
             "url": context["url"],
             "framework_detected": framework,
             "tech_stack": context["tech_stack"],
@@ -548,15 +554,9 @@ Return valid XML-like tags. Do NOT use markdown code blocks.
             "attack_priority": attack_priority,
             "skip_tests": skip_tests,
             "total_models": len(analyses),
-            "total_vulns_detected": len(all_vulns),
+            "total_vulns_detected": len(consensus_vulns + possible_vulns),
             "timestamp": datetime.now().isoformat()
         }
-        
-        logger.info(f"[{self.name}] Consensus: {len(consensus_vulns)}, Possible: {len(possible_vulns)}")
-        logger.info(f"[{self.name}] Attack priority: {attack_priority}")
-        logger.info(f"[{self.name}] Skip tests: {skip_tests}")
-        
-        return report
     
     def _empty_report(self, url: str) -> Dict[str, Any]:
         """Generate empty report when analysis fails."""
@@ -600,57 +600,61 @@ Return valid XML-like tags. Do NOT use markdown code blocks.
                 logger.debug(f"[{self.name}] Stats: {stats['urls_analyzed']} analyzed, {stats['cache_size']} cached")
     
     async def _save_report(self, url: str, report: Dict) -> None:
-        """
-        Save analysis report to disk for persistence and audit trail.
-        
-        Args:
-            url: Target URL
-            report: Consolidated analysis report
-        """
+        """Save analysis report to disk for persistence and audit trail."""
         try:
-            from urllib.parse import urlparse
-            
-            # Generate directory name: domain_YYYYMMDD_HHMMSS_milliseconds
-            parsed = urlparse(url)
-            domain = parsed.netloc or "unknown"
-            # Clean domain name (remove : and other invalid chars)
-            domain = domain.replace(':', '_').replace('/', '_')
-            
-            timestamp = datetime.now()
-            timestamp_str = timestamp.strftime('%Y%m%d_%H%M%S')
-            milliseconds = timestamp.microsecond // 1000
-            
-            report_dirname = f"{domain}_{timestamp_str}_{milliseconds:03d}"
-            
-            # Create report directory
-            report_dir = self.reports_dir / report_dirname
-            report_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save consolidated report
-            report_file = report_dir / "consolidated_report.json"
-            with open(report_file, "w") as f:
-                json.dump(report, f, indent=2)
-            
-            # Save metadata
-            metadata = {
-                "url": url,
-                "domain": domain,
-                "report_dir": report_dirname,
-                "timestamp": timestamp.isoformat(),
-                "approaches_count": len(self.approaches),
-                "approaches_used": self.approaches,
-                "model": self.model,
-                "total_vulnerabilities": report.get("total_vulns_detected", 0),
-                "consensus_count": len(report.get("consensus_vulns", [])),
-                "attack_priority_count": len(report.get("attack_priority", []))
-            }
-            
-            metadata_file = report_dir / "metadata.json"
-            with open(metadata_file, "w") as f:
-                json.dump(metadata, f, indent=2)
-            
+            report_dir = self._create_report_directory(url)
+            self._save_report_files(report_dir, url, report)
             logger.info(f"[{self.name}] 💾 Report saved to {report_dir}")
-            
+
         except Exception as e:
             logger.error(f"[{self.name}] Failed to save report: {e}", exc_info=True)
+
+    def _create_report_directory(self, url: str) -> Path:
+        """Create timestamped report directory."""
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        domain = (parsed.netloc or "unknown").replace(':', '_').replace('/', '_')
+
+        timestamp = datetime.now()
+        timestamp_str = timestamp.strftime('%Y%m%d_%H%M%S')
+        milliseconds = timestamp.microsecond // 1000
+
+        report_dirname = f"{domain}_{timestamp_str}_{milliseconds:03d}"
+        report_dir = self.reports_dir / report_dirname
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        return report_dir
+
+    def _save_report_files(self, report_dir: Path, url: str, report: Dict) -> None:
+        """Save consolidated report and metadata to files."""
+        # Save consolidated report
+        report_file = report_dir / "consolidated_report.json"
+        with open(report_file, "w") as f:
+            json.dump(report, f, indent=2)
+
+        # Save metadata
+        metadata = self._build_metadata(url, report)
+        metadata_file = report_dir / "metadata.json"
+        with open(metadata_file, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+    def _build_metadata(self, url: str, report: Dict) -> Dict[str, Any]:
+        """Build metadata dictionary for report."""
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        domain = (parsed.netloc or "unknown").replace(':', '_').replace('/', '_')
+
+        return {
+            "url": url,
+            "domain": domain,
+            "timestamp": datetime.now().isoformat(),
+            "approaches_count": len(self.approaches),
+            "approaches_used": self.approaches,
+            "model": self.model,
+            "total_vulnerabilities": report.get("total_vulns_detected", 0),
+            "consensus_count": len(report.get("consensus_vulns", [])),
+            "attack_priority_count": len(report.get("attack_priority", []))
+        }
 
