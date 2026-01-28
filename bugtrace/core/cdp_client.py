@@ -173,25 +173,45 @@ class CDPClient:
     async def _try_connect_to_existing_page(self) -> Optional[str]:
         """Try to connect to an existing Chrome page."""
         for attempt in range(20):
-            try:
-                async with self.session.get(
-                    f"http://127.0.0.1:{self.port}/json/list",
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as resp:
-                    targets = await resp.json()
-                    for target in targets:
-                        if target.get("type") == "page":
-                            page_ws_url = target.get("webSocketDebuggerUrl")
-                            if page_ws_url:
-                                logger.info(f"CDP connected to page: {page_ws_url[:60]}...")
-                                return page_ws_url
-            except Exception as e:
-                if self.chrome_process.poll() is not None:
-                    logger.error(f"Chrome process died early. Return code: {self.chrome_process.returncode}")
-                    return None
-                logger.debug(f"Waiting for Chrome... attempt {attempt+1}: {e}")
-                await asyncio.sleep(0.5)
+            page_ws_url = await self._attempt_chrome_connection(attempt)
+            if page_ws_url:
+                return page_ws_url
+        return None
 
+    async def _attempt_chrome_connection(self, attempt: int) -> Optional[str]:
+        """Attempt single Chrome connection try."""
+        try:
+            async with self.session.get(
+                f"http://127.0.0.1:{self.port}/json/list",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                targets = await resp.json()
+                return self._find_page_websocket_url(targets)
+        except Exception as e:
+            return await self._handle_connection_error(e, attempt)
+
+    def _find_page_websocket_url(self, targets: list) -> Optional[str]:
+        """Find WebSocket URL for a page target."""
+        for target in targets:
+            if target.get("type") != "page":
+                continue
+
+            page_ws_url = target.get("webSocketDebuggerUrl")
+            if not page_ws_url:
+                continue
+
+            logger.info(f"CDP connected to page: {page_ws_url[:60]}...")
+            return page_ws_url
+        return None
+
+    async def _handle_connection_error(self, error: Exception, attempt: int) -> Optional[str]:
+        """Handle Chrome connection error."""
+        if self.chrome_process.poll() is not None:
+            logger.error(f"Chrome process died early. Return code: {self.chrome_process.returncode}")
+            return None
+
+        logger.debug(f"Waiting for Chrome... attempt {attempt+1}: {error}")
+        await asyncio.sleep(0.5)
         return None
 
     async def _create_new_chrome_page(self) -> Optional[str]:
@@ -421,35 +441,55 @@ class CDPClient:
         """Background task to receive and dispatch CDP messages."""
         try:
             async for msg in self.ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
-                    self._handle_cdp_message(data)
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    logger.error(f"WebSocket error: {msg.data}")
-                    break
+                await self._process_websocket_message(msg)
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"CDP receive error: {e}")
+            logger.error(f"CDP receive error: {e}", exc_info=True)
+
+    async def _process_websocket_message(self, msg):
+        """Process a single WebSocket message."""
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            data = json.loads(msg.data)
+            self._handle_cdp_message(data)
+            return
+
+        if msg.type == aiohttp.WSMsgType.ERROR:
+            logger.error(f"WebSocket error: {msg.data}")
+            raise RuntimeError("WebSocket error occurred")
 
     def _handle_cdp_message(self, data: dict):
         """Handle received CDP message."""
         # Handle response to our command
         if "id" in data:
-            msg_id = data["id"]
-            if msg_id in self._pending_responses:
-                self._pending_responses[msg_id].set_result(data)
-                del self._pending_responses[msg_id]
+            self._handle_cdp_response(data)
+            return
 
         # Handle events
-        elif "method" in data:
-            method = data["method"]
-            if method in self._listeners:
-                for listener in self._listeners[method]:
-                    try:
-                        listener(data.get("params", {}))
-                    except Exception as e:
-                        logger.error(f"Listener error: {e}")
+        if "method" in data:
+            self._handle_cdp_event(data)
+
+    def _handle_cdp_response(self, data: dict):
+        """Handle CDP command response."""
+        msg_id = data["id"]
+        if msg_id not in self._pending_responses:
+            return
+
+        self._pending_responses[msg_id].set_result(data)
+        del self._pending_responses[msg_id]
+
+    def _handle_cdp_event(self, data: dict):
+        """Handle CDP event."""
+        method = data["method"]
+        if method not in self._listeners:
+            return
+
+        params = data.get("params", {})
+        for listener in self._listeners[method]:
+            try:
+                listener(params)
+            except Exception as e:
+                logger.error(f"Listener error: {e}", exc_info=True)
 
     def _add_listener(self, event: str, callback: Callable):
         """Add event listener."""
