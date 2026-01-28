@@ -621,9 +621,26 @@ Respond in JSON format:
             # Generic page capture for other types
             return await self._generic_capture(url, payload)
     
+    def _check_sql_errors(self, content: str) -> Optional[str]:
+        """Check page content for SQL error indicators. Returns error name if found."""
+        sql_errors = [
+            "SQL syntax",
+            "mysql_",
+            "ORA-",
+            "PostgreSQL",
+            "SQLITE_ERROR",
+            "Microsoft SQL Server"
+        ]
+
+        content_lower = content.lower()
+        for error in sql_errors:
+            if error.lower() in content_lower:
+                return error
+        return None
+
     async def _generic_capture(
-        self, 
-        url: str, 
+        self,
+        url: str,
         payload: Optional[str]
     ) -> Tuple[str, List[str], bool]:
         """
@@ -631,40 +648,28 @@ Respond in JSON format:
         """
         logs = []
         screenshot_path = ""
-        
+
         target_url = self._construct_payload_url(url, payload) if payload else url
-        
+
         async with browser_manager.get_page() as page:
             try:
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(2000)
-                
+
                 import uuid
                 screenshot_path = str(settings.LOG_DIR / f"validate_{uuid.uuid4().hex[:8]}.png")
                 await page.screenshot(path=screenshot_path)
-                
-                # Check page content for error indicators
+
                 content = await page.content()
-                
-                # SQL error patterns
-                sql_errors = [
-                    "SQL syntax",
-                    "mysql_",
-                    "ORA-",
-                    "PostgreSQL",
-                    "SQLITE_ERROR",
-                    "Microsoft SQL Server"
-                ]
-                
-                for error in sql_errors:
-                    if error.lower() in content.lower():
-                        logs.append(f"SQL Error detected: {error}")
-                        return screenshot_path, logs, True
-                        
+                sql_error = self._check_sql_errors(content)
+                if sql_error:
+                    logs.append(f"SQL Error detected: {sql_error}")
+                    return screenshot_path, logs, True
+
             except Exception as e:
                 logs.append(f"Capture error: {e}")
                 logger.error(f"Generic capture failed: {e}", exc_info=True)
-                
+
         return screenshot_path, logs, False
     
     def _construct_payload_url(self, url: str, payload: Optional[str]) -> str:
