@@ -36,122 +36,131 @@ class DASTySASTAgent(BaseAgent):
         """Performs 5-approach analysis on the URL (DAST+SAST)."""
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] Running DAST+SAST Analysis on {self.url[:50]}...", "INFO")
-        
+
         try:
             # 1. Prepare Context
-            # 1. Prepare Context
-            # Interactsh Integration: Get OOB payload for injection testing
-            from bugtrace.tools.interactsh import interactsh_client, get_oob_payload
-            
-            # Ensure registered (lazy init)
-            if not interactsh_client.registered:
-                await interactsh_client.register()
-                
-            oob_payload, oob_url = await get_oob_payload("generic")
-            
-            context = {
-                "url": self.url,
-                "tech_stack": self.tech_profile.get("frameworks", []),
-                "html_content": "", # Placeholder
-                "oob_info": {
-                    "callback_url": oob_url,
-                    "payload_template": oob_payload,
-                    "instructions": "Use this callback URL for Blind XSS/SSRF/RCE testing. If you inject this and it's triggered, we will detect it Out-of-Band."
-                }
-            }
-            
-            # Fetch HTML Content (Hybrid Analysis)
-            try:
-                from bugtrace.tools.visual.browser import browser_manager
-                # Ensure browser is started
-                await browser_manager.start()
-                capture = await browser_manager.capture_state(self.url)
-                if capture and capture.get("html"):
-                    # Truncate to save tokens, but keep enough for analysis
-                    html_full = capture["html"]
-                    # Simple heuristic: keep head and body start, cut middle if too huge
-                    if len(html_full) > 15000:
-                         context["html_content"] = html_full[:7500] + "\n...[TRUNCATED]...\n" + html_full[-7500:]
-                    else:
-                        context["html_content"] = html_full
-                    
-                    logger.info(f"[{self.name}] Fetched HTML content ({len(context['html_content'])} chars) for analysis.")
-            except Exception as e:
-                logger.warning(f"[{self.name}] Failed to fetch HTML content: {e}")
-            
-            # 2. Parallel Analysis (LLM Approaches + Specialized Detectors)
-            tasks = [
-                self._analyze_with_approach(context, approach)
-                for approach in self.approaches
-            ]
-            
-            # Add Header Injection Check
-            from bugtrace.tools.exploitation.header_injection import header_detector
-            tasks.append(self._check_header_injection(header_detector))
-            
-            analyses = await asyncio.gather(*tasks, return_exceptions=True)
-            valid_analyses = [a for a in analyses if isinstance(a, dict) and not a.get("error")]
-            
+            context = await self._run_prepare_context()
+
+            # 2. Parallel Analysis
+            valid_analyses = await self._run_execute_analyses(context)
             if not valid_analyses:
                 dashboard.log(f"[{self.name}] All analysis approaches failed.", "ERROR")
                 return {"error": "Analysis failed", "vulnerabilities": []}
-            
-            # 3. Consolidate (Consensus Voting)
+
+            # 3. Consolidate & Review
             consolidated = self._consolidate(valid_analyses)
-            
-            # 4. Skeptical LLM Review (Claude Haiku)
-            # Use a separate model to critically review findings and filter false positives
             vulnerabilities = await self._skeptical_review(consolidated)
-            
-            logger.info(f"🔍 DASTySAST Result: {len(vulnerabilities)} candidates for {self.url[:50]}")
-            for v in vulnerabilities:
-                # Normalize field names from various LLM approaches
-                v_name = v.get("vulnerability_name") or v.get("name") or v.get("vulnerability") or "Vulnerability"
-                v_desc = v.get("description") or v.get("reasoning") or v.get("details") or "No description provided."
-                
-                # Ensure v_name is at least somewhat descriptive for the Orchestrator
-                if v_name.lower() in ["vulnerability", "security issue", "finding"]:
-                    desc_lower = str(v_desc).lower()
-                    if "xss" in desc_lower or "script" in desc_lower:
-                        v_name = "Potential XSS Issue"
-                    elif "sql" in desc_lower:
-                        v_name = "Potential SQL Injection Issue"
-                    else:
-                        v_name = f"Potential {v.get('type', 'Security')} Issue"
-                
-                # Get proper severity based on vulnerability type
-                v_type_upper = (v.get("type") or v_name or "").upper()
-                v_severity = self._get_severity_for_type(v_type_upper, v.get("severity"))
 
-                self.state_manager.add_finding(
-                    url=self.url,
-                    type=str(v_name),
-                    description=str(v_desc),
-                    severity=str(v_severity),
-                    parameter=v.get("parameter") or v.get("vulnerable_parameter"),
-                    payload=v.get("payload") or v.get("logic") or v.get("exploitation_strategy"),
-                    evidence=v.get("evidence") or v.get("reasoning"),
-                    screenshot_path=v.get("screenshot_path"),
-                    validated=v.get("validated", False)
-                )
+            # 4. Save Results
+            await self._run_save_results(vulnerabilities)
 
-            # 6. Save Vulnerabilities Artifact (.md)
-            safe_name = self.url.replace("://", "_").replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_")[:50]
-            report_path = self.report_dir / f"vulnerabilities_{safe_name}.md"
-            
-            self._save_markdown_report(report_path, vulnerabilities)
-            
-            dashboard.log(f"[{self.name}] Found {len(vulnerabilities)} potential vulnerabilities.", "SUCCESS")
-            
             return {
                 "url": self.url,
                 "vulnerabilities": vulnerabilities,
-                "report_file": str(report_path)
+                "report_file": str(self.report_dir / f"vulnerabilities_{self._get_safe_name()}.md")
             }
-            
+
         except Exception as e:
             logger.error(f"DASTySASTAgent failed: {e}", exc_info=True)
             return {"error": str(e), "vulnerabilities": []}
+
+    async def _run_prepare_context(self) -> Dict:
+        """Prepare analysis context with OOB payload and HTML content."""
+        from bugtrace.tools.interactsh import interactsh_client, get_oob_payload
+
+        # Ensure registered (lazy init)
+        if not interactsh_client.registered:
+            await interactsh_client.register()
+
+        oob_payload, oob_url = await get_oob_payload("generic")
+
+        context = {
+            "url": self.url,
+            "tech_stack": self.tech_profile.get("frameworks", []),
+            "html_content": "",
+            "oob_info": {
+                "callback_url": oob_url,
+                "payload_template": oob_payload,
+                "instructions": "Use this callback URL for Blind XSS/SSRF/RCE testing. If you inject this and it's triggered, we will detect it Out-of-Band."
+            }
+        }
+
+        # Fetch HTML Content
+        try:
+            from bugtrace.tools.visual.browser import browser_manager
+            await browser_manager.start()
+            capture = await browser_manager.capture_state(self.url)
+            if capture and capture.get("html"):
+                html_full = capture["html"]
+                if len(html_full) > 15000:
+                     context["html_content"] = html_full[:7500] + "\n...[TRUNCATED]...\n" + html_full[-7500:]
+                else:
+                    context["html_content"] = html_full
+
+                logger.info(f"[{self.name}] Fetched HTML content ({len(context['html_content'])} chars) for analysis.")
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to fetch HTML content: {e}")
+
+        return context
+
+    async def _run_execute_analyses(self, context: Dict) -> List[Dict]:
+        """Execute parallel analyses with all approaches."""
+        tasks = [
+            self._analyze_with_approach(context, approach)
+            for approach in self.approaches
+        ]
+
+        # Add Header Injection Check
+        from bugtrace.tools.exploitation.header_injection import header_detector
+        tasks.append(self._check_header_injection(header_detector))
+
+        analyses = await asyncio.gather(*tasks, return_exceptions=True)
+        return [a for a in analyses if isinstance(a, dict) and not a.get("error")]
+
+    async def _run_save_results(self, vulnerabilities: List[Dict]):
+        """Save vulnerabilities to state manager and markdown report."""
+        logger.info(f"🔍 DASTySAST Result: {len(vulnerabilities)} candidates for {self.url[:50]}")
+
+        for v in vulnerabilities:
+            # Normalize field names
+            v_name = v.get("vulnerability_name") or v.get("name") or v.get("vulnerability") or "Vulnerability"
+            v_desc = v.get("description") or v.get("reasoning") or v.get("details") or "No description provided."
+
+            # Ensure v_name is descriptive
+            if v_name.lower() in ["vulnerability", "security issue", "finding"]:
+                desc_lower = str(v_desc).lower()
+                if "xss" in desc_lower or "script" in desc_lower:
+                    v_name = "Potential XSS Issue"
+                elif "sql" in desc_lower:
+                    v_name = "Potential SQL Injection Issue"
+                else:
+                    v_name = f"Potential {v.get('type', 'Security')} Issue"
+
+            # Get severity
+            v_type_upper = (v.get("type") or v_name or "").upper()
+            v_severity = self._get_severity_for_type(v_type_upper, v.get("severity"))
+
+            self.state_manager.add_finding(
+                url=self.url,
+                type=str(v_name),
+                description=str(v_desc),
+                severity=str(v_severity),
+                parameter=v.get("parameter") or v.get("vulnerable_parameter"),
+                payload=v.get("payload") or v.get("logic") or v.get("exploitation_strategy"),
+                evidence=v.get("evidence") or v.get("reasoning"),
+                screenshot_path=v.get("screenshot_path"),
+                validated=v.get("validated", False)
+            )
+
+        # Save markdown report
+        report_path = self.report_dir / f"vulnerabilities_{self._get_safe_name()}.md"
+        self._save_markdown_report(report_path, vulnerabilities)
+
+        dashboard.log(f"[{self.name}] Found {len(vulnerabilities)} potential vulnerabilities.", "SUCCESS")
+
+    def _get_safe_name(self) -> str:
+        """Generate safe filename from URL."""
+        return self.url.replace("://", "_").replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_")[:50]
 
     def _get_severity_for_type(self, vuln_type: str, llm_severity: Optional[str] = None) -> str:
         """
@@ -226,16 +235,38 @@ class DASTySASTAgent(BaseAgent):
 
     async def _analyze_with_approach(self, context: Dict, approach: str) -> Dict:
         """Analyze with a specific persona."""
-        # Load relevant skills for context enrichment
-        from bugtrace.agents.skills.loader import get_skills_for_findings
-        
-        # If we have prior findings, load relevant skills
-        skill_context = ""
-        if hasattr(self, "_prior_findings") and self._prior_findings:
-            skill_context = get_skills_for_findings(self._prior_findings, max_skills=2)
-        
+        skill_context = self._approach_get_skill_context()
         system_prompt = self._get_system_prompt(approach)
-        user_prompt = f"""Analyze this URL for security vulnerabilities:
+        user_prompt = self._approach_build_prompt(context, skill_context)
+
+        try:
+            response = await llm_client.generate(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                module_name="DASTySASTAgent",
+                max_tokens=8000
+            )
+
+            if not response:
+                return {"error": "Empty response from LLM"}
+
+            return self._approach_parse_response(response)
+
+        except Exception as e:
+            logger.error(f"Failed to analyze with approach {approach}: {e}", exc_info=True)
+            return {"vulnerabilities": []}
+
+    def _approach_get_skill_context(self) -> str:
+        """Get skill context for enrichment."""
+        from bugtrace.agents.skills.loader import get_skills_for_findings
+
+        if hasattr(self, "_prior_findings") and self._prior_findings:
+            return get_skills_for_findings(self._prior_findings, max_skills=2)
+        return ""
+
+    def _approach_build_prompt(self, context: Dict, skill_context: str) -> str:
+        """Build analysis prompt with context."""
+        return f"""Analyze this URL for security vulnerabilities:
 
 URL: {self.url}
 Technology Stack: {self.tech_profile.get('frameworks', [])}
@@ -273,49 +304,34 @@ EXAMPLE OUTPUT FORMAT (XML-Like):
 
 Return ONLY valid XML tags. Do not add markdown code blocks.
 """
-        
-        try:
-            response = await llm_client.generate(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                module_name="DASTySASTAgent",
-                max_tokens=8000
-            )
-            
-            if not response:
-                return {"error": "Empty response from LLM"}
 
-            # Parse using XmlParser
-            parser = XmlParser()
-            vuln_contents = parser.extract_list(response, "vulnerability")
-            
-            vulnerabilities = []
-            for vc in vuln_contents:
+    def _approach_parse_response(self, response: str) -> Dict:
+        """Parse LLM response into vulnerabilities."""
+        parser = XmlParser()
+        vuln_contents = parser.extract_list(response, "vulnerability")
+
+        vulnerabilities = []
+        for vc in vuln_contents:
+            try:
+                conf_str = parser.extract_tag(vc, "confidence_score") or parser.extract_tag(vc, "confidence") or "5"
                 try:
-                    conf_str = parser.extract_tag(vc, "confidence_score") or parser.extract_tag(vc, "confidence") or "5"
-                    try:
-                        conf = int(float(conf_str))
-                        conf = max(0, min(10, conf))  # Clamp to 0-10
-                    except (ValueError, TypeError):
-                        conf = 5
-                        
-                    vulnerabilities.append({
-                        "type": parser.extract_tag(vc, "type") or "Unknown",
-                        "parameter": parser.extract_tag(vc, "parameter") or "unknown",
-                        "confidence_score": conf,
-                        "reasoning": parser.extract_tag(vc, "reasoning") or "",
-                        "severity": parser.extract_tag(vc, "severity") or "Medium",
-                        "exploitation_strategy": parser.extract_tag(vc, "payload") or parser.extract_tag(vc, "exploitation_strategy") or ""
-                    })
-                except Exception as ex:
-                    logger.warning(f"Failed to parse vulnerability entry: {ex}")
-            
-            # Legacy return format expected by DASTAgent logic
-            return {"vulnerabilities": vulnerabilities}
-            
-        except Exception as e:
-            logger.error(f"Failed to analyze with approach {approach}: {e}", exc_info=True)
-            return {"vulnerabilities": []}
+                    conf = int(float(conf_str))
+                    conf = max(0, min(10, conf))  # Clamp to 0-10
+                except (ValueError, TypeError):
+                    conf = 5
+
+                vulnerabilities.append({
+                    "type": parser.extract_tag(vc, "type") or "Unknown",
+                    "parameter": parser.extract_tag(vc, "parameter") or "unknown",
+                    "confidence_score": conf,
+                    "reasoning": parser.extract_tag(vc, "reasoning") or "",
+                    "severity": parser.extract_tag(vc, "severity") or "Medium",
+                    "exploitation_strategy": parser.extract_tag(vc, "payload") or parser.extract_tag(vc, "exploitation_strategy") or ""
+                })
+            except Exception as ex:
+                logger.warning(f"Failed to parse vulnerability entry: {ex}")
+
+        return {"vulnerabilities": vulnerabilities}
 
     def _get_system_prompt(self, approach: str) -> str:
         """Get system prompt from external config."""
@@ -361,40 +377,69 @@ Return ONLY valid XML tags. Do not add markdown code blocks.
         Use a skeptical LLM (Claude Haiku) to review findings and filter false positives.
         This is the final gate before findings reach specialist agents.
         """
-        # 1. DEDUPLICATE by (type + parameter) - keep highest confidence
+        # 1. Deduplicate
+        vulnerabilities = self._review_deduplicate(vulnerabilities)
+        if not vulnerabilities:
+            return []
+
+        # 2. Build prompt
+        prompt = self._review_build_prompt(vulnerabilities)
+
+        # 3. Execute review
+        try:
+            response = await llm_client.generate(
+                prompt=prompt,
+                system_prompt="You are a skeptical security expert. Reject false positives ruthlessly.",
+                model_override=settings.SKEPTICAL_MODEL,
+                module_name="DASTySAST_Skeptical",
+                max_tokens=2000
+            )
+
+            if not response:
+                logger.warning(f"[{self.name}] Skeptical review empty - keeping all")
+                return vulnerabilities
+
+            # 4. Parse and approve
+            return self._review_parse_approval(response, vulnerabilities)
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Skeptical review failed: {e}", exc_info=True)
+            return vulnerabilities
+
+    def _review_deduplicate(self, vulnerabilities: List[Dict]) -> List[Dict]:
+        """Deduplicate vulnerabilities by type+parameter, keeping highest confidence."""
         deduped = {}
         for v in vulnerabilities:
             key = (v.get('type'), v.get('parameter'))
             existing = deduped.get(key)
             if not existing or v.get('confidence', 0) > existing.get('confidence', 0):
                 deduped[key] = v
-        
-        vulnerabilities = list(deduped.values())
-        logger.info(f"[{self.name}] Deduplicated: {len(deduped)} unique findings")
-        
-        if not vulnerabilities:
-            return []
-            
+
+        result = list(deduped.values())
+        logger.info(f"[{self.name}] Deduplicated: {len(result)} unique findings")
+        return result
+
+    def _review_build_prompt(self, vulnerabilities: List[Dict]) -> str:
+        """Build skeptical review prompt with enriched context."""
         from bugtrace.agents.skills.loader import get_scoring_guide, get_false_positives
-        
-        # Build enriched summary with scoring guides
+
         vulns_summary_parts = []
         for i, v in enumerate(vulnerabilities):
             vuln_type = v.get('type', 'Unknown')
             scoring_guide = get_scoring_guide(vuln_type)
             fp_guide = get_false_positives(vuln_type)
-            
+
             part = f"""{i+1}. {vuln_type} on '{v.get('parameter')}'
    DASTySAST Score: {v.get('confidence_score', 5)}/10 | Votes: {v.get('votes', 1)}/5
    Reasoning: {v.get('reasoning') or 'No reasoning'}
-   
+
    {scoring_guide[:500] if scoring_guide else ''}
    {fp_guide[:300] if fp_guide else ''}"""
             vulns_summary_parts.append(part)
 
         vulns_summary = "\n\n".join(vulns_summary_parts)
-        
-        prompt = f"""You are a security expert reviewing vulnerability findings.
+
+        return f"""You are a security expert reviewing vulnerability findings.
 
 === TARGET ===
 URL: {self.url}
@@ -432,53 +477,38 @@ Return XML:
 </reviewed>
 """
 
-        try:
-            response = await llm_client.generate(
-                prompt=prompt,
-                system_prompt="You are a skeptical security expert. Reject false positives ruthlessly.",
-                model_override=settings.SKEPTICAL_MODEL,
-                module_name="DASTySAST_Skeptical",
-                max_tokens=2000
-            )
-            
-            if not response:
-                logger.warning(f"[{self.name}] Skeptical review empty - keeping all")
-                return vulnerabilities
-            
-            parser = XmlParser()
-            finding_blocks = parser.extract_list(response, "finding")
-            
-            approved = []
-            
-            for block in finding_blocks:
-                try:
-                    idx = int(parser.extract_tag(block, "index")) - 1
-                    vuln_type = parser.extract_tag(block, "type") or "UNKNOWN"
-                    final_score = int(parser.extract_tag(block, "final_score") or "0")
-                    reasoning = parser.extract_tag(block, "reasoning") or ""
-                    
-                    # Get type-specific threshold
-                    threshold = settings.get_threshold_for_type(vuln_type)
-                    
-                    if 0 <= idx < len(vulnerabilities):
-                        vuln = vulnerabilities[idx]
-                        vuln["skeptical_score"] = final_score
-                        vuln["skeptical_reasoning"] = reasoning
-                        
-                        if final_score >= threshold:
-                            logger.info(f"[{self.name}] ✅ APPROVED #{idx+1} {vuln_type} (score: {final_score}/10 >= {threshold}): {reasoning[:60]}")
-                            approved.append(vuln)
-                        else:
-                            logger.info(f"[{self.name}] ❌ REJECTED #{idx+1} {vuln_type} (score: {final_score}/10 < {threshold}): {reasoning[:60]}")
-                except Exception as e:
-                    logger.warning(f"[{self.name}] Failed to parse finding: {e}")
-            
-            logger.info(f"[{self.name}] Skeptical Review: {len(approved)} passed, {len(vulnerabilities)-len(approved)} rejected")
-            return approved
-            
-        except Exception as e:
-            logger.error(f"[{self.name}] Skeptical review failed: {e}", exc_info=True)
-            return vulnerabilities
+    def _review_parse_approval(self, response: str, vulnerabilities: List[Dict]) -> List[Dict]:
+        """Parse skeptical review response and approve findings above threshold."""
+        parser = XmlParser()
+        finding_blocks = parser.extract_list(response, "finding")
+
+        approved = []
+
+        for block in finding_blocks:
+            try:
+                idx = int(parser.extract_tag(block, "index")) - 1
+                vuln_type = parser.extract_tag(block, "type") or "UNKNOWN"
+                final_score = int(parser.extract_tag(block, "final_score") or "0")
+                reasoning = parser.extract_tag(block, "reasoning") or ""
+
+                # Get type-specific threshold
+                threshold = settings.get_threshold_for_type(vuln_type)
+
+                if 0 <= idx < len(vulnerabilities):
+                    vuln = vulnerabilities[idx]
+                    vuln["skeptical_score"] = final_score
+                    vuln["skeptical_reasoning"] = reasoning
+
+                    if final_score >= threshold:
+                        logger.info(f"[{self.name}] ✅ APPROVED #{idx+1} {vuln_type} (score: {final_score}/10 >= {threshold}): {reasoning[:60]}")
+                        approved.append(vuln)
+                    else:
+                        logger.info(f"[{self.name}] ❌ REJECTED #{idx+1} {vuln_type} (score: {final_score}/10 < {threshold}): {reasoning[:60]}")
+            except Exception as e:
+                logger.warning(f"[{self.name}] Failed to parse finding: {e}")
+
+        logger.info(f"[{self.name}] Skeptical Review: {len(approved)} passed, {len(vulnerabilities)-len(approved)} rejected")
+        return approved
 
     def _save_markdown_report(self, path: Path, vulnerabilities: List[Dict]):
         """Saves a human-readable markdown report of potential vulnerabilities."""
