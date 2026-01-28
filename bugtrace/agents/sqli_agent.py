@@ -578,8 +578,8 @@ class SQLiAgent(BaseAgent):
 
                     if any(ind in content.lower() for ind in block_indicators):
                         filtered.add(char)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"operation failed: {e}")
 
         if filtered:
             self._detected_filters = filtered
@@ -1073,7 +1073,7 @@ class SQLiAgent(BaseAgent):
                     normalized = re.sub(r'\d{2}:\d{2}:\d{2}', 'TIME', normalized)
                     normalized = re.sub(r'[a-f0-9]{32}', 'HASH', normalized)
                     responses.append(normalized[:1000])
-            except:
+            except Exception as e:
                 responses.append("")
 
         # If all responses are very similar (>95% match) and no SQL errors
@@ -1709,8 +1709,8 @@ Write the exploitation explanation section for the report."""
             data = json.loads(post_data)
             if isinstance(data, dict):
                 params.extend(data.keys())
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
 
         return params
 

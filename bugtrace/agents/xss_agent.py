@@ -1615,7 +1615,8 @@ class XSSAgent(BaseAgent):
         try:
             result = urlparse(url)
             return all([result.scheme in ['http', 'https'], result.netloc])
-        except:
+        except Exception as e:
+            logger.debug(f"_is_valid_url failed: {e}")
             return False
 
     async def _probe_parameter(self, param: str) -> Tuple[str, str, int]:
@@ -1698,8 +1699,8 @@ class XSSAgent(BaseAgent):
                     context = "comment"
                 elif f"<{prefix}" in html:
                     context = "tag_name"
-        except:
-             pass
+        except Exception as e:
+             logger.debug(f"operation failed: {e}")
         
         return {
             "reflected": True,

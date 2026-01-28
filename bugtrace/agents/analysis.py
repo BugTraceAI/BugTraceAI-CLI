@@ -14,7 +14,6 @@ Created: 2026-01-02
 
 import asyncio
 import json
-import hashlib
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from collections import defaultdict
@@ -213,7 +212,7 @@ class AnalysisAgent(BaseAgent):
             try:
                 html_text = getattr(response, "text", "")
                 context["html_snippet"] = html_text[:5000]
-            except:
+            except Exception as e:
                 context["html_snippet"] = ""
         
         # Fallback: Extract HTML directly from event data (from ReconAgent)
@@ -338,7 +337,7 @@ class AnalysisAgent(BaseAgent):
                 
                 try:
                     v_conf = float(v_conf_str)
-                except:
+                except Exception as e:
                     v_conf = 0.5
                     
                 if v_type and v_type != "Unknown":

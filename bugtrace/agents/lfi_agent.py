@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import aiohttp
 from typing import Dict, List, Optional
@@ -72,7 +71,8 @@ class LFIAgent(BaseAgent):
         try:
             async with session.get(target_url, timeout=5) as resp:
                 return await resp.text()
-        except:
+        except Exception as e:
+            logger.debug(f"_get_response_text failed: {e}")
             return ""
         
     async def run_loop(self) -> Dict:

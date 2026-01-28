@@ -1,4 +1,3 @@
-import logging
 import asyncio
 from typing import Dict, List, Optional
 from pathlib import Path
@@ -177,7 +176,8 @@ class SSRFAgent(BaseAgent):
             # Cleanup common junk
             json_str = json_str.replace("```json", "").replace("```", "").strip()
             return json.loads(json_str)
-        except:
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
             return {}
 
     async def _create_finding(self, res: Dict):

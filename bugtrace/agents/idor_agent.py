@@ -1,5 +1,3 @@
-import logging
-import asyncio
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -113,7 +111,8 @@ class IDORAgent(BaseAgent):
             dashboard.update_task(f"IDOR:{param_name}", status=f"Probing ID {val}")
             async with session.get(target, timeout=5) as resp:
                 return await resp.text(), resp.status
-        except:
+        except Exception as e:
+            logger.debug(f"_fetch failed: {e}")
             return None, 0
 
     def _inject(self, val, param_name, original_val):
@@ -139,5 +138,6 @@ class IDORAgent(BaseAgent):
             dashboard.update_task(f"IDOR:{param_name}", status=f"Tampering Cookie for ID {val}")
             async with session.get(target, cookies=cookies, timeout=5) as resp:
                 return await resp.text()
-        except:
+        except Exception as e:
+            logger.debug(f"_fetch_with_cookie failed: {e}")
             return None

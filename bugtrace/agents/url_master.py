@@ -330,8 +330,8 @@ Response format:
                                     params_dict[k.strip()] = v.strip()
                         else:
                             params_dict = json.loads(params_raw)
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"operation failed: {e}")
                 
                 return {
                     "type": "skill",

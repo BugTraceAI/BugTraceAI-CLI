@@ -420,7 +420,8 @@ Output ONLY the Python code, no explanations.
         try:
             poc_script = await llm_client.generate(prompt, "PoCGenerator")
             return poc_script
-        except:
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
             return "# PoC generation failed"
 
     async def _update_graph_confidence(self, finding: Dict):

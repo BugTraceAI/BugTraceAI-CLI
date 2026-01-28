@@ -1,7 +1,5 @@
-import asyncio
 import logging
 from typing import Dict, List, Optional, Tuple
-from pathlib import Path
 from bs4 import BeautifulSoup
 import aiohttp
 from bugtrace.agents.base import BaseAgent
@@ -196,7 +194,8 @@ class FileUploadAgent(BaseAgent):
                     predicted_url = urljoin(self.url, f"/uploads/{filename}")
                     # Dojo validation: Check if text confirms upload
                     return resp.status in [200, 201], text, predicted_url
-        except:
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
             return False, "", ""
 
     async def _validate_execution(self, url: str) -> bool:
@@ -208,5 +207,6 @@ class FileUploadAgent(BaseAgent):
                         return False
                     text = await resp.text()
                     return "BT7331_SUCCESS" in text or "RCE_FLAG" in text
-        except:
+        except Exception as e:
+            logger.debug(f"_validate_execution failed: {e}")
             return False

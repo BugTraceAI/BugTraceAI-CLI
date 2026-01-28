@@ -439,7 +439,8 @@ class CSTIAgent(BaseAgent):
         try:
             async with session.get(self.url, timeout=10) as resp:
                 return await resp.text()
-        except:
+        except Exception as e:
+            logger.debug(f"_fetch_page failed: {e}")
             return ""
 
     async def _targeted_probe(self, session, param, engines) -> Optional[Dict]:
@@ -618,8 +619,8 @@ class CSTIAgent(BaseAgent):
                     if "49" in content:
                         finding_obj = self._create_finding(f"HEADER:{header}", payload, "header_injection", verified_url=str(resp.url))
                         return self._finding_to_dict(finding_obj)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"operation failed: {e}")
 
         return None
 
@@ -837,7 +838,8 @@ Response format (XML):
         try:
             async with session.get(self.url, timeout=5) as resp:
                 return await resp.text()
-        except:
+        except Exception as e:
+            logger.debug(f"_get_baseline_content failed: {e}")
             return ""
 
     async def _test_payload(self, session, param, payload) -> Tuple[Optional[str], Optional[str]]:

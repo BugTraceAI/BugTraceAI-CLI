@@ -16,7 +16,6 @@ import asyncio
 import json
 import re
 from typing import List, Dict, Set, Optional, Any
-from urllib.parse import urlparse, urljoin
 from loguru import logger
 
 import httpx
@@ -229,8 +228,8 @@ class APISecurityAgent(BaseAgent):
                             "payload": json.dumps(payload),
                             "response": response.text
                         }
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"operation failed: {e}")
 
         return {"vulnerable": False}
 
@@ -277,8 +276,8 @@ class APISecurityAgent(BaseAgent):
         except asyncio.TimeoutError:
             dashboard.log("  ⚠️  GraphQL DoS: Query timeout (15s)", "HIGH")
             return {"vulnerable": True, "duration": 15}
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
 
         return {"vulnerable": False}
 
@@ -357,8 +356,8 @@ class APISecurityAgent(BaseAgent):
                             "description": f"Authentication bypass vulnerability. The endpoint returns 200 OK without valid credentials using technique: {technique}. Original response was {baseline.status_code}.",
                             "reproduction": f"curl -X GET '{endpoint}' # Returns 200 instead of 401/403"
                         }
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
 
         return {"vulnerable": False}
 
@@ -416,8 +415,8 @@ class APISecurityAgent(BaseAgent):
                             "description": f"Insecure Direct Object Reference (IDOR) vulnerability. Changing ID from {original_id} to {test_id} returns different user data without authorization checks.",
                             "reproduction": f"# Original: curl '{endpoint}'\n# IDOR: curl '{test_endpoint}'"
                         }
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
 
         return {"vulnerable": False}
 
@@ -434,8 +433,8 @@ class APISecurityAgent(BaseAgent):
                     try:
                         response = await client.request(method, endpoint, timeout=5)
                         results_by_method[method] = response.status_code
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"operation failed: {e}")
 
                 # Check for verb tampering (e.g., DELETE allowed when it shouldn't be)
                 if "DELETE" in results_by_method and results_by_method["DELETE"] in [200, 204]:
@@ -452,8 +451,8 @@ class APISecurityAgent(BaseAgent):
                         "description": f"HTTP Verb Tampering vulnerability. The DELETE method is allowed on this endpoint, potentially allowing unauthorized resource deletion. Allowed methods: {list(results_by_method.keys())}",
                         "reproduction": f"curl -X DELETE '{endpoint}' # Returns {results_by_method['DELETE']}"
                     }
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
 
         return {"vulnerable": False}
 
@@ -486,7 +485,8 @@ class APISecurityAgent(BaseAgent):
                     await websocket.send(json.dumps(payload))
 
                 return {"accessible": True, "authenticated": False}
-        except:
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
             return {"accessible": False}
 
     # ==================== HELPERS ====================

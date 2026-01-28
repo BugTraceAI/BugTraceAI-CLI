@@ -1,4 +1,3 @@
-import asyncio
 from typing import List, Dict, Any
 from loguru import logger
 from bugtrace.tools.external import external_tools

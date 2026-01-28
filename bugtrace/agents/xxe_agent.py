@@ -1,5 +1,4 @@
 import logging
-import asyncio
 from typing import Dict, List, Optional
 import aiohttp
 from bugtrace.agents.base import BaseAgent

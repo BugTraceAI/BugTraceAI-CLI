@@ -12,8 +12,6 @@ Advanced reconnaissance and comprehensive asset mapping.
 """
 
 import asyncio
-import re
-import json
 import httpx
 from typing import List, Dict, Set, Optional, Any
 from urllib.parse import urlparse, urljoin
@@ -222,7 +220,7 @@ class AssetDiscoveryAgent(BaseAgent):
                             self.discovered_subdomains.add(hostname)
                             dashboard.log(f"  ✅ Found: {hostname}", "INFO")
                             return
-                    except:
+                    except Exception as e:
                         continue
         except Exception as e:
             pass  # DNS resolution failed
@@ -324,8 +322,8 @@ class AssetDiscoveryAgent(BaseAgent):
                         dashboard.log(f"  ⚠️  PUBLIC S3 bucket: {bucket_name}", "CRITICAL")
                     else:
                         dashboard.log(f"  🪣 Found S3 bucket: {bucket_name} (access denied)", "INFO")
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
 
     async def _check_azure_blob(self, container_name: str):
         """Check if Azure blob storage exists."""
@@ -337,8 +335,8 @@ class AssetDiscoveryAgent(BaseAgent):
                 if response.status_code in [200, 400, 403]:
                     self.discovered_cloud_buckets.add(f"azure://{container_name}")
                     dashboard.log(f"  🪣 Found Azure blob: {container_name}", "INFO")
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"_check_azure_blob failed: {e}")
 
     async def _common_paths_discovery(self, base_url: str):
         """Discover common paths and hidden endpoints."""
@@ -386,8 +384,8 @@ class AssetDiscoveryAgent(BaseAgent):
                             dashboard.log(f"  ⚠️  Sensitive endpoint exposed: {url}", "CRITICAL")
                         else:
                             dashboard.log(f"  📍 Found: {url}", "INFO")
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
 
 
 # Export for team orchestrator

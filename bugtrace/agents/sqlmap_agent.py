@@ -1465,8 +1465,8 @@ class SQLMapAgent(BaseAgent):
             data = json.loads(post_data)
             if isinstance(data, dict):
                 params.extend(data.keys())
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
 
         return params
 

@@ -99,7 +99,7 @@ class MemoryManager:
             logger.error(f"Failed to init vector table: {e}")
             try:
                 self.obs_table = self.vector_db.open_table("observations")
-            except:
+            except Exception as e:
                 self.obs_table = None
 
     def _get_embedding(self, text: str) -> List[float]:
@@ -133,7 +133,7 @@ class MemoryManager:
             else:
                 try:
                     safe_props[key_name] = json.dumps(v)
-                except:
+                except Exception as e:
                     safe_props[key_name] = str(v)
                     
         # 1. Update Graph

