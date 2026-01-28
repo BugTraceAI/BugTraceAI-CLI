@@ -106,37 +106,41 @@ class XXEAgent(BaseAgent):
         try:
             dashboard.update_task("XXE Agent", status="Injecting Entity...")
             headers = {'Content-Type': 'application/xml'}
-            
+
             self.think(f"Testing Payload: {xml_body[:60]}...")
-            
+
             async with session.post(self.url, data=xml_body, headers=headers, timeout=5) as resp:
                 text = await resp.text()
-                
-                # Success Indicators
-                indicators = [
-                    "root:x:0:0",                  # /etc/passwd success
-                    "BUGTRACE_XXE_CONFIRMED",      # Internal Entity success
-                    "[extensions] found",          # Win.ini success (if testing windows)
-                    "failed to load external entity", # Error-based success (often confirms processing)
-                    "No such file or directory",    # Error-based success
-                    "uid=0(root)",                  # RCE success (expect://)
-                    "XXE OOB Triggered"             # Blind Detection (Simulated)
-                ]
+                return self._check_xxe_indicators(text)
 
-                # Check indicators
-                for ind in indicators:
-                    if ind in text:
-                        self.think(f"SUCCESS: Indicator '{ind}' found in response.")
-                        return True
-                        
-                # Check for XInclude reflection (if we tried XInclude)
-                if "root:x:0:0" in text:
-                    self.think("SUCCESS: /etc/passwd content found (XInclude or Entity).")
-                    return True
-                    
         except Exception as e:
             logger.debug(f"XXE Request failed: {e}")
-            pass
+            return False
+
+    def _check_xxe_indicators(self, text: str) -> bool:
+        """Check response text for XXE success indicators."""
+        # Success Indicators
+        indicators = [
+            "root:x:0:0",                  # /etc/passwd success
+            "BUGTRACE_XXE_CONFIRMED",      # Internal Entity success
+            "[extensions] found",          # Win.ini success (if testing windows)
+            "failed to load external entity", # Error-based success (often confirms processing)
+            "No such file or directory",    # Error-based success
+            "uid=0(root)",                  # RCE success (expect://)
+            "XXE OOB Triggered"             # Blind Detection (Simulated)
+        ]
+
+        # Check indicators
+        for ind in indicators:
+            if ind in text:
+                self.think(f"SUCCESS: Indicator '{ind}' found in response.")
+                return True
+
+        # Check for XInclude reflection (if we tried XInclude)
+        if "root:x:0:0" in text:
+            self.think("SUCCESS: /etc/passwd content found (XInclude or Entity).")
+            return True
+
         return False
         
     async def _llm_get_strategy(self, previous_response: str) -> Dict:

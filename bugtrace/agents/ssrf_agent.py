@@ -55,21 +55,29 @@ class SSRFAgent(BaseAgent):
         dashboard.log(f"[{self.name}] 🤖 Requesting LLM bypass strategy for '{param}'...", "INFO")
         strategy = await self._llm_get_strategy(param)
 
-        if strategy and "payloads" in strategy:
-            for payload_item in strategy["payloads"]:
-                payload = payload_item.get("payload")
-                if payload:
-                    res = await self._test_payload(param, payload)
-                    if res and self._determine_validation_status(res):
-                        findings.append({
-                            "param": param,
-                            "payload": payload,
-                            "severity": "HIGH",
-                            "reason": "Confirmed via LLM-designed payload",
-                            "status": "VALIDATED_CONFIRMED",
-                            "validated": True
-                        })
-                        break
+        if not strategy or "payloads" not in strategy:
+            return findings
+
+        return await self._test_strategy_payloads(strategy, param, findings)
+
+    async def _test_strategy_payloads(self, strategy: Dict, param: str, findings: List) -> List:
+        """Test each payload in the strategy."""
+        for payload_item in strategy["payloads"]:
+            payload = payload_item.get("payload")
+            if not payload:
+                continue
+
+            res = await self._test_payload(param, payload)
+            if res and self._determine_validation_status(res):
+                findings.append({
+                    "param": param,
+                    "payload": payload,
+                    "severity": "HIGH",
+                    "reason": "Confirmed via LLM-designed payload",
+                    "status": "VALIDATED_CONFIRMED",
+                    "validated": True
+                })
+                break
         return findings
 
     async def run_loop(self) -> Dict:

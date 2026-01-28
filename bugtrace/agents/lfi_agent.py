@@ -134,25 +134,34 @@ class LFIAgent(BaseAgent):
                     logger.info(f"[{self.name}] Skipping {param} - already tested")
                     continue
 
-                # High-Performance Go Fuzzer
-                dashboard.log(f"[{self.name}] 🚀 Launching Go LFI Fuzzer on '{param}'...", "INFO")
-                go_result = await external_tools.run_go_lfi_fuzzer(self.url, param)
-
-                if go_result and go_result.get("hits"):
-                    for hit in go_result["hits"]:
-                        dashboard.log(f"[{self.name}] 🚨 LFI HIT: {hit['payload']} ({hit['severity']})", "CRITICAL")
-                        all_findings.append(self._create_lfi_finding_from_hit(hit, param))
-                        self._tested_params.add(key)
-                        break
-
-                # Base Payloads (Manual Fallback if Go fails or for PHP wrappers)
-                if key not in self._tested_params:
-                    wrapper_finding = await self._test_php_wrappers(session, param)
-                    if wrapper_finding:
-                        all_findings.append(wrapper_finding)
-                        self._tested_params.add(key)
+                await self._test_parameter_for_lfi(session, param, key, all_findings)
 
         return {"vulnerable": len(all_findings) > 0, "findings": all_findings}
+
+    async def _test_parameter_for_lfi(self, session, param: str, key: str, all_findings: List):
+        """Test a single parameter for LFI vulnerabilities."""
+        # High-Performance Go Fuzzer
+        dashboard.log(f"[{self.name}] 🚀 Launching Go LFI Fuzzer on '{param}'...", "INFO")
+        go_result = await external_tools.run_go_lfi_fuzzer(self.url, param)
+
+        if go_result and go_result.get("hits"):
+            self._process_go_fuzzer_hits(go_result, param, key, all_findings)
+            return
+
+        # Base Payloads (Manual Fallback if Go fails or for PHP wrappers)
+        if key not in self._tested_params:
+            wrapper_finding = await self._test_php_wrappers(session, param)
+            if wrapper_finding:
+                all_findings.append(wrapper_finding)
+                self._tested_params.add(key)
+
+    def _process_go_fuzzer_hits(self, go_result: Dict, param: str, key: str, all_findings: List):
+        """Process Go fuzzer hits and add to findings."""
+        for hit in go_result["hits"]:
+            dashboard.log(f"[{self.name}] 🚨 LFI HIT: {hit['payload']} ({hit['severity']})", "CRITICAL")
+            all_findings.append(self._create_lfi_finding_from_hit(hit, param))
+            self._tested_params.add(key)
+            break
 
     async def _test_payload(self, session, payload, param) -> bool:
         """Injects payload and analyzes response."""
