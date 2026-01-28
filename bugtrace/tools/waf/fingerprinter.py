@@ -449,38 +449,11 @@ class WAFFingerprinter:
             List of (waf_name, confidence, indicators) tuples, sorted by confidence
         """
         try:
-            # Phase 1: Normal request analysis
             normal_result = await self._analyze_normal_request(url, timeout)
-
-            # Phase 2: Trigger WAF with malicious payload
             triggered_result = await self._analyze_triggered_response(url, timeout)
 
-            # Combine results for all WAFs
-            combined: Dict[str, float] = {}
-            indicators: Dict[str, List[str]] = {}
-
-            all_wafs = set(normal_result.keys()) | set(triggered_result.keys())
-
-            for waf in all_wafs:
-                waf_indicators = []
-                if waf in normal_result and normal_result[waf] > 0:
-                    waf_indicators.append("header_match")
-                if waf in triggered_result and triggered_result[waf] > 0:
-                    waf_indicators.append("response_pattern")
-
-                indicators[waf] = waf_indicators
-                combined[waf] = (
-                    normal_result.get(waf, 0.0) * 0.3 +
-                    triggered_result.get(waf, 0.0) * 0.7
-                )
-
-            # Filter by minimum confidence and sort
-            detected = [
-                (waf, min(conf, 1.0), indicators.get(waf, []))
-                for waf, conf in combined.items()
-                if conf >= min_confidence
-            ]
-            detected.sort(key=lambda x: x[1], reverse=True)
+            combined, indicators = self._combine_all_waf_scores(normal_result, triggered_result)
+            detected = self._filter_and_sort_detections(combined, indicators, min_confidence)
 
             if detected:
                 waf_list = [f"{w}({c:.0%})" for w, c, _ in detected]
@@ -491,6 +464,46 @@ class WAFFingerprinter:
         except Exception as e:
             logger.debug(f"Multi-WAF detection failed: {e}")
             return []
+
+    def _combine_all_waf_scores(
+        self,
+        normal_result: Dict[str, float],
+        triggered_result: Dict[str, float]
+    ) -> Tuple[Dict[str, float], Dict[str, List[str]]]:
+        """Combine scores and indicators for all detected WAFs."""
+        combined: Dict[str, float] = {}
+        indicators: Dict[str, List[str]] = {}
+        all_wafs = set(normal_result.keys()) | set(triggered_result.keys())
+
+        for waf in all_wafs:
+            waf_indicators = []
+            if waf in normal_result and normal_result[waf] > 0:
+                waf_indicators.append("header_match")
+            if waf in triggered_result and triggered_result[waf] > 0:
+                waf_indicators.append("response_pattern")
+
+            indicators[waf] = waf_indicators
+            combined[waf] = (
+                normal_result.get(waf, 0.0) * 0.3 +
+                triggered_result.get(waf, 0.0) * 0.7
+            )
+
+        return combined, indicators
+
+    def _filter_and_sort_detections(
+        self,
+        combined: Dict[str, float],
+        indicators: Dict[str, List[str]],
+        min_confidence: float
+    ) -> List[Tuple[str, float, List[str]]]:
+        """Filter by confidence threshold and sort by confidence."""
+        detected = [
+            (waf, min(conf, 1.0), indicators.get(waf, []))
+            for waf, conf in combined.items()
+            if conf >= min_confidence
+        ]
+        detected.sort(key=lambda x: x[1], reverse=True)
+        return detected
 
     def get_cache_stats(self) -> Dict[str, int]:
         """Get cache statistics (TASK-69)."""
@@ -523,54 +536,68 @@ class WAFFingerprinter:
 
         try:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=ssl_verify) as client:
-                # Test 1: Check if server responds normally to safe requests
+                # Test 1: Validate safe request behavior
                 safe_response = await client.get(url)
+                is_valid, reason = self._validate_safe_request(safe_response)
+                if not is_valid:
+                    return is_valid, reason
 
-                if safe_response.status_code in [403, 429, 503]:
-                    # Site blocks normal requests - might be IP-based blocking, not WAF
-                    return False, "Site blocks normal requests - possible IP block, not WAF"
-
-                # Test 2: Send a definitely malicious payload
-                test_payload = "' OR 1=1--<script>alert(1)</script>"
-                test_url = f"{url}{'&' if '?' in url else '?'}test={test_payload}"
+                # Test 2 & 3: Validate malicious request behavior
+                test_url = f"{url}{'&' if '?' in url else '?'}test=' OR 1=1--<script>alert(1)</script>"
                 malicious_response = await client.get(test_url)
-
-                # If the malicious request wasn't blocked, detection might be wrong
-                if malicious_response.status_code == 200:
-                    # Check if WAF-specific indicators are still present
-                    headers_lower = {k.lower(): v.lower() for k, v in malicious_response.headers.items()}
-
-                    # WAF-specific validation rules
-                    if detected_waf == "cloudflare":
-                        if "cf-ray" not in headers_lower:
-                            return False, "Cloudflare indicators not present in follow-up request"
-                    elif detected_waf == "akamai":
-                        if not any(k.startswith("x-akamai") for k in headers_lower):
-                            return False, "Akamai indicators not present in follow-up request"
-
-                # Test 3: Verify block response matches expected WAF behavior
-                if malicious_response.status_code in [403, 406, 429, 503]:
-                    body_lower = malicious_response.text.lower()
-
-                    # Check for expected patterns in block page
-                    waf_patterns = {
-                        "cloudflare": ["cloudflare", "ray id"],
-                        "modsecurity": ["modsecurity", "not acceptable"],
-                        "aws_waf": ["request blocked", "aws"],
-                        "akamai": ["access denied", "akamai"],
-                        "imperva": ["incapsula", "incident id"],
-                    }
-
-                    if detected_waf in waf_patterns:
-                        patterns = waf_patterns[detected_waf]
-                        if not any(p in body_lower for p in patterns):
-                            return False, f"Block page doesn't match {detected_waf} patterns"
-
-                return True, "Detection validated successfully"
+                return self._validate_malicious_request(malicious_response, detected_waf)
 
         except Exception as e:
             logger.debug(f"Validation failed: {e}")
             return True, f"Validation inconclusive: {e}"
+
+    def _validate_safe_request(self, response: httpx.Response) -> Tuple[bool, str]:
+        """Validate that safe requests are not blocked."""
+        if response.status_code in [403, 429, 503]:
+            return False, "Site blocks normal requests - possible IP block, not WAF"
+        return True, "Safe request passed"
+
+    def _validate_malicious_request(self, response: httpx.Response, detected_waf: str) -> Tuple[bool, str]:
+        """Validate malicious request was handled correctly by detected WAF."""
+        if response.status_code == 200:
+            return self._validate_waf_indicators_in_success(response, detected_waf)
+
+        if response.status_code in [403, 406, 429, 503]:
+            return self._validate_block_page_patterns(response, detected_waf)
+
+        return True, "Detection validated successfully"
+
+    def _validate_waf_indicators_in_success(self, response: httpx.Response, detected_waf: str) -> Tuple[bool, str]:
+        """Check if WAF indicators are present even when malicious request succeeds."""
+        headers_lower = {k.lower(): v.lower() for k, v in response.headers.items()}
+
+        if detected_waf == "cloudflare":
+            if "cf-ray" not in headers_lower:
+                return False, "Cloudflare indicators not present in follow-up request"
+        elif detected_waf == "akamai":
+            if not any(k.startswith("x-akamai") for k in headers_lower):
+                return False, "Akamai indicators not present in follow-up request"
+
+        return True, "WAF indicators confirmed"
+
+    def _validate_block_page_patterns(self, response: httpx.Response, detected_waf: str) -> Tuple[bool, str]:
+        """Validate block page contains expected WAF patterns."""
+        body_lower = response.text.lower()
+
+        waf_patterns = {
+            "cloudflare": ["cloudflare", "ray id"],
+            "modsecurity": ["modsecurity", "not acceptable"],
+            "aws_waf": ["request blocked", "aws"],
+            "akamai": ["access denied", "akamai"],
+            "imperva": ["incapsula", "incident id"],
+        }
+
+        if detected_waf in waf_patterns:
+            patterns = waf_patterns[detected_waf]
+            if not any(p in body_lower for p in patterns):
+                return False, f"Block page doesn't match {detected_waf} patterns"
+
+        return True, "Detection validated successfully"
 
     def is_false_positive_likely(self, waf_name: str, confidence: float, indicators: List[str]) -> bool:
         """
