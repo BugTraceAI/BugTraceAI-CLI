@@ -341,7 +341,7 @@ class ValidationEngine:
                 dashboard.log(f"⏰ TIMEOUT: {finding_dict['type']}", "WARN")
                 self.db.update_finding_status(finding_obj.id, FindingStatus.ERROR, notes=f"Timeout ({timeout}s)")
             except Exception as e:
-                logger.error(f"Validation crash for {finding_obj.id}: {e}")
+                logger.error(f"Validation crash for {finding_obj.id}: {e}", exc_info=True)
                 self.db.update_finding_status(finding_obj.id, FindingStatus.ERROR, notes=str(e))
 
     def _update_db_from_result(self, finding_id: int, result: Dict[str, Any]):

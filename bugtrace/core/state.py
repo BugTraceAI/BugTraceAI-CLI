@@ -30,7 +30,7 @@ class StateManager:
                 with open(self.state_file, "r") as f:
                     return json.load(f)
             except Exception as e:
-                logger.error(f"Failed to load state: {e}")
+                logger.error(f"Failed to load state: {e}", exc_info=True)
         return {}
         
     def save(self, data: Dict[str, Any]):
@@ -41,7 +41,7 @@ class StateManager:
             with open(self.state_file, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
-            logger.error(f"Failed to save state: {e}")
+            logger.error(f"Failed to save state: {e}", exc_info=True)
 
     def add_finding(self, url: str, type: str, description: str, severity: str, parameter: str = None, payload: str = None, validated: bool = False, evidence: str = None, screenshot_path: str = None):
         """Adds a finding to the ephemeral state."""

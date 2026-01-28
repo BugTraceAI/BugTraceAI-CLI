@@ -51,7 +51,7 @@ async def run_agent_with_semaphore(semaphore: asyncio.Semaphore, agent, process_
             process_result_fn(result)
             return result
         except Exception as e:
-            logger.error(f"Agent {agent.name} failed: {e}")
+            logger.error(f"Agent {agent.name} failed: {e}", exc_info=True)
             return {"error": str(e), "findings": []}
 
 class TeamOrchestrator:
@@ -247,7 +247,7 @@ class TeamOrchestrator:
             else:
                 dashboard.log("Authentication Failed. Proceeding as guest.", "WARN")
         except Exception as e:
-            logger.error(f"Authentication error: {e}")
+            logger.error(f"Authentication error: {e}", exc_info=True)
             dashboard.log(f"Authentication Error: {e}. Proceeding as guest.", "ERROR")
         finally:
             try:
@@ -280,7 +280,7 @@ class TeamOrchestrator:
         except asyncio.TimeoutError as e:
             logger.critical(f"[ReportingAgent] ⏳ CRASH DETECTED: Report generation exceeded timeout. Killing tool. Error: {e}")
         except Exception as e:
-            logger.error(f"Failed to generate vertical report: {e}")
+            logger.error(f"Failed to generate vertical report: {e}", exc_info=True)
             import traceback
             logger.debug(traceback.format_exc())
             dashboard.log(f"❌ Report generation failed: {e}", "ERROR")
@@ -960,7 +960,7 @@ class TeamOrchestrator:
             urls_to_scan = await self._run_gospider(recon_dir)
             await self._scan_for_tokens(urls_to_scan)
         except Exception as e:
-            logger.error(f"GoSpiderAgent crash: {e}")
+            logger.error(f"GoSpiderAgent crash: {e}", exc_info=True)
             urls_to_scan = [self.target]
 
         return self._normalize_urls(urls_to_scan)
@@ -1345,7 +1345,7 @@ class TeamOrchestrator:
                 db = get_db_manager()
                 db.save_scan_result(self.target, all_validated_findings, scan_id=self.scan_id)
             except Exception as e:
-                logger.error(f"Failed to save findings to DB: {e}")
+                logger.error(f"Failed to save findings to DB: {e}", exc_info=True)
 
         self._save_checkpoint(url)
 
@@ -1462,7 +1462,7 @@ class TeamOrchestrator:
             await reporter.generate_all_deliverables()
             logger.info("Generated initial Hunter report")
         except Exception as e:
-            logger.error(f"Failed to generate initial report: {e}")
+            logger.error(f"Failed to generate initial report: {e}", exc_info=True)
 
     async def _decide_specialist(self, vuln: dict) -> str:
         """Uses LLM to classify vulnerability and select best specialist agent."""
@@ -1481,7 +1481,7 @@ class TeamOrchestrator:
             chosen_agent = self._extract_agent_from_decision(decision, vuln)
             return chosen_agent
         except Exception as e:
-            logger.error(f"Dispatcher LLM failed: {e}")
+            logger.error(f"Dispatcher LLM failed: {e}", exc_info=True)
             return self._fallback_classification(vuln)
 
     def _try_fast_path_classification(self, vuln: dict) -> Optional[str]:

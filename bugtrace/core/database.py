@@ -198,7 +198,7 @@ class DatabaseManager:
             self._run_migrations()
             logger.info("SQL Tables initialized.")
         except Exception as e:
-            logger.error(f"Failed to create SQL tables: {e}")
+            logger.error(f"Failed to create SQL tables: {e}", exc_info=True)
 
     def _run_migrations(self):
         """Run lightweight schema migrations for new columns on existing tables."""
@@ -222,7 +222,7 @@ class DatabaseManager:
                 pass
             logger.info("Vector Store initialized.")
         except Exception as e:
-            logger.error(f"Failed to init vector store: {e}")
+            logger.error(f"Failed to init vector store: {e}", exc_info=True)
 
     def get_session(self) -> Session:
         return Session(self.engine)
@@ -591,7 +591,7 @@ class DatabaseManager:
             else:
                 self.vector_db.create_table(collection_name, data=data)
         except Exception as e:
-            logger.error(f"Vector add failed: {e}")
+            logger.error(f"Vector add failed: {e}", exc_info=True)
     
     def search_similar_findings(self, query_text: str, limit: int = 5) -> List[Dict]:
         """
@@ -638,7 +638,7 @@ class DatabaseManager:
             return similar_findings
             
         except Exception as e:
-            logger.error(f"Vector search failed: {e}")
+            logger.error(f"Vector search failed: {e}", exc_info=True)
             import traceback
             logger.debug(traceback.format_exc())
             return []
@@ -674,7 +674,7 @@ class DatabaseManager:
             self.add_vector_embedding(collection, data)
             logger.debug(f"Stored embedding for finding: {finding.get('type')}")
         except Exception as e:
-            logger.error(f"Failed to store finding embedding: {e}")
+            logger.error(f"Failed to store finding embedding: {e}", exc_info=True)
             import traceback
             logger.debug(traceback.format_exc())
 
@@ -706,7 +706,7 @@ class DatabaseManager:
             result["sql_db"] = {"status": "healthy"}
         except Exception as e:
             result["sql_db"] = {"status": "unhealthy", "error": str(e)}
-            logger.error(f"SQL health check failed: {e}")
+            logger.error(f"SQL health check failed: {e}", exc_info=True)
 
         # Check LanceDB
         try:
@@ -714,7 +714,7 @@ class DatabaseManager:
             result["vector_db"] = {"status": "healthy"}
         except Exception as e:
             result["vector_db"] = {"status": "unhealthy", "error": str(e)}
-            logger.error(f"Vector DB health check failed: {e}")
+            logger.error(f"Vector DB health check failed: {e}", exc_info=True)
 
         result["latency_ms"] = round((time.perf_counter() - start) * 1000, 2)
 
@@ -826,7 +826,7 @@ class DatabaseManager:
 
         except Exception as e:
             result["error"] = str(e)
-            logger.error(f"Database backup failed: {e}")
+            logger.error(f"Database backup failed: {e}", exc_info=True)
             import traceback
             logger.debug(traceback.format_exc())
 

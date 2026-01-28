@@ -224,7 +224,7 @@ class CDPClient:
                 target = await resp.json()
                 return target.get("webSocketDebuggerUrl")
         except Exception as e:
-            logger.error(f"Failed to create new page: {e}")
+            logger.error(f"Failed to create new page: {e}", exc_info=True)
             return None
 
     def _handle_connection_failure(self):
@@ -560,7 +560,7 @@ class CDPClient:
 
             return True
         except Exception as e:
-            logger.error(f"Navigation failed: {e}")
+            logger.error(f"Navigation failed: {e}", exc_info=True)
             return False
 
     async def execute_js(self, expression: str) -> Any:
@@ -809,7 +809,7 @@ class CDPClient:
             await self.execute_js(f'document.write({json.dumps(payload)})')
             return True
         except Exception as e:
-            logger.error(f"Payload injection failed: {e}")
+            logger.error(f"Payload injection failed: {e}", exc_info=True)
             return False
 
 

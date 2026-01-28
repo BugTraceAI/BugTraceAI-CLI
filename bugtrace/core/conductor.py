@@ -117,7 +117,7 @@ class ConductorV2:
                 logger.debug(f"Loaded protocol file: {key} ({len(content)} chars)")
                 return content
             except Exception as e:
-                logger.error(f"Error loading {path}: {e}")
+                logger.error(f"Error loading {path}: {e}", exc_info=True)
                 return ""
         else:
             logger.warning(f"Protocol file not found: {path}")
@@ -504,7 +504,7 @@ class ConductorV2:
                 logger.info(f"[Conductor] XSS Agent found {len(xss_result.get('findings', []))} issues")
                 return xss_result.get("findings", [])
         except Exception as e:
-            logger.error(f"[Conductor] XSS Agent failed: {e}")
+            logger.error(f"[Conductor] XSS Agent failed: {e}", exc_info=True)
         return []
 
     async def _launch_sqli_agent(self, endpoint: str, first_param: Optional[str]) -> List[Dict]:
@@ -520,7 +520,7 @@ class ConductorV2:
                 logger.info(f"[Conductor] SQLi Agent found {len(sqli_result.get('findings', []))} issues")
                 return sqli_result.get("findings", [])
         except Exception as e:
-            logger.error(f"[Conductor] SQLi Agent failed: {e}")
+            logger.error(f"[Conductor] SQLi Agent failed: {e}", exc_info=True)
         return []
 
     async def _launch_ssrf_agent(self, endpoint: str, first_param: Optional[str]) -> List[Dict]:
@@ -536,7 +536,7 @@ class ConductorV2:
                 logger.info(f"[Conductor] SSRF Agent found {len(ssrf_result.get('findings', []))} issues")
                 return ssrf_result.get("findings", [])
         except Exception as e:
-            logger.error(f"[Conductor] SSRF Agent failed: {e}")
+            logger.error(f"[Conductor] SSRF Agent failed: {e}", exc_info=True)
         return []
 
     async def _launch_idor_agent(self, endpoint: str, first_param: Optional[str], first_value: str) -> List[Dict]:
@@ -554,7 +554,7 @@ class ConductorV2:
                 logger.info(f"[Conductor] IDOR Agent found {len(findings)} issues")
             return findings
         except Exception as e:
-            logger.error(f"[Conductor] IDOR Agent failed: {e}")
+            logger.error(f"[Conductor] IDOR Agent failed: {e}", exc_info=True)
         return []
 
     async def _launch_optional_agents(self, endpoint: str) -> List[Dict]:
@@ -572,7 +572,7 @@ class ConductorV2:
                 all_findings.extend(xxe_result.get("findings", []))
                 logger.info(f"[Conductor] XXE Agent found {len(xxe_result.get('findings', []))} issues")
         except Exception as e:
-            logger.error(f"[Conductor] XXE Agent failed: {e}")
+            logger.error(f"[Conductor] XXE Agent failed: {e}", exc_info=True)
 
         # JWT Agent
         try:
@@ -584,7 +584,7 @@ class ConductorV2:
                 all_findings.extend(jwt_result.get("findings", []))
                 logger.info(f"[Conductor] JWT Agent found {len(jwt_result.get('findings', []))} issues")
         except Exception as e:
-            logger.error(f"[Conductor] JWT Agent failed: {e}")
+            logger.error(f"[Conductor] JWT Agent failed: {e}", exc_info=True)
 
         # File Upload Agent
         try:
@@ -596,7 +596,7 @@ class ConductorV2:
                 all_findings.extend(fileupload_result.get("findings", []))
                 logger.info(f"[Conductor] File Upload Agent found {len(fileupload_result.get('findings', []))} issues")
         except Exception as e:
-            logger.error(f"[Conductor] File Upload Agent failed: {e}")
+            logger.error(f"[Conductor] File Upload Agent failed: {e}", exc_info=True)
 
         return all_findings
 
