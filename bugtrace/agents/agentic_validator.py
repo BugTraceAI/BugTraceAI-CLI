@@ -186,9 +186,22 @@ class AgenticValidator(BaseAgent):
         self.llm_client = llm_client
         
     def _load_prompts(self) -> Dict[str, str]:
-        """Load specialized prompts for different vulnerability types from external config."""
+        """Load specialized prompts for different vulnerability types."""
         prompts = {
-            "xss": """You are a security expert analyzing a screenshot for XSS vulnerability validation.
+            "xss": self._get_xss_prompt(),
+            "sqli": self._get_sqli_prompt(),
+            "general": self._get_general_prompt()
+        }
+
+        # Override with custom prompts if provided
+        if self.system_prompt:
+            self._apply_custom_prompts(prompts)
+
+        return prompts
+
+    def _get_xss_prompt(self) -> str:
+        """Get XSS validation prompt template."""
+        return """You are a security expert analyzing a screenshot for XSS vulnerability validation.
 
 CONTEXT:
 - BugTraceAI security scanner found a potential XSS vulnerability
@@ -223,9 +236,11 @@ Respond in JSON format:
     "confidence": 0.0-1.0,
     "evidence": "description of what you see that proves/disproves XSS",
     "recommendation": "next steps if any"
-}""",
-            
-            "sqli": """You are a security expert analyzing a screenshot for SQL Injection validation.
+}"""
+
+    def _get_sqli_prompt(self) -> str:
+        """Get SQL Injection validation prompt template."""
+        return """You are a security expert analyzing a screenshot for SQL Injection validation.
 
 CONTEXT:
 - A security scanner found a potential SQL Injection vulnerability
@@ -252,9 +267,11 @@ Respond in JSON format:
     "evidence": "description of what you see",
     "sql_error_type": "MySQL/PostgreSQL/MSSQL/None",
     "recommendation": "next steps"
-}""",
+}"""
 
-            "general": """You are a security expert analyzing a screenshot for vulnerability validation.
+    def _get_general_prompt(self) -> str:
+        """Get general vulnerability validation prompt template."""
+        return """You are a security expert analyzing a screenshot for vulnerability validation.
 
 Examine the screenshot and determine if there are any signs of:
 1. Security vulnerability exploitation
@@ -269,21 +286,20 @@ Respond in JSON format:
     "description": "what you observe",
     "security_implications": "potential impact if any"
 }"""
-        }
-        
-        if self.system_prompt:
-             # Try to split by header if they exist (Handle both H1 and H2)
-             import re
-             parts = re.split(r'#+\s+', self.system_prompt)
-             for part in parts:
-                 if part.lower().startswith("xss validation prompt"):
-                     prompts["xss"] = re.sub(r'^xss validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
-                 elif part.lower().startswith("sqli validation prompt"):
-                     prompts["sqli"] = re.sub(r'^sqli validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
-                 elif part.lower().startswith("general validation prompt"):
-                     prompts["general"] = re.sub(r'^general validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
-                         
-        return prompts
+
+    def _apply_custom_prompts(self, prompts: Dict[str, str]):
+        """Override default prompts with custom ones from system_prompt."""
+        import re
+        parts = re.split(r'#+\s+', self.system_prompt)
+
+        for part in parts:
+            part_lower = part.lower()
+            if part_lower.startswith("xss validation prompt"):
+                prompts["xss"] = re.sub(r'^xss validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
+            elif part_lower.startswith("sqli validation prompt"):
+                prompts["sqli"] = re.sub(r'^sqli validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
+            elif part_lower.startswith("general validation prompt"):
+                prompts["general"] = re.sub(r'^general validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
     
     async def run_loop(self):
         """Typically triggered by orchestrator, not continuous."""

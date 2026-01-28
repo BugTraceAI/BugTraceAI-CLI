@@ -430,12 +430,9 @@ class LFISkill(BaseSkill):
         findings = []
         try:
             async with browser_manager.get_page() as page:
-                for param_name, values in url_params.items():
-                    if self._is_lfi_candidate_param(param_name):
-                        finding = await self._test_param_for_lfi(page, url, param_name)
-                        if finding:
-                            findings.append(finding)
-                            break
+                finding = await self._test_all_params(page, url, url_params)
+                if finding:
+                    findings.append(finding)
         except Exception as e:
             logger.error(f"LFI skill failed: {e}")
 
@@ -444,6 +441,18 @@ class LFISkill(BaseSkill):
             "findings": findings,
             "lfi_found": len(findings) > 0
         }
+
+    async def _test_all_params(self, page, url: str, url_params: dict):
+        """Test all URL parameters for LFI vulnerabilities."""
+        for param_name, values in url_params.items():
+            if not self._is_lfi_candidate_param(param_name):
+                continue
+
+            finding = await self._test_param_for_lfi(page, url, param_name)
+            if finding:
+                return finding
+
+        return None
 
     def _is_lfi_candidate_param(self, param_name: str) -> bool:
         """Check if parameter name suggests LFI vulnerability."""
