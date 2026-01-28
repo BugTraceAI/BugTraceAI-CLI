@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse
 
 from bugtrace.core.config import settings
 from bugtrace.api.deps import ScanServiceDep, ReportServiceDep, EventBusDep, get_scan_service
+from bugtrace.api.exceptions import register_exception_handlers
 from bugtrace.services.event_bus import service_event_bus
 from bugtrace.utils.logger import get_logger, set_correlation_id
 
@@ -145,6 +146,10 @@ app.add_middleware(
     expose_headers=["X-Scan-Progress"],
     max_age=3600,  # Cache preflight for 1 hour
 )
+
+# Register global exception handlers
+# Must be registered AFTER middleware to ensure proper error handling
+register_exception_handlers(app)
 
 
 # Correlation ID middleware — sets correlation_id per request for structured log tracing
@@ -308,21 +313,6 @@ from bugtrace.api.routes.config import router as config_router
 app.include_router(scans_router, prefix="/api", tags=["scans"])
 app.include_router(reports_router, prefix="/api", tags=["reports"])
 app.include_router(config_router, prefix="/api", tags=["config"])
-
-
-# Global exception handlers
-@app.exception_handler(ValueError)
-async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
-    """
-    Global ValueError exception handler.
-
-    Converts ValueError exceptions to 400 Bad Request responses.
-    """
-    logger.warning(f"ValueError in {request.url.path}: {exc}")
-    return JSONResponse(
-        status_code=400,
-        content={"detail": str(exc)},
-    )
 
 
 # WebSocket endpoint for real-time scan event streaming
