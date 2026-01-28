@@ -200,19 +200,30 @@ class AssetDiscoveryAgent(BaseAgent):
         """Check if hostname resolves (simple HTTP check)."""
         try:
             async with httpx.AsyncClient(timeout=3, follow_redirects=False) as client:
-                # Try both HTTP and HTTPS
-                for scheme in ["https", "http"]:
-                    try:
-                        url = f"{scheme}://{hostname}"
-                        response = await client.get(url, timeout=3)
-                        if response.status_code < 500:  # Any response = exists
-                            self.discovered_subdomains.add(hostname)
-                            dashboard.log(f"  ✅ Found: {hostname}", "INFO")
-                            return
-                    except Exception as e:
-                        continue
+                await self._check_schemes(client, hostname)
         except Exception as e:
             pass  # DNS resolution failed
+
+    async def _check_schemes(self, client, hostname: str):
+        """Try both HTTP and HTTPS schemes for hostname."""
+        for scheme in ["https", "http"]:
+            if await self._try_scheme_check(client, hostname, scheme):
+                return
+
+    async def _try_scheme_check(self, client, hostname: str, scheme: str) -> bool:
+        """Try to check hostname with a specific scheme. Returns True if found."""
+        try:
+            url = f"{scheme}://{hostname}"
+            response = await client.get(url, timeout=3)
+            # Guard: Skip if server error
+            if response.status_code >= 500:
+                return False
+            # Any response = exists
+            self.discovered_subdomains.add(hostname)
+            dashboard.log(f"  ✅ Found: {hostname}", "INFO")
+            return True
+        except Exception:
+            return False
 
     async def _certificate_transparency(self):
         """Query Certificate Transparency logs via crt.sh."""
@@ -223,21 +234,35 @@ class AssetDiscoveryAgent(BaseAgent):
                 url = f"https://crt.sh/?q=%.{self.target_domain}&output=json"
                 response = await client.get(url)
 
-                if response.status_code == 200:
-                    certs = response.json()
-                    for cert in certs:
-                        name_value = cert.get("name_value", "")
-                        # CT logs can have multiple domains per cert
-                        domains = name_value.split("\n")
-                        for domain in domains:
-                            domain = domain.strip()
-                            # Skip wildcards and add valid subdomains
-                            if "*" not in domain and self.target_domain in domain:
-                                self.discovered_subdomains.add(domain)
+                # Guard: Skip if request failed
+                if response.status_code != 200:
+                    return
 
-                    dashboard.log(f"  📜 CT Logs: Found {len(certs)} certificates", "INFO")
+                certs = response.json()
+                self._process_ct_certificates(certs)
+                dashboard.log(f"  📜 CT Logs: Found {len(certs)} certificates", "INFO")
         except Exception as e:
             logger.warning(f"Certificate Transparency query failed: {e}")
+
+    def _process_ct_certificates(self, certs: list):
+        """Process certificate transparency results and extract subdomains."""
+        for cert in certs:
+            name_value = cert.get("name_value", "")
+            # CT logs can have multiple domains per cert
+            domains = name_value.split("\n")
+            self._extract_valid_subdomains(domains)
+
+    def _extract_valid_subdomains(self, domains: list):
+        """Extract valid subdomains from domain list."""
+        for domain in domains:
+            domain = domain.strip()
+            # Guard: Skip wildcards
+            if "*" in domain:
+                continue
+            # Guard: Skip if not our target domain
+            if self.target_domain not in domain:
+                continue
+            self.discovered_subdomains.add(domain)
 
     async def _wayback_discovery(self):
         """Query Wayback Machine for historical URLs."""
@@ -248,17 +273,25 @@ class AssetDiscoveryAgent(BaseAgent):
                 url = f"http://web.archive.org/cdx/search/cdx?url={self.target_domain}/*&output=json&collapse=urlkey&fl=original"
                 response = await client.get(url)
 
-                if response.status_code == 200:
-                    data = response.json()
-                    # Skip header row
-                    for row in data[1:]:
-                        if row:
-                            historical_url = row[0] if isinstance(row, list) else row
-                            self.discovered_endpoints.add(historical_url)
+                # Guard: Skip if request failed
+                if response.status_code != 200:
+                    return
 
-                    dashboard.log(f"  🕰️  Wayback: Found {len(data)-1} historical URLs", "INFO")
+                data = response.json()
+                self._process_wayback_results(data)
+                dashboard.log(f"  🕰️  Wayback: Found {len(data)-1} historical URLs", "INFO")
         except Exception as e:
             logger.warning(f"Wayback Machine query failed: {e}")
+
+    def _process_wayback_results(self, data: list):
+        """Process Wayback Machine results and extract historical URLs."""
+        # Skip header row
+        for row in data[1:]:
+            # Guard: Skip empty rows
+            if not row:
+                continue
+            historical_url = row[0] if isinstance(row, list) else row
+            self.discovered_endpoints.add(historical_url)
 
     async def _cloud_storage_enum(self):
         """Enumerate cloud storage buckets (S3, Azure, GCP)."""
@@ -302,17 +335,22 @@ class AssetDiscoveryAgent(BaseAgent):
                 url = f"https://{bucket_name}.s3.amazonaws.com"
                 response = await client.get(url, timeout=5)
 
-                # Bucket exists if we get XML response (even if access denied)
-                if response.status_code in [200, 403] or "<?xml" in response.text:
-                    self.discovered_cloud_buckets.add(f"s3://{bucket_name}")
+                # Guard: Skip if bucket doesn't exist
+                if response.status_code not in [200, 403] and "<?xml" not in response.text:
+                    return
 
-                    # Check if publicly accessible
-                    if response.status_code == 200 and "<Contents>" in response.text:
-                        dashboard.log(f"  ⚠️  PUBLIC S3 bucket: {bucket_name}", "CRITICAL")
-                    else:
-                        dashboard.log(f"  🪣 Found S3 bucket: {bucket_name} (access denied)", "INFO")
+                self.discovered_cloud_buckets.add(f"s3://{bucket_name}")
+                self._log_s3_bucket_access(bucket_name, response)
         except Exception as e:
             logger.debug(f"operation failed: {e}")
+
+    def _log_s3_bucket_access(self, bucket_name: str, response):
+        """Log S3 bucket access level."""
+        # Check if publicly accessible
+        if response.status_code == 200 and "<Contents>" in response.text:
+            dashboard.log(f"  ⚠️  PUBLIC S3 bucket: {bucket_name}", "CRITICAL")
+        else:
+            dashboard.log(f"  🪣 Found S3 bucket: {bucket_name} (access denied)", "INFO")
 
     async def _check_azure_blob(self, container_name: str):
         """Check if Azure blob storage exists."""
@@ -362,19 +400,26 @@ class AssetDiscoveryAgent(BaseAgent):
             async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
                 response = await client.get(url, timeout=5)
 
-                # Any non-404 response is interesting
-                if response.status_code != 404:
-                    self.discovered_endpoints.add(url)
+                # Guard: Skip 404 responses
+                if response.status_code == 404:
+                    return
 
-                    # Flag sensitive endpoints
-                    if response.status_code == 200:
-                        sensitive_keywords = [".git", ".env", "swagger", "graphql", "admin", "config", "backup"]
-                        if any(kw in url.lower() for kw in sensitive_keywords):
-                            dashboard.log(f"  ⚠️  Sensitive endpoint exposed: {url}", "CRITICAL")
-                        else:
-                            dashboard.log(f"  📍 Found: {url}", "INFO")
+                self.discovered_endpoints.add(url)
+                self._log_endpoint_discovery(url, response.status_code)
         except Exception as e:
             logger.debug(f"operation failed: {e}")
+
+    def _log_endpoint_discovery(self, url: str, status_code: int):
+        """Log discovered endpoint with appropriate severity."""
+        # Guard: Only check sensitive keywords for 200 responses
+        if status_code != 200:
+            return
+
+        sensitive_keywords = [".git", ".env", "swagger", "graphql", "admin", "config", "backup"]
+        if any(kw in url.lower() for kw in sensitive_keywords):
+            dashboard.log(f"  ⚠️  Sensitive endpoint exposed: {url}", "CRITICAL")
+        else:
+            dashboard.log(f"  📍 Found: {url}", "INFO")
 
 
 # Export for team orchestrator
