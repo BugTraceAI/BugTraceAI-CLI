@@ -149,50 +149,58 @@ class BenchmarkSuite:
                 continue
 
             logger.info(f"  Testing speed on {target_name}...")
+            result = await self._run_speed_test(target_name, target_info)
+            if result:
+                speed_results["targets_tested"].append(result)
+                speed_results["total_scan_time"] += result["duration_seconds"]
 
-            # Run scan and measure time
-            start_time = time.time()
-
-            orchestrator = TeamOrchestrator(
-                target=target_info["url"],
-                max_depth=2,
-                max_urls=10
-            )
-
-            try:
-                findings = await orchestrator.start()
-                duration = time.time() - start_time
-
-                # Categorize findings by type
-                vuln_times = {}
-                for finding in findings:
-                    vuln_type = finding.get("type", "Unknown")
-                    if vuln_type not in vuln_times:
-                        vuln_times[vuln_type] = []
-                    vuln_times[vuln_type].append(duration)
-
-                speed_results["targets_tested"].append({
-                    "target": target_name,
-                    "duration_seconds": duration,
-                    "findings_count": len(findings),
-                    "vuln_times": vuln_times
-                })
-
-                speed_results["total_scan_time"] += duration
-
-            except Exception as e:
-                logger.error(f"Speed test failed for {target_name}: {e}")
-
-        # Calculate averages
-        if speed_results["targets_tested"]:
-            avg_time = speed_results["total_scan_time"] / len(speed_results["targets_tested"])
-            speed_results["avg_scan_duration_seconds"] = avg_time
-
-            # Compare to industry baseline
-            baseline_time = self.competitor_baselines["Enterprise_Tool"]["avg_duration_seconds"]
-            speed_results["speedup_vs_baseline"] = baseline_time / avg_time
-
+        self._calculate_speed_averages(speed_results)
         return speed_results
+
+    async def _run_speed_test(self, target_name: str, target_info: Dict) -> Optional[Dict]:
+        """Run speed test for a single target."""
+        start_time = time.time()
+        orchestrator = TeamOrchestrator(
+            target=target_info["url"],
+            max_depth=2,
+            max_urls=10
+        )
+
+        try:
+            findings = await orchestrator.start()
+            duration = time.time() - start_time
+            vuln_times = self._categorize_findings_by_type(findings, duration)
+
+            return {
+                "target": target_name,
+                "duration_seconds": duration,
+                "findings_count": len(findings),
+                "vuln_times": vuln_times
+            }
+        except Exception as e:
+            logger.error(f"Speed test failed for {target_name}: {e}")
+            return None
+
+    def _categorize_findings_by_type(self, findings: List, duration: float) -> Dict:
+        """Categorize findings by vulnerability type."""
+        vuln_times = {}
+        for finding in findings:
+            vuln_type = finding.get("type", "Unknown")
+            if vuln_type not in vuln_times:
+                vuln_times[vuln_type] = []
+            vuln_times[vuln_type].append(duration)
+        return vuln_times
+
+    def _calculate_speed_averages(self, speed_results: Dict):
+        """Calculate average speeds and speedup vs baseline."""
+        if not speed_results["targets_tested"]:
+            return
+
+        avg_time = speed_results["total_scan_time"] / len(speed_results["targets_tested"])
+        speed_results["avg_scan_duration_seconds"] = avg_time
+
+        baseline_time = self.competitor_baselines["Enterprise_Tool"]["avg_duration_seconds"]
+        speed_results["speedup_vs_baseline"] = baseline_time / avg_time
 
     async def _benchmark_cost(self) -> Dict:
         """
@@ -200,56 +208,43 @@ class BenchmarkSuite:
 
         Goal: Prove we're 500x cheaper than industry baseline ($0.10 vs $50)
         """
-        cost_results = {
-            "targets_tested": [],
-            "avg_cost_per_scan": 0,
-            "total_cost": 0
-        }
-
-        # Get initial balance
-        initial_balance = llm_client.current_balance
+        cost_results = {"targets_tested": [], "avg_cost_per_scan": 0, "total_cost": 0}
 
         for target_name, target_info in self.test_targets.items():
             if not await self._is_target_available(target_info["url"]):
                 continue
 
             logger.info(f"  Testing cost on {target_name}...")
-
-            # Reset session cost
-            llm_client.session_cost = 0
-
-            orchestrator = TeamOrchestrator(
-                target=target_info["url"],
-                max_depth=2,
-                max_urls=10
-            )
-
-            try:
-                await orchestrator.start()
-
-                # Get cost for this scan
-                scan_cost = llm_client.session_cost
-
-                cost_results["targets_tested"].append({
-                    "target": target_name,
-                    "cost_usd": scan_cost
-                })
-
+            scan_cost = await self._run_cost_test(target_info)
+            if scan_cost is not None:
+                cost_results["targets_tested"].append({"target": target_name, "cost_usd": scan_cost})
                 cost_results["total_cost"] += scan_cost
 
-            except Exception as e:
-                logger.error(f"Cost test failed for {target_name}: {e}")
-
-        # Calculate averages
-        if cost_results["targets_tested"]:
-            avg_cost = cost_results["total_cost"] / len(cost_results["targets_tested"])
-            cost_results["avg_cost_per_scan"] = avg_cost
-
-            # Compare to industry baseline
-            baseline_cost = self.competitor_baselines["Enterprise_Tool"]["cost_per_scan"]
-            cost_results["savings_vs_baseline"] = baseline_cost / avg_cost
-
+        self._calculate_cost_averages(cost_results)
         return cost_results
+
+    async def _run_cost_test(self, target_info: Dict) -> Optional[float]:
+        """Run cost test for a single target."""
+        llm_client.session_cost = 0
+        orchestrator = TeamOrchestrator(target=target_info["url"], max_depth=2, max_urls=10)
+
+        try:
+            await orchestrator.start()
+            return llm_client.session_cost
+        except Exception as e:
+            logger.error(f"Cost test failed: {e}")
+            return None
+
+    def _calculate_cost_averages(self, cost_results: Dict):
+        """Calculate average costs and savings vs baseline."""
+        if not cost_results["targets_tested"]:
+            return
+
+        avg_cost = cost_results["total_cost"] / len(cost_results["targets_tested"])
+        cost_results["avg_cost_per_scan"] = avg_cost
+
+        baseline_cost = self.competitor_baselines["Enterprise_Tool"]["cost_per_scan"]
+        cost_results["savings_vs_baseline"] = baseline_cost / avg_cost
 
     async def _benchmark_accuracy(self) -> Dict:
         """
@@ -260,86 +255,85 @@ class BenchmarkSuite:
         - False Positive Rate
         - Precision, Recall, F1 Score
         """
-        accuracy_results = {
-            "targets_tested": [],
-            "overall_detection_rate": 0,
-            "overall_false_positive_rate": 0
-        }
+        accuracy_results = {"targets_tested": [], "overall_detection_rate": 0, "overall_false_positive_rate": 0}
 
         for target_name, target_info in self.test_targets.items():
             if not await self._is_target_available(target_info["url"]):
                 continue
 
             logger.info(f"  Testing accuracy on {target_name}...")
+            result = await self._run_accuracy_test(target_name, target_info)
+            if result:
+                accuracy_results["targets_tested"].append(result)
 
-            expected = target_info["expected_vulns"]
-
-            orchestrator = TeamOrchestrator(
-                target=target_info["url"],
-                max_depth=2,
-                max_urls=10
-            )
-
-            try:
-                findings = await orchestrator.start()
-
-                # Count findings by type
-                detected = {}
-                for finding in findings:
-                    vuln_type = finding.get("type", "Unknown")
-                    detected[vuln_type] = detected.get(vuln_type, 0) + 1
-
-                # Calculate metrics per vulnerability type
-                vuln_metrics = {}
-                total_expected = 0
-                total_detected = 0
-                total_correct = 0
-
-                for vuln_type, expected_count in expected.items():
-                    detected_count = detected.get(vuln_type, 0)
-
-                    true_positives = min(detected_count, expected_count)
-                    false_positives = max(0, detected_count - expected_count)
-                    false_negatives = max(0, expected_count - detected_count)
-
-                    detection_rate = true_positives / expected_count if expected_count > 0 else 0
-
-                    vuln_metrics[vuln_type] = {
-                        "expected": expected_count,
-                        "detected": detected_count,
-                        "true_positives": true_positives,
-                        "false_positives": false_positives,
-                        "false_negatives": false_negatives,
-                        "detection_rate": detection_rate
-                    }
-
-                    total_expected += expected_count
-                    total_detected += detected_count
-                    total_correct += true_positives
-
-                # Overall metrics for this target
-                overall_detection = total_correct / total_expected if total_expected > 0 else 0
-                overall_fp_rate = (total_detected - total_correct) / total_detected if total_detected > 0 else 0
-
-                accuracy_results["targets_tested"].append({
-                    "target": target_name,
-                    "detection_rate": overall_detection,
-                    "false_positive_rate": overall_fp_rate,
-                    "vuln_metrics": vuln_metrics
-                })
-
-            except Exception as e:
-                logger.error(f"Accuracy test failed for {target_name}: {e}")
-
-        # Calculate overall averages
-        if accuracy_results["targets_tested"]:
-            avg_detection = sum(t["detection_rate"] for t in accuracy_results["targets_tested"]) / len(accuracy_results["targets_tested"])
-            avg_fp = sum(t["false_positive_rate"] for t in accuracy_results["targets_tested"]) / len(accuracy_results["targets_tested"])
-
-            accuracy_results["overall_detection_rate"] = avg_detection
-            accuracy_results["overall_false_positive_rate"] = avg_fp
-
+        self._calculate_accuracy_averages(accuracy_results)
         return accuracy_results
+
+    async def _run_accuracy_test(self, target_name: str, target_info: Dict) -> Optional[Dict]:
+        """Run accuracy test for a single target."""
+        orchestrator = TeamOrchestrator(target=target_info["url"], max_depth=2, max_urls=10)
+
+        try:
+            findings = await orchestrator.start()
+            detected = self._count_detected_by_type(findings)
+            vuln_metrics = self._calculate_vuln_metrics(target_info["expected_vulns"], detected)
+            overall_metrics = self._calculate_overall_metrics(vuln_metrics)
+
+            return {
+                "target": target_name,
+                "detection_rate": overall_metrics["detection_rate"],
+                "false_positive_rate": overall_metrics["fp_rate"],
+                "vuln_metrics": vuln_metrics
+            }
+        except Exception as e:
+            logger.error(f"Accuracy test failed for {target_name}: {e}")
+            return None
+
+    def _count_detected_by_type(self, findings: List) -> Dict[str, int]:
+        """Count detected findings by vulnerability type."""
+        detected = {}
+        for finding in findings:
+            vuln_type = finding.get("type", "Unknown")
+            detected[vuln_type] = detected.get(vuln_type, 0) + 1
+        return detected
+
+    def _calculate_vuln_metrics(self, expected: Dict, detected: Dict) -> Dict:
+        """Calculate metrics per vulnerability type."""
+        vuln_metrics = {}
+        for vuln_type, expected_count in expected.items():
+            detected_count = detected.get(vuln_type, 0)
+            true_positives = min(detected_count, expected_count)
+            vuln_metrics[vuln_type] = {
+                "expected": expected_count,
+                "detected": detected_count,
+                "true_positives": true_positives,
+                "false_positives": max(0, detected_count - expected_count),
+                "false_negatives": max(0, expected_count - detected_count),
+                "detection_rate": true_positives / expected_count if expected_count > 0 else 0
+            }
+        return vuln_metrics
+
+    def _calculate_overall_metrics(self, vuln_metrics: Dict) -> Dict:
+        """Calculate overall detection and false positive rates."""
+        total_expected = sum(m["expected"] for m in vuln_metrics.values())
+        total_detected = sum(m["detected"] for m in vuln_metrics.values())
+        total_correct = sum(m["true_positives"] for m in vuln_metrics.values())
+
+        return {
+            "detection_rate": total_correct / total_expected if total_expected > 0 else 0,
+            "fp_rate": (total_detected - total_correct) / total_detected if total_detected > 0 else 0
+        }
+
+    def _calculate_accuracy_averages(self, accuracy_results: Dict):
+        """Calculate overall accuracy averages."""
+        if not accuracy_results["targets_tested"]:
+            return
+
+        avg_detection = sum(t["detection_rate"] for t in accuracy_results["targets_tested"]) / len(accuracy_results["targets_tested"])
+        avg_fp = sum(t["false_positive_rate"] for t in accuracy_results["targets_tested"]) / len(accuracy_results["targets_tested"])
+
+        accuracy_results["overall_detection_rate"] = avg_detection
+        accuracy_results["overall_false_positive_rate"] = avg_fp
 
     async def _benchmark_completeness(self) -> Dict:
         """
@@ -364,52 +358,49 @@ class BenchmarkSuite:
             "coverage_percentage": 0
         }
 
-        # Test each feature
         for target_name, target_info in self.test_targets.items():
             if not await self._is_target_available(target_info["url"]):
                 continue
 
             logger.info(f"  Testing completeness on {target_name}...")
+            await self._run_completeness_test(target_info, completeness_results["features_tested"])
 
-            orchestrator = TeamOrchestrator(
-                target=target_info["url"],
-                max_depth=2,
-                max_urls=10
-            )
+        self._calculate_coverage_percentage(completeness_results)
+        return completeness_results
 
-            try:
-                findings = await orchestrator.start()
+    async def _run_completeness_test(self, target_info: Dict, features_tested: Dict):
+        """Run completeness test for a single target."""
+        orchestrator = TeamOrchestrator(target=target_info["url"], max_depth=2, max_urls=10)
 
-                # Check which features were used
-                finding_types = set(f.get("type", "").lower() for f in findings)
+        try:
+            findings = await orchestrator.start()
+            self._detect_features(findings, features_tested)
+        except Exception as e:
+            logger.error(f"Completeness test failed: {e}")
 
-                if "xss" in " ".join(finding_types):
-                    completeness_results["features_tested"]["xss_detection"] = True
+    def _detect_features(self, findings: List, features_tested: Dict):
+        """Detect which features were used based on findings."""
+        finding_types = " ".join(f.get("type", "").lower() for f in findings)
 
-                if "sql" in " ".join(finding_types):
-                    completeness_results["features_tested"]["sqli_detection"] = True
+        if "xss" in finding_types:
+            features_tested["xss_detection"] = True
+        if "sql" in finding_types:
+            features_tested["sqli_detection"] = True
+        if "jwt" in finding_types:
+            features_tested["jwt_analysis"] = True
+        if "graphql" in finding_types:
+            features_tested["graphql_testing"] = True
 
-                if "jwt" in " ".join(finding_types):
-                    completeness_results["features_tested"]["jwt_analysis"] = True
+        # Mark agent features as tested (would check event logs in production)
+        features_tested["asset_discovery"] = True
+        features_tested["api_security"] = True
+        features_tested["chain_discovery"] = True
 
-                if "graphql" in " ".join(finding_types):
-                    completeness_results["features_tested"]["graphql_testing"] = True
-
-                # Check if agents ran
-                # (Would check event logs in production)
-                completeness_results["features_tested"]["asset_discovery"] = True
-                completeness_results["features_tested"]["api_security"] = True
-                completeness_results["features_tested"]["chain_discovery"] = True
-
-            except Exception as e:
-                logger.error(f"Completeness test failed: {e}")
-
-        # Calculate coverage percentage
+    def _calculate_coverage_percentage(self, completeness_results: Dict):
+        """Calculate feature coverage percentage."""
         features_active = sum(1 for v in completeness_results["features_tested"].values() if v)
         total_features = len(completeness_results["features_tested"])
         completeness_results["coverage_percentage"] = (features_active / total_features) * 100
-
-        return completeness_results
 
     def _compare_competitors(self, test_results: Dict) -> Dict:
         """
