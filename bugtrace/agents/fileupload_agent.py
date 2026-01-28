@@ -198,11 +198,16 @@ class FileUploadAgent(BaseAgent):
         """Check if the uploaded file actually executes code."""
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url) as resp:
-                    if resp.status == 404:
-                        return False
-                    text = await resp.text()
-                    return "BT7331_SUCCESS" in text or "RCE_FLAG" in text
+                return await self._check_execution_markers(session, url)
         except Exception as e:
             logger.debug(f"_validate_execution failed: {e}")
             return False
+
+    async def _check_execution_markers(self, session, url: str) -> bool:
+        """Check if response contains execution success markers."""
+        async with session.get(url) as resp:
+            # Guard: 404 means file not accessible
+            if resp.status == 404:
+                return False
+            text = await resp.text()
+            return "BT7331_SUCCESS" in text or "RCE_FLAG" in text
