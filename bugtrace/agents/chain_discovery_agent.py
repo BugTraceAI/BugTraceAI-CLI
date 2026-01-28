@@ -276,6 +276,14 @@ class ChainDiscoveryAgent(BaseAgent):
             "CRITICAL"
         )
 
+        # Execute chain steps
+        exploit_log, success = await self._chain_execute_steps(chain, template)
+
+        # Report results
+        await self._chain_report_results(success, template, chain, exploit_log)
+
+    async def _chain_execute_steps(self, chain: List[Dict], template: Dict) -> Tuple[List[Dict], bool]:
+        """Execute all steps in exploitation chain."""
         exploit_log = []
         success = True
 
@@ -302,13 +310,15 @@ class ChainDiscoveryAgent(BaseAgent):
             dashboard.log(f"  ✅ Step {i+1} success!", "SUCCESS")
             await asyncio.sleep(1)  # Rate limiting
 
-        # Report results
+        return exploit_log, success
+
+    async def _chain_report_results(self, success: bool, template: Dict, chain: List[Dict], exploit_log: List[Dict]):
+        """Report chain exploitation results."""
         if success:
             dashboard.log(
                 f"🏆 CHAIN EXPLOITED: {template['name']} - FULL IMPACT ACHIEVED!",
                 "CRITICAL"
             )
-
             await self._report_chain_exploitation(template, chain, exploit_log)
         else:
             dashboard.log(
