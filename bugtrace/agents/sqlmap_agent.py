@@ -539,22 +539,42 @@ class EnhancedSQLMapRunner:
             return SQLiEvidence(vulnerable=False)
 
         # TASK-35: Verify SQLMap on first run
-        if not self._sqlmap_verified:
-            if not await self.verify_sqlmap():
-                logger.error("SQLMap verification failed, aborting")
-                return SQLiEvidence(vulnerable=False)
-            self._sqlmap_verified = True
+        if not await self._verify_sqlmap_first_run():
+            return SQLiEvidence(vulnerable=False)
 
         config = config or SQLMapConfig()
 
         # TASK-40: Check cache first
+        cached_result = self._check_result_cache(url, post_data)
+        if cached_result:
+            return cached_result
+
+        # TASK-39: Rate limiting - acquire semaphore before execution
+        return await self._execute_with_rate_limit(url, param, config, post_data, db_type)
+
+    async def _verify_sqlmap_first_run(self) -> bool:
+        """Verify SQLMap on first run (TASK-35)."""
+        if not self._sqlmap_verified:
+            if not await self.verify_sqlmap():
+                logger.error("SQLMap verification failed, aborting")
+                return False
+            self._sqlmap_verified = True
+        return True
+
+    def _check_result_cache(self, url: str, post_data: Optional[str]) -> Optional[SQLiEvidence]:
+        """Check result cache (TASK-40)."""
         method = "POST" if post_data else "GET"
         cache_key = self._cache_key(url, method, post_data)
         if cache_key in self._result_cache:
             logger.info(f"Using cached SQLMap result for {url}")
             return self._result_cache[cache_key]
+        return None
 
-        # TASK-39: Rate limiting - acquire semaphore before execution
+    async def _execute_with_rate_limit(
+        self, url: str, param: Optional[str], config: SQLMapConfig,
+        post_data: Optional[str], db_type: DBType
+    ) -> SQLiEvidence:
+        """Execute SQLMap with rate limiting (TASK-39)."""
         semaphore = get_sqlmap_semaphore()
         async with semaphore:
             logger.debug(f"Acquired SQLMap semaphore, executing scan on {url}")
@@ -572,6 +592,8 @@ class EnhancedSQLMapRunner:
             evidence.reproduction_command = reproduction_cmd
 
             # TASK-40: Cache the result
+            method = "POST" if post_data else "GET"
+            cache_key = self._cache_key(url, method, post_data)
             self._result_cache[cache_key] = evidence
 
             return evidence
@@ -589,7 +611,29 @@ class EnhancedSQLMapRunner:
         Security: All user inputs are validated before being added to command.
         (TASK-30, TASK-32, TASK-33)
         """
-        cmd = [
+        cmd = self._build_base_command(url, config)
+
+        if config.random_agent:
+            cmd.append("--random-agent")
+
+        if param:
+            cmd.extend(["-p", param])
+
+        if post_data:
+            self._add_post_data(cmd, post_data)
+
+        self._add_cookies(cmd)
+        self._add_headers(cmd)
+        self._add_tamper_scripts(cmd, config, db_type)
+
+        if config.extract_dbs:
+            cmd.append("--dbs")
+
+        return cmd
+
+    def _build_base_command(self, url: str, config: SQLMapConfig) -> List[str]:
+        """Build base SQLMap command with core options."""
+        return [
             "-u", url,
             "--batch",
             f"--level={config.level}",
@@ -603,62 +647,51 @@ class EnhancedSQLMapRunner:
             "--output-dir=/tmp"
         ]
 
-        # Random agent
-        if config.random_agent:
-            cmd.append("--random-agent")
+    def _add_post_data(self, cmd: List[str], post_data: str):
+        """Add POST data to command (TASK-30)."""
+        validated_post_data = validate_post_data(post_data)
+        cmd.extend(["--data", validated_post_data])
 
-        # Specific parameter
-        if param:
-            cmd.extend(["-p", param])
+    def _add_cookies(self, cmd: List[str]):
+        """Add cookies to command (TASK-32)."""
+        if not self.cookies:
+            return
 
-        # POST data - SECURITY: Validate to prevent command injection (TASK-30)
-        if post_data:
-            validated_post_data = validate_post_data(post_data)
-            cmd.extend(["--data", validated_post_data])
+        try:
+            validated_cookies = []
+            for c in self.cookies:
+                name = c.get('name', '')
+                value = c.get('value', '')
+                validated_value = validate_cookie_value(name, value)
+                validated_cookies.append(f"{name}={validated_value}")
+            cookie_str = "; ".join(validated_cookies)
+            cmd.append(f"--cookie={cookie_str}")
+        except ValueError as e:
+            logger.warning(f"Invalid cookie skipped: {e}")
 
-        # Cookies - SECURITY: Validate each cookie value (TASK-32)
-        if self.cookies:
+    def _add_headers(self, cmd: List[str]):
+        """Add custom headers to command (TASK-33)."""
+        if not self.headers:
+            return
+
+        for name, value in self.headers.items():
             try:
-                validated_cookies = []
-                for c in self.cookies:
-                    name = c.get('name', '')
-                    value = c.get('value', '')
-                    validated_value = validate_cookie_value(name, value)
-                    validated_cookies.append(f"{name}={validated_value}")
-                cookie_str = "; ".join(validated_cookies)
-                cmd.append(f"--cookie={cookie_str}")
+                validated_name, validated_value = validate_header(name, value)
+                cmd.extend(["--header", f"{validated_name}: {validated_value}"])
             except ValueError as e:
-                logger.warning(f"Invalid cookie skipped: {e}")
+                logger.warning(f"Invalid header skipped: {e}")
 
-        # Custom headers - SECURITY: Validate for CRLF injection (TASK-33)
-        if self.headers:
-            for name, value in self.headers.items():
-                try:
-                    validated_name, validated_value = validate_header(name, value)
-                    cmd.extend(["--header", f"{validated_name}: {validated_value}"])
-                except ValueError as e:
-                    logger.warning(f"Invalid header skipped: {e}")
-
-        # Tamper scripts
+    def _add_tamper_scripts(self, cmd: List[str], config: SQLMapConfig, db_type: DBType):
+        """Add tamper scripts to command."""
         tampers = list(config.tamper_scripts)
         if db_type != DBType.UNKNOWN:
             tampers.extend(DBFingerprinter.get_recommended_tampers(db_type))
+
         if tampers:
             # Deduplicate while preserving order
             seen = set()
             unique_tampers = [t for t in tampers if not (t in seen or seen.add(t))]
-            cmd.append(f"--tamper={','.join(unique_tampers[:5])}")  # Max 5 tampers
-
-        # Data extraction options
-        if config.extract_dbs:
-            cmd.append("--dbs")
-
-        # NOTE: SQLMap's --headers requires an argument (e.g., --headers="User-Agent: test")
-        # Header injection testing would need a different approach (e.g., request file with * markers)
-        # Removed: --headers flag was causing SQLMap to fail immediately with "requires 1 argument"
-        # 2026-01-23 FIX: Removed invalid --headers flag that was breaking SQLMap execution
-
-        return cmd
+            cmd.append(f"--tamper={','.join(unique_tampers[:5])}")
 
     def _build_reproduction_command(
         self,
@@ -691,16 +724,12 @@ class EnhancedSQLMapRunner:
         - TASK-37: Output size limit
         - TASK-38: Better error detection
         """
-        full_cmd = [self.docker_cmd, "run", "--rm", "--network", "host"]
-        full_cmd.append("googlesky/sqlmap:latest")
-        full_cmd.extend(cmd)
+        full_cmd = self._build_docker_command(cmd)
 
-        # 2026-01-23: Log full command for debugging (was only DEBUG, now INFO)
         cmd_str = ' '.join(full_cmd)
         logger.info(f"SQLMap executing: {cmd_str[:200]}...")
         dashboard.log(f"[SQLMapAgent] Executing SQLMap...", "DEBUG")
 
-        # TASK-36: Configurable timeout (default 10 minutes)
         timeout_seconds = getattr(settings, 'SQLMAP_TIMEOUT_SECONDS', 600)
 
         try:
@@ -711,55 +740,8 @@ class EnhancedSQLMapRunner:
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
 
-            stdout_text = stdout.decode()
-            stderr_text = stderr.decode()
-
-            # TASK-34: Strip ANSI codes from output
-            stdout_text = strip_ansi_codes(stdout_text)
-            stderr_text = strip_ansi_codes(stderr_text)
-
-            # TASK-37: Limit output size (10MB max)
-            max_output_size = getattr(settings, 'SQLMAP_MAX_OUTPUT_SIZE', 10_000_000)
-            if len(stdout_text) > max_output_size:
-                logger.warning(f"SQLMap output truncated from {len(stdout_text)} to {max_output_size} bytes")
-                stdout_text = stdout_text[:max_output_size]
-
-            # TASK-38: Better error detection
-            if proc.returncode != 0:
-                logger.error(f"SQLMap failed with return code {proc.returncode}")
-                if stderr_text:
-                    logger.error(f"SQLMap stderr: {stderr_text[:500]}")
-                # Check for specific error patterns
-                if "connection refused" in stderr_text.lower():
-                    raise ConnectionError("Target not reachable")
-                if "not enough time" in stderr_text.lower():
-                    raise TimeoutError("SQLMap needs more time")
-
-            # 2026-01-23: Log stderr if there are errors (critical for debugging)
-            if stderr_text and ("error" in stderr_text.lower() or proc.returncode != 0):
-                logger.warning(f"SQLMap stderr: {stderr_text[:500]}")
-
-            # Check for SQLMap-specific error patterns in stdout (TASK-38)
-            error_patterns = [
-                ("target url is not responding", "TargetUnreachable"),
-                ("connection timed out", "ConnectionTimeout"),
-                ("no parameter(s) found", "NoParameters"),
-                ("unable to connect", "ConnectionFailed"),
-            ]
-            for pattern, error_type in error_patterns:
-                if pattern in stdout_text.lower():
-                    logger.warning(f"SQLMap error detected: {error_type}")
-
-            # Log summary of output
-            if "is vulnerable" in stdout_text.lower():
-                logger.info("SQLMap detected vulnerability!")
-            elif "no injection found" in stdout_text.lower():
-                logger.debug("SQLMap: No injection found")
-            elif not stdout_text:
-                logger.warning("SQLMap returned empty output")
-            else:
-                # Log first 200 chars for debugging
-                logger.debug(f"SQLMap output preview: {stdout_text[:200]}")
+            stdout_text, stderr_text = self._process_sqlmap_output(stdout, stderr, proc.returncode)
+            self._log_sqlmap_result(stdout_text, stderr_text, proc.returncode)
 
             return stdout_text
         except asyncio.TimeoutError:
@@ -771,6 +753,68 @@ class EnhancedSQLMapRunner:
         except Exception as e:
             logger.error(f"SQLMap execution error: {e}", exc_info=True)
             return ""
+
+    def _build_docker_command(self, cmd: List[str]) -> List[str]:
+        """Build Docker command for SQLMap execution."""
+        full_cmd = [self.docker_cmd, "run", "--rm", "--network", "host"]
+        full_cmd.append("googlesky/sqlmap:latest")
+        full_cmd.extend(cmd)
+        return full_cmd
+
+    def _process_sqlmap_output(self, stdout: bytes, stderr: bytes, returncode: int) -> Tuple[str, str]:
+        """Process SQLMap output (TASK-34, TASK-37, TASK-38)."""
+        stdout_text = strip_ansi_codes(stdout.decode())
+        stderr_text = strip_ansi_codes(stderr.decode())
+
+        # TASK-37: Limit output size (10MB max)
+        max_output_size = getattr(settings, 'SQLMAP_MAX_OUTPUT_SIZE', 10_000_000)
+        if len(stdout_text) > max_output_size:
+            logger.warning(f"SQLMap output truncated from {len(stdout_text)} to {max_output_size} bytes")
+            stdout_text = stdout_text[:max_output_size]
+
+        # TASK-38: Better error detection
+        if returncode != 0:
+            logger.error(f"SQLMap failed with return code {returncode}")
+            if stderr_text:
+                logger.error(f"SQLMap stderr: {stderr_text[:500]}")
+            self._check_critical_errors(stderr_text)
+
+        if stderr_text and ("error" in stderr_text.lower() or returncode != 0):
+            logger.warning(f"SQLMap stderr: {stderr_text[:500]}")
+
+        self._check_sqlmap_error_patterns(stdout_text)
+
+        return stdout_text, stderr_text
+
+    def _check_critical_errors(self, stderr_text: str):
+        """Check for critical error patterns (TASK-38)."""
+        if "connection refused" in stderr_text.lower():
+            raise ConnectionError("Target not reachable")
+        if "not enough time" in stderr_text.lower():
+            raise TimeoutError("SQLMap needs more time")
+
+    def _check_sqlmap_error_patterns(self, stdout_text: str):
+        """Check for SQLMap-specific error patterns (TASK-38)."""
+        error_patterns = [
+            ("target url is not responding", "TargetUnreachable"),
+            ("connection timed out", "ConnectionTimeout"),
+            ("no parameter(s) found", "NoParameters"),
+            ("unable to connect", "ConnectionFailed"),
+        ]
+        for pattern, error_type in error_patterns:
+            if pattern in stdout_text.lower():
+                logger.warning(f"SQLMap error detected: {error_type}")
+
+    def _log_sqlmap_result(self, stdout_text: str, stderr_text: str, returncode: int):
+        """Log SQLMap execution result."""
+        if "is vulnerable" in stdout_text.lower():
+            logger.info("SQLMap detected vulnerability!")
+        elif "no injection found" in stdout_text.lower():
+            logger.debug("SQLMap: No injection found")
+        elif not stdout_text:
+            logger.warning("SQLMap returned empty output")
+        else:
+            logger.debug(f"SQLMap output preview: {stdout_text[:200]}")
 
     def _parse_output(self, output: str, url: str, param: Optional[str]) -> SQLiEvidence:
         """Parse SQLMap output for results.
@@ -786,72 +830,80 @@ class EnhancedSQLMapRunner:
             return evidence
 
         param_match = re.search(r"Parameter:\s+(.+?)\s+\(", output)
-
-        # 2026-01-23 FIX: Find ALL injection types, not just the first one
         all_types = re.findall(r"Type:\s+(.+?)[\n\r]", output)
 
         if param_match or "is vulnerable" in output.lower():
-            evidence.vulnerable = True
-            evidence.parameter = param_match.group(1) if param_match else param or "unknown"
+            self._populate_vulnerability_evidence(evidence, param_match, all_types, param, output)
 
-            # Store all types found (e.g., "boolean-based blind, UNION query")
-            if all_types:
-                evidence.injection_type = ", ".join(all_types)
-            else:
-                evidence.injection_type = "unknown"
+        evidence.output_snippet = self._extract_meaningful_output(output)
+        return evidence
 
-            evidence.confidence = 1.0  # SQLMap confirmation = high confidence
+    def _populate_vulnerability_evidence(
+        self, evidence: SQLiEvidence, param_match: re.Match,
+        all_types: List[str], param: Optional[str], output: str
+    ):
+        """Populate evidence with vulnerability details."""
+        evidence.vulnerable = True
+        evidence.parameter = param_match.group(1) if param_match else param or "unknown"
 
-            # Extract database info
-            db_match = re.search(r"back-end DBMS:\s+(.+?)[\n\r]", output)
-            if db_match:
-                db_str = db_match.group(1).lower()
-                evidence.extracted_data["dbms_full"] = db_match.group(1)
-                for db_type in DBType:
-                    if db_type.value in db_str:
-                        evidence.db_type = db_type
-                        break
+        # Store all types found
+        evidence.injection_type = ", ".join(all_types) if all_types else "unknown"
+        evidence.confidence = 1.0
 
-            # Extract databases found
-            dbs_section = re.search(r"available databases.*?:\s*\n((?:\[\*\]\s+.+\n)+)", output, re.DOTALL)
-            if dbs_section:
-                dbs = re.findall(r"\[\*\]\s+(.+)", dbs_section.group(1))
-                evidence.extracted_data["databases"] = dbs
+        self._extract_database_info(evidence, output)
+        self._extract_databases_list(evidence, output)
+        self._extract_technology_info(evidence, output)
+        self._extract_union_info(evidence, output)
 
-            # Extract technology
-            version_match = re.search(r"web application technology:\s+(.+?)[\n\r]", output, re.IGNORECASE)
-            if version_match:
-                evidence.extracted_data["technology"] = version_match.group(1)
+    def _extract_database_info(self, evidence: SQLiEvidence, output: str):
+        """Extract database type and version."""
+        db_match = re.search(r"back-end DBMS:\s+(.+?)[\n\r]", output)
+        if db_match:
+            db_str = db_match.group(1).lower()
+            evidence.extracted_data["dbms_full"] = db_match.group(1)
+            for db_type in DBType:
+                if db_type.value in db_str:
+                    evidence.db_type = db_type
+                    break
 
-            # 2026-01-23 FIX: Extract UNION columns if present
-            union_match = re.search(r"UNION query.*?(\d+)\s+columns", output, re.IGNORECASE)
-            if union_match:
-                evidence.extracted_data["union_columns"] = int(union_match.group(1))
+    def _extract_databases_list(self, evidence: SQLiEvidence, output: str):
+        """Extract list of databases found."""
+        dbs_section = re.search(r"available databases.*?:\s*\n((?:\[\*\]\s+.+\n)+)", output, re.DOTALL)
+        if dbs_section:
+            dbs = re.findall(r"\[\*\]\s+(.+)", dbs_section.group(1))
+            evidence.extracted_data["databases"] = dbs
 
-            # Also check for NULL-based UNION
-            null_match = re.search(r"NULL,?\s*NULL", output)
-            if null_match:
-                evidence.extracted_data["union_null_based"] = True
+    def _extract_technology_info(self, evidence: SQLiEvidence, output: str):
+        """Extract web application technology."""
+        version_match = re.search(r"web application technology:\s+(.+?)[\n\r]", output, re.IGNORECASE)
+        if version_match:
+            evidence.extracted_data["technology"] = version_match.group(1)
 
-        # 2026-01-23 FIX: Skip SQLMap banner (starts with "___"), capture meaningful output
-        # Find where actual results start (after "[*] starting")
+    def _extract_union_info(self, evidence: SQLiEvidence, output: str):
+        """Extract UNION query information."""
+        union_match = re.search(r"UNION query.*?(\d+)\s+columns", output, re.IGNORECASE)
+        if union_match:
+            evidence.extracted_data["union_columns"] = int(union_match.group(1))
+
+        null_match = re.search(r"NULL,?\s*NULL", output)
+        if null_match:
+            evidence.extracted_data["union_null_based"] = True
+
+    def _extract_meaningful_output(self, output: str) -> str:
+        """Extract meaningful output, skipping SQLMap banner."""
         meaningful_start = output.find("[*] starting")
         if meaningful_start > 0:
-            # Skip the "starting" line, find next useful content
             next_line = output.find("\n", meaningful_start)
             if next_line > 0:
                 meaningful_output = output[next_line:].strip()
-                # Further skip to vulnerability findings if present
                 vuln_start = meaningful_output.find("Parameter:")
                 if vuln_start > 0:
                     meaningful_output = meaningful_output[vuln_start:]
-                evidence.output_snippet = meaningful_output[:2000]
+                return meaningful_output[:2000]
             else:
-                evidence.output_snippet = output[meaningful_start:][:2000]
+                return output[meaningful_start:][:2000]
         else:
-            evidence.output_snippet = output[:2000]
-
-        return evidence
+            return output[:2000]
 
 
 # =============================================================================
@@ -930,150 +982,167 @@ class SQLMapAgent(BaseAgent):
         4. Data extraction for proof
         """
         dashboard.current_agent = self.name
-        # 2026-01-23: Log to both dashboard (TUI) and logger (file) for debugging
         logger.info(f"[{self.name}] 🔍 Starting intelligent SQLi scan on {self.url}")
         dashboard.log(f"[{self.name}] 🔍 Starting intelligent SQLi scan on {self.url}", "INFO")
 
         findings = []
 
         try:
-            # =========================================================
             # PHASE 1: Initial probe and fingerprinting
-            # =========================================================
-            logger.info(f"[{self.name}] Phase 1: Probing and fingerprinting...")
-            dashboard.log(f"[{self.name}] Phase 1: Probing and fingerprinting...", "INFO")
+            await self._run_phase1_probe()
 
-            probe_result = await self._initial_probe()
-            if probe_result:
-                self._detected_db_type = probe_result.get("db_type", DBType.UNKNOWN)
-                self._detected_waf = probe_result.get("waf")
-
-                if probe_result.get("quick_vuln"):
-                    dashboard.log(f"[{self.name}] ✅ Quick probe found SQLi!", "SUCCESS")
-                    # Still run SQLMap for proper validation
-
-            # =========================================================
             # PHASE 2: Parameter-by-parameter testing
-            # =========================================================
-            logger.info(f"[{self.name}] Phase 2: Testing {len(self.params)} parameters: {self.params}")
-            dashboard.log(f"[{self.name}] Phase 2: Testing {len(self.params)} parameters...", "INFO")
+            params_to_test = self._get_parameters_to_test()
+            findings = await self._run_phase2_parameter_testing(params_to_test)
 
-            # If no params specified, extract from URL
-            params_to_test = self.params
-            if not params_to_test:
-                parsed = urlparse(self.url)
-                query_params = parse_qs(parsed.query)
-                params_to_test = list(query_params.keys())
-
-            # Also test POST params if POST data provided
-            if self.post_data:
-                post_params = self._extract_post_params(self.post_data)
-                params_to_test.extend(post_params)
-
-            # Deduplicate
-            params_to_test = list(set(params_to_test))
-
-            if not params_to_test:
-                params_to_test = ["id"]  # Sensible fallback
-
-            for param in params_to_test:
-                if param in self._tested_params:
-                    continue
-                self._tested_params.add(param)
-                self._stats["params_tested"] += 1
-
-                dashboard.log(f"[{self.name}] Testing parameter: {param}", "INFO")
-
-                # Convert localhost for Docker
-                docker_url = self._docker_url(self.url)
-
-                # Build config based on context (uses Q-Learning for WAF bypass)
-                config = await self._build_intelligent_config_async()
-
-                # Run SQLMap
-                evidence = await self.sqlmap_runner.run_intelligent(
-                    url=docker_url,
-                    param=param,
-                    config=config,
-                    post_data=self.post_data,
-                    db_type=self._detected_db_type
-                )
-
-                if evidence.vulnerable:
-                    self._stats["vulns_found"] += 1
-                    finding = self._evidence_to_finding(evidence)
-                    findings.append(finding)
-                    dashboard.add_finding("SQLi", f"{self.url} [{param}]", "CRITICAL")
-
-                    # Early exit check
-                    if settings.EARLY_EXIT_ON_FINDING:
-                        remaining = len(params_to_test) - len(self._tested_params)
-                        if remaining > 0:
-                            dashboard.log(f"[{self.name}] ⚡ Early exit: Skipping {remaining} params", "INFO")
-                        break
-                    continue
-
-                # =========================================================
-                # PHASE 3: WAF bypass retry if blocked
-                # =========================================================
-                if self._detected_waf:
-                    dashboard.log(f"[{self.name}] Phase 3: Attempting WAF bypass ({self._detected_waf})...", "INFO")
-
-                    bypass_evidence = await self._waf_bypass_retry(docker_url, param)
-                    if bypass_evidence and bypass_evidence.vulnerable:
-                        self._stats["waf_bypassed"] += 1
-                        self._stats["vulns_found"] += 1
-                        finding = self._evidence_to_finding(bypass_evidence)
-                        findings.append(finding)
-                        dashboard.add_finding("SQLi", f"{self.url} [{param}] (WAF Bypass)", "CRITICAL")
-
-                        if settings.EARLY_EXIT_ON_FINDING:
-                            break
-                        continue
-
-                # Fallback to error detection
-                dashboard.log(f"[{self.name}] SQLMap inconclusive, trying error detection...", "DEBUG")
-                error_finding = await self._detect_sql_error(param)
-                if error_finding:
-                    findings.append(error_finding)
-                    dashboard.add_finding("SQLi", f"{self.url} [{param}]", "CRITICAL")
-
-            # =========================================================
-            # PHASE 4: Data extraction verification (if vulns found)
-            # =========================================================
+            # PHASE 4: Data extraction verification
             if findings and getattr(settings, "SQLMAP_EXTRACT_PROOF", True):
-                dashboard.log(f"[{self.name}] Phase 4: Extracting proof data...", "INFO")
-
-                for finding in findings:
-                    if finding.get("extraction_verified"):
-                        continue
-
-                    extraction = await self._extract_proof_data(finding)
-                    if extraction:
-                        finding["extracted_data"] = extraction
-                        finding["extraction_verified"] = True
-                        self._stats["data_extracted"] += 1
+                await self._run_phase4_extraction(findings)
 
             # Save report
             if findings:
                 self._save_detailed_report(findings)
 
-            # Log statistics
-            logger.info(
-                f"[{self.name}] Complete: {self._stats['params_tested']} tested, "
-                f"{self._stats['vulns_found']} vulns, {self._stats['waf_bypassed']} WAF bypasses"
-            )
-            dashboard.log(
-                f"[{self.name}] Complete: {self._stats['params_tested']} tested, "
-                f"{self._stats['vulns_found']} vulns, {self._stats['waf_bypassed']} WAF bypasses",
-                "SUCCESS" if findings else "INFO"
-            )
+            self._log_completion_stats(findings)
 
             return {"findings": findings, "status": JobStatus.COMPLETED, "stats": self._stats}
 
         except Exception as e:
-            logger.error(f"SQLMapAgent failed: {e}", exc_info=True)  # Added traceback
+            logger.error(f"SQLMapAgent failed: {e}", exc_info=True)
             return {"error": str(e), "findings": [], "status": JobStatus.FAILED}
+
+    async def _run_phase1_probe(self):
+        """Run PHASE 1: Initial probe and fingerprinting."""
+        logger.info(f"[{self.name}] Phase 1: Probing and fingerprinting...")
+        dashboard.log(f"[{self.name}] Phase 1: Probing and fingerprinting...", "INFO")
+
+        probe_result = await self._initial_probe()
+        if probe_result:
+            self._detected_db_type = probe_result.get("db_type", DBType.UNKNOWN)
+            self._detected_waf = probe_result.get("waf")
+
+            if probe_result.get("quick_vuln"):
+                dashboard.log(f"[{self.name}] ✅ Quick probe found SQLi!", "SUCCESS")
+
+    def _get_parameters_to_test(self) -> List[str]:
+        """Get list of parameters to test."""
+        params_to_test = self.params
+        if not params_to_test:
+            parsed = urlparse(self.url)
+            query_params = parse_qs(parsed.query)
+            params_to_test = list(query_params.keys())
+
+        if self.post_data:
+            post_params = self._extract_post_params(self.post_data)
+            params_to_test.extend(post_params)
+
+        params_to_test = list(set(params_to_test))
+
+        if not params_to_test:
+            params_to_test = ["id"]
+
+        return params_to_test
+
+    async def _run_phase2_parameter_testing(self, params_to_test: List[str]) -> List[Dict]:
+        """Run PHASE 2: Parameter-by-parameter testing."""
+        logger.info(f"[{self.name}] Phase 2: Testing {len(params_to_test)} parameters...")
+        dashboard.log(f"[{self.name}] Phase 2: Testing {len(params_to_test)} parameters...", "INFO")
+
+        findings = []
+        docker_url = self._docker_url(self.url)
+
+        for param in params_to_test:
+            if param in self._tested_params:
+                continue
+
+            self._tested_params.add(param)
+            self._stats["params_tested"] += 1
+            dashboard.log(f"[{self.name}] Testing parameter: {param}", "INFO")
+
+            finding = await self._test_single_parameter(docker_url, param)
+            if finding:
+                findings.append(finding)
+                if settings.EARLY_EXIT_ON_FINDING:
+                    remaining = len(params_to_test) - len(self._tested_params)
+                    if remaining > 0:
+                        dashboard.log(f"[{self.name}] ⚡ Early exit: Skipping {remaining} params", "INFO")
+                    break
+
+        return findings
+
+    async def _test_single_parameter(self, docker_url: str, param: str) -> Optional[Dict]:
+        """Test a single parameter for SQLi."""
+        config = await self._build_intelligent_config_async()
+
+        evidence = await self.sqlmap_runner.run_intelligent(
+            url=docker_url,
+            param=param,
+            config=config,
+            post_data=self.post_data,
+            db_type=self._detected_db_type
+        )
+
+        if evidence.vulnerable:
+            return self._handle_vulnerable_evidence(evidence, param)
+
+        # PHASE 3: WAF bypass retry if blocked
+        if self._detected_waf:
+            bypass_finding = await self._try_waf_bypass(docker_url, param)
+            if bypass_finding:
+                return bypass_finding
+
+        # Fallback to error detection
+        dashboard.log(f"[{self.name}] SQLMap inconclusive, trying error detection...", "DEBUG")
+        error_finding = await self._detect_sql_error(param)
+        if error_finding:
+            dashboard.add_finding("SQLi", f"{self.url} [{param}]", "CRITICAL")
+            return error_finding
+
+        return None
+
+    def _handle_vulnerable_evidence(self, evidence: SQLiEvidence, param: str) -> Dict:
+        """Handle confirmed vulnerable evidence."""
+        self._stats["vulns_found"] += 1
+        finding = self._evidence_to_finding(evidence)
+        dashboard.add_finding("SQLi", f"{self.url} [{param}]", "CRITICAL")
+        return finding
+
+    async def _try_waf_bypass(self, docker_url: str, param: str) -> Optional[Dict]:
+        """Try WAF bypass techniques."""
+        dashboard.log(f"[{self.name}] Phase 3: Attempting WAF bypass ({self._detected_waf})...", "INFO")
+
+        bypass_evidence = await self._waf_bypass_retry(docker_url, param)
+        if bypass_evidence and bypass_evidence.vulnerable:
+            self._stats["waf_bypassed"] += 1
+            self._stats["vulns_found"] += 1
+            finding = self._evidence_to_finding(bypass_evidence)
+            dashboard.add_finding("SQLi", f"{self.url} [{param}] (WAF Bypass)", "CRITICAL")
+            return finding
+
+        return None
+
+    async def _run_phase4_extraction(self, findings: List[Dict]):
+        """Run PHASE 4: Data extraction verification."""
+        dashboard.log(f"[{self.name}] Phase 4: Extracting proof data...", "INFO")
+
+        for finding in findings:
+            if finding.get("extraction_verified"):
+                continue
+
+            extraction = await self._extract_proof_data(finding)
+            if extraction:
+                finding["extracted_data"] = extraction
+                finding["extraction_verified"] = True
+                self._stats["data_extracted"] += 1
+
+    def _log_completion_stats(self, findings: List[Dict]):
+        """Log completion statistics."""
+        stats_msg = (
+            f"[{self.name}] Complete: {self._stats['params_tested']} tested, "
+            f"{self._stats['vulns_found']} vulns, {self._stats['waf_bypassed']} WAF bypasses"
+        )
+        logger.info(stats_msg)
+        dashboard.log(stats_msg, "SUCCESS" if findings else "INFO")
 
     async def _initial_probe(self) -> Dict:
         """
@@ -1090,50 +1159,57 @@ class SQLMapAgent(BaseAgent):
         }
 
         try:
-            # =========================================================
             # PHASE 1: Use framework's WAF fingerprinter (Q-Learning)
-            # =========================================================
-            waf_name, waf_confidence = await WAFBypassStrategy.detect_waf_async(self.url)
-            result["waf"] = waf_name if waf_name != "unknown" else None
-            result["waf_confidence"] = waf_confidence
+            await self._detect_waf(result)
 
-            if waf_name != "unknown":
-                dashboard.log(f"[{self.name}] 🛡️ WAF Detected: {waf_name} ({waf_confidence:.0%} confidence)", "INFO")
-
-            # =========================================================
             # PHASE 2: Probe for DB fingerprinting and quick vuln check
-            # =========================================================
             async with aiohttp.ClientSession() as session:
-                # Build headers
-                req_headers = {"User-Agent": settings.USER_AGENT}
-                req_headers.update(self.headers)
-
-                # Build cookies
-                if self.cookies:
-                    cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
-                    req_headers["Cookie"] = cookie_str
-
-                # Probe with error payload
-                probe_url = self._inject_probe_payload(self.url)
-                async with session.get(probe_url, headers=req_headers, timeout=aiohttp.ClientTimeout(total=10), ssl=False) as resp:
-                    body = await resp.text()
-
-                    # Fingerprint DB
-                    result["db_type"] = DBFingerprinter.fingerprint(body)
-
-                    if result["db_type"] != DBType.UNKNOWN:
-                        dashboard.log(f"[{self.name}] 🔍 DB Fingerprint: {result['db_type'].value}", "INFO")
-
-                    # Quick vuln check
-                    for pattern in self.error_patterns or self._default_error_patterns():
-                        if re.search(pattern, body, re.IGNORECASE):
-                            result["quick_vuln"] = True
-                            break
+                await self._probe_db_and_vuln(session, result)
 
         except Exception as e:
             logger.debug(f"Initial probe failed: {e}")
 
         return result
+
+    async def _detect_waf(self, result: Dict):
+        """Detect WAF using framework fingerprinter."""
+        waf_name, waf_confidence = await WAFBypassStrategy.detect_waf_async(self.url)
+        result["waf"] = waf_name if waf_name != "unknown" else None
+        result["waf_confidence"] = waf_confidence
+
+        if waf_name != "unknown":
+            dashboard.log(f"[{self.name}] 🛡️ WAF Detected: {waf_name} ({waf_confidence:.0%} confidence)", "INFO")
+
+    async def _probe_db_and_vuln(self, session, result: Dict):
+        """Probe for DB fingerprinting and quick vulnerability check."""
+        req_headers = self._build_probe_headers()
+        probe_url = self._inject_probe_payload(self.url)
+
+        async with session.get(probe_url, headers=req_headers, timeout=aiohttp.ClientTimeout(total=10), ssl=False) as resp:
+            body = await resp.text()
+
+            # Fingerprint DB
+            result["db_type"] = DBFingerprinter.fingerprint(body)
+
+            if result["db_type"] != DBType.UNKNOWN:
+                dashboard.log(f"[{self.name}] 🔍 DB Fingerprint: {result['db_type'].value}", "INFO")
+
+            # Quick vuln check
+            for pattern in self.error_patterns or self._default_error_patterns():
+                if re.search(pattern, body, re.IGNORECASE):
+                    result["quick_vuln"] = True
+                    break
+
+    def _build_probe_headers(self) -> Dict[str, str]:
+        """Build headers for probe request."""
+        req_headers = {"User-Agent": settings.USER_AGENT}
+        req_headers.update(self.headers)
+
+        if self.cookies:
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
+            req_headers["Cookie"] = cookie_str
+
+        return req_headers
 
     def _inject_probe_payload(self, url: str) -> str:
         """Inject a simple probe payload to trigger errors."""
@@ -1250,13 +1326,23 @@ class SQLMapAgent(BaseAgent):
         url = self._docker_url(finding.get("url", self.url))
         param = finding.get("parameter")
 
-        # Run extraction command
+        cmd = self._build_extraction_command(url, param)
+
+        try:
+            output = await self._run_extraction_command(cmd)
+            return self._parse_extracted_data(output)
+        except Exception as e:
+            logger.debug(f"Data extraction failed: {e}")
+            return None
+
+    def _build_extraction_command(self, url: str, param: Optional[str]) -> List[str]:
+        """Build SQLMap data extraction command."""
         cmd = [
             "docker", "run", "--rm", "--network", "host",
             "googlesky/sqlmap:latest",
             "-u", url,
             "--batch",
-            "--dbs",  # List databases
+            "--dbs",
             "--threads=4"
         ]
 
@@ -1267,35 +1353,33 @@ class SQLMapAgent(BaseAgent):
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
             cmd.append(f"--cookie={cookie_str}")
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
-            output = stdout.decode()
+        return cmd
 
-            # Parse extracted data
-            extracted = {}
+    async def _run_extraction_command(self, cmd: List[str]) -> str:
+        """Run extraction command and return output."""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+        return stdout.decode()
 
-            # Databases
-            dbs_match = re.search(r"available databases.*?:\s*\n((?:\[\*\]\s+.+\n)+)", output, re.DOTALL)
-            if dbs_match:
-                extracted["databases"] = re.findall(r"\[\*\]\s+(.+)", dbs_match.group(1))
+    def _parse_extracted_data(self, output: str) -> Optional[Dict]:
+        """Parse extracted data from SQLMap output."""
+        extracted = {}
 
-            # Version
-            version_match = re.search(r"back-end DBMS:\s+(.+?)[\n\r]", output)
-            if version_match:
-                extracted["db_version"] = version_match.group(1)
+        # Databases
+        dbs_match = re.search(r"available databases.*?:\s*\n((?:\[\*\]\s+.+\n)+)", output, re.DOTALL)
+        if dbs_match:
+            extracted["databases"] = re.findall(r"\[\*\]\s+(.+)", dbs_match.group(1))
 
-            if extracted:
-                return extracted
+        # Version
+        version_match = re.search(r"back-end DBMS:\s+(.+?)[\n\r]", output)
+        if version_match:
+            extracted["db_version"] = version_match.group(1)
 
-        except Exception as e:
-            logger.debug(f"Data extraction failed: {e}")
-
-        return None
+        return extracted if extracted else None
 
     def _evidence_to_finding(self, evidence: SQLiEvidence) -> Dict:
         """Convert SQLiEvidence to finding dict.
@@ -1304,71 +1388,91 @@ class SQLMapAgent(BaseAgent):
         """
         import json
 
-        # 2026-01-23 FIX: Build clean, human-readable description
+        human_readable_description = self._build_evidence_description(evidence)
+        details = self._build_evidence_details(evidence, human_readable_description)
+
+        return self._build_finding_dict(evidence, human_readable_description, details)
+
+    def _build_evidence_description(self, evidence: SQLiEvidence) -> str:
+        """Build human-readable description from evidence."""
         description_parts = [
             f"SQL Injection vulnerability confirmed via SQLMap.",
             f"Parameter: {evidence.parameter}",
             f"Injection Types: {evidence.injection_type}",
         ]
 
-        # Add DBMS info if available
+        self._add_dbms_info(description_parts, evidence)
+        self._add_union_info_to_desc(description_parts, evidence)
+        self._add_databases_info(description_parts, evidence)
+        self._add_technology_info(description_parts, evidence)
+        self._add_tamper_info(description_parts, evidence)
+
+        return "\n".join(description_parts)
+
+    def _add_dbms_info(self, description_parts: List[str], evidence: SQLiEvidence):
+        """Add DBMS info to description."""
         if evidence.db_type != DBType.UNKNOWN:
             dbms_full = evidence.extracted_data.get("dbms_full", evidence.db_type.value)
             description_parts.append(f"Database: {dbms_full}")
 
-        # Add UNION columns info if available
+    def _add_union_info_to_desc(self, description_parts: List[str], evidence: SQLiEvidence):
+        """Add UNION columns info to description."""
         if "union_columns" in evidence.extracted_data:
             cols = evidence.extracted_data["union_columns"]
             description_parts.append(f"UNION-based with {cols} columns")
 
-        # Add extracted databases if available
+    def _add_databases_info(self, description_parts: List[str], evidence: SQLiEvidence):
+        """Add extracted databases info to description."""
         if "databases" in evidence.extracted_data:
             dbs = evidence.extracted_data["databases"]
             if dbs:
                 description_parts.append(f"Databases found: {', '.join(dbs[:5])}")
 
-        # Add technology if available
+    def _add_technology_info(self, description_parts: List[str], evidence: SQLiEvidence):
+        """Add technology info to description."""
         if "technology" in evidence.extracted_data:
             description_parts.append(f"Technology: {evidence.extracted_data['technology']}")
 
-        # Add tamper script if used
+    def _add_tamper_info(self, description_parts: List[str], evidence: SQLiEvidence):
+        """Add tamper script info to description."""
         if evidence.tamper_used:
             description_parts.append(f"WAF bypass: {evidence.tamper_used}")
 
-        human_readable_description = "\n".join(description_parts)
-
-        # Build metadata dict for detailed storage
-        details = {
-            "description": human_readable_description,
+    def _build_evidence_details(self, evidence: SQLiEvidence, description: str) -> Dict:
+        """Build metadata dict for detailed storage."""
+        return {
+            "description": description,
             "db_type": evidence.db_type.value,
             "injection_type": evidence.injection_type,
             "tamper_used": evidence.tamper_used,
             "confidence": evidence.confidence,
-            "raw_output_snippet": evidence.output_snippet[:1000],  # More chars, but labeled as raw
+            "raw_output_snippet": evidence.output_snippet[:1000],
             "reproduction_command": evidence.reproduction_command
         }
+
+    def _build_finding_dict(self, evidence: SQLiEvidence, description: str, details: Dict) -> Dict:
+        """Build final finding dictionary."""
+        import json
 
         return {
             "type": "SQLi",
             "url": self.url,
             "parameter": evidence.parameter,
             "payload": evidence.injection_type,
-            "details": json.dumps(details),  # Store as JSON
+            "details": json.dumps(details),
             "reproduction": evidence.reproduction_command,
             "validated": True,
             "validation_method": "SQLMap v2",
             "severity": "CRITICAL",
             "status": "VALIDATED_CONFIRMED",
-            # 2026-01-23 FIX: Use human-readable description for 'evidence' field
-            # This is what gets stored in DB.details and shown in reports
-            "evidence": human_readable_description,
-            "note": human_readable_description,  # Fallback field
+            "evidence": description,
+            "note": description,
             # Legacy fields for backward compatibility
             "db_type": evidence.db_type.value,
             "extracted_data": evidence.extracted_data,
             "tamper_used": evidence.tamper_used,
             "confidence": evidence.confidence,
-            "raw_sqlmap_output": evidence.output_snippet[:1000]  # Renamed, not used as evidence
+            "raw_sqlmap_output": evidence.output_snippet[:1000]
         }
 
     async def _detect_sql_error(self, param: str) -> Optional[Dict]:
@@ -1377,50 +1481,70 @@ class SQLMapAgent(BaseAgent):
 
         try:
             parsed = urlparse(self.url)
-            base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-            existing_params = parse_qs(parsed.query)
-
-            # Use test payloads from config or defaults
+            base_url, existing_params = self._parse_target_url(parsed)
             payloads_to_test = self.test_payloads[:10] if self.test_payloads else self._default_test_payloads()
 
             async with aiohttp.ClientSession() as session:
-                # Build headers
-                req_headers = {"User-Agent": settings.USER_AGENT}
-                req_headers.update(self.headers)
-
-                # Build cookies
-                if self.cookies:
-                    cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
-                    req_headers["Cookie"] = cookie_str
+                req_headers = self._build_error_detection_headers()
 
                 for payload in payloads_to_test:
-                    test_params = {k: v[0] if isinstance(v, list) else v for k, v in existing_params.items()}
-                    test_params[param] = payload
+                    finding = await self._test_payload_for_error(
+                        session, base_url, existing_params, param, payload, req_headers
+                    )
+                    if finding:
+                        return finding
 
-                    test_url = f"{base_url}?{urlencode(test_params)}"
-
-                    async with session.get(test_url, headers=req_headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                        body = await response.text()
-
-                        # Check for SQL error patterns
-                        patterns = self.error_patterns if self.error_patterns else self._default_error_patterns()
-                        for pattern in patterns:
-                            match = re.search(pattern, body, re.IGNORECASE)
-                            if match:
-                                dashboard.log(f"[{self.name}] ✅ SQL Error detected: {match.group()[:50]}...", "SUCCESS")
-                                return {
-                                    "type": "SQLi",
-                                    "url": self.url,
-                                    "parameter": param,
-                                    "payload": payload,
-                                    "evidence": f"SQL Error detected: {match.group()}",
-                                    "validated": True,
-                                    "validation_method": "SQL Error Detection",
-                                    "severity": "CRITICAL",
-                                    "status": "VALIDATED_CONFIRMED"
-                                }
         except Exception as e:
             logger.debug(f"SQL error detection failed: {e}")
+
+        return None
+
+    def _parse_target_url(self, parsed: urlparse) -> Tuple[str, Dict]:
+        """Parse target URL into base URL and parameters."""
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        existing_params = parse_qs(parsed.query)
+        return base_url, existing_params
+
+    def _build_error_detection_headers(self) -> Dict[str, str]:
+        """Build headers for error detection requests."""
+        req_headers = {"User-Agent": settings.USER_AGENT}
+        req_headers.update(self.headers)
+
+        if self.cookies:
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
+            req_headers["Cookie"] = cookie_str
+
+        return req_headers
+
+    async def _test_payload_for_error(
+        self, session, base_url: str, existing_params: Dict,
+        param: str, payload: str, req_headers: Dict
+    ) -> Optional[Dict]:
+        """Test a single payload for SQL errors."""
+        test_params = {k: v[0] if isinstance(v, list) else v for k, v in existing_params.items()}
+        test_params[param] = payload
+
+        test_url = f"{base_url}?{urlencode(test_params)}"
+
+        async with session.get(test_url, headers=req_headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            body = await response.text()
+
+            patterns = self.error_patterns if self.error_patterns else self._default_error_patterns()
+            for pattern in patterns:
+                match = re.search(pattern, body, re.IGNORECASE)
+                if match:
+                    dashboard.log(f"[{self.name}] ✅ SQL Error detected: {match.group()[:50]}...", "SUCCESS")
+                    return {
+                        "type": "SQLi",
+                        "url": self.url,
+                        "parameter": param,
+                        "payload": payload,
+                        "evidence": f"SQL Error detected: {match.group()}",
+                        "validated": True,
+                        "validation_method": "SQL Error Detection",
+                        "severity": "CRITICAL",
+                        "status": "VALIDATED_CONFIRMED"
+                    }
 
         return None
 
@@ -1479,7 +1603,15 @@ class SQLMapAgent(BaseAgent):
         safe_name = re.sub(r'[^\w\-_]', '_', self.url)[:50]
         report_path = self.report_dir / f"sqli_report_{safe_name}.md"
 
-        content = f"""# SQL Injection Report
+        content = self._build_report_header()
+        content += self._build_report_findings(findings)
+
+        self._write_report_file(report_path, content)
+        logger.info(f"Report saved to {report_path}")
+
+    def _build_report_header(self) -> str:
+        """Build report header with summary."""
+        return f"""# SQL Injection Report
 ## Target: {self.url}
 ## Date: {__import__('datetime').datetime.now().isoformat()}
 ## Agent: {self.name}
@@ -1499,47 +1631,57 @@ class SQLMapAgent(BaseAgent):
 ## Findings
 
 """
+
+    def _build_report_findings(self, findings: List[Dict]) -> str:
+        """Build findings section of report."""
+        content = ""
         for i, f in enumerate(findings, 1):
-            content += f"""### Finding #{i}: {f['type']} CONFIRMED
+            content += self._build_single_finding(i, f)
+        return content
+
+    def _build_single_finding(self, index: int, finding: Dict) -> str:
+        """Build markdown for a single finding."""
+        content = f"""### Finding #{index}: {finding['type']} CONFIRMED
 
 | Field | Value |
 |-------|-------|
-| **URL** | `{f.get('url', 'N/A')}` |
-| **Parameter** | `{f.get('parameter', 'N/A')}` |
-| **Injection Type** | {f.get('payload', 'N/A')} |
-| **DB Type** | {f.get('db_type', 'unknown')} |
-| **Validation Method** | {f.get('validation_method', 'N/A')} |
-| **Confidence** | {f.get('confidence', 1.0):.0%} |
-| **Tamper Used** | {f.get('tamper_used', 'None')} |
+| **URL** | `{finding.get('url', 'N/A')}` |
+| **Parameter** | `{finding.get('parameter', 'N/A')}` |
+| **Injection Type** | {finding.get('payload', 'N/A')} |
+| **DB Type** | {finding.get('db_type', 'unknown')} |
+| **Validation Method** | {finding.get('validation_method', 'N/A')} |
+| **Confidence** | {finding.get('confidence', 1.0):.0%} |
+| **Tamper Used** | {finding.get('tamper_used', 'None')} |
 
 **Reproduction Command:**
 ```bash
-{f.get('reproduction', 'N/A')}
+{finding.get('reproduction', 'N/A')}
 ```
 
 """
-            if f.get('extracted_data'):
-                content += f"""**Extracted Data:**
+        if finding.get('extracted_data'):
+            content += f"""**Extracted Data:**
 ```json
-{json.dumps(f['extracted_data'], indent=2)}
+{json.dumps(finding['extracted_data'], indent=2)}
 ```
 
 """
 
-            content += f"""**Evidence:**
+        content += f"""**Evidence:**
 ```
-{f.get('evidence', 'N/A')[:1000]}
+{finding.get('evidence', 'N/A')[:1000]}
 ```
 
 ---
 
 """
+        return content
 
+    def _write_report_file(self, report_path: Path, content: str):
+        """Write report content to file."""
         self.report_dir.mkdir(parents=True, exist_ok=True)
         with open(report_path, "w") as f:
             f.write(content)
-
-        logger.info(f"Report saved to {report_path}")
 
     def get_stats(self) -> Dict:
         """Get agent statistics."""
