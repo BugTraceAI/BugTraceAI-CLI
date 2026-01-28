@@ -181,76 +181,97 @@ class MutationSkill(BaseSkill):
     async def execute(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         from bugtrace.tools.exploitation.mutation import mutation_engine
         from bugtrace.tools.visual.browser import browser_manager
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        
+
         findings = []
         base_payload = params.get("payload", "<script>alert(1)</script>")
         target_param = params.get("parameter", "test")
-        
+
         try:
-            # Get mutated payloads from AI
             mutations = await mutation_engine.mutate(base_payload, strategies=["encode", "polyglot", "obfuscate"])
-            
             if mutations:
-                async with browser_manager.get_page() as page:
-                    alert_detected = False
-                    
-                    async def handle_dialog(dialog):
-                        nonlocal alert_detected
-                        alert_detected = True
-                        await dialog.dismiss()
-                    
-                    page.on("dialog", handle_dialog)
-                    
-                    for mutation in mutations[:10]:  # Limit to 10 attempts
-                        parsed = urlparse(url)
-                        url_params = parse_qs(parsed.query)
-                        url_params[target_param] = [mutation]
-                        
-                        test_url = urlunparse((
-                            parsed.scheme, parsed.netloc, parsed.path,
-                            parsed.params, urlencode(url_params, doseq=True), parsed.fragment
-                        ))
-                        
-                        try:
-                            await page.goto(test_url, wait_until="domcontentloaded", timeout=8000)
-                            await asyncio.sleep(1)
-                            
-                            if alert_detected:
-                                from bugtrace.core.config import settings
-                                screenshot_path = str(settings.LOG_DIR / f"{self.master.thread.thread_id}_mutation.png")
-                                await page.screenshot(path=screenshot_path)
-                                
-                                findings.append({
-                                    "type": "XSS",
-                                    "url": url,
-                                    "parameter": target_param,
-                                    "param": target_param,
-                                    "payload": mutation,
-                                    "screenshot": screenshot_path,
-                                    "validated": True,
-                                    "alert_triggered": True,
-                                    "severity": "HIGH",
-                                    "note": "WAF bypass via mutation",
-                                    "description": f"Cross-Site Scripting (XSS) confirmed via WAF bypass mutation. Alert dialog triggered in browser. Parameter: {target_param}",
-                                    "reproduction": f"# Open in browser:\n{test_url}"
-                                })
-                                
-                                self.master.thread.record_payload_attempt("XSS", mutation, success=True)
-                                logger.info(f"[{self.master.name}] ✅ Mutation bypass successful!")
-                                break
-                                
-                        except Exception as e:
-                            logger.debug(f"Mutation test failed for payload: {e}")
-                        
-                        alert_detected = False
-            
+                findings = await self._test_mutations_with_browser(browser_manager, url, target_param, mutations)
         except Exception as e:
             logger.error(f"Mutation skill failed: {e}")
-        
+
         return {
             "success": True,
             "mutations_tested": len(mutations) if 'mutations' in dir() else 0,
             "findings": findings,
             "bypass_found": len(findings) > 0
+        }
+
+    async def _test_mutations_with_browser(self, browser_manager, url: str, target_param: str, mutations: list) -> list:
+        """Test mutations with browser to detect XSS."""
+        findings = []
+
+        async with browser_manager.get_page() as page:
+            self._alert_detected = False
+            page.on("dialog", self._handle_alert_dialog)
+
+            for mutation in mutations[:10]:
+                finding = await self._test_single_mutation(page, url, target_param, mutation)
+                if finding:
+                    findings.append(finding)
+                    logger.info(f"[{self.master.name}] ✅ Mutation bypass successful!")
+                    break
+
+        return findings
+
+    async def _handle_alert_dialog(self, dialog):
+        """Handle browser alert dialog."""
+        self._alert_detected = True
+        await dialog.dismiss()
+
+    async def _test_single_mutation(self, page, url: str, target_param: str, mutation: str):
+        """Test a single mutation payload."""
+        test_url = self._build_mutation_test_url(url, target_param, mutation)
+        self._alert_detected = False
+
+        try:
+            await page.goto(test_url, wait_until="domcontentloaded", timeout=8000)
+            await asyncio.sleep(1)
+
+            if self._alert_detected:
+                return await self._create_mutation_finding(page, url, target_param, mutation, test_url)
+
+        except Exception as e:
+            logger.debug(f"Mutation test failed for payload: {e}")
+
+        return None
+
+    def _build_mutation_test_url(self, url: str, target_param: str, mutation: str) -> str:
+        """Build test URL with mutated payload."""
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        parsed = urlparse(url)
+        url_params = parse_qs(parsed.query)
+        url_params[target_param] = [mutation]
+
+        return urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, urlencode(url_params, doseq=True), parsed.fragment
+        ))
+
+    async def _create_mutation_finding(self, page, url: str, target_param: str, mutation: str, test_url: str) -> dict:
+        """Create finding dict for successful mutation."""
+        from bugtrace.core.config import settings
+
+        screenshot_path = str(settings.LOG_DIR / f"{self.master.thread.thread_id}_mutation.png")
+        await page.screenshot(path=screenshot_path)
+
+        self.master.thread.record_payload_attempt("XSS", mutation, success=True)
+
+        return {
+            "type": "XSS",
+            "url": url,
+            "parameter": target_param,
+            "param": target_param,
+            "payload": mutation,
+            "screenshot": screenshot_path,
+            "validated": True,
+            "alert_triggered": True,
+            "severity": "HIGH",
+            "note": "WAF bypass via mutation",
+            "description": f"Cross-Site Scripting (XSS) confirmed via WAF bypass mutation. Alert dialog triggered in browser. Parameter: {target_param}",
+            "reproduction": f"# Open in browser:\n{test_url}"
         }

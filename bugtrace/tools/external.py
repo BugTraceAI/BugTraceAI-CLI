@@ -412,17 +412,32 @@ class ExternalToolManager:
         urls = []
         for line in output.splitlines():
             parts = line.replace("[", "").replace("]", "").split(" - ")
-            for p in parts:
-                p = p.strip()
-                if p.startswith("http"):
-                    try:
-                        parsed = urlparse(p)
-                        url_host = (parsed.hostname or "").lower()
-                        if url_host == target_domain or url_host.endswith("." + target_domain):
-                            urls.append(p)
-                    except Exception as e:
-                        logger.debug(f"URL parsing error in GoSpider output: {e}")
+            urls.extend(self._extract_urls_from_parts(parts, target_domain))
         return list(set(urls))
+
+    def _extract_urls_from_parts(self, parts: list, target_domain: str) -> list:
+        """Extract in-scope URLs from line parts."""
+        urls = []
+        for p in parts:
+            p = p.strip()
+            if not p.startswith("http"):
+                continue
+
+            url = self._parse_url_if_in_scope(p, target_domain)
+            if url:
+                urls.append(url)
+        return urls
+
+    def _parse_url_if_in_scope(self, url: str, target_domain: str) -> str:
+        """Parse URL and return it if in scope, otherwise None."""
+        try:
+            parsed = urlparse(url)
+            url_host = (parsed.hostname or "").lower()
+            if url_host == target_domain or url_host.endswith("." + target_domain):
+                return url
+        except Exception as e:
+            logger.debug(f"URL parsing error in GoSpider output: {e}")
+        return None
 
     async def run_gospider(self, url: str, cookies: List[Dict] = None, depth: int = 3) -> List[str]:
         """
