@@ -438,7 +438,8 @@ def is_safe_url(url):
         addr = ipaddress.ip_address(ip)
         if addr.is_private or addr.is_loopback:
             return False
-    except:
+    except (socket.gaierror, ValueError, OSError) as e:
+        # DNS resolution failed or invalid IP
         return False
 
     return True

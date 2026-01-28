@@ -35,13 +35,14 @@ def _is_valid_jwt_format(token: str) -> bool:
         # Check for mandatory JWT fields in header
         if "alg" not in header:
             return False
-            
+
         # Try to decode payload
         payload_raw = _base64_decode(parts[1])
         json.loads(payload_raw) # Should be valid JSON
-        
+
         return True
-    except:
+    except (json.JSONDecodeError, ValueError, KeyError, UnicodeDecodeError) as e:
+        # Invalid JWT format - not a valid JWT token
         return False
 
 def _base64_decode(data: str) -> str:

@@ -1,11 +1,9 @@
 import asyncio
 import typer
-import click
 import warnings
 from typing import Optional
 from datetime import datetime
 from rich.console import Console
-from bugtrace.core.team import TeamOrchestrator
 from bugtrace.core.config import settings
 from pathlib import Path
 
@@ -24,8 +22,10 @@ def _save_qlearning_data():
     """Persist Q-Learning WAF bypass data on shutdown."""
     try:
         strategy_router.force_save()
-    except Exception:
-        pass  # Silent fail - don't interrupt shutdown
+    except Exception as e:
+        # Silent fail on shutdown - Q-Learning data is non-critical
+        # Don't log to avoid cluttering shutdown sequence
+        pass
 
 
 # Configure Click context to allow options after positional args: ./bugtraceai-cli URL --xss
@@ -180,7 +180,9 @@ def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False
                         # Still running after grace period — force kill
                         try:
                             os.killpg(os.getpgrp(), sig_mod.SIGKILL)
-                        except Exception:
+                        except Exception as e:
+                            # killpg might fail if process group doesn't exist or permission denied
+                            # Fall back to direct exit
                             os._exit(1)
 
         with Live(dashboard, refresh_per_second=4, screen=True):
@@ -403,7 +405,8 @@ def _run_focused_mode(target: str, xss: bool = False, sqli: bool = False, lfi: b
                 import signal
                 try:
                     os.killpg(os.getpgrp(), signal.SIGKILL)
-                except:
+                except Exception as e:
+                    # killpg might fail - fall back to sys.exit
                     import sys
                     sys.exit(1)
         
