@@ -30,69 +30,77 @@ class SSRFAgent(BaseAgent):
         # Deduplication
         self._tested_params = set()
         
+    async def _test_with_go_fuzzer(self, param: str) -> list:
+        """Test parameter with Go SSRF fuzzer."""
+        findings = []
+        dashboard.log(f"[{self.name}] 🚀 Launching Go SSRF Fuzzer on '{param}'...", "INFO")
+        go_result = await external_tools.run_go_ssrf_fuzzer(self.url, param)
+
+        if go_result and go_result.get("hits"):
+            for hit in go_result["hits"]:
+                dashboard.log(f"[{self.name}] 🚨 SSRF HIT: {hit['payload']} ({hit['severity']})", "CRITICAL")
+                findings.append({
+                    "param": param,
+                    "payload": hit["payload"],
+                    "severity": hit["severity"],
+                    "reason": hit["reason"],
+                    "status": "VALIDATED_CONFIRMED",
+                    "validated": True
+                })
+        return findings
+
+    async def _test_with_llm_strategy(self, param: str) -> list:
+        """Test parameter with LLM-generated payloads."""
+        findings = []
+        dashboard.log(f"[{self.name}] 🤖 Requesting LLM bypass strategy for '{param}'...", "INFO")
+        strategy = await self._llm_get_strategy(param)
+
+        if strategy and "payloads" in strategy:
+            for payload_item in strategy["payloads"]:
+                payload = payload_item.get("payload")
+                if payload:
+                    res = await self._test_payload(param, payload)
+                    if res and self._determine_validation_status(res):
+                        findings.append({
+                            "param": param,
+                            "payload": payload,
+                            "severity": "HIGH",
+                            "reason": "Confirmed via LLM-designed payload",
+                            "status": "VALIDATED_CONFIRMED",
+                            "validated": True
+                        })
+                        break
+        return findings
+
     async def run_loop(self) -> Dict:
         """Main execution loop for SSRF testing."""
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] 🚀 Starting SSRF analysis on {self.url}", "INFO")
-        
+
         all_findings = []
-        
         for param in self.params:
             logger.info(f"[{self.name}] Testing {param} on {self.url}")
-            
-            # Deduplication check
+
             key = f"{self.url}#{param}"
             if key in self._tested_params:
                 logger.info(f"[{self.name}] Skipping {param} - already tested")
                 continue
-            
-            findings = []
-            previous_response = ""
-            
-            # 1. High-Performance Go Fuzzer (Bypass Levels 1-5)
-            dashboard.log(f"[{self.name}] 🚀 Launching Go SSRF Fuzzer on '{param}'...", "INFO")
-            go_result = await external_tools.run_go_ssrf_fuzzer(self.url, param)
-            
-            if go_result and go_result.get("hits"):
-                for hit in go_result["hits"]:
-                    dashboard.log(f"[{self.name}] 🚨 SSRF HIT: {hit['payload']} ({hit['severity']})", "CRITICAL")
-                    findings.append({
-                        "param": param,
-                        "payload": hit["payload"],
-                        "severity": hit["severity"],
-                        "reason": hit["reason"],
-                        "status": "VALIDATED_CONFIRMED",
-                        "validated": True
-                    })
-            
-            # 2. LLM-Driven deep strategy (Level 6+) - Fallback/Supplement
+
+            # High-Performance Go Fuzzer
+            findings = await self._test_with_go_fuzzer(param)
+
+            # LLM-Driven deep strategy (fallback)
             if not findings:
-                dashboard.log(f"[{self.name}] 🤖 Requesting LLM bypass strategy for '{param}'...", "INFO")
-                strategy = await self._llm_get_strategy(param)
-                if strategy and "payloads" in strategy:
-                    for payload_item in strategy["payloads"]:
-                        payload = payload_item.get("payload")
-                        if payload:
-                            res = await self._test_payload(param, payload)
-                            if res and self._determine_validation_status(res):
-                                findings.append({
-                                    "param": param,
-                                    "payload": payload,
-                                    "severity": "HIGH",
-                                    "reason": "Confirmed via LLM-designed payload",
-                                    "status": "VALIDATED_CONFIRMED",
-                                    "validated": True
-                                })
-                                break
-            
+                findings = await self._test_with_llm_strategy(param)
+
             if findings:
                 all_findings.extend(findings)
                 await self._create_finding(findings[0])
-            
+
             self._tested_params.add(key)
-        
+
         return {
-            "status": JobStatus.COMPLETED, 
+            "status": JobStatus.COMPLETED,
             "vulnerable": len(all_findings) > 0,
             "findings": all_findings,
             "findings_count": len(all_findings)

