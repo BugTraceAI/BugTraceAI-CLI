@@ -414,7 +414,8 @@ class ExternalToolManager:
                         url_host = (parsed.hostname or "").lower()
                         if url_host == target_domain or url_host.endswith("." + target_domain):
                             urls.append(p)
-                    except:
+                    except Exception as e:
+                        logger.debug(f"URL parsing error in GoSpider output: {e}")
                         continue
                     
         unique_urls = list(set(urls))

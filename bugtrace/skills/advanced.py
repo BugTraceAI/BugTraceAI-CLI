@@ -74,8 +74,8 @@ class SSRFSkill(BaseSkill):
                                     })
                                     logger.info(f"[{self.master.name}] ✅ SSRF detected: {indicator}")
                                     break
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"SSRF/IDOR/OpenRedirect test failed: {e}")
         
         return {"success": True, "findings": findings}
 
@@ -142,8 +142,8 @@ class IDORSkill(BaseSkill):
                                 })
                                 logger.info(f"[{self.master.name}] ⚠️ Potential IDOR on {param_name}")
                                 break
-                    except:
-                        pass
+                    except Exception as e:
+                logger.debug(f"OOB XSS payload injection failed: {e}")
         
         return {"success": True, "findings": findings}
 

@@ -234,7 +234,8 @@ class XSSVerifier:
                                     }''', inp)
                                     await asyncio.sleep(0.8)
                                     if dialog_detected: break
-                                except: pass
+                                except Exception as e:
+                                    logger.debug(f"Focus event failed: {e}")
                         
                         if dialog_detected: return _make_result()
 
@@ -246,7 +247,8 @@ class XSSVerifier:
                                 if await cand.is_visible():
                                     await cand.hover(timeout=500)
                                     if dialog_detected: break
-                            except: pass
+                            except Exception as e:
+                                logger.debug(f"Hover action failed: {e}")
                             
                         if dialog_detected: return _make_result()
 
@@ -328,7 +330,8 @@ class XSSVerifier:
                             if pwn_elements > 0:
                                 visual_confirmed = True
                                 logger.info(f"[{url}] Visual Defacement Confirmed: bt-pwn element found (count: {pwn_elements})!")
-                        except:
+                        except Exception as e:
+                            logger.debug(f"Visual defacement check failed: {e}")
                             # Fallback to specific ID checks
                             if await page.locator("#bt-pwn").count() > 0:
                                 visual_confirmed = True
@@ -439,7 +442,8 @@ class XSSVerifier:
         finally:
             try:
                 if page: await page.close()
-            except: pass
+            except Exception as e:
+                logger.debug(f"Page/Context/Browser close error: {e}")
             try:
                 if context: await context.close()
             except: pass

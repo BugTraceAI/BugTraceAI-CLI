@@ -33,8 +33,8 @@ class SQLMapSkill(BaseSkill):
             try:
                 session_data = await browser_manager.get_session_data()
                 cookies = session_data.get("cookies", [])
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Session data fetch failed: {e}")
             
             result = await external_tools.run_sqlmap(
                 url, 

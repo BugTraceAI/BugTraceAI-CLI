@@ -39,7 +39,8 @@ class VisualCrawler:
             
             # Remove fragment
             return urlunparse((scheme, netloc, parsed.path, parsed.params, parsed.query, ""))
-        except:
+        except Exception as e:
+            logger.debug(f"URL normalization error: {e}")
             return ""
 
     def _is_in_scope(self, url: str, start_url: str) -> bool:
@@ -58,7 +59,8 @@ class VisualCrawler:
             # Check if path is under start path (optional, maybe too strict for typical crawling)
             # usually we just want same domain.
             return True
-        except:
+        except Exception as e:
+            logger.debug(f"Scope check error: {e}")
             return False
 
     async def crawl(self, start_url: str, max_pages: int = 25, max_depth: int = 2) -> Dict[str, Any]:

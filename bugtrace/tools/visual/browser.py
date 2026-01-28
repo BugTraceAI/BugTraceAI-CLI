@@ -179,8 +179,8 @@ class BrowserManager:
                 await self._browser.close()
             if self._playwright:
                 await self._playwright.stop()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Emergency cleanup error: {e}")
         finally:
             self._browser = None
             self._playwright = None
@@ -284,7 +284,8 @@ class BrowserManager:
                                     await page.wait_for_timeout(1000)
                                     if triggered:
                                         break
-                                except: pass
+                                except Exception as e:
+                                    logger.debug(f"Back link click failed: {e}")
                                 
                     except Exception as interact_e:
                         logger.warning(f"Interaction phase failed: {interact_e}")

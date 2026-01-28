@@ -57,8 +57,8 @@ class ManipulatorOrchestrator:
         try:
             payload_sample = str(request.params)[:80]
             dashboard.set_current_payload(payload=payload_sample, vector="HTTP Mutation", status="Testing")
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Dashboard update failed: {e}")
 
         status_code, body, duration = await self.controller.execute(request)
         
