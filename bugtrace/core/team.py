@@ -55,7 +55,7 @@ async def run_agent_with_semaphore(semaphore: asyncio.Semaphore, agent, process_
             return {"error": str(e), "findings": []}
 
 class TeamOrchestrator:
-    
+
     def __init__(self, target: str, resume: bool = False, max_depth: int = 2, max_urls: int = 15, use_vertical_agents: bool = False, output_dir: Optional[Path] = None):
         self.target = target
         self.output_dir = output_dir
@@ -65,64 +65,91 @@ class TeamOrchestrator:
         self.agents: List[BaseAgent] = []
         self._stop_event = asyncio.Event()
         self.auth_creds: Optional[str] = None
-        
-        # Specialist Agents (Persistent instances for event-driven mode)
-        self.jwt_agent = JWTAgent(event_bus=event_bus)
 
-        # NEW: Phase 1 Competitive Advantage Agents
+        # Initialize specialist agents
+        self._init_specialist_agents()
+
+        # Setup vertical agent architecture
+        self._init_vertical_mode(use_vertical_agents)
+
+        # Setup persistence and resumption
+        self._init_database(resume)
+
+    def _init_specialist_agents(self):
+        """Initialize specialist agent instances."""
+        self.jwt_agent = JWTAgent(event_bus=event_bus)
         self.asset_discovery_agent = AssetDiscoveryAgent(event_bus=event_bus)
         self.api_security_agent = APISecurityAgent(event_bus=event_bus)
         self.chain_discovery_agent = ChainDiscoveryAgent(event_bus=event_bus)
 
-        # Event Bus reference
         self.event_bus = event_bus
         logger.info("Event Bus integrated into TeamOrchestrator")
         logger.info("✨ Phase 1 Agents loaded: AssetDiscovery, APISecurity, ChainDiscovery")
-        
-        # New: Vertical Agent Architecture (URLMasterAgent)
+
+    def _init_vertical_mode(self, use_vertical_agents: bool):
+        """Initialize vertical agent architecture settings."""
         self.use_vertical_agents = use_vertical_agents
         self.url_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_URL_AGENTS)
         if use_vertical_agents:
             logger.info(f"Sequential Pipeline (V2) ENABLED (max {settings.MAX_CONCURRENT_URL_AGENTS} concurrent URLs)")
-            
-        # --- Persistence & Resumption Logic ---
+
+    def _init_database(self, resume: bool):
+        """Initialize database and resumption logic."""
         from bugtrace.core.database import get_db_manager
         self.db = get_db_manager()
-        
+
         if resume:
-            self.scan_id = self.db.get_active_scan(target)
+            self.scan_id = self.db.get_active_scan(self.target)
             if not self.scan_id:
-                logger.warning(f"No active scan found to resume for {target}. Starting new.")
-                self.scan_id = self.db.create_new_scan(target)
-                self.resume = False # False start
+                logger.warning(f"No active scan found to resume for {self.target}. Starting new.")
+                self.scan_id = self.db.create_new_scan(self.target)
+                self.resume = False
         else:
-            self.scan_id = self.db.create_new_scan(target)
-            
+            self.scan_id = self.db.create_new_scan(self.target)
+
         logger.info(f"TeamOrchestrator initialized for Scan ID: {self.scan_id}")
-        
-        # State Manager (Now DB backed)
-        self.state_manager = get_state_manager(target)
+
+        # State Manager (Database backed)
+        self.state_manager = get_state_manager(self.target)
         self.state_manager.set_scan_id(self.scan_id)
-        
-        # Initialize State
+
+        # Initialize state
         self.processed_urls = set()
-        self.url_queue = [] 
-        
-        # Load active state if reusing scan
+        self.url_queue = []
+
+        # Load active state if resuming
         if self.resume:
-             state = self.state_manager.load_state()
-             if state:
-                 self.processed_urls = set(state.get("processed_urls", []))
-                 self.url_queue = state.get("url_queue", [])
-                 logger.info(f"Resumed scan: {len(self.processed_urls)} URLs already processed, {len(self.url_queue)} pending.")
-    
+            state = self.state_manager.load_state()
+            if state:
+                self.processed_urls = set(state.get("processed_urls", []))
+                self.url_queue = state.get("url_queue", [])
+                logger.info(f"Resumed scan: {len(self.processed_urls)} URLs already processed, {len(self.url_queue)} pending.")
+
     def set_auth(self, creds: str):
         self.auth_creds = creds
-        
+
     async def start(self):
         """Starts the Multi-Agent Team."""
-        
-        # UI Setup
+        # Setup dashboard sink
+        self._setup_dashboard_sink()
+
+        # Setup signal handlers
+        self._setup_signal_handlers()
+
+        # Configure logging
+        self._configure_logging()
+
+        # Run main logic
+        if not dashboard.active:
+            with Live(dashboard, refresh_per_second=4, screen=True) as live:
+                dashboard.active = True
+                await self._run_hunter_core()
+                dashboard.active = False
+        else:
+            await self._run_hunter_core()
+
+    def _setup_dashboard_sink(self):
+        """Setup dashboard log sink."""
         def dashboard_sink(message):
             try:
                 record = message.record
@@ -132,13 +159,16 @@ class TeamOrchestrator:
                     dashboard.log(text, level)
             except Exception as e:
                 logger.debug(f"Dashboard sink error: {e}")
-        
-        # Signal Management with HITL (Human-In-The-Loop)
+
+        self._dashboard_sink = dashboard_sink
+
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for HITL mode."""
         loop = asyncio.get_running_loop()
         self.sigint_count = 0
         self.hitl_active = False
         self.current_findings = []
-        
+
         def handle_sigint():
             self.sigint_count += 1
             if self.sigint_count >= 3:
@@ -147,7 +177,6 @@ class TeamOrchestrator:
             elif self.sigint_count == 2:
                 dashboard.log("Press Ctrl+C again to force quit.", "WARN")
             else:
-                # First Ctrl+C: Enter HITL mode
                 self.hitl_active = True
                 asyncio.create_task(self._enter_hitl_mode())
 
@@ -155,245 +184,276 @@ class TeamOrchestrator:
             try:
                 loop.add_signal_handler(sig, handle_sigint)
             except NotImplementedError:
-                pass 
-        
-        logger.remove()
-        logger.add(dashboard_sink, level="INFO")
-        logger.add("logs/execution.log", rotation="10 MB", level="DEBUG")
-        
-        # Input Helper
-        import sys, select, tty, termios
-        
-        def is_data():
-            return select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], [])
+                pass
 
-        if not dashboard.active:
-            with Live(dashboard, refresh_per_second=4, screen=True) as live:
-                dashboard.active = True
-                await self._run_hunter_core()
-                dashboard.active = False
-        else:
-            await self._run_hunter_core()
+    def _configure_logging(self):
+        """Configure logging for dashboard and file."""
+        logger.remove()
+        logger.add(self._dashboard_sink, level="INFO")
+        logger.add("logs/execution.log", rotation="10 MB", level="DEBUG")
 
     async def _run_hunter_core(self):
         """Core Hunter logic separated from UI lifecycle."""
         dashboard.set_target(self.target)
-        
-        # --- PHASE 0: Diagnostics ---
-        from bugtrace.core.diagnostics import diagnostics
-        if not await diagnostics.run_all():
-            dashboard.log("❌ CRITICAL SYSTEM FAILURE: Diagnostics failed. Aborting.", "CRITICAL")
-            await asyncio.sleep(3) # Initial wait to read
-            sys.exit(1)
-        
+
+        # Run diagnostics
+        if not await self._run_diagnostics():
+            return
+
         dashboard.set_phase("TEAM_ASSEMBLY")
-        
+
         if not self.resume:
             self.state_manager.clear()
-        
-        # --- PHASE 0.5: Authentication ---
-        # TASK-07: Added try/finally for browser cleanup on auth errors
-        if self.auth_creds:
-            dashboard.set_phase("AUTHENTICATION")
-            dashboard.current_agent = "AuthAgent"
-            dashboard.log(f"Initiating authenticated session for {self.auth_creds.split(':')[0]}...", "INFO")
-            from bugtrace.tools.visual.browser import browser_manager
-            # Attempt login at common paths or target directly
-            # For Gin & Juice, login is at /login
-            login_url = f"{self.target.rstrip('/')}/login"
-            try:
-                success = await browser_manager.login(login_url, self.auth_creds)
-                if success:
-                    dashboard.log("Authentication Successful. Session captured.", "SUCCESS")
-                else:
-                    dashboard.log("Authentication Failed. Proceeding as guest.", "WARN")
-            except Exception as e:
-                logger.error(f"Authentication error: {e}")
-                dashboard.log(f"Authentication Error: {e}. Proceeding as guest.", "ERROR")
-            finally:
-                # Ensure browser resources are cleaned up even on error
-                try:
-                    if hasattr(browser_manager, 'cleanup_auth_session'):
-                        await browser_manager.cleanup_auth_session()
-                except Exception as cleanup_err:
-                    logger.debug(f"Auth session cleanup warning: {cleanup_err}")
-            
-        # =====================================================
-        # V2 SEQUENTIAL PIPELINE MODE (THE ONLY MODE)
-        # =====================================================
-        # We strictly enforce sequential execution to ensure stability
-        # Parallel chaos is removed.
-        
+
+        # Authentication phase
+        await self._handle_authentication()
+
+        # Sequential pipeline execution
         dashboard.log("🔒 Enforcing Sequential Hunter Loop for stability", "INFO")
-        
+
         if dashboard.stop_requested or self._stop_event.is_set():
             return
 
-        # Register Global Event Handlers
-        # File Upload Agent is usually on-demand or per-url, but can be global
         await self._run_sequential_pipeline(dashboard)
-        
+
         dashboard.set_phase("COMPLETE")
         await asyncio.sleep(2)
 
+    async def _run_diagnostics(self) -> bool:
+        """Run system diagnostics."""
+        from bugtrace.core.diagnostics import diagnostics
+        if not await diagnostics.run_all():
+            dashboard.log("❌ CRITICAL SYSTEM FAILURE: Diagnostics failed. Aborting.", "CRITICAL")
+            await asyncio.sleep(3)
+            sys.exit(1)
+        return True
+
+    async def _handle_authentication(self):
+        """Handle authentication if credentials provided."""
+        if not self.auth_creds:
+            return
+
+        dashboard.set_phase("AUTHENTICATION")
+        dashboard.current_agent = "AuthAgent"
+        dashboard.log(f"Initiating authenticated session for {self.auth_creds.split(':')[0]}...", "INFO")
+
+        from bugtrace.tools.visual.browser import browser_manager
+        login_url = f"{self.target.rstrip('/')}/login"
+
+        try:
+            success = await browser_manager.login(login_url, self.auth_creds)
+            if success:
+                dashboard.log("Authentication Successful. Session captured.", "SUCCESS")
+            else:
+                dashboard.log("Authentication Failed. Proceeding as guest.", "WARN")
+        except Exception as e:
+            logger.error(f"Authentication error: {e}")
+            dashboard.log(f"Authentication Error: {e}. Proceeding as guest.", "ERROR")
+        finally:
+            try:
+                if hasattr(browser_manager, 'cleanup_auth_session'):
+                    await browser_manager.cleanup_auth_session()
+            except Exception as cleanup_err:
+                logger.debug(f"Auth session cleanup warning: {cleanup_err}")
+
     async def _generate_vertical_report(self, findings: list, urls_scanned: list, metadata: dict = None):
-        """
-        Generate consolidated report for vertical mode.
-        Uses the new ReportingAgent for high-quality artifacts.
-        """
+        """Generate consolidated report for vertical mode using ReportingAgent."""
         from pathlib import Path
         from datetime import datetime
         from urllib.parse import urlparse
         import shutil
-        
+
         try:
-            # Create report directory based on target
-            parsed = urlparse(self.target)
-            domain = parsed.netloc.replace(":", "_") or "local"
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            report_dir = settings.REPORT_DIR / f"{domain}_{timestamp}"
-            report_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Create subdirectories for organization
-            (report_dir / "logs").mkdir(exist_ok=True)
-            
-            # 1. Use ReportingAgent for the "Beautiful" part
-            dashboard.log(f"🤖 Deploying ReportingAgent for final assessment...", "INFO")
-            reporting_agent = ReportingAgent(self.target)
-            
-            # Organize Artifacts by URL (Per-URL Folder Structure)
-            url_folders = {}
-            for u in urls_scanned:
-                # Sanitize URL for folder name
-                safe_name = u.replace("://", "_").replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_")
-                # Limit length
-                safe_name = safe_name[:100]
-                folder = report_dir / safe_name
-                folder.mkdir(exist_ok=True)
-                url_folders[u] = folder
-                
-            # Move screenshots to their respective URL folders
-            linked_screenshots = set()
-            for f in findings:
-                f_url = f.get("url", "unknown")
-                # find matching folder (closest match or default to root/logs)
-                target_folder = report_dir / "logs" # Default
-                
-                # Match finding URL to scanned URLs
-                # Simple exact match or derived
-                safe_name = f_url.replace("://", "_").replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_")[:100]
-                possible_folder = report_dir / safe_name
-                
-                if possible_folder.exists():
-                    target_folder = possible_folder
-                
-                # Handle Screenshot
-                if f.get("screenshot"):
-                    original_name = Path(f["screenshot"]).name
-                    source_path = settings.LOG_DIR / original_name
-                    
-                    # Try legacy location too
-                    if not source_path.exists():
-                         source_path = Path("reports") / original_name
-                         
-                    if source_path.exists():
-                        dest_path = target_folder / original_name
-                        shutil.move(str(source_path), str(dest_path))
-                        # Update finding to point to relative path for HTML
-                        f["screenshot"] = f"{target_folder.name}/{original_name}"
-                        linked_screenshots.add(original_name)
-                    else:
-                        # Keep original path if not found (might be absolute custom path)
-                        pass
-                
-                # Generate Mini-Report for this URL (JSON)
-                # This matches "URL1-Exploit_Report" concept
-                with open(target_folder / "finding_details.json", "a") as fd:
-                     import json
-                     fd.write(json.dumps(f, default=str) + "\n")
+            report_dir = self._create_report_directory()
+            url_folders = self._create_url_folders(report_dir, urls_scanned)
+            linked_screenshots = self._organize_artifacts(findings, url_folders, report_dir)
+            self._cleanup_unlinked_screenshots(linked_screenshots)
 
-            # Cleanup unlinked screenshots in LOG_DIR
-            for file in settings.LOG_DIR.glob("*.png"):
-                if file.name not in linked_screenshots:
-                    try:
-                        file.unlink() # Delete unreferenced to save space
-                    except OSError as e:
-                        logger.debug(f"Failed to delete screenshot {file}: {e}")
+            # Generate AI report
+            await self._invoke_reporting_agent(findings, urls_scanned, metadata, report_dir)
 
-            # 2. Invoke AI Report Generation
-            await reporting_agent.generate_final_report(findings, urls_scanned, metadata, report_dir)
-            
-            # 3. Cleanup redundant folders if they were used
-            for folder in ["evidence", "screenshots", "test_results"]:
-                p = Path(folder)
-                if p.exists() and p.is_dir():
-                    # Move orphan files if any
-                    for file in p.glob("*"):
-                        if file.is_file():
-                             shutil.move(str(file), str(report_dir / "logs" / file.name))
-                    try:
-                        p.rmdir() # Only if empty now
-                    except OSError as e:
-                        logger.debug(f"Failed to remove directory {p}: {e}")
+            # Cleanup redundant folders
+            self._cleanup_redundant_folders(report_dir)
 
-            print(f"\n{'='*60}")
-            print(f"[✓] SCAN COMPLETE - V1.6.1 Phoenix")
-            print(f"[✓] Target: {self.target}")
-            print(f"[✓] Findings: {len(findings)}")
-            print(f"[✓] Detailed Report: {report_dir / 'REPORT.html'}")
-            print(f"{'='*60}\n")
-            
+            self._print_completion_summary(report_dir, findings)
+
         except asyncio.TimeoutError as e:
             logger.critical(f"[ReportingAgent] ⏳ CRASH DETECTED: Report generation exceeded timeout. Killing tool. Error: {e}")
-            # Optionally, return a default or partial report structure
-            return {}
         except Exception as e:
             logger.error(f"Failed to generate vertical report: {e}")
             import traceback
             logger.debug(traceback.format_exc())
             dashboard.log(f"❌ Report generation failed: {e}", "ERROR")
 
+    def _create_report_directory(self) -> Path:
+        """Create and return report directory."""
+        parsed = urlparse(self.target)
+        domain = parsed.netloc.replace(":", "_") or "local"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_dir = settings.REPORT_DIR / f"{domain}_{timestamp}"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        (report_dir / "logs").mkdir(exist_ok=True)
+        return report_dir
+
+    def _create_url_folders(self, report_dir: Path, urls_scanned: list) -> dict:
+        """Create folders for each scanned URL."""
+        url_folders = {}
+        for u in urls_scanned:
+            safe_name = u.replace("://", "_").replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_")
+            safe_name = safe_name[:100]
+            folder = report_dir / safe_name
+            folder.mkdir(exist_ok=True)
+            url_folders[u] = folder
+        return url_folders
+
+    def _organize_artifacts(self, findings: list, url_folders: dict, report_dir: Path) -> set:
+        """Organize artifacts (screenshots) into URL folders."""
+        from shutil import move
+        linked_screenshots = set()
+
+        for f in findings:
+            f_url = f.get("url", "unknown")
+            target_folder = self._determine_target_folder(f_url, report_dir)
+
+            if f.get("screenshot"):
+                self._move_screenshot(f, target_folder, linked_screenshots)
+
+            self._write_finding_details(target_folder, f)
+
+        return linked_screenshots
+
+    def _determine_target_folder(self, f_url: str, report_dir: Path) -> Path:
+        """Determine target folder for finding artifacts."""
+        safe_name = f_url.replace("://", "_").replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_")[:100]
+        possible_folder = report_dir / safe_name
+        return possible_folder if possible_folder.exists() else report_dir / "logs"
+
+    def _move_screenshot(self, finding: dict, target_folder: Path, linked_screenshots: set):
+        """Move screenshot to target folder and update finding."""
+        from shutil import move
+        original_name = Path(finding["screenshot"]).name
+        source_path = settings.LOG_DIR / original_name
+
+        if not source_path.exists():
+            source_path = Path("reports") / original_name
+
+        if source_path.exists():
+            dest_path = target_folder / original_name
+            move(str(source_path), str(dest_path))
+            finding["screenshot"] = f"{target_folder.name}/{original_name}"
+            linked_screenshots.add(original_name)
+
+    def _write_finding_details(self, target_folder: Path, finding: dict):
+        """Write finding details to JSON file."""
+        with open(target_folder / "finding_details.json", "a") as fd:
+            import json
+            fd.write(json.dumps(finding, default=str) + "\n")
+
+    def _cleanup_unlinked_screenshots(self, linked_screenshots: set):
+        """Delete unreferenced screenshots."""
+        for file in settings.LOG_DIR.glob("*.png"):
+            if file.name not in linked_screenshots:
+                try:
+                    file.unlink()
+                except OSError as e:
+                    logger.debug(f"Failed to delete screenshot {file}: {e}")
+
+    async def _invoke_reporting_agent(self, findings: list, urls_scanned: list, metadata: dict, report_dir: Path):
+        """Invoke ReportingAgent for final report."""
+        dashboard.log(f"🤖 Deploying ReportingAgent for final assessment...", "INFO")
+        reporting_agent = ReportingAgent(self.target)
+        await reporting_agent.generate_final_report(findings, urls_scanned, metadata, report_dir)
+
+    def _cleanup_redundant_folders(self, report_dir: Path):
+        """Cleanup redundant artifact folders."""
+        from shutil import move
+        for folder in ["evidence", "screenshots", "test_results"]:
+            p = Path(folder)
+            if p.exists() and p.is_dir():
+                for file in p.glob("*"):
+                    if file.is_file():
+                        move(str(file), str(report_dir / "logs" / file.name))
+                try:
+                    p.rmdir()
+                except OSError as e:
+                    logger.debug(f"Failed to remove directory {p}: {e}")
+
+    def _print_completion_summary(self, report_dir: Path, findings: list):
+        """Print scan completion summary."""
+        print(f"\n{'='*60}")
+        print(f"[✓] SCAN COMPLETE - V1.6.1 Phoenix")
+        print(f"[✓] Target: {self.target}")
+        print(f"[✓] Findings: {len(findings)}")
+        print(f"[✓] Detailed Report: {report_dir / 'REPORT.html'}")
+        print(f"{'='*60}\n")
+
     async def _generate_ai_reports(self, report_dir, report_data: dict, screenshots: list):
-        """
-        Generate professional AI-written reports: Technical + Executive.
-        """
+        """Generate professional AI-written reports: Technical + Executive."""
         from bugtrace.core.llm_client import llm_client
         import json
-        
+
         findings_summary = json.dumps(report_data["findings"], indent=2, default=str)[:8000]
         meta_summary = json.dumps(report_data.get("metadata", {}), indent=2, default=str)[:4000]
-        
-        # 1. Technical Report (Pentester Level)
+
+        # Generate technical report
+        tech_report = await self._generate_technical_report(
+            report_data, findings_summary, meta_summary, screenshots
+        )
+
+        # Generate executive summary
+        exec_report = await self._generate_executive_summary(report_data)
+
+        # Generate HTML version
+        if tech_report:
+            await self._generate_html_report(report_dir, tech_report, exec_report, screenshots, report_data.get("findings", []))
+
+    async def _generate_technical_report(self, report_data: dict, findings_summary: str, meta_summary: str, screenshots: list) -> str:
+        """Generate technical assessment report."""
+        from bugtrace.core.llm_client import llm_client
+
         dashboard.log("🤖 Generating Technical Report (AI)...", "INFO")
-        
+
+        tech_prompt = self._build_technical_prompt(report_data, findings_summary, meta_summary, screenshots)
+        tech_report = await llm_client.generate(tech_prompt, "Report-Tech")
+
+        if tech_report:
+            tech_report = self._embed_screenshots(tech_report, screenshots)
+            with open(self.report_dir / "TECHNICAL_REPORT.md", "w") as f:
+                f.write(tech_report)
+            dashboard.log("✅ Technical Report generated", "SUCCESS")
+
+        return tech_report
+
+    def _build_technical_prompt(self, report_data: dict, findings_summary: str, meta_summary: str, screenshots: list) -> str:
+        """Build prompt for technical report generation."""
         system_prompt = conductor.get_full_system_prompt("ai_writer")
         if system_prompt:
-             tech_prompt = system_prompt.split("## Technical Assessment Report Prompt (Full)")[-1].split("## ")[0].strip()
+            tech_prompt = system_prompt.split("## Technical Assessment Report Prompt (Full)")[-1].split("## ")[0].strip()
         else:
             tech_prompt = f"""You are a Senior Penetration Tester writing a Professional Technical Assessment Report.
-            
+
             TARGET: {report_data["scan_info"]["target"]}
             SCAN DATE: {report_data["scan_info"]["scan_date"]}
             URLS ANALYZED: {report_data["scan_info"]["urls_scanned"]}
             FINDINGS:
             {findings_summary}
-            
+
             ATTACK SURFACE / METADATA:
             {meta_summary}
-            
+
             SCREENSHOTS CAPTURED: {screenshots}
-            
+
             Write a comprehensive Technical Vulnerability Report in Markdown format.
-            
+
             STRUCTURE:
             # Technical Assessment Report
-            
+
             ## 1. Engagement Overview
             - Target, scope, methodology used
-            
+
             ## 2. Executive Summary
             - High-level findings count and severity breakdown
-            
+
             ## 3. Vulnerability Details
             For EACH finding, write:
             ### [Vulnerability Type] - [Severity]
@@ -404,19 +464,19 @@ class TeamOrchestrator:
             - **Remediation**: How to fix it
             - **Screenshot**: If available, reference the screenshot filename
             - **Reproduction**: If provided in metadata (e.g., sqlmap command), include it in a code block.
-            
+
             ## 4. Attack Surface Analysis
             - Analyze the types of inputs found
             - Potential attack vectors
-            
+
             ## 5. Recommendations
             - Prioritized security recommendations
-            
+
             TONE: Technical, precise, professional. Write as if this is a real pentest report for a client.
             Include CVSS scores where applicable.
             """
-        
-        tech_prompt = tech_prompt.format(
+
+        return tech_prompt.format(
             target=report_data["scan_info"]["target"],
             scan_date=report_data["scan_info"]["scan_date"],
             urls_scanned=report_data["scan_info"]["urls_scanned"],
@@ -424,64 +484,77 @@ class TeamOrchestrator:
             meta_summary=meta_summary,
             screenshots=screenshots
         )
-        
-        tech_report = await llm_client.generate(tech_prompt, "Report-Tech")
-        
-        if tech_report:
-            # Embed screenshots as references in markdown
-            for screenshot in screenshots:
-                if screenshot in tech_report:
-                    tech_report = tech_report.replace(screenshot, f"![Evidence](./{screenshot})")
-            
-            with open(report_dir / "TECHNICAL_REPORT.md", "w") as f:
-                f.write(tech_report)
-            dashboard.log("✅ Technical Report generated", "SUCCESS")
-        
-        # 2. Executive Summary (C-Level)
+
+    def _embed_screenshots(self, tech_report: str, screenshots: list) -> str:
+        """Embed screenshot references in markdown."""
+        for screenshot in screenshots:
+            if screenshot in tech_report:
+                tech_report = tech_report.replace(screenshot, f"![Evidence](./{screenshot})")
+        return tech_report
+
+    async def _generate_executive_summary(self, report_data: dict) -> str:
+        """Generate executive summary report."""
+        from bugtrace.core.llm_client import llm_client
+        import json
+
         dashboard.log("🤖 Generating Executive Summary (AI)...", "INFO")
-        
+
+        exec_prompt = self._build_executive_prompt(report_data)
+        exec_report = await llm_client.generate(exec_prompt, "Report-Exec")
+
+        if exec_report:
+            with open(self.report_dir / "EXECUTIVE_SUMMARY.md", "w") as f:
+                f.write(exec_report)
+            dashboard.log("✅ Executive Summary generated", "SUCCESS")
+
+        return exec_report
+
+    def _build_executive_prompt(self, report_data: dict) -> str:
+        """Build prompt for executive summary generation."""
+        import json
+        system_prompt = conductor.get_full_system_prompt("ai_writer")
         if system_prompt:
-             exec_prompt = system_prompt.split("## CISO Executive Summary Prompt (Full)")[-1].split("## ")[0].strip()
+            exec_prompt = system_prompt.split("## CISO Executive Summary Prompt (Full)")[-1].split("## ")[0].strip()
         else:
             exec_prompt = f"""You are a CISO writing an Executive Summary for board-level stakeholders.
-            
+
             TARGET: {report_data["scan_info"]["target"]}
             TOTAL VULNERABILITIES: {report_data["summary"]["total_findings"]}
             BY TYPE: {json.dumps(report_data["summary"]["by_type"])}
             BY SEVERITY: {json.dumps(report_data["summary"]["by_severity"])}
             ATTACK SURFACE (INPUTS): {len(report_data.get("metadata", {}).get("inputs_found", []))}
             TECH STACK: {json.dumps(report_data.get("metadata", {}).get("tech_stack", {}))}
-            
+
             Write a business-focused Executive Summary in Markdown.
-            
+
             STRUCTURE:
             # Executive Summary - Security Assessment
-            
+
             ## Risk Overview
             - Overall risk rating (Critical/High/Medium/Low)
             - Business impact summary
-            
+
             ## Key Findings
             - Bullet points of the most critical issues
             - NO technical jargon - explain in business terms
-            
+
             ## Risk Matrix
             | Severity | Count | Business Impact |
             |----------|-------|-----------------|
             (fill in the table)
-            
+
             ## Recommended Actions
             1. Immediate (within 24-48 hours)
             2. Short-term (within 1 week)
             3. Long-term (ongoing)
-            
+
             ## Conclusion
             - Summary assessment and next steps
-            
+
             TONE: Professional, business-focused. Avoid technical jargon.
             """
-        
-        exec_prompt = exec_prompt.format(
+
+        return exec_prompt.format(
             target=report_data["scan_info"]["target"],
             total_findings=report_data["summary"]["total_findings"],
             by_type=json.dumps(report_data["summary"]["by_type"]),
@@ -489,30 +562,50 @@ class TeamOrchestrator:
             inputs_count=len(report_data.get("metadata", {}).get("inputs_found", [])),
             tech_stack=json.dumps(report_data.get("metadata", {}).get("tech_stack", {}))
         )
-        
-        exec_report = await llm_client.generate(exec_prompt, "Report-Exec")
-        
-        if exec_report:
-            with open(report_dir / "EXECUTIVE_SUMMARY.md", "w") as f:
-                f.write(exec_report)
-            dashboard.log("✅ Executive Summary generated", "SUCCESS")
-        
-        # 3. Generate HTML version (optional but nice)
-        if tech_report:
-            await self._generate_html_report(report_dir, tech_report, exec_report, screenshots, report_data.get("findings", []))
-    
+
     async def _generate_html_report(self, report_dir, tech_md: str, exec_md: str, screenshots: list, findings: list = None):
         """Generate a beautiful HTML report from the markdown."""
         try:
             import markdown
             import re
         except ImportError:
-            # If markdown not installed, skip HTML generation
             return
-        
+
         findings = findings or []
-        
-        # Calculate Severity Counts
+        sev_counts = self._calculate_severity_counts(findings)
+
+        # Convert markdown to HTML
+        tech_html = markdown.markdown(tech_md or "", extensions=['tables', 'fenced_code'])
+        exec_html = markdown.markdown(exec_md or "", extensions=['tables', 'fenced_code'])
+
+        # Inject anchor IDs
+        tech_html = self._inject_severity_anchors(tech_html)
+
+        # Build evidence section
+        evidence_section = self._build_evidence_section(screenshots)
+
+        # Generate HTML
+        html_content = self._build_html_template().format(
+            tech_content=tech_html,
+            exec_content=exec_html,
+            evidence_section=evidence_section,
+            c_crit=sev_counts["Critical"],
+            c_high=sev_counts["High"],
+            c_med=sev_counts["Medium"],
+            c_low=sev_counts["Low"],
+            has_crit="disabled" if sev_counts["Critical"] == 0 else "",
+            has_high="disabled" if sev_counts["High"] == 0 else "",
+            has_med="disabled" if sev_counts["Medium"] == 0 else "",
+            has_low="disabled" if sev_counts["Low"] == 0 else ""
+        )
+
+        with open(report_dir / "REPORT.html", "w") as f:
+            f.write(html_content)
+
+        dashboard.log("✅ HTML Report generated", "SUCCESS")
+
+    def _calculate_severity_counts(self, findings: list) -> dict:
+        """Calculate severity counts from findings."""
         sev_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
         for f in findings:
             s = f.get("severity", "Info").capitalize()
@@ -520,8 +613,28 @@ class TeamOrchestrator:
                 sev_counts[s] += 1
             else:
                 sev_counts["Info"] += 1
+        return sev_counts
 
-        html_template = """<!DOCTYPE html>
+    def _inject_severity_anchors(self, tech_html: str) -> str:
+        """Inject anchor IDs into HTML for navigation."""
+        import re
+        for sev in ["Critical", "High", "Medium", "Low"]:
+            pattern = re.compile(rf'(<h3.*?>.*?[\s\-(]+{sev}.*?</h3>)', re.IGNORECASE)
+            def replace_first(match):
+                return match.group(0).replace('<h3', f'<h3 id="severity-{sev.lower()}"', 1)
+            tech_html = pattern.sub(replace_first, tech_html, count=1)
+        return tech_html
+
+    def _build_evidence_section(self, screenshots: list) -> str:
+        """Build evidence section HTML."""
+        evidence_items = []
+        for screenshot in screenshots:
+            evidence_items.append(f'<div><h3>{screenshot}</h3><img src="{screenshot}" alt="{screenshot}"></div>')
+        return "\n".join(evidence_items) if evidence_items else "<p>No screenshots captured.</p>"
+
+    def _build_html_template(self) -> str:
+        """Build HTML report template."""
+        return """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -548,7 +661,7 @@ class TeamOrchestrator:
         .nav a:hover {{ text-decoration: underline; }}
         .header {{ background: linear-gradient(135deg, #238636, #1f6feb); padding: 30px; border-radius: 10px; margin-bottom: 30px; }}
         .header h1 {{ border: none; color: white; margin: 0; }}
-        
+
         /* Floating Sidebar */
         .sidebar {{
             position: fixed;
@@ -571,7 +684,7 @@ class TeamOrchestrator:
         .high-badge {{ background: rgba(219, 109, 40, 0.2); color: #db6d28; }}
         .med-badge {{ background: rgba(210, 153, 34, 0.2); color: #d29922; }}
         .low-badge {{ background: rgba(63, 185, 80, 0.2); color: #3fb950; }}
-        
+
         @media (max-width: 1000px) {{
             body {{ padding-right: 20px; }}
             .sidebar {{ position: static; width: auto; margin-bottom: 20px; }}
@@ -608,22 +721,22 @@ class TeamOrchestrator:
     <div class="header">
         <h1>🔒 BugtraceAI Security Assessment</h1>
     </div>
-    
+
     <section id="executive">
         <h1>Executive Summary</h1>
         {exec_content}
     </section>
-    
+
     <section id="technical">
         <h1>Technical Assessment</h1>
         {tech_content}
     </section>
-    
+
     <section id="evidence">
         <h1>Evidence Screenshots</h1>
         {evidence_section}
     </section>
-    
+
     <footer style="margin-top: 50px; padding-top: 20px; border-top: 1px solid #30363d; color: #6e7681; font-size: 0.9em;">
         <div style="display: flex; justify-content: space-between; align-items: center;">
             <div>
@@ -641,67 +754,35 @@ class TeamOrchestrator:
     </footer>
 </body>
 </html>"""
-        
-        # Convert markdown to HTML
-        tech_html = markdown.markdown(tech_md or "", extensions=['tables', 'fenced_code'])
-        exec_html = markdown.markdown(exec_md or "", extensions=['tables', 'fenced_code'])
-        
-        # Inject IDs into Technical HTML for anchoring
-        # We look for <h3>Title - Severity</h3> patterns and inject id="severity-[level]" into the FIRST occurrence
-        for sev in ["Critical", "High", "Medium", "Low"]:
-            # Valid patterns: <h3>XSS - Critical</h3> or <h3>... (Critical)</h3>
-            # The prompt says: ### [Vulnerability Type] - [Severity]
-            # So looking for " - Critical" or similar inside h3 tag
-            pattern = re.compile(rf'(<h3.*?>.*?[\s\-(]+{sev}.*?</h3>)', re.IGNORECASE)
-            
-            # Use a function to only replace the FIRST occurrence with the ID
-            def replace_first(match):
-                return match.group(0).replace('<h3', f'<h3 id="severity-{sev.lower()}"', 1)
-            
-            # re.sub with count=1
-            tech_html = pattern.sub(replace_first, tech_html, count=1)
-        
-        # Build evidence section
-        evidence_items = []
-        for screenshot in screenshots:
-            evidence_items.append(f'<div><h3>{screenshot}</h3><img src="{screenshot}" alt="{screenshot}"></div>')
-        evidence_section = "\n".join(evidence_items) if evidence_items else "<p>No screenshots captured.</p>"
-        
-        html_content = html_template.format(
-            tech_content=tech_html,
-            exec_content=exec_html,
-            evidence_section=evidence_section,
-            c_crit=sev_counts["Critical"],
-            c_high=sev_counts["High"],
-            c_med=sev_counts["Medium"],
-            c_low=sev_counts["Low"],
-            has_crit="disabled" if sev_counts["Critical"] == 0 else "",
-            has_high="disabled" if sev_counts["High"] == 0 else "",
-            has_med="disabled" if sev_counts["Medium"] == 0 else "",
-            has_low="disabled" if sev_counts["Low"] == 0 else ""
-        )
-        
-        with open(report_dir / "REPORT.html", "w") as f:
-            f.write(html_content)
-        
-        dashboard.log("✅ HTML Report generated", "SUCCESS")
 
     async def _enter_hitl_mode(self):
-        """
-        Enter Human-In-The-Loop mode.
-        Pauses scan and shows interactive menu.
-        """
+        """Enter Human-In-The-Loop mode. Pauses scan and shows interactive menu."""
         import sys
         import termios
         import tty
-        
-        # Restore terminal to normal mode for input
+
+        self._restore_terminal()
+        self._print_hitl_menu()
+
+        try:
+            choice = input("Your choice: ").strip().lower()
+        except EOFError:
+            choice = 'c'
+
+        await self._handle_hitl_choice(choice)
+
+    def _restore_terminal(self):
+        """Restore terminal to normal mode for input."""
+        import sys
+        import termios
         try:
             old_settings = termios.tcgetattr(sys.stdin)
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         except (termios.error, AttributeError) as e:
             logger.debug(f"Terminal settings restoration failed: {e}")
-        
+
+    def _print_hitl_menu(self):
+        """Print HITL mode menu."""
         print("\n" + "="*60)
         print("⏸️  SCAN PAUSED - Human-In-The-Loop Mode")
         print("="*60)
@@ -714,41 +795,34 @@ class TeamOrchestrator:
         print("  [s] Save progress and exit")
         print("  [q] Quit immediately")
         print()
-        
-        try:
-            choice = input("Your choice: ").strip().lower()
-        except EOFError:
-            choice = 'c'
-        
+
+    async def _handle_hitl_choice(self, choice: str):
+        """Handle HITL menu choice."""
         if choice == 'c':
             print("▶️  Resuming scan...")
             self.hitl_active = False
             self.sigint_count = 0
-            
         elif choice == 'f':
             self._show_findings()
-            await self._enter_hitl_mode()  # Show menu again
-            
+            await self._enter_hitl_mode()
         elif choice == 's':
             print("💾 Saving progress...")
             await self._save_hitl_progress()
             print("✅ Progress saved. Exiting...")
             self._stop_event.set()
-            
         elif choice == 'q':
             print("👋 Quitting...")
             sys.exit(0)
-            
         else:
             print(f"❓ Unknown option: {choice}")
             await self._enter_hitl_mode()
-    
+
     def _show_findings(self):
         """Display current findings in HITL mode."""
         print("\n" + "-"*50)
         print("📋 CURRENT FINDINGS")
         print("-"*50)
-        
+
         if not self.current_findings:
             print("  No findings yet.")
         else:
@@ -757,19 +831,18 @@ class TeamOrchestrator:
                 url = finding.get('url', 'N/A')
                 validated = "✅" if finding.get('conductor_validated') else "⚠️"
                 print(f"  {i}. [{ftype}] {validated} {url[:60]}...")
-        
+
         print("-"*50 + "\n")
-    
+
     async def _save_hitl_progress(self):
         """Save current progress when exiting via HITL."""
         import json
         from pathlib import Path
         from datetime import datetime
-        
-        # Create partial report
+
         report_dir = Path("reports") / f"partial_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         report_dir.mkdir(parents=True, exist_ok=True)
-        
+
         report_data = {
             "status": "partial",
             "target": self.target,
@@ -777,30 +850,32 @@ class TeamOrchestrator:
             "findings": self.current_findings,
             "findings_count": len(self.current_findings)
         }
-        
+
         with open(report_dir / "partial_report.json", "w") as f:
             json.dump(report_data, f, indent=2, default=str)
-        
+
         print(f"📁 Saved to: {report_dir}")
 
     async def _checkpoint(self, phase_name: str):
         """V4 Feature: Step-by-Step Debugging Checkpoint."""
-        if settings.DEBUG: # Only in debug mode (set in bugtraceaicli.conf)
-            print(f"\n✋ [V4 DEBUG] Phase '{phase_name}' Complete. System PAUSED.")
-            print(f"👉 Press ENTER to continue to next phase... (or Ctrl+C to abort)")
-            try:
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, input)
-            except Exception as e:
-                logger.debug(f"User input wait interrupted: {e}")
-            print("▶️ Resuming...")
+        if not settings.DEBUG:
+            return
 
-    
+        print(f"\n✋ [V4 DEBUG] Phase '{phase_name}' Complete. System PAUSED.")
+        print(f"👉 Press ENTER to continue to next phase... (or Ctrl+C to abort)")
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, input)
+        except Exception as e:
+            logger.debug(f"User input wait interrupted: {e}")
+        print("▶️ Resuming...")
+
+
     def _save_checkpoint(self, current_url: str = None):
         """Save progress to Database via StateManager."""
         if current_url:
             self.processed_urls.add(current_url)
-        
+
         state = {
             "processed_urls": list(self.processed_urls),
             "url_queue": getattr(self, "url_queue", []),
@@ -813,7 +888,7 @@ class TeamOrchestrator:
         return set()
 
     def _setup_scan_directory(self, start_time: datetime) -> tuple:
-        """Setup scan folder with organized structure. Returns (scan_dir, recon_dir, analysis_dir, captures_dir)."""
+        """Setup scan folder with organized structure."""
         timestamp = start_time.strftime("%Y%m%d_%H%M%S")
         domain = urlparse(self.target).netloc or "unknown"
         if ":" in domain:
@@ -837,7 +912,7 @@ class TeamOrchestrator:
         return scan_dir, recon_dir, analysis_dir, captures_dir
 
     async def _check_target_health(self, dashboard) -> bool:
-        """Check if target is reachable and stable. Returns True if healthy, False otherwise."""
+        """Check if target is reachable and stable."""
         async with httpx.AsyncClient() as client:
             try:
                 resp = await client.get(self.target, timeout=10.0)
@@ -860,28 +935,36 @@ class TeamOrchestrator:
         dashboard.log("Starting Phase 1: Reconnaissance (Nuclei + GoSpider)", "INFO")
 
         try:
-            logger.info(f"Triggering GoSpiderAgent for {self.target}")
-            gospider = GoSpiderAgent(self.target, recon_dir, max_depth=self.max_depth, max_urls=self.max_urls)
-            urls_to_scan = await gospider.run()
-            logger.info(f"GoSpiderAgent finished. Found {len(urls_to_scan)} URLs")
-
-            # TOKEN SCANNING
-            dashboard.log("🔍 Scanning discovery artifacts for authentication tokens...", "INFO")
-            combined_recon_data = " ".join(urls_to_scan) + " " + json.dumps(self.tech_profile)
-            found_jwts = find_jwts(combined_recon_data)
-            if found_jwts:
-                dashboard.log(f"🔑 Found {len(found_jwts)} potential JWT(s) in recon data!", "WARN")
-                for token in found_jwts:
-                    self.event_bus.publish("auth_token_found", {
-                        "token": token,
-                        "url": self.target,
-                        "location": "recon_discovery"
-                    })
+            urls_to_scan = await self._run_gospider(recon_dir)
+            await self._scan_for_tokens(urls_to_scan)
         except Exception as e:
             logger.error(f"GoSpiderAgent crash: {e}")
             urls_to_scan = [self.target]
 
         return self._normalize_urls(urls_to_scan)
+
+    async def _run_gospider(self, recon_dir) -> list:
+        """Run GoSpider agent for URL discovery."""
+        logger.info(f"Triggering GoSpiderAgent for {self.target}")
+        gospider = GoSpiderAgent(self.target, recon_dir, max_depth=self.max_depth, max_urls=self.max_urls)
+        urls_to_scan = await gospider.run()
+        logger.info(f"GoSpiderAgent finished. Found {len(urls_to_scan)} URLs")
+        return urls_to_scan
+
+    async def _scan_for_tokens(self, urls_to_scan: list):
+        """Scan discovered URLs for authentication tokens."""
+        dashboard.log("🔍 Scanning discovery artifacts for authentication tokens...", "INFO")
+        combined_recon_data = " ".join(urls_to_scan) + " " + json.dumps(self.tech_profile)
+        found_jwts = find_jwts(combined_recon_data)
+
+        if found_jwts:
+            dashboard.log(f"🔑 Found {len(found_jwts)} potential JWT(s) in recon data!", "WARN")
+            for token in found_jwts:
+                self.event_bus.publish("auth_token_found", {
+                    "token": token,
+                    "url": self.target,
+                    "location": "recon_discovery"
+                })
 
     def _normalize_urls(self, urls_to_scan: list) -> list:
         """Deduplicate and normalize URLs."""
@@ -926,32 +1009,49 @@ class TeamOrchestrator:
     def _create_finding_processor(self, seen_keys: set, all_validated_findings: list, dashboard):
         """Create a processor function for handling specialist agent results."""
         def process_result(res):
-            if res and res.get("findings"):
-                for f in res["findings"]:
-                    is_valid, error_msg = conductor._validate_payload_format(f)
-                    if not is_valid:
-                        logger.warning(f"[TeamOrchestrator] {error_msg}")
-                        continue
+            if not res or not res.get("findings"):
+                return
 
-                    finding_url = f.get('url', '')
-                    finding_path = urlparse(finding_url).path if finding_url else ''
-                    key = f"{f['type']}:{finding_path}:{f.get('parameter', 'none')}"
-                    logger.info(f"[TeamOrchestrator] Processing finding Key: {key}")
-                    if key not in seen_keys:
-                        logger.info(f"[TeamOrchestrator] New Key! Adding finding.")
-                        seen_keys.add(key)
-                        all_validated_findings.append(f)
-                        dashboard.add_finding(f['type'], f"{f['url']} [{f.get('parameter')}]", f.get('severity', 'HIGH'))
+            for f in res["findings"]:
+                if not self._validate_finding_format(f):
+                    continue
 
-                        self.state_manager.add_finding(
-                            url=f['url'], type=f['type'], description=f.get('description', f"Discovery finding"),
-                            severity=f.get('severity', 'HIGH'), parameter=f.get('parameter'), payload=f.get('payload'),
-                            evidence=f.get('evidence'), screenshot_path=f.get('screenshot') or f.get('screenshot_path'),
-                            validated=f.get('validated', False),
-                            status=f.get('status', 'PENDING_VALIDATION'),
-                            reproduction=f.get('reproduction') or f.get('reproduction_command')
-                        )
+                key = self._generate_finding_key(f)
+                if key in seen_keys:
+                    continue
+
+                self._add_new_finding(f, key, seen_keys, all_validated_findings, dashboard)
+
         return process_result
+
+    def _validate_finding_format(self, finding: dict) -> bool:
+        """Validate finding payload format."""
+        is_valid, error_msg = conductor._validate_payload_format(finding)
+        if not is_valid:
+            logger.warning(f"[TeamOrchestrator] {error_msg}")
+        return is_valid
+
+    def _generate_finding_key(self, finding: dict) -> str:
+        """Generate unique key for finding deduplication."""
+        finding_url = finding.get('url', '')
+        finding_path = urlparse(finding_url).path if finding_url else ''
+        return f"{finding['type']}:{finding_path}:{finding.get('parameter', 'none')}"
+
+    def _add_new_finding(self, finding: dict, key: str, seen_keys: set, all_validated_findings: list, dashboard):
+        """Add new finding to results."""
+        logger.info(f"[TeamOrchestrator] New Key! Adding finding.")
+        seen_keys.add(key)
+        all_validated_findings.append(finding)
+        dashboard.add_finding(finding['type'], f"{finding['url']} [{finding.get('parameter')}]", finding.get('severity', 'HIGH'))
+
+        self.state_manager.add_finding(
+            url=finding['url'], type=finding['type'], description=finding.get('description', f"Discovery finding"),
+            severity=finding.get('severity', 'HIGH'), parameter=finding.get('parameter'), payload=finding.get('payload'),
+            evidence=finding.get('evidence'), screenshot_path=finding.get('screenshot') or finding.get('screenshot_path'),
+            validated=finding.get('validated', False),
+            status=finding.get('status', 'PENDING_VALIDATION'),
+            reproduction=finding.get('reproduction') or finding.get('reproduction_command')
+        )
 
     async def _dispatch_specialists(self, vulnerabilities: list, url: str, dashboard, process_result) -> dict:
         """Analyze vulnerabilities and dispatch appropriate specialist agents."""
@@ -1008,76 +1108,100 @@ class TeamOrchestrator:
         parsed_url = dispatch_info["parsed_url"]
         current_qs = dispatch_info["current_qs"]
 
-        if "XSS_AGENT" in specialist_dispatches:
-            p_list = list(params_map.get("XSS_AGENT", [])) or None
-            xss_agent = XSSAgent(url, params=p_list, report_dir=url_dir)
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, xss_agent, process_result))
+        agent_tasks.extend(await self._build_xss_task(specialist_dispatches, params_map, url, url_dir, process_result))
+        agent_tasks.extend(await self._build_sql_task(specialist_dispatches, params_map, url, url_dir, parsed_url, current_qs, process_result))
+        agent_tasks.extend(await self._build_csti_task(specialist_dispatches, params_map, url, url_dir, process_result))
+        agent_tasks.extend(await self._build_other_tasks(specialist_dispatches, params_map, idor_params, url, url_dir, process_result))
 
+        return agent_tasks
+
+    async def _build_xss_task(self, specialist_dispatches: set, params_map: dict, url: str, url_dir: Path, process_result) -> list:
+        """Build XSS agent task."""
+        if "XSS_AGENT" not in specialist_dispatches:
+            return []
+
+        p_list = list(params_map.get("XSS_AGENT", [])) or None
+        xss_agent = XSSAgent(url, params=p_list, report_dir=url_dir)
+        return [run_agent_with_semaphore(self.url_semaphore, xss_agent, process_result)]
+
+    async def _build_sql_task(self, specialist_dispatches: set, params_map: dict, url: str, url_dir: Path, parsed_url, current_qs: dict, process_result) -> list:
+        """Build SQL agent task."""
         url_has_params = bool(parsed_url.query)
-        if "SQL_AGENT" in specialist_dispatches or url_has_params:
-            p_list = list(params_map.get("SQL_AGENT", []))
-            if not p_list and url_has_params:
-                p_list = list(current_qs.keys())
-            sql_agent = SQLMapAgent(url, p_list or None, url_dir)
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, sql_agent, process_result))
+        if "SQL_AGENT" not in specialist_dispatches and not url_has_params:
+            return []
 
-        if "CSTI_AGENT" in specialist_dispatches:
-            p_list = list(params_map.get("CSTI_AGENT", [])) or None
-            csti_agent = CSTIAgent(url, params=[{"parameter": p} for p in p_list] if p_list else None, report_dir=url_dir)
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, csti_agent, process_result))
+        p_list = list(params_map.get("SQL_AGENT", []))
+        if not p_list and url_has_params:
+            p_list = list(current_qs.keys())
+        sql_agent = SQLMapAgent(url, p_list or None, url_dir)
+        return [run_agent_with_semaphore(self.url_semaphore, sql_agent, process_result)]
+
+    async def _build_csti_task(self, specialist_dispatches: set, params_map: dict, url: str, url_dir: Path, process_result) -> list:
+        """Build CSTI agent task."""
+        if "CSTI_AGENT" not in specialist_dispatches:
+            return []
+
+        p_list = list(params_map.get("CSTI_AGENT", [])) or None
+        csti_agent = CSTIAgent(url, params=[{"parameter": p} for p in p_list] if p_list else None, report_dir=url_dir)
+        return [run_agent_with_semaphore(self.url_semaphore, csti_agent, process_result)]
+
+    async def _build_other_tasks(self, specialist_dispatches: set, params_map: dict, idor_params: list, url: str, url_dir: Path, process_result) -> list:
+        """Build other specialist agent tasks."""
+        tasks = []
 
         if "XXE_AGENT" in specialist_dispatches:
             from bugtrace.agents.exploit_specialists import XXEAgent
             p_list = list(params_map.get("XXE_AGENT", [])) or None
             xxe_agent = XXEAgent(url, p_list, url_dir)
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, xxe_agent, process_result))
+            tasks.append(run_agent_with_semaphore(self.url_semaphore, xxe_agent, process_result))
 
         if "SSRF_AGENT" in specialist_dispatches:
             from bugtrace.agents.ssrf_agent import SSRFAgent
             p_list = list(params_map.get("SSRF_AGENT", [])) or None
             ssrf_agent = SSRFAgent(url, p_list, url_dir)
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, ssrf_agent, process_result))
+            tasks.append(run_agent_with_semaphore(self.url_semaphore, ssrf_agent, process_result))
 
         if "LFI_AGENT" in specialist_dispatches:
             from bugtrace.agents.lfi_agent import LFIAgent
             p_list = list(params_map.get("LFI_AGENT", [])) or None
             lfi_agent = LFIAgent(url, p_list, url_dir)
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, lfi_agent, process_result))
+            tasks.append(run_agent_with_semaphore(self.url_semaphore, lfi_agent, process_result))
 
         if "RCE_AGENT" in specialist_dispatches:
             from bugtrace.agents.rce_agent import RCEAgent
             p_list = list(params_map.get("RCE_AGENT", [])) or None
             rce_agent = RCEAgent(url, p_list, url_dir)
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, rce_agent, process_result))
+            tasks.append(run_agent_with_semaphore(self.url_semaphore, rce_agent, process_result))
 
         if "PROTO_AGENT" in specialist_dispatches:
             from bugtrace.agents.exploit_specialists import ProtoAgent
             p_list = list(params_map.get("PROTO_AGENT", [])) or None
             proto_agent = ProtoAgent(url, p_list, url_dir)
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, proto_agent, process_result))
+            tasks.append(run_agent_with_semaphore(self.url_semaphore, proto_agent, process_result))
 
         if "FILE_UPLOAD_AGENT" in specialist_dispatches:
             from bugtrace.agents.fileupload_agent import FileUploadAgent
             upload_agent = FileUploadAgent(url)
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, upload_agent, process_result))
+            tasks.append(run_agent_with_semaphore(self.url_semaphore, upload_agent, process_result))
 
         if "JWT_AGENT" in specialist_dispatches:
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, self.jwt_agent, process_result))
+            tasks.append(run_agent_with_semaphore(self.url_semaphore, self.jwt_agent, process_result))
 
         if "IDOR_AGENT" in specialist_dispatches:
             from bugtrace.agents.idor_agent import IDORAgent
             idor_agent = IDORAgent(url, params=idor_params, report_dir=url_dir)
-            agent_tasks.append(run_agent_with_semaphore(self.url_semaphore, idor_agent, process_result))
+            tasks.append(run_agent_with_semaphore(self.url_semaphore, idor_agent, process_result))
 
-        return agent_tasks
+        return tasks
 
     async def _execute_agents(self, agent_tasks: list, dashboard) -> bool:
-        """Execute agent tasks with stop request handling. Returns False if stopped."""
+        """Execute agent tasks with stop request handling."""
         if not agent_tasks:
             return True
 
         logger.info(f"[TeamOrchestrator] Executing {len(agent_tasks)} agents in parallel (max {settings.MAX_CONCURRENT_URL_AGENTS} concurrent)")
         pending = {asyncio.ensure_future(t) for t in agent_tasks}
+
         while pending:
             done, pending = await asyncio.wait(pending, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
             if dashboard.stop_requested or self._stop_event.is_set():
@@ -1090,7 +1214,7 @@ class TeamOrchestrator:
         return True
 
     async def _process_url(self, url: str, url_index: int, total_urls: int, analysis_dir: Path, dashboard) -> list:
-        """Process a single URL for vulnerabilities. Returns list of validated findings."""
+        """Process a single URL for vulnerabilities."""
         if url in self.processed_urls:
             dashboard.log(f"⏩ Skipping already processed URL: {url[:60]}", "INFO")
             return []
@@ -1151,72 +1275,95 @@ class TeamOrchestrator:
         # Setup
         scan_dir, recon_dir, analysis_dir, captures_dir = self._setup_scan_directory(start_time)
         dashboard.log(f"📂 Scan directory created: {scan_dir.name}", "INFO")
-        
-        # 1. PHASE 1: RECONNAISSANCE
+
+        # Phase 1: Reconnaissance
+        await self._phase_1_reconnaissance(dashboard, recon_dir)
+
+        if self._check_stop_requested(dashboard):
+            return
+
+        # Phase 2: URL-by-URL Analysis
+        await self._phase_2_analysis(dashboard, analysis_dir)
+
+        if self._check_stop_requested(dashboard):
+            return
+
+        # Phase 3: Global Review
+        await self._phase_3_global_review(dashboard, scan_dir)
+
+        if self._check_stop_requested(dashboard):
+            return
+
+        # Phase 4: Reporting
+        await self._phase_4_reporting(dashboard, scan_dir)
+
+        logger.info("=== V2 SEQUENTIAL PIPELINE COMPLETE ===")
+
+    async def _phase_1_reconnaissance(self, dashboard, recon_dir):
+        """Execute Phase 1: Reconnaissance."""
         dashboard.set_phase("PHASE_1_RECON")
 
         if not await self._check_target_health(dashboard):
             return
 
         self.tech_profile = {"frameworks": [], "server": "unknown"}
-        urls_to_scan = await self._run_reconnaissance(dashboard, recon_dir)
+        self.urls_to_scan = await self._run_reconnaissance(dashboard, recon_dir)
 
-        # Stop check after recon
-        if dashboard.stop_requested or self._stop_event.is_set():
-            dashboard.log("🛑 Stop requested after reconnaissance. Exiting.", "WARN")
-            from bugtrace.schemas.db_models import ScanStatus
-            self.db.update_scan_status(self.scan_id, ScanStatus.STOPPED)
-            return
-
-        # 2. PHASE 2: URL-BY-URL ANALYSIS
+    async def _phase_2_analysis(self, dashboard, analysis_dir):
+        """Execute Phase 2: URL-by-URL Analysis."""
         dashboard.set_phase("PHASE_2_ANALYSIS")
-        # variables moved inside loop
-        
-        for i, url in enumerate(urls_to_scan):
-            await self._process_url(url, i, len(urls_to_scan), analysis_dir, dashboard)
+
+        for i, url in enumerate(self.urls_to_scan):
+            await self._process_url(url, i, len(self.urls_to_scan), analysis_dir, dashboard)
             if dashboard.stop_requested or self._stop_event.is_set():
                 dashboard.log("🛑 Stop requested. Finishing current URL and exiting...", "WARN")
                 break
-        
-        # V4 Checkpoint
+
         await self._checkpoint("Analysis & Exploitation (DAST + Specialists)")
 
-        # Stop check before Phase 3
-        if dashboard.stop_requested or self._stop_event.is_set():
-            dashboard.log("🛑 Stop requested. Skipping review and reporting.", "WARN")
-            from bugtrace.schemas.db_models import ScanStatus
-            self.db.update_scan_status(self.scan_id, ScanStatus.STOPPED)
-            return
-
-        # 3. PHASE 3: GLOBAL REVIEW
+    async def _phase_3_global_review(self, dashboard, scan_dir):
+        """Execute Phase 3: Global Review."""
         logger.info("=== PHASE 3: GLOBAL REVIEW ===")
         dashboard.set_phase("PHASE_3_REVIEW")
         dashboard.log("🔍 Phase 3: Global Review and Chaining Analysis", "INFO")
-        # Use all findings from state_manager for global review (not just validated ones)
+
         all_findings_for_review = self.state_manager.get_findings()
         await self._global_review(all_findings_for_review, scan_dir, dashboard)
         logger.info("Phase 3 complete")
-        
-        
-        # V4 Checkpoint
+
         await self._checkpoint("Global Review")
 
-        # Stop check before Phase 4
-        if dashboard.stop_requested or self._stop_event.is_set():
-            dashboard.log("🛑 Stop requested. Skipping report generation.", "WARN")
-            from bugtrace.schemas.db_models import ScanStatus
-            self.db.update_scan_status(self.scan_id, ScanStatus.STOPPED)
-            return
-
-        # 4. PHASE 4: REPORTING
+    async def _phase_4_reporting(self, dashboard, scan_dir):
+        """Execute Phase 4: Reporting."""
         logger.info("=== PHASE 4: REPORTING ===")
         dashboard.set_phase("PHASE_4_REPORTING")
         dashboard.log("📊 Phase 4: Generating Final Reports", "INFO")
         dashboard.log("Generating final consolidated reports...", "INFO")
-        
-        # Aggregate ALL findings from StateManager (Database source of truth)
+
         all_findings = self.state_manager.get_findings()
         logger.info(f"Retrieved {len(all_findings)} findings from state manager")
+
+        self._save_raw_findings(scan_dir, all_findings)
+        await self._generate_initial_report(scan_dir)
+
+        dashboard.log(f"📄 Final report in {scan_dir}", "INFO")
+
+        from bugtrace.schemas.db_models import ScanStatus
+        self.db.update_scan_status(self.scan_id, ScanStatus.COMPLETED)
+        logger.info(f"Scan {self.scan_id} marked as COMPLETED")
+        logger.info("Phase 4 complete")
+
+    def _check_stop_requested(self, dashboard) -> bool:
+        """Check if stop was requested and update scan status."""
+        if dashboard.stop_requested or self._stop_event.is_set():
+            dashboard.log("🛑 Stop requested. Skipping remaining phases.", "WARN")
+            from bugtrace.schemas.db_models import ScanStatus
+            self.db.update_scan_status(self.scan_id, ScanStatus.STOPPED)
+            return True
+        return False
+
+    def _save_raw_findings(self, scan_dir: Path, all_findings: list):
+        """Save raw findings to JSON file."""
         raw_findings_path = scan_dir / "raw_findings.json"
         with open(raw_findings_path, "w") as f:
             json.dump({
@@ -1225,7 +1372,8 @@ class TeamOrchestrator:
             }, f, indent=2, default=str)
         logger.info(f"Saved {len(all_findings)} raw findings to {raw_findings_path}")
 
-        # V5: Also trigger an initial report generation so the user has an HTML immediately
+    async def _generate_initial_report(self, scan_dir: Path):
+        """Generate initial Hunter report."""
         try:
             from bugtrace.agents.reporting import ReportingAgent
             reporter = ReportingAgent(self.scan_id, self.target, scan_dir)
@@ -1234,26 +1382,30 @@ class TeamOrchestrator:
         except Exception as e:
             logger.error(f"Failed to generate initial report: {e}")
 
-        logger.info("Phase 4 complete")
-        
-        dashboard.log(f"📄 Final report in {scan_dir}", "INFO")
-        
-        # Mark scan as completed
-        from bugtrace.schemas.db_models import ScanStatus
-        self.db.update_scan_status(self.scan_id, ScanStatus.COMPLETED)
-        logger.info(f"Scan {self.scan_id} marked as COMPLETED")
-        
-        logger.info("=== V2 SEQUENTIAL PIPELINE COMPLETE ===")
-
     async def _decide_specialist(self, vuln: dict) -> str:
-        """
-        Uses LLM to classify vulnerability and select best specialist agent.
-        Uses industry-standard dispatcher patterns.
-        """
+        """Uses LLM to classify vulnerability and select best specialist agent."""
         from bugtrace.core.llm_client import llm_client
-        
-        # Fast path for obvious ones to save tokens
+
+        # Fast path for obvious classifications
+        fast_path_result = self._try_fast_path_classification(vuln)
+        if fast_path_result:
+            return fast_path_result
+
+        # LLM-based classification
+        prompt = self._build_dispatcher_prompt(vuln)
+
+        try:
+            decision = await llm_client.generate(prompt, module_name="Dispatcher", max_tokens=100)
+            chosen_agent = self._extract_agent_from_decision(decision, vuln)
+            return chosen_agent
+        except Exception as e:
+            logger.error(f"Dispatcher LLM failed: {e}")
+            return self._fallback_classification(vuln)
+
+    def _try_fast_path_classification(self, vuln: dict) -> Optional[str]:
+        """Try fast-path classification for obvious vulnerability types."""
         v_type = str(vuln.get("type", "")).upper()
+
         if "XSS" in v_type: return "XSS_AGENT"
         if "SQL" in v_type: return "SQL_AGENT"
         if "CSTI" in v_type or "TEMPLATE" in v_type or "SSTI" in v_type: return "CSTI_AGENT"
@@ -1263,17 +1415,21 @@ class TeamOrchestrator:
         if "RCE" in v_type or "COMMAND" in v_type or "REMOTE CODE" in v_type: return "RCE_AGENT"
         if "UPLOAD" in v_type or "FILES" in v_type: return "FILE_UPLOAD_AGENT"
         if "JWT" in v_type or "TOKEN" in v_type: return "JWT_AGENT"
-        
-        prompt = f"""
+
+        return None
+
+    def _build_dispatcher_prompt(self, vuln: dict) -> str:
+        """Build prompt for LLM dispatcher."""
+        return f"""
         Act as a Security Dispatcher.
         Analyze this potential vulnerability finding and assign the correct Specialist Agent.
-        
+
         FINDING: {vuln}
-        
+
         AVAILABLE AGENTS:
         - XSS_AGENT (Cross-Site Scripting, HTML injection)
         - SQL_AGENT (SQL Injection, Database errors)
-        - CSTI_AGENT (Client-Side Template Injection, SSTI, {{7*7}} indicators)
+        - CSTI_AGENT (Client-Side Template Injection, SSTI, {{{{7*7}}}} indicators)
         - XXE_AGENT (XML External Entity, XML parsing)
         - PROTO_AGENT (Prototype Pollution, JS Object injection)
         - JWT_AGENT (JSON Web Token vulnerabilities, alg: none, weak secrets)
@@ -1281,74 +1437,72 @@ class TeamOrchestrator:
         - FILE_UPLOAD_AGENT (Unrestricted file upload, RCE via shell)
         - IDOR_AGENT (Insecure Direct Object Reference, Parameter Tampering)
         - IGNORE (If low confidence or not relevant)
-        
+
         Return ONLY the Agent Name using XML format:
         <thought>Reasoning for selection</thought>
         <agent>AGENT_NAME</agent>
         """
-        
-        try:
-            # Use a faster model for dispatching if possible
-            decision = await llm_client.generate(prompt, module_name="Dispatcher", max_tokens=100)
-            
-            from bugtrace.utils.parsers import XmlParser
-            chosen_agent = XmlParser.extract_tag(decision, "agent")
-            
-            if chosen_agent:
-                chosen_agent = chosen_agent.strip().replace("`", "").upper()
-                valid_agents = ["XSS_AGENT", "SQL_AGENT", "XXE_AGENT", "SSRF_AGENT", "LFI_AGENT", "RCE_AGENT", "PROTO_AGENT", "HEADER_INJECTION", "IDOR_AGENT", "JWT_AGENT", "FILE_UPLOAD_AGENT", "IGNORE"]
-                
-                # Fuzzy match in case of minor typos or extra chars
-                for valid in valid_agents:
-                    if valid in chosen_agent:
-                        return valid
-            
-            # Simple keyword fallback for JWTAgent
-            v_type_lower = v_type.lower()
-            if "jwt" in v_type_lower or "auth token" in v_type_lower:
-                return "JWT_AGENT"
 
-            # Fallback if no valid tag found but text contains the agent name clearly (heuristic backup)
-            if decision:
-                 valid_agents = ["XSS_AGENT", "SQL_AGENT", "XXE_AGENT", "PROTO_AGENT", "HEADER_INJECTION", "IDOR_AGENT", "IGNORE"]
-                 for agent in valid_agents:
-                     if agent in decision and "NOT" not in decision: # Basic negative constraint
-                         return agent
+    def _extract_agent_from_decision(self, decision: str, vuln: dict) -> str:
+        """Extract agent name from LLM decision."""
+        from bugtrace.utils.parsers import XmlParser
 
-            return "IGNORE"
-            
-        except Exception as e:
-            logger.error(f"Dispatcher LLM failed: {e}")
-            # Fallback to naive keyword matching
-            if "XML" in v_type: return "XXE_AGENT"
-            if "PROTO" in v_type: return "PROTO_AGENT"
-            if "HEADER" in v_type: return "HEADER_INJECTION"
-            return "IGNORE"
+        chosen_agent = XmlParser.extract_tag(decision, "agent")
+
+        if chosen_agent:
+            chosen_agent = chosen_agent.strip().replace("`", "").upper()
+            valid_agents = ["XSS_AGENT", "SQL_AGENT", "XXE_AGENT", "SSRF_AGENT", "LFI_AGENT", "RCE_AGENT", "PROTO_AGENT", "HEADER_INJECTION", "IDOR_AGENT", "JWT_AGENT", "FILE_UPLOAD_AGENT", "IGNORE"]
+
+            for valid in valid_agents:
+                if valid in chosen_agent:
+                    return valid
+
+        # JWT keyword fallback
+        v_type_lower = str(vuln.get("type", "")).lower()
+        if "jwt" in v_type_lower or "auth token" in v_type_lower:
+            return "JWT_AGENT"
+
+        # Text-based heuristic fallback
+        if decision:
+            valid_agents = ["XSS_AGENT", "SQL_AGENT", "XXE_AGENT", "PROTO_AGENT", "HEADER_INJECTION", "IDOR_AGENT", "IGNORE"]
+            for agent in valid_agents:
+                if agent in decision and "NOT" not in decision:
+                    return agent
+
+        return "IGNORE"
+
+    def _fallback_classification(self, vuln: dict) -> str:
+        """Fallback classification when LLM fails."""
+        v_type = str(vuln.get("type", "")).upper()
+        if "XML" in v_type: return "XXE_AGENT"
+        if "PROTO" in v_type: return "PROTO_AGENT"
+        if "HEADER" in v_type: return "HEADER_INJECTION"
+        return "IGNORE"
 
 
     async def _global_review(self, findings: list, scan_dir: Path, dashboard):
         """Phase 3: Analyzes cross-URL patterns and vulnerability chaining."""
         if not findings:
             return
-            
+
         dashboard.log("🔍 Starting Global Review and Chaining Analysis...", "INFO")
-        
+
         from bugtrace.core.llm_client import llm_client
-        
+
         findings_summary = json.dumps([{
-            "type": f.get("type"), 
-            "url": f.get("url"), 
+            "type": f.get("type"),
+            "url": f.get("url"),
             "param": f.get("parameter"),
             "severity": f.get("severity")
         } for f in findings])
-        
+
         prompt = f"""As a Senior Red Team Lead, review these validated findings and identify possible ATTACK CHAINS.
         Findings: {findings_summary}
-        
+
         Look for correlations like:
         - IDOR (User A can see User B) + Info Disclosure (sees token) = Account Takeover
         - Path Traversal (read config) + SQLi (update admin) = Full Compromise
-        
+
         Return a list of attack chains using XML format:
         <thought>Reasoning about how these vulnerabilities can be combined</thought>
         <chain>
@@ -1357,21 +1511,11 @@ class TeamOrchestrator:
           <impact>Full system compromise via...</impact>
         </chain>
         """
-        
+
         try:
             response = await llm_client.generate(prompt, module_name="GlobalReview")
-            from bugtrace.utils.parsers import XmlParser
-            
-            chain_contents = XmlParser.extract_list(response, "chain")
-            chains = []
-            
-            for cc in chain_contents:
-                chains.append({
-                    "name": XmlParser.extract_tag(cc, "name") or "Unnamed Chain",
-                    "vulnerabilities": XmlParser.extract_tag(cc, "vulnerabilities") or "",
-                    "impact": XmlParser.extract_tag(cc, "impact") or "High"
-                })
-            
+            chains = self._extract_attack_chains(response)
+
             if chains:
                 dashboard.log(f"🔗 Detected {len(chains)} potential attack chains!", "WARN")
                 with open(scan_dir / "attack_chains.json", "w") as f:
@@ -1379,109 +1523,124 @@ class TeamOrchestrator:
         except Exception as e:
             logger.debug(f"Global review failed: {e}")
 
+    def _extract_attack_chains(self, response: str) -> list:
+        """Extract attack chains from LLM response."""
+        from bugtrace.utils.parsers import XmlParser
+
+        chain_contents = XmlParser.extract_list(response, "chain")
+        chains = []
+
+        for cc in chain_contents:
+            chains.append({
+                "name": XmlParser.extract_tag(cc, "name") or "Unnamed Chain",
+                "vulnerabilities": XmlParser.extract_tag(cc, "vulnerabilities") or "",
+                "impact": XmlParser.extract_tag(cc, "impact") or "High"
+            })
+
+        return chains
+
     async def _generate_v2_report(self, findings: list, urls: list, tech_profile: dict, scan_dir: Path, start_time: datetime):
-        """Phase 4: Generates a premium report based on the sequential scan results. Pulls high-fidelity audits from DB."""
+        """Phase 4: Generates a premium report based on the sequential scan results."""
         try:
-            from bugtrace.core.database import get_db_manager
-            db = get_db_manager()
-            
-            # Pull findings from DB for this scan (Source of Truth)
-            if hasattr(self, "scan_id"):
-                db_findings = db.get_findings_for_scan(self.scan_id)
-                if db_findings:
-                    logger.info(f"Loaded {len(db_findings)} findings from DB for reporting.")
-                    # Convert DB models to list of dicts for collector compatibility
-                    findings = []
-                    for db_f in db_findings:
-                        f = {
-                            "id": db_f.id,
-                            "type": str(db_f.type.value if hasattr(db_f.type, 'value') else db_f.type),
-                            "severity": db_f.severity,
-                            "description": db_f.details,
-                            "payload": db_f.payload_used,
-                            "url": db_f.attack_url,
-                            "parameter": db_f.vuln_parameter,
-                            "validated": (db_f.status == "VALIDATED_CONFIRMED"),
-                            "status": db_f.status,
-                            "validator_notes": db_f.validator_notes,
-                            "screenshot_path": db_f.proof_screenshot_path,
-                            # 2026-01-24 FIX: Include reproduction command for SQLi/reports
-                            "reproduction": db_f.reproduction_command
-                        }
-                        findings.append(f)
-            
+            # Load findings from database
+            findings = self._load_findings_from_db()
+
             logger.info(f"Starting report generation with {len(findings)} findings")
             dashboard.log(f"📊 Generating final reports with {len(findings)} findings...", "INFO")
-            
-            from bugtrace.reporting.collector import DataCollector
-            from bugtrace.reporting.ai_writer import AIReportWriter
-            
-            collector = DataCollector(self.target, scan_id=self.scan_id)
-            
-            # Add Findings with Deduplication and Audit Filtering
-            seen_findings = set()
-            
-            # V3 Filter: Only show Confirmed findings in high-impact sections
-            confirmed_findings = [f for f in findings if f.get("status") == "VALIDATED_CONFIRMED"]
-            pending_findings = [f for f in findings if f.get("status") == "PENDING_VALIDATION"]
-            
-            if settings.REPORT_ONLY_VALIDATED:
-                prioritized_findings = confirmed_findings
-            else:
-                prioritized_findings = confirmed_findings + pending_findings
-            
-            for f in prioritized_findings:
-                # Deduplication Logic - Use PATH only (not full URL with query params)
-                # This groups SQLi in productId=18 and productId=11 as the SAME finding
-                vType = (f.get("type") or "").upper()
-                url = f.get("url", "")
-                path = urlparse(url).path if url else ""
-                param = f.get("parameter", "")
-                dedupe_key = f"{vType}:{path}:{param}"
-                
-                if dedupe_key in seen_findings:
-                    continue
-                seen_findings.add(dedupe_key)
-                
-                # Ensure validator metadata is passed through
-                if "validator_notes" not in f:
-                    f["validator_notes"] = None
-                if "status" not in f:
-                    f["status"] = "PENDING_VALIDATION"
-                
-                collector.add_vulnerability(f)
-            
-            # Add Context
-            collector.context.stats.urls_scanned = len(urls)
-            collector.context.stats.start_time = start_time if isinstance(start_time, datetime) else datetime.fromisoformat(start_time)
-            end_time = datetime.now()
-            collector.context.stats.end_time = end_time
-            collector.context.stats.duration_seconds = (end_time - start_time).total_seconds()
-            collector.context.tech_stack = tech_profile.get("frameworks", [])
-            
-            # Generate Reports - Use MarkdownGenerator for Triager-Ready format
-            from bugtrace.reporting.markdown_generator import MarkdownGenerator
-            from bugtrace.reporting.generator import HTMLGenerator
 
-            # 1. Triager-Ready Markdown (Primary deliverable)
-            md_gen = MarkdownGenerator(output_base_dir=str(scan_dir))
-            md_gen.generate(collector.get_context())
+            # Collect and deduplicate findings
+            collector = self._build_data_collector(findings, urls, tech_profile, start_time)
 
-            # 2. HTML version for visual review
-            html_gen = HTMLGenerator()
-            html_gen.generate(collector.get_context(), str(scan_dir / "report.html"))
+            # Generate reports
+            await self._generate_all_reports(collector, scan_dir)
 
-            # 3. Optional: AI-enhanced summary (supplementary, not primary)
-            try:
-                from bugtrace.reporting.ai_writer import AIReportWriter
-                ai_writer = AIReportWriter(output_base_dir=str(scan_dir))
-                await ai_writer.generate_async(collector.get_context())
-            except Exception as e:
-                logger.warning(f"AI report enhancement failed (non-critical): {e}")
-            
             dashboard.log(f"✅ Reports generated in {scan_dir}", "SUCCESS")
-            
+
         except Exception as e:
             logger.error(f"Failed to generate V2 report: {e}", exc_info=True)
             dashboard.log(f"❌ Report generation failed: {e}", "ERROR")
 
+    def _load_findings_from_db(self) -> list:
+        """Load findings from database."""
+        from bugtrace.core.database import get_db_manager
+        db = get_db_manager()
+
+        findings = []
+        if hasattr(self, "scan_id"):
+            db_findings = db.get_findings_for_scan(self.scan_id)
+            if db_findings:
+                logger.info(f"Loaded {len(db_findings)} findings from DB for reporting.")
+                for db_f in db_findings:
+                    findings.append({
+                        "id": db_f.id,
+                        "type": str(db_f.type.value if hasattr(db_f.type, 'value') else db_f.type),
+                        "severity": db_f.severity,
+                        "description": db_f.details,
+                        "payload": db_f.payload_used,
+                        "url": db_f.attack_url,
+                        "parameter": db_f.vuln_parameter,
+                        "validated": (db_f.status == "VALIDATED_CONFIRMED"),
+                        "status": db_f.status,
+                        "validator_notes": db_f.validator_notes,
+                        "screenshot_path": db_f.proof_screenshot_path,
+                        "reproduction": db_f.reproduction_command
+                    })
+        return findings
+
+    def _build_data_collector(self, findings: list, urls: list, tech_profile: dict, start_time: datetime):
+        """Build data collector with deduplicated findings."""
+        from bugtrace.reporting.collector import DataCollector
+
+        collector = DataCollector(self.target, scan_id=self.scan_id)
+
+        # Add deduplicated findings
+        seen_findings = set()
+        confirmed_findings = [f for f in findings if f.get("status") == "VALIDATED_CONFIRMED"]
+        pending_findings = [f for f in findings if f.get("status") == "PENDING_VALIDATION"]
+
+        prioritized_findings = confirmed_findings if settings.REPORT_ONLY_VALIDATED else confirmed_findings + pending_findings
+
+        for f in prioritized_findings:
+            dedupe_key = f"{(f.get('type') or '').upper()}:{urlparse(f.get('url', '')).path}:{f.get('parameter', '')}"
+
+            if dedupe_key in seen_findings:
+                continue
+            seen_findings.add(dedupe_key)
+
+            if "validator_notes" not in f:
+                f["validator_notes"] = None
+            if "status" not in f:
+                f["status"] = "PENDING_VALIDATION"
+
+            collector.add_vulnerability(f)
+
+        # Add context
+        collector.context.stats.urls_scanned = len(urls)
+        collector.context.stats.start_time = start_time if isinstance(start_time, datetime) else datetime.fromisoformat(start_time)
+        end_time = datetime.now()
+        collector.context.stats.end_time = end_time
+        collector.context.stats.duration_seconds = (end_time - start_time).total_seconds()
+        collector.context.tech_stack = tech_profile.get("frameworks", [])
+
+        return collector
+
+    async def _generate_all_reports(self, collector, scan_dir: Path):
+        """Generate all report formats."""
+        from bugtrace.reporting.markdown_generator import MarkdownGenerator
+        from bugtrace.reporting.generator import HTMLGenerator
+
+        # Triager-Ready Markdown
+        md_gen = MarkdownGenerator(output_base_dir=str(scan_dir))
+        md_gen.generate(collector.get_context())
+
+        # HTML version
+        html_gen = HTMLGenerator()
+        html_gen.generate(collector.get_context(), str(scan_dir / "report.html"))
+
+        # Optional AI-enhanced summary
+        try:
+            from bugtrace.reporting.ai_writer import AIReportWriter
+            ai_writer = AIReportWriter(output_base_dir=str(scan_dir))
+            await ai_writer.generate_async(collector.get_context())
+        except Exception as e:
+            logger.warning(f"AI report enhancement failed (non-critical): {e}")
