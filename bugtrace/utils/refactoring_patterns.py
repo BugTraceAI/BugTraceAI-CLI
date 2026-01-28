@@ -126,4 +126,49 @@ BENEFITS:
 - Testable in isolation
 """
 
+# Template Exceptions (CR-01)
+"""
+These functions exceed 50 lines but are acceptable because they contain
+pure template content (HTML, JavaScript, LLM prompts) with no business logic.
+Splitting would reduce readability without improving maintainability.
+
+DOCUMENTED EXCEPTIONS:
+  1. bugtrace/agents/reporting.py::_build_html_template (119L) - HTML report template
+  2. bugtrace/agents/reporting.py::_cvss_build_prompt (54L) - LLM prompt template
+  3. bugtrace/agents/reporting.py::_poc_build_prompt (52L) - LLM prompt template
+  4. bugtrace/agents/analysis_agent.py::_review_build_prompt (57L) - LLM prompt template
+  5. bugtrace/agents/analysis.py::_prompt_template (55L) - LLM prompt template
+  6. bugtrace/tools/headless/dom_xss_detector.py::_build_sink_monitoring (113L) - JavaScript template
+
+CRITERIA FOR TEMPLATE EXCEPTIONS:
+  - Function body is primarily string content (>80%)
+  - No conditional logic or loops in the template
+  - Splitting into smaller pieces would harm readability
+  - Template is used as-is, not constructed dynamically
+
+DECISION SOURCE: 08-03, 08-05, 08-11, 08-19, 08-21
+  - 08-03: HTML template functions acceptable at >50 lines
+  - 08-05: Accept JavaScript template strings >50 lines as exception
+  - 08-11: Extract prompt templates as separate methods (established pattern)
+  - 08-19: LLM prompt templates >50 lines acceptable as template string exceptions
+  - 08-21: Accept prompt template strings >50 lines
+"""
+
+TEMPLATE_EXCEPTIONS = {
+    "bugtrace/agents/reporting.py": [
+        ("_build_html_template", 119, "HTML report template"),
+        ("_cvss_build_prompt", 54, "CVSS scoring LLM prompt"),
+        ("_poc_build_prompt", 52, "PoC generation LLM prompt"),
+    ],
+    "bugtrace/agents/analysis_agent.py": [
+        ("_review_build_prompt", 57, "Code review LLM prompt"),
+    ],
+    "bugtrace/agents/analysis.py": [
+        ("_prompt_template", 55, "Analysis LLM prompt"),
+    ],
+    "bugtrace/tools/headless/dom_xss_detector.py": [
+        ("_build_sink_monitoring", 113, "JavaScript DOM sink monitoring"),
+    ],
+}
+
 __all__ = []  # Documentation module only - no exports needed
