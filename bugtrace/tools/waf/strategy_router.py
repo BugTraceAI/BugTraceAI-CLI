@@ -194,46 +194,7 @@ class StrategyRouter:
             with open(self.learning_file, 'r') as f:
                 raw_data = json.load(f)
 
-            result = {}
-            rejected_wafs = 0
-            rejected_strategies = 0
-
-            for waf_name, waf_data in raw_data.items():
-                # TASK-67: Validate WAF name on load
-                if not re.match(r'^[a-z0-9_]+$', waf_name.lower()):
-                    rejected_wafs += 1
-                    continue
-                if waf_name.lower() not in VALID_WAF_TYPES:
-                    rejected_wafs += 1
-                    continue
-
-                waf_name_clean = waf_name.lower()
-                strategies = {}
-
-                for strat_name, strat_data in waf_data.get("strategies", {}).items():
-                    # TASK-67: Validate strategy name on load
-                    if not re.match(r'^[a-z0-9_]+$', strat_name.lower()):
-                        rejected_strategies += 1
-                        continue
-                    if strat_name.lower() not in VALID_STRATEGIES:
-                        rejected_strategies += 1
-                        continue
-
-                    # Validate numeric values
-                    attempts = strat_data.get("attempts", 0)
-                    successes = strat_data.get("successes", 0)
-                    if not isinstance(attempts, (int, float)) or not isinstance(successes, (int, float)):
-                        rejected_strategies += 1
-                        continue
-
-                    strategies[strat_name.lower()] = StrategyStats(
-                        attempts=int(attempts),
-                        successes=int(successes),
-                        last_used=str(strat_data.get("last_used", ""))[:50]  # Limit length
-                    )
-
-                if strategies:  # Only add WAF if it has valid strategies
-                    result[waf_name_clean] = WAFLearningData(waf_name=waf_name_clean, strategies=strategies)
+            result, rejected_wafs, rejected_strategies = self._parse_and_validate_learning_data(raw_data)
 
             if rejected_wafs or rejected_strategies:
                 logger.warning(f"Rejected {rejected_wafs} invalid WAFs and {rejected_strategies} invalid strategies during load")
@@ -247,6 +208,64 @@ class StrategyRouter:
         except Exception as e:
             logger.warning(f"Failed to load learning data: {e}")
             return {}
+
+    def _parse_and_validate_learning_data(self, raw_data: Dict) -> Tuple[Dict[str, WAFLearningData], int, int]:
+        """Parse and validate raw learning data with TASK-67 checks."""
+        result = {}
+        rejected_wafs = 0
+        rejected_strategies = 0
+
+        for waf_name, waf_data in raw_data.items():
+            # Validate WAF name
+            if not self._is_valid_waf_name(waf_name):
+                rejected_wafs += 1
+                continue
+
+            waf_name_clean = waf_name.lower()
+            strategies, strat_rejects = self._parse_strategies(waf_data.get("strategies", {}))
+            rejected_strategies += strat_rejects
+
+            if strategies:  # Only add WAF if it has valid strategies
+                result[waf_name_clean] = WAFLearningData(waf_name=waf_name_clean, strategies=strategies)
+
+        return result, rejected_wafs, rejected_strategies
+
+    def _is_valid_waf_name(self, waf_name: str) -> bool:
+        """Validate WAF name format and whitelist."""
+        if not re.match(r'^[a-z0-9_]+$', waf_name.lower()):
+            return False
+        if waf_name.lower() not in VALID_WAF_TYPES:
+            return False
+        return True
+
+    def _parse_strategies(self, raw_strategies: Dict) -> Tuple[Dict[str, StrategyStats], int]:
+        """Parse and validate strategy data from JSON."""
+        strategies = {}
+        rejected = 0
+
+        for strat_name, strat_data in raw_strategies.items():
+            # Validate strategy name
+            if not re.match(r'^[a-z0-9_]+$', strat_name.lower()):
+                rejected += 1
+                continue
+            if strat_name.lower() not in VALID_STRATEGIES:
+                rejected += 1
+                continue
+
+            # Validate numeric values
+            attempts = strat_data.get("attempts", 0)
+            successes = strat_data.get("successes", 0)
+            if not isinstance(attempts, (int, float)) or not isinstance(successes, (int, float)):
+                rejected += 1
+                continue
+
+            strategies[strat_name.lower()] = StrategyStats(
+                attempts=int(attempts),
+                successes=int(successes),
+                last_used=str(strat_data.get("last_used", ""))[:50]  # Limit length
+            )
+
+        return strategies, rejected
 
     def _save_learning_data(self):
         """Save learning data to disk with automatic backup (TASK-71)."""
@@ -478,6 +497,28 @@ class StrategyRouter:
         Returns:
             Dict with overall stats, per-WAF stats, and per-strategy stats
         """
+        total_attempts, total_successes, by_waf, by_strategy = self._aggregate_metrics()
+        self._calculate_strategy_success_rates(by_strategy)
+
+        return {
+            "overall": {
+                "total_attempts": total_attempts,
+                "total_successes": total_successes,
+                "overall_success_rate": total_successes / total_attempts if total_attempts > 0 else 0.0,
+                "wafs_encountered": len(self.learning_data),
+                "strategies_used": len(by_strategy)
+            },
+            "by_waf": by_waf,
+            "by_strategy": by_strategy,
+            "best_strategies": sorted(
+                [(s, d["success_rate"]) for s, d in by_strategy.items() if d["attempts"] >= 5],
+                key=lambda x: x[1],
+                reverse=True
+            )[:5]
+        }
+
+    def _aggregate_metrics(self) -> Tuple[int, int, Dict, Dict]:
+        """Aggregate attempts, successes, and build per-WAF and per-strategy stats."""
         total_attempts = 0
         total_successes = 0
         by_waf = {}
@@ -502,26 +543,12 @@ class StrategyRouter:
                 by_strategy[strat_name]["attempts"] += stats.attempts
                 by_strategy[strat_name]["successes"] += stats.successes
 
-        # Calculate success rates for strategies
+        return total_attempts, total_successes, by_waf, by_strategy
+
+    def _calculate_strategy_success_rates(self, by_strategy: Dict):
+        """Calculate success rates for each strategy."""
         for strat_name, stats in by_strategy.items():
             stats["success_rate"] = stats["successes"] / stats["attempts"] if stats["attempts"] > 0 else 0.0
-
-        return {
-            "overall": {
-                "total_attempts": total_attempts,
-                "total_successes": total_successes,
-                "overall_success_rate": total_successes / total_attempts if total_attempts > 0 else 0.0,
-                "wafs_encountered": len(self.learning_data),
-                "strategies_used": len(by_strategy)
-            },
-            "by_waf": by_waf,
-            "by_strategy": by_strategy,
-            "best_strategies": sorted(
-                [(s, d["success_rate"]) for s, d in by_strategy.items() if d["attempts"] >= 5],
-                key=lambda x: x[1],
-                reverse=True
-            )[:5]
-        }
 
     def get_best_strategy_for_waf(self, waf_name: str) -> Optional[Tuple[str, float]]:
         """
@@ -570,39 +597,46 @@ class StrategyRouter:
         wafs_to_show = [waf_filter] if waf_filter else list(self.learning_data.keys())
 
         for waf_name in wafs_to_show:
-            if waf_name not in self.learning_data:
-                continue
+            if waf_name in self.learning_data:
+                lines.extend(self._visualize_waf_strategies(waf_name))
 
-            waf_data = self.learning_data[waf_name]
-            total_attempts = waf_data.get_total_attempts()
-            total_successes = waf_data.get_total_successes()
-            overall_rate = total_successes / total_attempts if total_attempts > 0 else 0
+        lines.extend(self._build_summary_footer())
 
-            lines.append(f"\n[{waf_name.upper()}] Total: {total_attempts} attempts, {overall_rate:.1%} success")
-            lines.append("-" * 50)
+        return "\n".join(lines)
 
-            # Sort strategies by success rate
-            sorted_strategies = sorted(
-                waf_data.strategies.items(),
-                key=lambda x: x[1].success_rate,
-                reverse=True
+    def _visualize_waf_strategies(self, waf_name: str) -> List[str]:
+        """Generate visualization lines for a single WAF."""
+        lines = []
+        waf_data = self.learning_data[waf_name]
+        total_attempts = waf_data.get_total_attempts()
+        total_successes = waf_data.get_total_successes()
+        overall_rate = total_successes / total_attempts if total_attempts > 0 else 0
+
+        lines.append(f"\n[{waf_name.upper()}] Total: {total_attempts} attempts, {overall_rate:.1%} success")
+        lines.append("-" * 50)
+
+        sorted_strategies = sorted(
+            waf_data.strategies.items(),
+            key=lambda x: x[1].success_rate,
+            reverse=True
+        )
+
+        for strat_name, stats in sorted_strategies:
+            bar_length = int(stats.success_rate * 20)
+            bar = "█" * bar_length + "░" * (20 - bar_length)
+            ucb = stats.ucb_score(total_attempts)
+            lines.append(
+                f"  {strat_name:<25} [{bar}] "
+                f"{stats.success_rate:>5.1%} ({stats.successes}/{stats.attempts}) UCB:{ucb:.2f}"
             )
 
-            for strat_name, stats in sorted_strategies:
-                # Create visual bar
-                bar_length = int(stats.success_rate * 20)
-                bar = "█" * bar_length + "░" * (20 - bar_length)
+        return lines
 
-                ucb = stats.ucb_score(total_attempts)
-                lines.append(
-                    f"  {strat_name:<25} [{bar}] "
-                    f"{stats.success_rate:>5.1%} ({stats.successes}/{stats.attempts}) UCB:{ucb:.2f}"
-                )
-
-        lines.append("\n" + "=" * 70)
-
-        # Add summary
+    def _build_summary_footer(self) -> List[str]:
+        """Build summary footer for Q-table visualization."""
+        lines = ["\n" + "=" * 70]
         metrics = self.get_detailed_metrics()
+
         lines.append(f"Overall: {metrics['overall']['total_attempts']} attempts, "
                     f"{metrics['overall']['overall_success_rate']:.1%} success rate")
 
@@ -610,7 +644,7 @@ class StrategyRouter:
             best = metrics['best_strategies'][0]
             lines.append(f"Best strategy overall: {best[0]} ({best[1]:.1%})")
 
-        return "\n".join(lines)
+        return lines
 
     def print_q_table(self, waf_filter: Optional[str] = None):
         """Print Q-table visualization to console (TASK-78)."""

@@ -89,38 +89,46 @@ class ScanService:
             RuntimeError: If max concurrent scans already running
         """
         async with self._lock:
-            # Check concurrent limit
-            if len(self._active_scans) >= self.max_concurrent:
-                raise RuntimeError(
-                    f"Maximum concurrent scans ({self.max_concurrent}) already running. "
-                    f"Wait for a scan to complete or stop one."
-                )
+            self._check_concurrent_limit()
 
-            # Create database scan record
-            scan_id = self.db.create_new_scan(options.target_url, origin=origin)
-            logger.info(f"Created scan {scan_id} for target: {options.target_url} (origin={origin})")
+            scan_id = self._create_scan_record(options, origin)
+            ctx = self._build_scan_context(scan_id, options)
 
-            # Create scan context
-            ctx = ScanContext(scan_id, options, self.event_bus)
-            ctx.freeze_settings()  # Capture immutable settings snapshot
-
-            # Add to active scans before starting task
             self._active_scans[scan_id] = ctx
+            ctx._task = asyncio.create_task(self._run_scan(ctx))
 
-            # Start scan in background task
-            task = asyncio.create_task(self._run_scan(ctx))
-            ctx._task = task
-
-            # Emit event
-            await self.event_bus.emit("scan.created", {
-                "scan_id": scan_id,
-                "target": options.target_url,
-                "scan_type": options.scan_type,
-            })
-
+            await self._emit_scan_created_event(scan_id, options)
             logger.info(f"Scan {scan_id} task started (active: {len(self._active_scans)})")
 
             return scan_id
+
+    def _check_concurrent_limit(self):
+        """Check if at concurrent scan limit."""
+        if len(self._active_scans) >= self.max_concurrent:
+            raise RuntimeError(
+                f"Maximum concurrent scans ({self.max_concurrent}) already running. "
+                f"Wait for a scan to complete or stop one."
+            )
+
+    def _create_scan_record(self, options: ScanOptions, origin: str) -> int:
+        """Create database scan record."""
+        scan_id = self.db.create_new_scan(options.target_url, origin=origin)
+        logger.info(f"Created scan {scan_id} for target: {options.target_url} (origin={origin})")
+        return scan_id
+
+    def _build_scan_context(self, scan_id: int, options: ScanOptions) -> ScanContext:
+        """Build and freeze scan context."""
+        ctx = ScanContext(scan_id, options, self.event_bus)
+        ctx.freeze_settings()
+        return ctx
+
+    async def _emit_scan_created_event(self, scan_id: int, options: ScanOptions):
+        """Emit scan.created event."""
+        await self.event_bus.emit("scan.created", {
+            "scan_id": scan_id,
+            "target": options.target_url,
+            "scan_type": options.scan_type,
+        })
 
     async def _run_scan(self, ctx: ScanContext):
         """
@@ -370,43 +378,10 @@ class ScanService:
             from sqlmodel import select, func
             from bugtrace.schemas.db_models import ScanTable, TargetTable
 
-            # Build query
-            statement = select(ScanTable).order_by(ScanTable.id.desc())
-
-            if status_filter:
-                statement = statement.where(ScanTable.status == ScanStatus[status_filter.upper()])
-
-            # Count total
-            count_statement = select(func.count()).select_from(ScanTable)
-            if status_filter:
-                count_statement = count_statement.where(ScanTable.status == ScanStatus[status_filter.upper()])
-            total = session.exec(count_statement).one()
-
-            # Paginate
-            statement = statement.offset(offset).limit(per_page)
-            scans = session.exec(statement).all()
-
-            # Format results
-            report_base = settings.REPORT_DIR
-            results = []
-            for scan in scans:
-                target = session.get(TargetTable, scan.target_id)
-                target_url = target.url if target else None
-
-                # Check if report files exist on disk (uses timestamp for precise match)
-                has_report = self._has_report_dir(
-                    report_base, scan.id, target_url, scan.timestamp
-                )
-
-                results.append({
-                    "scan_id": scan.id,
-                    "target": target_url or "unknown",
-                    "status": scan.status.value,
-                    "progress": scan.progress_percent,
-                    "timestamp": scan.timestamp.isoformat(),
-                    "origin": getattr(scan, "origin", "cli"),
-                    "has_report": has_report,
-                })
+            statement = self._build_scans_query(status_filter)
+            total = self._count_scans(session, status_filter, func)
+            scans = session.exec(statement.offset(offset).limit(per_page)).all()
+            results = self._format_scan_results(session, scans)
 
             return {
                 "scans": results,
@@ -414,6 +389,48 @@ class ScanService:
                 "page": page,
                 "per_page": per_page,
             }
+
+    def _build_scans_query(self, status_filter: Optional[str]):
+        """Build scans query with optional status filter."""
+        from sqlmodel import select
+        from bugtrace.schemas.db_models import ScanTable
+
+        statement = select(ScanTable).order_by(ScanTable.id.desc())
+        if status_filter:
+            statement = statement.where(ScanTable.status == ScanStatus[status_filter.upper()])
+        return statement
+
+    def _count_scans(self, session, status_filter: Optional[str], func) -> int:
+        """Count total scans matching filter."""
+        from sqlmodel import select
+        from bugtrace.schemas.db_models import ScanTable
+
+        count_statement = select(func.count()).select_from(ScanTable)
+        if status_filter:
+            count_statement = count_statement.where(ScanTable.status == ScanStatus[status_filter.upper()])
+        return session.exec(count_statement).one()
+
+    def _format_scan_results(self, session, scans) -> List[Dict[str, Any]]:
+        """Format scan results with report status."""
+        from bugtrace.schemas.db_models import TargetTable
+
+        report_base = settings.REPORT_DIR
+        results = []
+        for scan in scans:
+            target = session.get(TargetTable, scan.target_id)
+            target_url = target.url if target else None
+            has_report = self._has_report_dir(report_base, scan.id, target_url, scan.timestamp)
+
+            results.append({
+                "scan_id": scan.id,
+                "target": target_url or "unknown",
+                "status": scan.status.value,
+                "progress": scan.progress_percent,
+                "timestamp": scan.timestamp.isoformat(),
+                "origin": getattr(scan, "origin", "cli"),
+                "has_report": has_report,
+            })
+        return results
 
     async def delete_scan(self, scan_id: int, force: bool = False) -> Dict[str, Any]:
         """
@@ -432,48 +449,50 @@ class ScanService:
             PermissionError: If scan origin is 'cli' and force=False (web cannot delete CLI scans)
         """
         with self.db.get_session() as session:
-            from sqlmodel import select
-            from bugtrace.schemas.db_models import ScanTable, FindingTable, ScanStateTable, TargetTable
+            from bugtrace.schemas.db_models import ScanTable, TargetTable
 
             scan = session.get(ScanTable, scan_id)
             if not scan:
                 raise ValueError(f"Scan {scan_id} not found")
-
             if scan.status == ScanStatus.RUNNING:
                 raise ValueError(f"Cannot delete scan {scan_id}: scan is still running")
 
-            # Origin field available for informational purposes
-            # All scans can be deleted from any interface
-
-            # Resolve target URL and timestamp for report directory cleanup
             target = session.get(TargetTable, scan.target_id)
             target_url = target.url if target else None
             scan_timestamp = scan.timestamp
 
-            # Delete associated findings first (FK constraint)
-            findings = session.exec(
-                select(FindingTable).where(FindingTable.scan_id == scan_id)
-            ).all()
-            for finding in findings:
-                session.delete(finding)
+            findings_count = self._delete_scan_findings(session, scan_id)
+            self._delete_scan_states(session, scan_id)
 
-            # Delete associated scan state (FK constraint)
-            scan_states = session.exec(
-                select(ScanStateTable).where(ScanStateTable.scan_id == scan_id)
-            ).all()
-            for state in scan_states:
-                session.delete(state)
-
-            # Delete the scan
             session.delete(scan)
             session.commit()
+            logger.info(f"Deleted scan {scan_id} with {findings_count} findings")
 
-            logger.info(f"Deleted scan {scan_id} with {len(findings)} findings")
-
-        # Delete report files from disk (outside DB session)
         deleted_dirs = self._delete_report_dirs(scan_id, target_url, scan_timestamp)
+        return self._build_delete_response(scan_id, findings_count, deleted_dirs)
 
-        parts = [f"Scan {scan_id} deleted ({len(findings)} findings removed)"]
+    def _delete_scan_findings(self, session, scan_id: int) -> int:
+        """Delete all findings associated with a scan."""
+        from sqlmodel import select
+        from bugtrace.schemas.db_models import FindingTable
+
+        findings = session.exec(select(FindingTable).where(FindingTable.scan_id == scan_id)).all()
+        for finding in findings:
+            session.delete(finding)
+        return len(findings)
+
+    def _delete_scan_states(self, session, scan_id: int):
+        """Delete all scan states associated with a scan."""
+        from sqlmodel import select
+        from bugtrace.schemas.db_models import ScanStateTable
+
+        scan_states = session.exec(select(ScanStateTable).where(ScanStateTable.scan_id == scan_id)).all()
+        for state in scan_states:
+            session.delete(state)
+
+    def _build_delete_response(self, scan_id: int, findings_count: int, deleted_dirs: List[Path]) -> Dict[str, Any]:
+        """Build delete scan response message."""
+        parts = [f"Scan {scan_id} deleted ({findings_count} findings removed)"]
         if deleted_dirs:
             parts.append(f"{len(deleted_dirs)} report folder(s) removed")
 
@@ -546,7 +565,14 @@ class ScanService:
         report_base = settings.REPORT_DIR
         deleted = []
 
-        # Pattern 1: API-generated reports (scan_{id}/)
+        self._delete_api_report_dir(report_base, scan_id, deleted)
+        if target_url:
+            self._delete_pipeline_report_dirs(report_base, target_url, scan_timestamp, deleted)
+
+        return deleted
+
+    def _delete_api_report_dir(self, report_base: Path, scan_id: int, deleted: List[Path]):
+        """Delete API-generated report directory (scan_{id}/)."""
         api_dir = report_base / f"scan_{scan_id}"
         if api_dir.is_dir():
             try:
@@ -556,36 +582,53 @@ class ScanService:
             except OSError as e:
                 logger.warning(f"Failed to delete report directory {api_dir}: {e}")
 
-        # Pattern 2: Pipeline-generated reports ({domain}_{timestamp}/)
-        if target_url:
-            try:
-                hostname = urlparse(target_url).hostname or ""
-                if hostname:
-                    if scan_timestamp:
-                        # Precise match: {domain}_{YYYYMMDD}_{HHMMSS}
-                        ts_prefix = scan_timestamp.strftime("%Y%m%d_%H%M")
-                        for match in report_base.glob(f"{hostname}_{ts_prefix}*"):
-                            if match.is_dir():
-                                try:
-                                    shutil.rmtree(match)
-                                    deleted.append(match)
-                                    logger.info(f"Deleted report directory: {match}")
-                                except OSError as e:
-                                    logger.warning(f"Failed to delete report directory {match}: {e}")
-                    else:
-                        # Fallback: match all dirs for this domain (less precise)
-                        for match in report_base.glob(f"{hostname}_*"):
-                            if match.is_dir():
-                                try:
-                                    shutil.rmtree(match)
-                                    deleted.append(match)
-                                    logger.info(f"Deleted report directory: {match}")
-                                except OSError as e:
-                                    logger.warning(f"Failed to delete report directory {match}: {e}")
-            except Exception as e:
-                logger.warning(f"Error finding report dirs for {target_url}: {e}")
+    def _delete_pipeline_report_dirs(
+        self,
+        report_base: Path,
+        target_url: str,
+        scan_timestamp: Optional[datetime],
+        deleted: List[Path]
+    ):
+        """Delete pipeline-generated report directories ({domain}_{timestamp}/)."""
+        try:
+            hostname = urlparse(target_url).hostname or ""
+            if not hostname:
+                return
 
-        return deleted
+            if scan_timestamp:
+                self._delete_timestamped_reports(report_base, hostname, scan_timestamp, deleted)
+            else:
+                self._delete_all_domain_reports(report_base, hostname, deleted)
+        except Exception as e:
+            logger.warning(f"Error finding report dirs for {target_url}: {e}")
+
+    def _delete_timestamped_reports(
+        self,
+        report_base: Path,
+        hostname: str,
+        scan_timestamp: datetime,
+        deleted: List[Path]
+    ):
+        """Delete reports matching precise timestamp."""
+        ts_prefix = scan_timestamp.strftime("%Y%m%d_%H%M")
+        for match in report_base.glob(f"{hostname}_{ts_prefix}*"):
+            if match.is_dir():
+                self._try_delete_dir(match, deleted)
+
+    def _delete_all_domain_reports(self, report_base: Path, hostname: str, deleted: List[Path]):
+        """Delete all reports for a domain (fallback when no timestamp)."""
+        for match in report_base.glob(f"{hostname}_*"):
+            if match.is_dir():
+                self._try_delete_dir(match, deleted)
+
+    def _try_delete_dir(self, path: Path, deleted: List[Path]):
+        """Attempt to delete a directory and track success."""
+        try:
+            shutil.rmtree(path)
+            deleted.append(path)
+            logger.info(f"Deleted report directory: {path}")
+        except OSError as e:
+            logger.warning(f"Failed to delete report directory {path}: {e}")
 
     async def get_findings(
         self,
@@ -614,45 +657,10 @@ class ScanService:
             from sqlmodel import select, func
             from bugtrace.schemas.db_models import FindingTable
 
-            # Build query
-            statement = select(FindingTable).where(FindingTable.scan_id == scan_id)
-
-            if severity:
-                statement = statement.where(FindingTable.severity == severity.upper())
-
-            if vuln_type:
-                statement = statement.where(FindingTable.type == vuln_type.upper())
-
-            # Count total
-            count_statement = select(func.count()).select_from(FindingTable).where(
-                FindingTable.scan_id == scan_id
-            )
-            if severity:
-                count_statement = count_statement.where(FindingTable.severity == severity.upper())
-            if vuln_type:
-                count_statement = count_statement.where(FindingTable.type == vuln_type.upper())
-
-            total = session.exec(count_statement).one()
-
-            # Paginate
-            statement = statement.offset(offset).limit(per_page)
-            findings = session.exec(statement).all()
-
-            # Format results
-            results = []
-            for finding in findings:
-                results.append({
-                    "finding_id": finding.id,
-                    "type": finding.type.value if hasattr(finding.type, 'value') else str(finding.type),
-                    "severity": finding.severity,
-                    "details": finding.details,
-                    "payload": finding.payload_used,
-                    "url": finding.attack_url,
-                    "parameter": finding.vuln_parameter,
-                    "validated": finding.visual_validated,
-                    "status": finding.status.value,
-                    "confidence": finding.confidence_score,
-                })
+            statement = self._build_findings_query(scan_id, severity, vuln_type)
+            total = self._count_findings(session, scan_id, severity, vuln_type, func)
+            findings = session.exec(statement.offset(offset).limit(per_page)).all()
+            results = self._format_findings(findings)
 
             return {
                 "findings": results,
@@ -660,6 +668,50 @@ class ScanService:
                 "page": page,
                 "per_page": per_page,
             }
+
+    def _build_findings_query(self, scan_id: int, severity: Optional[str], vuln_type: Optional[str]):
+        """Build findings query with filters."""
+        from sqlmodel import select
+        from bugtrace.schemas.db_models import FindingTable
+
+        statement = select(FindingTable).where(FindingTable.scan_id == scan_id)
+        if severity:
+            statement = statement.where(FindingTable.severity == severity.upper())
+        if vuln_type:
+            statement = statement.where(FindingTable.type == vuln_type.upper())
+        return statement
+
+    def _count_findings(self, session, scan_id: int, severity: Optional[str], vuln_type: Optional[str], func) -> int:
+        """Count total findings matching filters."""
+        from sqlmodel import select
+        from bugtrace.schemas.db_models import FindingTable
+
+        count_statement = select(func.count()).select_from(FindingTable).where(
+            FindingTable.scan_id == scan_id
+        )
+        if severity:
+            count_statement = count_statement.where(FindingTable.severity == severity.upper())
+        if vuln_type:
+            count_statement = count_statement.where(FindingTable.type == vuln_type.upper())
+        return session.exec(count_statement).one()
+
+    def _format_findings(self, findings) -> List[Dict[str, Any]]:
+        """Format finding records for API response."""
+        results = []
+        for finding in findings:
+            results.append({
+                "finding_id": finding.id,
+                "type": finding.type.value if hasattr(finding.type, 'value') else str(finding.type),
+                "severity": finding.severity,
+                "details": finding.details,
+                "payload": finding.payload_used,
+                "url": finding.attack_url,
+                "parameter": finding.vuln_parameter,
+                "validated": finding.visual_validated,
+                "status": finding.status.value,
+                "confidence": finding.confidence_score,
+            })
+        return results
 
     @property
     def active_scan_count(self) -> int:

@@ -23,42 +23,47 @@ def normalize_vuln_type(type_str: str) -> VulnType:
     Handles case variations and common aliases.
     """
     type_upper = type_str.upper().strip()
-    
-    # Direct mappings
-    type_map = {
+    type_map = _build_vuln_type_mappings()
+
+    # Direct lookup
+    if type_upper in type_map:
+        return type_map[type_upper]
+
+    # Fuzzy match
+    fuzzy_match = _try_fuzzy_match(type_upper, type_map)
+    if fuzzy_match:
+        return fuzzy_match
+
+    # Enum value match
+    return _try_enum_match(type_str)
+
+def _build_vuln_type_mappings() -> dict:
+    """Build mapping of vulnerability type strings to VulnType enum."""
+    return {
         "XSS": VulnType.XSS,
         "CROSS-SITE SCRIPTING": VulnType.XSS,
         "CROSS-SITE SCRIPTING (XSS)": VulnType.XSS,
-        
         "SQLI": VulnType.SQLI,
         "SQL INJECTION": VulnType.SQLI,
         "SQL": VulnType.SQLI,
         "SQLINJECTION": VulnType.SQLI,
-        
         "RCE": VulnType.RCE,
         "REMOTE CODE EXECUTION": VulnType.RCE,
-        
         "XXE": VulnType.XXE,
         "XML EXTERNAL ENTITY": VulnType.XXE,
-        
         "CSTI": VulnType.CSTI,
         "CLIENT-SIDE TEMPLATE INJECTION": VulnType.CSTI,
         "SSTI": VulnType.CSTI,
         "SERVER-SIDE TEMPLATE INJECTION": VulnType.CSTI,
-        
         "PROTOTYPE_POLLUTION": VulnType.PROTO_POLLUTION,
         "PROTOTYPE POLLUTION": VulnType.PROTO_POLLUTION,
-        
         "OPEN_REDIRECT": VulnType.OPEN_REDIRECT,
         "OPEN REDIRECT": VulnType.OPEN_REDIRECT,
-        
         "HEADER_INJECTION": VulnType.HEADER_INJECTION,
         "HEADER INJECTION": VulnType.HEADER_INJECTION,
-        
         "SENSITIVE_DATA_EXPOSURE": VulnType.SENSITIVE_DATA,
         "SENSITIVE DATA EXPOSURE": VulnType.SENSITIVE_DATA,
         "DATA EXPOSURE": VulnType.SENSITIVE_DATA,
-        
         "IDOR": VulnType.IDOR,
         "INSECURE DIRECT OBJECT REFERENCE": VulnType.IDOR,
         "LFI": VulnType.LFI,
@@ -69,20 +74,19 @@ def normalize_vuln_type(type_str: str) -> VulnType:
         "SECURITY MISCONFIGURATION": VulnType.MISCONFIG,
         "MISCONFIG": VulnType.MISCONFIG,
     }
-    
-    if type_upper in type_map:
-        return type_map[type_upper]
-    
-    # Fuzzy match for variants (e.g. "Reflected XSS" -> "XSS")
-    for key, val in type_map.items():
-        if key in type_upper and len(key) > 2: 
-            return val
 
-    # Try to match as enum value
+def _try_fuzzy_match(type_upper: str, type_map: dict) -> Optional[VulnType]:
+    """Attempt fuzzy match for vulnerability type variants."""
+    for key, val in type_map.items():
+        if key in type_upper and len(key) > 2:
+            return val
+    return None
+
+def _try_enum_match(type_str: str) -> VulnType:
+    """Try to match as enum value, default to MISCONFIG if invalid."""
     try:
         return VulnType(type_str)
     except ValueError:
-        # Default to MISCONFIG for unknown types
         return VulnType.MISCONFIG
 
 class ReflectionContext(str, Enum):

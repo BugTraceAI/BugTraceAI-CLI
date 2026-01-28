@@ -129,65 +129,81 @@ class URLReporter:
     ):
         """Save DAST/SAST combined analysis report."""
         report_path = url_dir / "analysis_dast_sast.md"
-        
+
         with open(report_path, 'w', encoding='utf-8') as f:
-            f.write(f"# URL Analysis Report - DAST/SAST\n\n")
-            f.write(f"**Target URL:** `{url}`\n\n")
-            f.write(f"**Timestamp:** {datetime.now().isoformat()}\n\n")
-            f.write("---\n\n")
-            
-            # Metadata section
-            if metadata:
-                f.write("## 🔍 Metadata\n\n")
-                if 'params' in metadata:
-                    f.write(f"**Parameters:** {', '.join(metadata['params'].keys())}\n\n")
-                if 'tech_stack' in metadata:
-                    f.write(f"**Technology Stack:** {', '.join(metadata['tech_stack'])}\n\n")
-                if 'response_time' in metadata:
-                    f.write(f"**Response Time:** {metadata['response_time']}ms\n\n")
-                f.write("\n")
-            
-            # DAST Analysis
-            f.write("## 🎯 DAST Analysis (Dynamic Testing)\n\n")
-            if 'dast' in analysis_results:
-                dast = analysis_results['dast']
-                f.write(f"**Status:** {dast.get('status', 'N/A')}\n\n")
-                f.write(f"**Confidence:** {dast.get('confidence', 0)}%\n\n")
-                
-                if 'findings' in dast:
-                    f.write("### Findings:\n\n")
-                    for finding in dast['findings']:
-                        f.write(f"- **{finding.get('type', 'Unknown')}**: {finding.get('description', '')}\n")
-                f.write("\n")
-            else:
-                f.write("*No DAST analysis performed*\n\n")
-            
-            # SAST Analysis
-            f.write("## 📊 SAST Analysis (Static Code Analysis)\n\n")
-            if 'sast' in analysis_results:
-                sast = analysis_results['sast']
-                f.write(f"**Patterns Detected:** {len(sast.get('patterns', []))}\n\n")
-                
-                if 'patterns' in sast:
-                    f.write("### Vulnerable Patterns:\n\n")
-                    for pattern in sast['patterns']:
-                        f.write(f"- **{pattern.get('name', 'Unknown')}**\n")
-                        f.write(f"  - **Risk:** {pattern.get('risk_level', 'Unknown')}\n")
-                        f.write(f"  - **Details:** {pattern.get('details', '')}\n\n")
-            else:
-                f.write("*No SAST analysis performed*\n\n")
-            
-            # Overall Risk Assessment
-            f.write("## ⚠️ Risk Assessment\n\n")
-            overall_risk = analysis_results.get('overall_risk', 'Unknown')
-            f.write(f"**Overall Risk Level:** {overall_risk}\n\n")
-            
-            if 'recommendations' in analysis_results:
-                f.write("### Recommendations:\n\n")
-                for rec in analysis_results['recommendations']:
-                    f.write(f"- {rec}\n")
-        
+            self._write_report_header(f, url)
+            self._write_metadata_section(f, metadata)
+            self._write_dast_section(f, analysis_results)
+            self._write_sast_section(f, analysis_results)
+            self._write_risk_assessment(f, analysis_results)
+
         logger.debug(f"Saved analysis report: {report_path}")
+
+    def _write_report_header(self, f, url: str):
+        """Write report header with URL and timestamp."""
+        f.write(f"# URL Analysis Report - DAST/SAST\n\n")
+        f.write(f"**Target URL:** `{url}`\n\n")
+        f.write(f"**Timestamp:** {datetime.now().isoformat()}\n\n")
+        f.write("---\n\n")
+
+    def _write_metadata_section(self, f, metadata: Optional[Dict]):
+        """Write metadata section if available."""
+        if not metadata:
+            return
+
+        f.write("## 🔍 Metadata\n\n")
+        if 'params' in metadata:
+            f.write(f"**Parameters:** {', '.join(metadata['params'].keys())}\n\n")
+        if 'tech_stack' in metadata:
+            f.write(f"**Technology Stack:** {', '.join(metadata['tech_stack'])}\n\n")
+        if 'response_time' in metadata:
+            f.write(f"**Response Time:** {metadata['response_time']}ms\n\n")
+        f.write("\n")
+
+    def _write_dast_section(self, f, analysis_results: Dict):
+        """Write DAST analysis section."""
+        f.write("## 🎯 DAST Analysis (Dynamic Testing)\n\n")
+        if 'dast' not in analysis_results:
+            f.write("*No DAST analysis performed*\n\n")
+            return
+
+        dast = analysis_results['dast']
+        f.write(f"**Status:** {dast.get('status', 'N/A')}\n\n")
+        f.write(f"**Confidence:** {dast.get('confidence', 0)}%\n\n")
+
+        if 'findings' in dast:
+            f.write("### Findings:\n\n")
+            for finding in dast['findings']:
+                f.write(f"- **{finding.get('type', 'Unknown')}**: {finding.get('description', '')}\n")
+        f.write("\n")
+
+    def _write_sast_section(self, f, analysis_results: Dict):
+        """Write SAST analysis section."""
+        f.write("## 📊 SAST Analysis (Static Code Analysis)\n\n")
+        if 'sast' not in analysis_results:
+            f.write("*No SAST analysis performed*\n\n")
+            return
+
+        sast = analysis_results['sast']
+        f.write(f"**Patterns Detected:** {len(sast.get('patterns', []))}\n\n")
+
+        if 'patterns' in sast:
+            f.write("### Vulnerable Patterns:\n\n")
+            for pattern in sast['patterns']:
+                f.write(f"- **{pattern.get('name', 'Unknown')}**\n")
+                f.write(f"  - **Risk:** {pattern.get('risk_level', 'Unknown')}\n")
+                f.write(f"  - **Details:** {pattern.get('details', '')}\n\n")
+
+    def _write_risk_assessment(self, f, analysis_results: Dict):
+        """Write overall risk assessment section."""
+        f.write("## ⚠️ Risk Assessment\n\n")
+        overall_risk = analysis_results.get('overall_risk', 'Unknown')
+        f.write(f"**Overall Risk Level:** {overall_risk}\n\n")
+
+        if 'recommendations' in analysis_results:
+            f.write("### Recommendations:\n\n")
+            for rec in analysis_results['recommendations']:
+                f.write(f"- {rec}\n")
     
     def _save_vulnerabilities_report(
         self,
