@@ -71,36 +71,44 @@ class IDORAgent(BaseAgent):
         all_findings = []
         async with aiohttp.ClientSession() as session:
             for item in self.params:
-                param = item.get("parameter")
-                original_value = str(item.get("original_value", ""))
+                finding = await self._test_idor_param(item)
+                if finding:
+                    all_findings.append(finding)
 
-                if not param:
-                    continue
+        return {"vulnerable": len(all_findings) > 0, "findings": all_findings}
 
-                logger.info(f"[{self.name}] Testing IDOR on {param}={original_value}")
+    async def _test_idor_param(self, item: dict):
+        """Test a single parameter for IDOR vulnerability."""
+        param = item.get("parameter")
+        original_value = str(item.get("original_value", ""))
 
-                # Deduplication check
-                key = f"{self.url}#{param}"
-                if key in self._tested_params:
-                    logger.info(f"[{self.name}] Skipping {param} - already tested")
-                    continue
+        # Guard: Skip if no parameter
+        if not param:
+            return None
 
-                # High-Performance Go IDOR Fuzzer
-                dashboard.log(f"[{self.name}] 🚀 Launching Go IDOR Fuzzer on '{param}' (Range 1-1000)...", "INFO")
-                go_result = await external_tools.run_go_idor_fuzzer(self.url, param, id_range="1-1000", baseline_id=original_value)
+        logger.info(f"[{self.name}] Testing IDOR on {param}={original_value}")
 
-                if go_result and go_result.get("hits"):
-                    for hit in go_result["hits"]:
-                        dashboard.log(f"[{self.name}] 🚨 IDOR HIT: ID {hit['id']} ({hit['severity']})", "CRITICAL")
-                        all_findings.append(self._create_idor_finding(hit, param, original_value))
-                        self._tested_params.add(key)
-                        break # Found one, move on
-                else:
-                    logger.info(f"[{self.name}] ✅ No IDOR found on '{param}' - semantic analysis passed")
+        # Guard: Skip if already tested
+        key = f"{self.url}#{param}"
+        if key in self._tested_params:
+            logger.info(f"[{self.name}] Skipping {param} - already tested")
+            return None
 
-                self._tested_params.add(key)
+        # High-Performance Go IDOR Fuzzer
+        dashboard.log(f"[{self.name}] 🚀 Launching Go IDOR Fuzzer on '{param}' (Range 1-1000)...", "INFO")
+        go_result = await external_tools.run_go_idor_fuzzer(self.url, param, id_range="1-1000", baseline_id=original_value)
 
-        return {"findings": all_findings, "status": JobStatus.COMPLETED}
+        self._tested_params.add(key)
+
+        # Guard: Skip if no hits
+        if not go_result or not go_result.get("hits"):
+            logger.info(f"[{self.name}] ✅ No IDOR found on '{param}' - semantic analysis passed")
+            return None
+
+        # Process first hit
+        hit = go_result["hits"][0]
+        dashboard.log(f"[{self.name}] 🚨 IDOR HIT: ID {hit['id']} ({hit['severity']})", "CRITICAL")
+        return self._create_idor_finding(hit, param, original_value)
 
     async def _fetch(self, session, val, param_name, original_val) -> Optional[str]:
         text, _ = await self._fetch_full(session, val, param_name, original_val)
