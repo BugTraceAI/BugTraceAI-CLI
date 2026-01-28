@@ -90,56 +90,70 @@ class ServiceEventBus:
         scan_id = data.get("scan_id")
         if scan_id is not None:
             async with self._lock:
-                # Assign monotonically increasing sequence number
-                current_seq = self._seq_counters.get(scan_id, 0) + 1
-                self._seq_counters[scan_id] = current_seq
+                await self._store_event_in_history(scan_id, event, data)
 
-                # Map internal event names to WS-02 types
-                event_type_mapping = {
-                    "scan.created": "scan_started",
-                    "scan.started": "scan_started",
-                    "scan.completed": "scan_complete",
-                    "scan.stopped": "scan_complete",
-                    "scan.failed": "error",
-                    "scan.error": "error",
-                }
+    async def _store_event_in_history(self, scan_id: int, event: str, data: Dict[str, Any]):
+        """Store event in scan-scoped history and push to streams."""
+        # Assign sequence number
+        current_seq = self._seq_counters.get(scan_id, 0) + 1
+        self._seq_counters[scan_id] = current_seq
 
-                # Check for event categories
-                if event in event_type_mapping:
-                    event_type = event_type_mapping[event]
-                elif "agent" in event:
-                    event_type = "agent_active"
-                elif "finding" in event:
-                    event_type = "finding_discovered"
-                elif "phase" in event:
-                    event_type = "phase_complete"
-                else:
-                    event_type = event  # Use original event name as-is
+        # Map event to type
+        event_type = self._map_event_type(event)
 
-                # Create history entry
-                history_entry = {
-                    "event": event,
-                    "data": data,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "seq": current_seq,
-                    "event_type": event_type,
-                }
+        # Create history entry
+        history_entry = {
+            "event": event,
+            "data": data,
+            "timestamp": datetime.utcnow().isoformat(),
+            "seq": current_seq,
+            "event_type": event_type,
+        }
 
-                # Append to history with cap
-                history = self._event_history[scan_id]
-                history.append(history_entry)
+        # Store and cap history
+        self._append_to_history(scan_id, history_entry)
 
-                # Cap history to prevent memory leak
-                if len(history) > self._max_history_per_scan:
-                    self._event_history[scan_id] = history[-self._max_history_per_scan:]
-                    logger.debug(f"Capped history for scan {scan_id} to {self._max_history_per_scan} events")
+        # Push to stream queues
+        self._push_to_queues(scan_id, event, history_entry)
 
-                # Push to all stream queues for this scan_id
-                for queue in self._scan_queues[scan_id]:
-                    try:
-                        queue.put_nowait(history_entry)
-                    except asyncio.QueueFull:
-                        logger.warning(f"Queue full for scan {scan_id}, dropping event {event}")
+    def _map_event_type(self, event: str) -> str:
+        """Map internal event names to WS-02 types."""
+        event_type_mapping = {
+            "scan.created": "scan_started",
+            "scan.started": "scan_started",
+            "scan.completed": "scan_complete",
+            "scan.stopped": "scan_complete",
+            "scan.failed": "error",
+            "scan.error": "error",
+        }
+
+        if event in event_type_mapping:
+            return event_type_mapping[event]
+        if "agent" in event:
+            return "agent_active"
+        if "finding" in event:
+            return "finding_discovered"
+        if "phase" in event:
+            return "phase_complete"
+        return event
+
+    def _append_to_history(self, scan_id: int, history_entry: Dict[str, Any]):
+        """Append entry to history with cap."""
+        history = self._event_history[scan_id]
+        history.append(history_entry)
+
+        # Cap history to prevent memory leak
+        if len(history) > self._max_history_per_scan:
+            self._event_history[scan_id] = history[-self._max_history_per_scan:]
+            logger.debug(f"Capped history for scan {scan_id} to {self._max_history_per_scan} events")
+
+    def _push_to_queues(self, scan_id: int, event: str, history_entry: Dict[str, Any]):
+        """Push event to all stream queues for this scan."""
+        for queue in self._scan_queues[scan_id]:
+            try:
+                queue.put_nowait(history_entry)
+            except asyncio.QueueFull:
+                logger.warning(f"Queue full for scan {scan_id}, dropping event {event}")
 
     def get_history(self, scan_id: int, since_seq: int = 0) -> List[Dict[str, Any]]:
         """

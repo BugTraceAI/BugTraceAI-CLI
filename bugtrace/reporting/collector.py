@@ -31,6 +31,17 @@ class DataCollector:
 
     def add_vulnerability(self, vuln_data: Dict[str, Any]):
         """Ingests a raw vulnerability dictionary"""
+        # Parse and create finding
+        finding = self._create_finding_from_vuln_data(vuln_data)
+
+        # Add evidence
+        self._add_evidence_to_finding(finding, vuln_data)
+
+        # Deduplication and add to context
+        self._deduplicate_and_add_finding(finding, vuln_data)
+
+    def _create_finding_from_vuln_data(self, vuln_data: Dict[str, Any]) -> Finding:
+        """Create Finding object from vulnerability data."""
         severity_map = {
             "CRITICAL": Severity.CRITICAL,
             "HIGH": Severity.HIGH,
@@ -39,28 +50,18 @@ class DataCollector:
             "INFO": Severity.INFO,
             "SAFE": Severity.SAFE
         }
-        
+
         # Default to INFO if unknown
         sev_str = vuln_data.get('severity', 'INFO').upper()
         severity = severity_map.get(sev_str, Severity.INFO)
-        
+
         # Determine validation status
         is_validated = vuln_data.get('validated', False)
-        
-        # Determine validation method based on vulnerability type and evidence
-        validation_method = None
-        if is_validated:
-            vuln_type = (vuln_data.get('type') or '').upper()
-            if 'XSS' in vuln_type:
-                validation_method = "Browser + Vision AI"
-            elif 'SQL' in vuln_type:
-                validation_method = "SQLMap Confirmation"
-            elif 'HEADER' in vuln_type or 'CRLF' in vuln_type:
-                validation_method = "HTTP Response Analysis"
-            else:
-                validation_method = "Automated Verification"
-        
-        finding = Finding(
+
+        # Determine validation method
+        validation_method = self._determine_validation_method(vuln_data, is_validated)
+
+        return Finding(
             title=vuln_data.get('type', 'Unknown Vulnerability'),
             type=FindingType.VULNERABILITY,
             severity=severity,
@@ -73,74 +74,84 @@ class DataCollector:
             validation_method=validation_method,
             metadata=vuln_data
         )
-        
+
+    def _determine_validation_method(self, vuln_data: Dict[str, Any], is_validated: bool) -> Optional[str]:
+        """Determine validation method based on vulnerability type."""
+        if not is_validated:
+            return None
+
+        vuln_type = (vuln_data.get('type') or '').upper()
+        if 'XSS' in vuln_type:
+            return "Browser + Vision AI"
+        elif 'SQL' in vuln_type:
+            return "SQLMap Confirmation"
+        elif 'HEADER' in vuln_type or 'CRLF' in vuln_type:
+            return "HTTP Response Analysis"
+        else:
+            return "Automated Verification"
+
+    def _add_evidence_to_finding(self, finding: Finding, vuln_data: Dict[str, Any]):
+        """Add evidence items to finding."""
         if 'payload' in vuln_data and vuln_data['payload']:
             finding.evidence.append(Evidence(
                 description="Payload causing the issue",
                 content=str(vuln_data['payload'])
             ))
-        
+
         # Add reproduction command as POC
         if 'reproduction' in vuln_data and vuln_data['reproduction']:
             finding.evidence.append(Evidence(
                 description="POC Command (Reproduction)",
                 content=str(vuln_data['reproduction'])
             ))
-            
-        # DEDUPLICATION LOGIC
-        # Generate a unique signature for the finding
+
+    def _deduplicate_and_add_finding(self, finding: Finding, vuln_data: Dict[str, Any]):
+        """Check for duplicates and add finding to context."""
         from urllib.parse import urlparse
-        
+
+        # Generate signature
         parsed_url = urlparse(str(vuln_data.get('url', '')))
         path = parsed_url.path
-        
-        # Signature: TYPE + PATH + PARAMETER
-        # We ignore differences in protocol/port or specific payload for deduplication purposes
         param = str(vuln_data.get('parameter', ''))
         vtype = str(vuln_data.get('type', '')).upper()
-        
-        signature = f"{vtype}|{path}|{param}"
-        
-        # Check if already exists with same signature
-        existing_idx = -1
+
+        # Check if already exists
+        existing_idx = self._find_existing_vulnerability(vtype, path, param)
+
+        if existing_idx != -1:
+            # Handle duplicate
+            if self._should_replace_existing(finding, self.context.findings[existing_idx]):
+                self.context.findings[existing_idx] = finding
+            # Otherwise skip duplicate
+            return
+
+        self.context.add_finding(finding)
+
+    def _find_existing_vulnerability(self, vtype: str, path: str, param: str) -> int:
+        """Find existing vulnerability with same signature."""
+        from urllib.parse import urlparse
+
         for i, existing in enumerate(self.context.findings):
-            if not hasattr(existing, 'metadata'): continue
-            
+            if not hasattr(existing, 'metadata'):
+                continue
+
             ex_url = urlparse(str(existing.metadata.get('url', '')))
             ex_path = ex_url.path
             ex_param = str(existing.metadata.get('parameter', ''))
             ex_type = str(existing.title).upper()
-            
-            if ex_type == vtype and ex_path == path and ex_param == param:
-                existing_idx = i
-                break
-        
-        if existing_idx != -1:
-            # If exists, keep the one with higher severity or validation
-            existing = self.context.findings[existing_idx]
-            old_sev = severity_map.get(str(existing.severity.value).upper(), 0)
-            new_sev = severity_map.get(sev_str, 0)
-            
-            # If new one is validated and old one isn't, replace
-            if is_validated and not existing.validated:
-                self.context.findings[existing_idx] = finding
-                return
-            
-            # If both valid/invalid, keep higher severity (assuming CRITICAL < HIGH in enum value, wait enum is opposite usually)
-            # Actually let's just use the priority map we defined
-            # In our map: CRITICAL is most severe.
-            # Assuming enum comparison works or we trust the order.
-            # Let's simple check: if existing is already VALIDATED, don't overwrite unless new is also VALIDATED and more critical.
-            
-            # For header injection noise, usually the first one is enough.
-            # We strictly replace ONLY if the new finding is VALIDATED and the old one wasn't.
-            if is_validated and not existing.validated:
-                 self.context.findings[existing_idx] = finding
-            
-            # Otherwise, skip duplicate
-            return
 
-        self.context.add_finding(finding)
+            if ex_type == vtype and ex_path == path and ex_param == param:
+                return i
+
+        return -1
+
+    def _should_replace_existing(self, new_finding: Finding, existing_finding: Finding) -> bool:
+        """Determine if new finding should replace existing one."""
+        # Replace if new is validated and old isn't
+        if new_finding.validated and not existing_finding.validated:
+            return True
+
+        return False
 
     def ingest_json_file(self, file_path: str):
         """Helper to load legacy JSON files and try to map them"""

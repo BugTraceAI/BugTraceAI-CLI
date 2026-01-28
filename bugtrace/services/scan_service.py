@@ -145,92 +145,116 @@ class ScanService:
         scan_id = ctx.scan_id
 
         try:
-            # Acquire semaphore - blocks if at concurrent limit
             async with self._semaphore:
-                logger.info(f"Scan {scan_id} acquired semaphore, starting execution")
-
-                # Update status
-                ctx.status = "running"
-                ctx.phase = "INIT"
-                self.db.update_scan_status(scan_id, ScanStatus.RUNNING)
-
-                await self.event_bus.emit("scan.started", {
-                    "scan_id": scan_id,
-                    "target": ctx.options.target_url,
-                })
-
-                # Compute output directory (pattern: {REPORT_DIR}/{domain}_{timestamp})
-                domain = urlparse(ctx.options.target_url).netloc.replace(":", "_")
-                timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                output_dir = settings.REPORT_DIR / f"{domain}_{timestamp}"
-                output_dir.mkdir(parents=True, exist_ok=True)
-
-                # Create TeamOrchestrator using settings from context snapshot
-                from bugtrace.core.team import TeamOrchestrator
-
-                orchestrator = TeamOrchestrator(
-                    target=ctx.options.target_url,
-                    resume=ctx.options.resume,
-                    max_depth=ctx.options.max_depth,
-                    max_urls=ctx.options.max_urls,
-                    use_vertical_agents=ctx.options.use_vertical,
-                    output_dir=output_dir,
-                )
-
-                # CRITICAL: Monkey-patch orchestrator's stop_event to use our context's stop_event
-                # This ensures stop_scan() can signal the orchestrator
-                orchestrator._stop_event = ctx.stop_event
-                orchestrator.scan_id = scan_id  # Already set by TeamOrchestrator.__init__ but be explicit
-
-                # Execute scan (blocks until complete or stopped)
-                logger.info(f"Scan {scan_id} starting TeamOrchestrator")
-                await orchestrator.start()
-
-                # Scan completed successfully
-                ctx.status = "completed"
-                ctx.progress = 100
-                self.db.update_scan_status(scan_id, ScanStatus.COMPLETED)
-
-                await self.event_bus.emit("scan.completed", {
-                    "scan_id": scan_id,
-                    "target": ctx.options.target_url,
-                    "findings_count": ctx.findings_count,
-                })
-
-                logger.success(f"Scan {scan_id} completed successfully")
-
+                await self._execute_scan(ctx)
         except asyncio.CancelledError:
-            # Task was cancelled (stop_scan called)
-            ctx.status = "stopped"
-            self.db.update_scan_status(scan_id, ScanStatus.STOPPED)
-
-            await self.event_bus.emit("scan.stopped", {
-                "scan_id": scan_id,
-                "target": ctx.options.target_url,
-            })
-
-            logger.warning(f"Scan {scan_id} was cancelled")
-            raise  # Re-raise to properly cancel the task
-
+            await self._handle_scan_cancellation(ctx)
+            raise
         except Exception as e:
-            # Scan failed with error
-            ctx.status = "failed"
-            self.db.update_scan_status(scan_id, ScanStatus.FAILED)
-
-            await self.event_bus.emit("scan.failed", {
-                "scan_id": scan_id,
-                "target": ctx.options.target_url,
-                "error": str(e),
-            })
-
-            logger.error(f"Scan {scan_id} failed: {e}")
-
+            await self._handle_scan_failure(ctx, e)
         finally:
-            # Cleanup: remove from active scans
-            async with self._lock:
-                if scan_id in self._active_scans:
-                    del self._active_scans[scan_id]
-                    logger.info(f"Scan {scan_id} removed from active scans (remaining: {len(self._active_scans)})")
+            await self._cleanup_scan(scan_id)
+
+    async def _execute_scan(self, ctx: ScanContext):
+        """Execute scan with orchestrator."""
+        scan_id = ctx.scan_id
+        logger.info(f"Scan {scan_id} acquired semaphore, starting execution")
+
+        # Update status
+        ctx.status = "running"
+        ctx.phase = "INIT"
+        self.db.update_scan_status(scan_id, ScanStatus.RUNNING)
+
+        await self.event_bus.emit("scan.started", {
+            "scan_id": scan_id,
+            "target": ctx.options.target_url,
+        })
+
+        # Compute output directory
+        output_dir = self._compute_output_dir(ctx.options.target_url)
+
+        # Create and configure orchestrator
+        orchestrator = self._create_orchestrator(ctx, output_dir)
+
+        # Execute scan
+        logger.info(f"Scan {scan_id} starting TeamOrchestrator")
+        await orchestrator.start()
+
+        # Mark as completed
+        await self._mark_scan_completed(ctx)
+
+    def _compute_output_dir(self, target_url: str) -> Path:
+        """Compute output directory for scan reports."""
+        domain = urlparse(target_url).netloc.replace(":", "_")
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        output_dir = settings.REPORT_DIR / f"{domain}_{timestamp}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir
+
+    def _create_orchestrator(self, ctx: ScanContext, output_dir: Path):
+        """Create and configure TeamOrchestrator."""
+        from bugtrace.core.team import TeamOrchestrator
+
+        orchestrator = TeamOrchestrator(
+            target=ctx.options.target_url,
+            resume=ctx.options.resume,
+            max_depth=ctx.options.max_depth,
+            max_urls=ctx.options.max_urls,
+            use_vertical_agents=ctx.options.use_vertical,
+            output_dir=output_dir,
+        )
+
+        # CRITICAL: Monkey-patch stop_event for graceful shutdown
+        orchestrator._stop_event = ctx.stop_event
+        orchestrator.scan_id = ctx.scan_id
+
+        return orchestrator
+
+    async def _mark_scan_completed(self, ctx: ScanContext):
+        """Mark scan as completed with success event."""
+        ctx.status = "completed"
+        ctx.progress = 100
+        self.db.update_scan_status(ctx.scan_id, ScanStatus.COMPLETED)
+
+        await self.event_bus.emit("scan.completed", {
+            "scan_id": ctx.scan_id,
+            "target": ctx.options.target_url,
+            "findings_count": ctx.findings_count,
+        })
+
+        logger.success(f"Scan {ctx.scan_id} completed successfully")
+
+    async def _handle_scan_cancellation(self, ctx: ScanContext):
+        """Handle scan cancellation."""
+        ctx.status = "stopped"
+        self.db.update_scan_status(ctx.scan_id, ScanStatus.STOPPED)
+
+        await self.event_bus.emit("scan.stopped", {
+            "scan_id": ctx.scan_id,
+            "target": ctx.options.target_url,
+        })
+
+        logger.warning(f"Scan {ctx.scan_id} was cancelled")
+
+    async def _handle_scan_failure(self, ctx: ScanContext, error: Exception):
+        """Handle scan failure."""
+        ctx.status = "failed"
+        self.db.update_scan_status(ctx.scan_id, ScanStatus.FAILED)
+
+        await self.event_bus.emit("scan.failed", {
+            "scan_id": ctx.scan_id,
+            "target": ctx.options.target_url,
+            "error": str(error),
+        })
+
+        logger.error(f"Scan {ctx.scan_id} failed: {error}")
+
+    async def _cleanup_scan(self, scan_id: int):
+        """Remove scan from active scans."""
+        async with self._lock:
+            if scan_id in self._active_scans:
+                del self._active_scans[scan_id]
+                logger.info(f"Scan {scan_id} removed from active scans (remaining: {len(self._active_scans)})")
 
     async def get_scan_status(self, scan_id: int) -> Dict[str, Any]:
         """

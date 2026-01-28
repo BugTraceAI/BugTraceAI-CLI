@@ -197,6 +197,16 @@ class URLReporter:
     ):
         """Save vulnerabilities report."""
         # JSON format for machine-readable
+        self._save_vulnerabilities_json(url_dir, url, vulnerabilities)
+
+        # Markdown format for human-readable
+        md_path = url_dir / "vulnerabilities.md"
+        self._save_vulnerabilities_markdown(md_path, url, vulnerabilities)
+
+        logger.debug(f"Saved vulnerabilities report: {md_path}")
+
+    def _save_vulnerabilities_json(self, url_dir: Path, url: str, vulnerabilities: List[Dict]):
+        """Save JSON format vulnerability report."""
         json_path = url_dir / "vulnerabilities.json"
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump({
@@ -205,144 +215,193 @@ class URLReporter:
                 'total_vulnerabilities': len(vulnerabilities),
                 'vulnerabilities': vulnerabilities
             }, f, indent=2)
-        
-        # Markdown format for human-readable
-        md_path = url_dir / "vulnerabilities.md"
+
+    def _save_vulnerabilities_markdown(self, md_path: Path, url: str, vulnerabilities: List[Dict]):
+        """Save markdown format vulnerability report."""
         with open(md_path, 'w', encoding='utf-8') as f:
-            f.write(f"# Vulnerabilities Report\n\n")
-            f.write(f"**Target URL:** `{url}`\n\n")
-            f.write(f"**Total Vulnerabilities:** {len(vulnerabilities)}\n\n")
-            f.write("---\n\n")
-            
+            self._write_vuln_report_header(f, url, vulnerabilities)
+
             if not vulnerabilities:
                 f.write("✅ **No vulnerabilities found**\n")
             else:
-                # Group by severity
-                by_severity = self._group_by_severity(vulnerabilities)
-                
-                for severity in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFORMATIONAL']:
-                    vulns = by_severity.get(severity, [])
-                    if vulns:
-                        emoji = {
-                            'CRITICAL': '🔴',
-                            'HIGH': '🟠',
-                            'MEDIUM': '🟡',
-                            'LOW': '🔵',
-                            'INFORMATIONAL': 'ℹ️'
-                        }.get(severity, '⚪')
-                        
-                        f.write(f"## {emoji} {severity} ({len(vulns)})\n\n")
-                        
-                        for idx, vuln in enumerate(vulns, 1):
-                            f.write(f"### {idx}. {vuln.get('type', 'Unknown Vulnerability')}\n\n")
-                            f.write(f"**Parameter:** `{vuln.get('parameter', 'N/A')}`\n\n")
-                            f.write(f"**Confidence:** {vuln.get('confidence', 0)}%\n\n")
-                            
-                            if 'payload' in vuln:
-                                f.write(f"**Payload:**\n```\n{vuln['payload']}\n```\n\n")
-                            
-                            if 'details' in vuln:
-                                f.write(f"**Details:** {vuln['details']}\n\n")
-                            # CSTI Reporting (V5)
-                            if vuln.get('type') == 'CSTI' or 'template' in vuln.get('type', '').lower():
-                                meta = vuln.get('csti_metadata', {})
-                                f.write(f"#### 🎭 CSTI Deep Dive\n\n")
-                                f.write(f"- **Engine:** {meta.get('engine', 'Unknown')} ({meta.get('type', 'Unknown')})\n")
-                                f.write(f"- **Syntax:** `{meta.get('syntax', 'Unknown')}`\n")
-                                f.write(f"- **Confirmed URL:** `{meta.get('verified_url', vuln.get('url'))}`\n")
-                                
-                                if meta.get('arithmetic_proof'):
-                                    f.write(f"- **Proof:** Arithmetic evaluation confirmed (7*7 -> 49)\n")
-                                
-                                if vuln.get('reproduction_steps'):
-                                    f.write(f"\n**🛠️ Reproduction:**\n")
-                                    for step in vuln['reproduction_steps']:
-                                        f.write(f"- {step}\n")
-                                    f.write("\n")
-                                
-                                if vuln.get('reproduction'):
-                                    f.write(f"**Command:**\n```bash\n{vuln['reproduction']}\n```\n\n")
+                self._write_vulnerabilities_by_severity(f, vulnerabilities)
 
-                            # SQLi Reporting (V5)
-                            if vuln.get('injection_type') and (vuln_type == 'SQLI' or 'SQL' in vuln_type):
-                                f.write(f"#### 💉 SQLi Deep Dive\n\n")
-                                f.write(f"- **Technique:** {vuln.get('injection_type')}\n")
-                                f.write(f"- **DBMS:** {vuln.get('dbms_detected', 'Unknown')}\n")
-                                if vuln.get('columns_detected'):
-                                    f.write(f"- **Columns Detected:** {vuln.get('columns_detected')}\n")
-                                
-                                if vuln.get('working_payload'):
-                                    f.write(f"\n**🧨 Verification & Exploitation:**\n")
-                                    f.write(f"**Working Payload:**\n```sql\n{vuln.get('working_payload')}\n```\n\n")
-                                
-                                if vuln.get('exploit_url_encoded'):
-                                    f.write(f"**🔗 One-Click Exploit:**\n[{vuln.get('exploit_url')}]({vuln.get('exploit_url_encoded')})\n\n")
-                                
-                                if vuln.get('extracted_databases') or vuln.get('extracted_tables'):
-                                    f.write(f"**📂 Extracted Data (Proof):**\n")
-                                    if vuln.get('extracted_databases'):
-                                        f.write(f"- **Databases:** {', '.join(vuln['extracted_databases'])}\n")
-                                    if vuln.get('extracted_tables'):
-                                        f.write(f"- **Tables:** {', '.join(vuln['extracted_tables'])}\n")
-                                    f.write("\n")
-                                
-                                if vuln.get('reproduction_steps'):
-                                    f.write(f"**🛠️ Reproduction:**\n")
-                                    for step in vuln['reproduction_steps']:
-                                        f.write(f"- {step}\n")
-                                    f.write("\n")
-                                
-                                if vuln.get('curl_command'):
-                                    f.write(f"**cURL:**\n```bash\n{vuln['curl_command']}\n```\n")
-                                
-                                if vuln.get('sqlmap_reproduce_command'):
-                                    f.write(f"**SQLMap:**\n```bash\n{vuln['sqlmap_reproduce_command']}\n```\n")
-                                f.write("\n")
+    def _write_vuln_report_header(self, f, url: str, vulnerabilities: List[Dict]):
+        """Write vulnerability report header."""
+        f.write(f"# Vulnerabilities Report\n\n")
+        f.write(f"**Target URL:** `{url}`\n\n")
+        f.write(f"**Total Vulnerabilities:** {len(vulnerabilities)}\n\n")
+        f.write("---\n\n")
 
-                            # Extended XSS Reporting (V5)
-                            if 'xss_type' in vuln:
-                                f.write(f"#### 🔬 XSS Deep Dive\n\n")
-                                f.write(f"- **Type:** {vuln.get('xss_type')}\n")
-                                f.write(f"- **Injection Context:** `{vuln.get('injection_context_type')}`\n")
-                                if vuln.get('vulnerable_code_snippet'):
-                                    f.write(f"- **Snippet:** `{vuln.get('vulnerable_code_snippet')}`\n")
-                                f.write(f"- **Bypass Technique:** {vuln.get('escape_bypass_technique')} ({vuln.get('bypass_explanation')})\n\n")
-                                
-                                if vuln.get('exploit_url'):
-                                    f.write(f"**🧨 Exploit URL (Click to Test):**\n[{vuln.get('exploit_url')}]({vuln.get('exploit_url_encoded')})\n\n")
-                                
-                                if vuln.get('verification_methods'):
-                                    f.write(f"**✅ HOW TO VERIFY (Avoid alerts):**\n")
-                                    for vm in vuln['verification_methods']:
-                                        f.write(f"- **{vm.get('name')}**: {vm.get('instructions')}\n")
-                                        if vm.get('url_encoded'):
-                                            f.write(f"  - [👉 Execute Verification]({vm['url_encoded']})\n")
-                                    f.write("\n")
-                                
-                                if vuln.get('reproduction_steps'):
-                                    f.write(f"**📝 Step-by-Step Reproduction:**\n")
-                                    for step in vuln['reproduction_steps']:
-                                        f.write(f"1. {step}\n")
-                                    f.write("\n")
+    def _write_vulnerabilities_by_severity(self, f, vulnerabilities: List[Dict]):
+        """Write vulnerabilities grouped by severity."""
+        by_severity = self._group_by_severity(vulnerabilities)
 
-                            
-                            # Different validation indicators based on vulnerability type
-                            vuln_type = vuln.get('type', '').upper()
-                            if 'validated' in vuln and vuln['validated']:
-                                if 'XSS' in vuln_type:
-                                    f.write("✅ **XSS Validated** - Alert popup captured in browser\n\n")
-                                else:
-                                    f.write("✅ **Validated** - Confirmed with technical evidence\n\n")
-                            
-                            if 'screenshot' in vuln:
-                                if 'XSS' in vuln_type:
-                                    f.write(f"**XSS Validation Proof:** [Alert Screenshot](screenshots/{Path(vuln['screenshot']).name})\n\n")
-                                else:
-                                    f.write(f"**Screenshot:** [View](screenshots/{Path(vuln['screenshot']).name})\n\n")
-                            
-                            f.write("---\n\n")
-        
-        logger.debug(f"Saved vulnerabilities report: {md_path}")
+        for severity in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFORMATIONAL']:
+            vulns = by_severity.get(severity, [])
+            if vulns:
+                self._write_severity_section(f, severity, vulns)
+
+    def _write_severity_section(self, f, severity: str, vulns: List[Dict]):
+        """Write a severity-level section with all vulnerabilities."""
+        emoji = {
+            'CRITICAL': '🔴',
+            'HIGH': '🟠',
+            'MEDIUM': '🟡',
+            'LOW': '🔵',
+            'INFORMATIONAL': 'ℹ️'
+        }.get(severity, '⚪')
+
+        f.write(f"## {emoji} {severity} ({len(vulns)})\n\n")
+
+        for idx, vuln in enumerate(vulns, 1):
+            self._write_single_vulnerability(f, vuln, idx)
+
+    def _write_single_vulnerability(self, f, vuln: Dict, idx: int):
+        """Write a single vulnerability entry."""
+        f.write(f"### {idx}. {vuln.get('type', 'Unknown Vulnerability')}\n\n")
+        f.write(f"**Parameter:** `{vuln.get('parameter', 'N/A')}`\n\n")
+        f.write(f"**Confidence:** {vuln.get('confidence', 0)}%\n\n")
+
+        if 'payload' in vuln:
+            f.write(f"**Payload:**\n```\n{vuln['payload']}\n```\n\n")
+
+        if 'details' in vuln:
+            f.write(f"**Details:** {vuln['details']}\n\n")
+
+        # Write vulnerability-specific deep dives
+        self._write_vuln_deep_dive(f, vuln)
+
+        # Validation status
+        self._write_validation_status(f, vuln)
+
+        f.write("---\n\n")
+
+    def _write_vuln_deep_dive(self, f, vuln: Dict):
+        """Write vulnerability-specific deep dive sections."""
+        # CSTI Reporting
+        if vuln.get('type') == 'CSTI' or 'template' in vuln.get('type', '').lower():
+            self._write_csti_deep_dive(f, vuln)
+
+        # SQLi Reporting
+        vuln_type = vuln.get('type', '').upper()
+        if vuln.get('injection_type') and (vuln_type == 'SQLI' or 'SQL' in vuln_type):
+            self._write_sqli_deep_dive(f, vuln)
+
+        # XSS Reporting
+        if 'xss_type' in vuln:
+            self._write_xss_deep_dive(f, vuln)
+
+    def _write_csti_deep_dive(self, f, vuln: Dict):
+        """Write CSTI-specific details."""
+        meta = vuln.get('csti_metadata', {})
+        f.write(f"#### 🎭 CSTI Deep Dive\n\n")
+        f.write(f"- **Engine:** {meta.get('engine', 'Unknown')} ({meta.get('type', 'Unknown')})\n")
+        f.write(f"- **Syntax:** `{meta.get('syntax', 'Unknown')}`\n")
+        f.write(f"- **Confirmed URL:** `{meta.get('verified_url', vuln.get('url'))}`\n")
+
+        if meta.get('arithmetic_proof'):
+            f.write(f"- **Proof:** Arithmetic evaluation confirmed (7*7 -> 49)\n")
+
+        if vuln.get('reproduction_steps'):
+            f.write(f"\n**🛠️ Reproduction:**\n")
+            for step in vuln['reproduction_steps']:
+                f.write(f"- {step}\n")
+            f.write("\n")
+
+        if vuln.get('reproduction'):
+            f.write(f"**Command:**\n```bash\n{vuln['reproduction']}\n```\n\n")
+
+    def _write_sqli_deep_dive(self, f, vuln: Dict):
+        """Write SQLi-specific details."""
+        f.write(f"#### 💉 SQLi Deep Dive\n\n")
+        f.write(f"- **Technique:** {vuln.get('injection_type')}\n")
+        f.write(f"- **DBMS:** {vuln.get('dbms_detected', 'Unknown')}\n")
+        if vuln.get('columns_detected'):
+            f.write(f"- **Columns Detected:** {vuln.get('columns_detected')}\n")
+
+        if vuln.get('working_payload'):
+            f.write(f"\n**🧨 Verification & Exploitation:**\n")
+            f.write(f"**Working Payload:**\n```sql\n{vuln.get('working_payload')}\n```\n\n")
+
+        if vuln.get('exploit_url_encoded'):
+            f.write(f"**🔗 One-Click Exploit:**\n[{vuln.get('exploit_url')}]({vuln.get('exploit_url_encoded')})\n\n")
+
+        self._write_sqli_extracted_data(f, vuln)
+        self._write_sqli_reproduction(f, vuln)
+
+    def _write_sqli_extracted_data(self, f, vuln: Dict):
+        """Write SQLi extracted data section."""
+        if vuln.get('extracted_databases') or vuln.get('extracted_tables'):
+            f.write(f"**📂 Extracted Data (Proof):**\n")
+            if vuln.get('extracted_databases'):
+                f.write(f"- **Databases:** {', '.join(vuln['extracted_databases'])}\n")
+            if vuln.get('extracted_tables'):
+                f.write(f"- **Tables:** {', '.join(vuln['extracted_tables'])}\n")
+            f.write("\n")
+
+    def _write_sqli_reproduction(self, f, vuln: Dict):
+        """Write SQLi reproduction commands."""
+        if vuln.get('reproduction_steps'):
+            f.write(f"**🛠️ Reproduction:**\n")
+            for step in vuln['reproduction_steps']:
+                f.write(f"- {step}\n")
+            f.write("\n")
+
+        if vuln.get('curl_command'):
+            f.write(f"**cURL:**\n```bash\n{vuln['curl_command']}\n```\n")
+
+        if vuln.get('sqlmap_reproduce_command'):
+            f.write(f"**SQLMap:**\n```bash\n{vuln['sqlmap_reproduce_command']}\n```\n")
+        f.write("\n")
+
+    def _write_xss_deep_dive(self, f, vuln: Dict):
+        """Write XSS-specific details."""
+        f.write(f"#### 🔬 XSS Deep Dive\n\n")
+        f.write(f"- **Type:** {vuln.get('xss_type')}\n")
+        f.write(f"- **Injection Context:** `{vuln.get('injection_context_type')}`\n")
+        if vuln.get('vulnerable_code_snippet'):
+            f.write(f"- **Snippet:** `{vuln.get('vulnerable_code_snippet')}`\n")
+        f.write(f"- **Bypass Technique:** {vuln.get('escape_bypass_technique')} ({vuln.get('bypass_explanation')})\n\n")
+
+        if vuln.get('exploit_url'):
+            f.write(f"**🧨 Exploit URL (Click to Test):**\n[{vuln.get('exploit_url')}]({vuln.get('exploit_url_encoded')})\n\n")
+
+        self._write_xss_verification(f, vuln)
+        self._write_xss_reproduction_steps(f, vuln)
+
+    def _write_xss_verification(self, f, vuln: Dict):
+        """Write XSS verification methods."""
+        if vuln.get('verification_methods'):
+            f.write(f"**✅ HOW TO VERIFY (Avoid alerts):**\n")
+            for vm in vuln['verification_methods']:
+                f.write(f"- **{vm.get('name')}**: {vm.get('instructions')}\n")
+                if vm.get('url_encoded'):
+                    f.write(f"  - [👉 Execute Verification]({vm['url_encoded']})\n")
+            f.write("\n")
+
+    def _write_xss_reproduction_steps(self, f, vuln: Dict):
+        """Write XSS reproduction steps."""
+        if vuln.get('reproduction_steps'):
+            f.write(f"**📝 Step-by-Step Reproduction:**\n")
+            for step in vuln['reproduction_steps']:
+                f.write(f"1. {step}\n")
+            f.write("\n")
+
+    def _write_validation_status(self, f, vuln: Dict):
+        """Write validation status and screenshots."""
+        vuln_type = vuln.get('type', '').upper()
+        if 'validated' in vuln and vuln['validated']:
+            if 'XSS' in vuln_type:
+                f.write("✅ **XSS Validated** - Alert popup captured in browser\n\n")
+            else:
+                f.write("✅ **Validated** - Confirmed with technical evidence\n\n")
+
+        if 'screenshot' in vuln:
+            if 'XSS' in vuln_type:
+                f.write(f"**XSS Validation Proof:** [Alert Screenshot](screenshots/{Path(vuln['screenshot']).name})\n\n")
+            else:
+                f.write(f"**Screenshot:** [View](screenshots/{Path(vuln['screenshot']).name})\n\n")
     
     def _group_by_severity(self, vulnerabilities: List[Dict]) -> Dict[str, List[Dict]]:
         """Group vulnerabilities by severity."""
