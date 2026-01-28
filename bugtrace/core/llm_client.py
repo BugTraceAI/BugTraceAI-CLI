@@ -241,135 +241,272 @@ class LLMClient:
             dashboard.log("CRITICAL: No AI models are responding.", "ERROR")
             return False
 
+    def _build_request_payload(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int
+    ) -> Dict[str, Any]:
+        """Build API request payload with common parameters."""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        if settings.OPENROUTER_ONLINE:
+            payload["online"] = True
+        return payload
+
+    def _build_headers(self, module_name: str) -> Dict[str, str]:
+        """Build API request headers."""
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://bugtraceai.com",
+            "X-Title": f"Bugtrace-{module_name}",
+        }
+
+    def _build_messages(self, prompt: str, system_prompt: Optional[str] = None) -> List[Dict[str, str]]:
+        """Build message array for API request."""
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    async def _handle_refusal(
+        self,
+        text: str,
+        current_model: str,
+        model_override: Optional[str],
+        prompt: str,
+        module_name: str,
+        system_prompt: Optional[str],
+        temperature: float,
+        max_tokens: int
+    ) -> Optional[str]:
+        """Handle LLM refusal and attempt fallback to uncensored model."""
+        if not (any(phrase.lower() in text.lower() for phrase in self.REFUSAL_PHRASES) and len(text) < 300):
+            return text
+
+        logger.warning(f"LLM Refusal Detected from {current_model}: '...{text[:50]}...'")
+
+        fallback_model = settings.MUTATION_MODEL
+        if model_override != fallback_model:
+            logger.info(f"Triggering Hybrid Resilience: Switching to Uncensored Model ({fallback_model})")
+            return await self.generate(
+                prompt, module_name,
+                model_override=fallback_model,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+        else:
+            logger.error("Fallback Model also refused. Returning None to prevent crash.")
+            return None
+
+    async def _update_telemetry(self, data: Dict[str, Any], current_model: str, module_name: str):
+        """Update dashboard telemetry and token tracking."""
+        self.req_count += 1
+        dashboard.total_requests += 1
+
+        if 'usage' not in data:
+            return
+
+        input_tokens = data['usage'].get('prompt_tokens', 0)
+        output_tokens = data['usage'].get('completion_tokens', 0)
+        tokens = data['usage'].get('total_tokens', 0)
+
+        self.token_tracker.record_usage(
+            model=current_model,
+            agent=module_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens
+        )
+
+        cost = (tokens / 1_000_000) * 0.20
+        dashboard.session_cost += cost
+
+        if self.req_count % 10 == 0:
+            asyncio.create_task(self.update_balance())
+
+    async def _handle_api_response(
+        self,
+        resp: aiohttp.ClientResponse,
+        current_model: str,
+        module_name: str,
+        prompt: str,
+        latency_ms: float,
+        model_override: Optional[str],
+        system_prompt: Optional[str],
+        temperature: float,
+        max_tokens: int
+    ) -> Optional[str]:
+        """Process API response and handle errors/refusals."""
+        if resp.status == 200:
+            data = await resp.json()
+            if 'choices' not in data or len(data['choices']) == 0:
+                self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+                logger.warning(f"LLM Shift: Model {current_model} returned empty response.")
+                return None
+
+            text = data['choices'][0]['message']['content']
+
+            # Check for refusal
+            result = await self._handle_refusal(
+                text, current_model, model_override,
+                prompt, module_name, system_prompt,
+                temperature, max_tokens
+            )
+            if result != text:
+                return result
+
+            # Success path
+            self._record_model_call(current_model, success=True, latency_ms=latency_ms)
+            await self._update_telemetry(data, current_model, module_name)
+            await self._audit_log(module_name, current_model, prompt, text)
+            logger.info(f"LLM Shift Success: Using {current_model} for {module_name}")
+            return text
+
+        elif resp.status == 429:
+            self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+            logger.warning(f"LLM Shift: Model {current_model} rate limited (429). Shifting...")
+        else:
+            self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+            error_text = await resp.text()
+            await self._audit_log(module_name, current_model, prompt, f"ERROR: {resp.status} - {error_text}")
+            logger.error(f"LLM Shift: Model {current_model} failed ({resp.status}). Reason: {error_text}. Shifting...")
+
+        return None
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     async def generate(
-        self, 
-        prompt: str, 
-        module_name: str, 
+        self,
+        prompt: str,
+        module_name: str,
         model_override: Optional[str] = None,
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 1500
     ) -> Optional[str]:
         """
-        Generates text using Model Shifting. 
+        Generates text using Model Shifting.
         If a model fails or is filtered, it 'shifts' to the next one in the list.
         """
-        # Sequential Processing Enforced by Semaphore
         async with self.semaphore:
             if not self.api_key:
                 logger.warning(f"LLM Client: No API Key found for {module_name}. Skipping generation.")
                 await self._audit_log(module_name, "NONE", prompt, "SKIPPED: Missing API Key")
                 return None
-    
-            # Determine which models to try
-            models_to_try = [model_override] if model_override else self.models
-    
-            for current_model in models_to_try:
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://bugtraceai.com",
-                    "X-Title": f"Bugtrace-{module_name}",
-                }
-    
-                messages = []
-                if system_prompt:
-                    messages.append({"role": "system", "content": system_prompt})
-                messages.append({"role": "user", "content": prompt})
 
-                payload = {
-                    "model": current_model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens
-                }
-                
-                # Add online parameter if enabled (for models that support web search/browsing)
-                if settings.OPENROUTER_ONLINE:
-                    payload["online"] = True
-    
+            models_to_try = [model_override] if model_override else self.models
+            headers = self._build_headers(module_name)
+            messages = self._build_messages(prompt, system_prompt)
+
+            for current_model in models_to_try:
+                payload = self._build_request_payload(current_model, messages, temperature, max_tokens)
                 start_time = time.time()
+
                 try:
                     async with aiohttp.ClientSession() as session:
                         async with session.post(self.base_url, headers=headers, json=payload) as resp:
                             latency_ms = (time.time() - start_time) * 1000
-
-                            if resp.status == 200:
-                                data = await resp.json()
-                                if 'choices' in data and len(data['choices']) > 0:
-                                    text = data['choices'][0]['message']['content']
-
-                                    # REFUSAL DETECTION & FALLBACK
-                                    # If the model refuses, we consider it a "Soft Failure" and try the fallback model (usually Uncensored)
-                                    if any(phrase.lower() in text.lower() for phrase in self.REFUSAL_PHRASES) and len(text) < 300:
-                                        logger.warning(f"LLM Refusal Detected from {current_model}: '...{text[:50]}...'")
-                                        self._record_model_call(current_model, success=False, latency_ms=latency_ms)
-
-                                        # Should we try fallback? Only if we haven't already tried the mutation model
-                                        fallback_model = settings.MUTATION_MODEL
-                                        if model_override != fallback_model:
-                                            logger.info(f"Triggering Hybrid Resilience: Switching to Uncensored Model ({fallback_model})")
-                                            # Recursive call with override
-                                            return await self.generate(prompt, module_name, model_override=fallback_model, system_prompt=system_prompt, temperature=temperature, max_tokens=max_tokens)
-                                        else:
-                                            logger.error("Fallback Model also refused. Returning None to prevent crash.")
-                                            return None
-
-                                    # TASK-133: Record model metrics
-                                    self._record_model_call(current_model, success=True, latency_ms=latency_ms)
-
-                                    # Update Dashboard Telemetry
-                                    self.req_count += 1
-                                    dashboard.total_requests += 1
-                                    if 'usage' in data:
-                                        # TASK-130: Track token usage
-                                        input_tokens = data['usage'].get('prompt_tokens', 0)
-                                        output_tokens = data['usage'].get('completion_tokens', 0)
-                                        tokens = data['usage'].get('total_tokens', 0)
-
-                                        self.token_tracker.record_usage(
-                                            model=current_model,
-                                            agent=module_name,
-                                            input_tokens=input_tokens,
-                                            output_tokens=output_tokens
-                                        )
-
-                                        # Estimated blended cost (Input + Output mix)
-                                        cost = (tokens / 1_000_000) * 0.20
-                                        dashboard.session_cost += cost
-
-                                    # Poll balance every 10 requests
-                                    if self.req_count % 10 == 0:
-                                        asyncio.create_task(self.update_balance())
-
-                                    # Audit Logging
-                                    await self._audit_log(module_name, current_model, prompt, text)
-                                    logger.info(f"LLM Shift Success: Using {current_model} for {module_name}")
-                                    return text
-                                else:
-                                    self._record_model_call(current_model, success=False, latency_ms=latency_ms)
-                                    logger.warning(f"LLM Shift: Model {current_model} returned empty response.")
-                            elif resp.status == 429:
-                                self._record_model_call(current_model, success=False, latency_ms=latency_ms)
-                                logger.warning(f"LLM Shift: Model {current_model} rate limited (429). Shifting...")
-                            else:
-                                self._record_model_call(current_model, success=False, latency_ms=latency_ms)
-                                error_text = await resp.text()
-                                await self._audit_log(module_name, current_model, prompt, f"ERROR: {resp.status} - {error_text}")
-                                logger.error(f"LLM Shift: Model {current_model} failed ({resp.status}). Reason: {error_text}. Shifting...")
-
+                            result = await self._handle_api_response(
+                                resp, current_model, module_name, prompt,
+                                latency_ms, model_override, system_prompt,
+                                temperature, max_tokens
+                            )
+                            if result:
+                                return result
                 except Exception as e:
                     latency_ms = (time.time() - start_time) * 1000
                     self._record_model_call(current_model, success=False, latency_ms=latency_ms)
                     await self._audit_log(module_name, current_model, prompt, f"EXCEPTION: {str(e)}")
                     logger.error(f"LLM Shift Exception with {current_model}: {str(e)}")
-                
-                # Brief pause before shifting
+
                 await asyncio.sleep(0.5)
-    
+
             logger.critical(f"LLM Client: All models exhausted for module {module_name}. Check connectivity or API Key.")
             return None
+
+    async def _handle_thread_response(
+        self,
+        resp: aiohttp.ClientResponse,
+        current_model: str,
+        module_name: str,
+        thread: "ConversationThread",
+        prompt: str
+    ) -> Optional[str]:
+        """Process API response for threaded generation."""
+        if resp.status == 200:
+            data = await resp.json()
+            if 'choices' not in data or len(data['choices']) == 0:
+                logger.warning(f"LLM Thread: Model {current_model} returned empty response.")
+                return None
+
+            response_text = data['choices'][0]['message']['content']
+            thread.add_message("assistant", response_text)
+
+            # Update telemetry
+            self.req_count += 1
+            dashboard.total_requests += 1
+            if 'usage' in data:
+                tokens = data['usage'].get('total_tokens', 0)
+                cost = (tokens / 1_000_000) * 0.20
+                dashboard.session_cost += cost
+
+            if self.req_count % 10 == 0:
+                asyncio.create_task(self.update_balance())
+
+            await self._audit_log(module_name, current_model, f"[Thread: {thread.thread_id}] {prompt}", response_text)
+            logger.info(f"LLM Thread Success: {current_model} for {module_name} (thread: {thread.thread_id})")
+            return response_text
+
+        elif resp.status == 429:
+            logger.warning(f"LLM Thread: Model {current_model} rate limited (429). Shifting...")
+        else:
+            error_text = await resp.text()
+            logger.error(f"LLM Thread: Model {current_model} failed ({resp.status}). Shifting...")
+
+        return None
+
+    async def _try_thread_models(
+        self,
+        models_to_try: List[str],
+        headers: Dict[str, str],
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+        module_name: str,
+        thread: "ConversationThread",
+        prompt: str
+    ) -> Optional[str]:
+        """Try multiple models for threaded generation."""
+        for current_model in models_to_try:
+            payload = {
+                "model": current_model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
+            if settings.OPENROUTER_ONLINE:
+                payload["online"] = True
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(self.base_url, headers=headers, json=payload) as resp:
+                        result = await self._handle_thread_response(
+                            resp, current_model, module_name, thread, prompt
+                        )
+                        if result:
+                            return result
+            except Exception as e:
+                logger.error(f"LLM Thread Exception with {current_model}: {str(e)}")
+
+            await asyncio.sleep(0.5)
+        return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     async def generate_with_thread(
@@ -381,98 +518,27 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int = 2000
     ) -> Optional[str]:
-        """
-        Generates text using a ConversationThread for persistent context.
-        
-        This method maintains the full conversation history, allowing the LLM
-        to reference previous messages, tool results, and decisions.
-        
-        Args:
-            prompt: New user message to add
-            thread: ConversationThread with message history
-            module_name: Module identifier for logging
-            model_override: Optional specific model to use
-            temperature: LLM temperature
-            max_tokens: Maximum tokens in response
-        
-        Returns:
-            LLM response text, or None if failed
-        """
-        # Import here to avoid circular import
+        """Generate text using ConversationThread for persistent context."""
         from bugtrace.core.conversation_thread import ConversationThread
-        
+
         async with self.semaphore:
             if not self.api_key:
                 logger.warning(f"LLM Client: No API Key for {module_name}")
                 return None
-            
-            # Add the new user message to thread
+
             thread.add_message("user", prompt)
-            
-            # Get all messages formatted for API
             messages = thread.get_messages(format_for_api=True)
-            
-            # Determine which models to try
             models_to_try = [model_override] if model_override else self.models
-            
-            for current_model in models_to_try:
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://bugtraceai.com",
-                    "X-Title": f"Bugtrace-{module_name}",
-                }
-                
-                payload = {
-                    "model": current_model,
-                    "messages": messages,  # Full conversation history
-                    "temperature": temperature,
-                    "max_tokens": max_tokens
-                }
-                
-                if settings.OPENROUTER_ONLINE:
-                    payload["online"] = True
-                
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(self.base_url, headers=headers, json=payload) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                if 'choices' in data and len(data['choices']) > 0:
-                                    response_text = data['choices'][0]['message']['content']
-                                    
-                                    # Add assistant response to thread
-                                    thread.add_message("assistant", response_text)
-                                    
-                                    # Update telemetry
-                                    self.req_count += 1
-                                    dashboard.total_requests += 1
-                                    if 'usage' in data:
-                                        tokens = data['usage'].get('total_tokens', 0)
-                                        cost = (tokens / 1_000_000) * 0.20
-                                        dashboard.session_cost += cost
-                                    
-                                    if self.req_count % 10 == 0:
-                                        asyncio.create_task(self.update_balance())
-                                    
-                                    await self._audit_log(module_name, current_model, f"[Thread: {thread.thread_id}] {prompt}", response_text)
-                                    logger.info(f"LLM Thread Success: {current_model} for {module_name} (thread: {thread.thread_id})")
-                                    return response_text
-                                else:
-                                    logger.warning(f"LLM Thread: Model {current_model} returned empty response.")
-                            elif resp.status == 429:
-                                logger.warning(f"LLM Thread: Model {current_model} rate limited (429). Shifting...")
-                            else:
-                                error_text = await resp.text()
-                                logger.error(f"LLM Thread: Model {current_model} failed ({resp.status}). Shifting...")
-                
-                except Exception as e:
-                    logger.error(f"LLM Thread Exception with {current_model}: {str(e)}")
-                
-                await asyncio.sleep(0.5)
-            
-            logger.critical(f"LLM Client: All models exhausted for threaded generation in {module_name}")
-            return None
+
+            result = await self._try_thread_models(
+                models_to_try, self._build_headers(module_name), messages,
+                temperature, max_tokens, module_name, thread, prompt
+            )
+
+            if not result:
+                logger.critical(f"LLM Client: All models exhausted for threaded generation in {module_name}")
+
+            return result
 
     async def update_balance(self):
         """Polls OpenRouter for current credit balance."""
@@ -759,6 +825,56 @@ class LLMClient:
         return self.token_tracker.get_summary()
 
     # ========== TASK-132: Streaming Support ==========
+    async def _process_stream_line(
+        self,
+        line: bytes,
+        full_response: str,
+        on_chunk: Optional[callable]
+    ) -> tuple[str, Optional[str]]:
+        """Process a single line from streaming response.
+
+        Returns:
+            Tuple of (updated_full_response, chunk_or_none)
+        """
+        line_str = line.decode('utf-8').strip()
+        if not line_str or not line_str.startswith('data: '):
+            return full_response, None
+
+        data_str = line_str[6:]  # Remove 'data: ' prefix
+        if data_str == '[DONE]':
+            return full_response, None
+
+        try:
+            data = json.loads(data_str)
+            if 'choices' in data and len(data['choices']) > 0:
+                delta = data['choices'][0].get('delta', {})
+                chunk = delta.get('content', '')
+                if chunk:
+                    full_response += chunk
+                    if on_chunk:
+                        on_chunk(chunk)
+                    return full_response, chunk
+        except json.JSONDecodeError:
+            pass
+
+        return full_response, None
+
+    async def _stream_response_content(
+        self,
+        resp: aiohttp.ClientResponse,
+        full_response: str,
+        on_chunk: Optional[callable]
+    ):
+        """Stream and yield response content line by line."""
+        async for line in resp.content:
+            full_response, chunk = await self._process_stream_line(
+                line, full_response, on_chunk
+            )
+            if chunk:
+                yield chunk, full_response
+            else:
+                yield None, full_response
+
     async def generate_stream(
         self,
         prompt: str,
@@ -769,20 +885,7 @@ class LLMClient:
         max_tokens: int = 1500,
         on_chunk: Optional[callable] = None
     ):
-        """Generate with streaming response.
-
-        Args:
-            prompt: The prompt to send
-            module_name: Module identifier
-            model_override: Optional specific model
-            system_prompt: Optional system prompt
-            temperature: LLM temperature
-            max_tokens: Maximum tokens
-            on_chunk: Callback function called with each chunk
-
-        Yields:
-            Response chunks as they arrive
-        """
+        """Generate with streaming response, yields chunks as they arrive."""
         async with self.semaphore:
             if not self.api_key:
                 logger.warning(f"LLM Client: No API Key for streaming {module_name}")
@@ -793,18 +896,8 @@ class LLMClient:
                 logger.error("No model available for streaming")
                 return
 
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://bugtraceai.com",
-                "X-Title": f"Bugtrace-{module_name}",
-            }
-
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
-
+            headers = self._build_headers(module_name)
+            messages = self._build_messages(prompt, system_prompt)
             payload = {
                 "model": model,
                 "messages": messages,
@@ -822,31 +915,13 @@ class LLMClient:
                             logger.error(f"Stream error ({resp.status}): {error_text}")
                             return
 
-                        async for line in resp.content:
-                            line = line.decode('utf-8').strip()
-                            if not line or not line.startswith('data: '):
-                                continue
+                        async for chunk, full_response in self._stream_response_content(
+                            resp, full_response, on_chunk
+                        ):
+                            if chunk:
+                                yield chunk
 
-                            data_str = line[6:]  # Remove 'data: ' prefix
-                            if data_str == '[DONE]':
-                                break
-
-                            try:
-                                data = json.loads(data_str)
-                                if 'choices' in data and len(data['choices']) > 0:
-                                    delta = data['choices'][0].get('delta', {})
-                                    chunk = delta.get('content', '')
-                                    if chunk:
-                                        full_response += chunk
-                                        if on_chunk:
-                                            on_chunk(chunk)
-                                        yield chunk
-                            except json.JSONDecodeError:
-                                continue
-
-                # Audit log the complete response
                 await self._audit_log(module_name, model, prompt, full_response)
-
             except Exception as e:
                 logger.error(f"Streaming error: {e}")
 
