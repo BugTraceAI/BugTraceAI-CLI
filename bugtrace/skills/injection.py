@@ -245,169 +245,216 @@ class XSSSkill(BaseSkill):
 
 class SQLiSkill(BaseSkill):
     """SQLi exploitation skill - Ladder Logic: Lightweight Detector -> SQLMap Confirmation."""
-    
+
     description = "Test SQL injection using Ladder Logic (Detector -> SQLMap Confirmation)"
-    
+
     async def execute(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        from bugtrace.tools.exploitation.sqli import sqli_detector
-        from bugtrace.tools.external import external_tools
-        from bugtrace.tools.visual.browser import browser_manager
-        from bugtrace.core.config import settings
         from urllib.parse import urlparse, parse_qs
-        
-        findings = []
+
         parsed = urlparse(url)
         url_params = parse_qs(parsed.query)
-        
-        # Skip if no params to test
+
         if not url_params:
             return {"success": True, "findings": [], "skipped": "no_params"}
-        
+
+        findings = []
         try:
-            # =================================================================
-            # STEP 1: Lightweight Python Detector (FAST, NO DOCKER)
-            # Detects obvious error-based and boolean-based SQLi
-            # =================================================================
-            logger.info(f"[{self.master.name}] Ladder Logic Step 1: Lightweight Python Detector...")
-            result = await sqli_detector.check(url)
-            
-            potential_vuln = False
-            detector_message = ""
-            
-            if result:
-                detector_message, _ = result if isinstance(result, tuple) else (result, None)
-                potential_vuln = True
-                logger.info(f"[{self.master.name}] 🔍 Detector found potential SQLi: {detector_message}")
-            
-            # =================================================================
-            # STEP 2: SQLMap Confirmation (GOLD STANDARD)
-            # Only run if:
-            # 1. Detector found something (potential_vuln)
-            # 2. OR Analysis Agent (AI) strongly suggested SQLi (context override)
-            # 3. OR Safe Mode is OFF (aggressive)
-            # =================================================================
-            
-            # Check AI context for strong SQLi signal
-            ai_suggests_sqli = False
-            if self.master.analysis_context:
-                # Merge validated and possible vulns from AnalysisAgent report
-                vulns = self.master.analysis_context.get("consensus_vulns", []) + \
-                        self.master.analysis_context.get("possible_vulns", [])
-                
-                # Check for SQLi (case insensitive match on type, accepting various formats)
-                for v in vulns:
-                    v_type = v.get("type", "").upper()
-                    if ("SQL" in v_type or "INJECTION" in v_type) and v.get("confidence", 0) >= 0.4:
-                        ai_suggests_sqli = True
-                        logger.info(f"[{self.master.name}] 🧠 AI Analysis suggests SQLi ({v_type}: {v.get('confidence')}) - Forcing SQLMap check")
-                        break
-            
-            if (potential_vuln or ai_suggests_sqli or not settings.SAFE_MODE) and not settings.MANDATORY_SQLMAP_VALIDATION == False:
-                logger.info(f"[{self.master.name}] Ladder Logic Step 2: SQLMap Confirmation (Triggered by: {'Detector' if potential_vuln else 'AI Analysis' if ai_suggests_sqli else 'Aggressive Mode'})...")
-                
-                # Get session cookies if available
-                cookies = None
-                try:
-                    session_data = await browser_manager.get_session_data()
-                    cookies = session_data.get("cookies", [])
-                except Exception as e:
-                    logger.debug(f"Session data fetch failed: {e}")
-                
-                try:
-                    is_vulnerable = await external_tools.run_sqlmap(
-                        url, 
-                        cookies, 
-                        target_param=params.get("parameter")
-                    )
-                    
-                    if is_vulnerable:
-                        # Handle Dict return type (enhanced run_sqlmap returns detailed dict)
-                        if isinstance(is_vulnerable, dict):
-                            evidence_msg = is_vulnerable.get("output_snippet", "SQLMap confirmed")
-                            repro_cmd = is_vulnerable.get("reproduction_command", f"sqlmap -u '{url}' --batch --dbs")
-                            param_name = is_vulnerable.get("parameter", params.get("parameter", "unknown"))
-                            finding_data = {
-                                "type": "SQLi",
-                                "url": url,
-                                "tool": "sqlmap",
-                                "parameter": param_name,
-                                "payload": is_vulnerable.get("type", "SQLi"),
-                                "evidence": f"SQLMap Command: {repro_cmd}\n\nEvidence: {evidence_msg}",
-                                "validated": True,
-                                "reproduction_command": repro_cmd,
-                                "severity": "CRITICAL",
-                                "description": f"SQL Injection confirmed by SQLMap. Parameter: {param_name}. Type: {is_vulnerable.get('type', 'unknown')}",
-                                "reproduction": repro_cmd
-                            }
-                        else:
-                            # Legacy boolean fallback
-                            finding_data = {
-                                "type": "SQLi",
-                                "url": url,
-                                "tool": "sqlmap",
-                                "evidence": "SQLMap confirmed SQL Injection vulnerability",
-                                "validated": True,
-                                "severity": "CRITICAL",
-                                "description": "SQL Injection vulnerability confirmed by SQLMap automated scanner.",
-                                "reproduction": f"sqlmap -u '{url}' --batch --dbs"
-                            }
+            potential_vuln, detector_message = await self._run_detector_phase(url)
 
-                        findings.append(finding_data)
-                        
-                        self.master.thread.record_payload_attempt("SQLi", "sqlmap-confirmed", success=True)
-                        logger.info(f"[{self.master.name}] ✅ SQLMap confirmed SQLi!")
-                    elif potential_vuln:
-                        # Detector found something but SQLMap didn't confirm?
-                        # Might be a false positive or complex injection
-                        findings.append({
-                            "type": "SQLi",
-                            "url": url,
-                            "evidence": f"Potential SQLi detected: {detector_message} (SQLMap could not confirm)",
-                            "validated": False,
-                            "severity": "MEDIUM",
-                            "method": "sqli_detector",
-                            "description": f"Potential SQL Injection detected by error-based analysis but not confirmed by SQLMap. May require manual verification. Evidence: {detector_message[:200] if detector_message else 'N/A'}",
-                            "reproduction": f"sqlmap -u '{url}' --batch --level=5 --risk=3"
-                        })
-                        logger.info(f"[{self.master.name}] ⚠️ SQLi detected by Python but NOT confirmed by SQLMap")
-
-                except Exception as sqlmap_err:
-                    logger.debug(f"SQLMap execution failed: {sqlmap_err}")
-                    # Fallback to detector result if SQLMap failed
-                    if potential_vuln:
-                        findings.append({
-                            "type": "SQLi",
-                            "url": url,
-                            "evidence": detector_message,
-                            "validated": True,
-                            "method": "sqli_detector",
-                            "severity": "HIGH",
-                            "description": f"SQL Injection detected via error-based analysis. SQLMap could not run but detector found evidence: {detector_message[:200] if detector_message else 'N/A'}",
-                            "reproduction": f"sqlmap -u '{url}' --batch --dbs"
-                        })
-            
+            if self._should_run_sqlmap(potential_vuln):
+                await self._run_sqlmap_phase(url, params, potential_vuln, detector_message, findings)
         except Exception as e:
             logger.error(f"SQLi Ladder Logic test failed: {e}")
-        
+
         return {
             "success": True,
             "findings": findings,
             "sqli_found": len(findings) > 0
         }
 
+    async def _run_detector_phase(self, url: str) -> tuple:
+        """Phase 1: Lightweight Python Detector (FAST, NO DOCKER)."""
+        from bugtrace.tools.exploitation.sqli import sqli_detector
+
+        logger.info(f"[{self.master.name}] Ladder Logic Step 1: Lightweight Python Detector...")
+        result = await sqli_detector.check(url)
+
+        potential_vuln = False
+        detector_message = ""
+
+        if result:
+            detector_message, _ = result if isinstance(result, tuple) else (result, None)
+            potential_vuln = True
+            logger.info(f"[{self.master.name}] 🔍 Detector found potential SQLi: {detector_message}")
+
+        return potential_vuln, detector_message
+
+    def _should_run_sqlmap(self, potential_vuln: bool) -> bool:
+        """Check if SQLMap confirmation should run."""
+        from bugtrace.core.config import settings
+
+        if settings.MANDATORY_SQLMAP_VALIDATION == False:
+            return False
+
+        if potential_vuln or not settings.SAFE_MODE:
+            return True
+
+        return self._check_ai_suggests_sqli()
+
+    def _check_ai_suggests_sqli(self) -> bool:
+        """Check if AI analysis context suggests SQLi."""
+        if not self.master.analysis_context:
+            return False
+
+        vulns = self.master.analysis_context.get("consensus_vulns", []) + \
+                self.master.analysis_context.get("possible_vulns", [])
+
+        for v in vulns:
+            v_type = v.get("type", "").upper()
+            if ("SQL" in v_type or "INJECTION" in v_type) and v.get("confidence", 0) >= 0.4:
+                logger.info(f"[{self.master.name}] 🧠 AI Analysis suggests SQLi ({v_type}: {v.get('confidence')}) - Forcing SQLMap check")
+                return True
+
+        return False
+
+    async def _run_sqlmap_phase(self, url: str, params: Dict[str, Any],
+                                potential_vuln: bool, detector_message: str, findings: list):
+        """Phase 2: SQLMap Confirmation (GOLD STANDARD)."""
+        from bugtrace.tools.external import external_tools
+
+        logger.info(f"[{self.master.name}] Ladder Logic Step 2: SQLMap Confirmation...")
+
+        cookies = await self._get_session_cookies()
+
+        try:
+            is_vulnerable = await external_tools.run_sqlmap(
+                url, cookies, target_param=params.get("parameter")
+            )
+
+            if is_vulnerable:
+                finding_data = self._build_sqlmap_finding(url, params, is_vulnerable)
+                findings.append(finding_data)
+                self.master.thread.record_payload_attempt("SQLi", "sqlmap-confirmed", success=True)
+                logger.info(f"[{self.master.name}] ✅ SQLMap confirmed SQLi!")
+            elif potential_vuln:
+                findings.append(self._build_unconfirmed_finding(url, detector_message))
+                logger.info(f"[{self.master.name}] ⚠️ SQLi detected by Python but NOT confirmed by SQLMap")
+        except Exception as sqlmap_err:
+            logger.debug(f"SQLMap execution failed: {sqlmap_err}")
+            if potential_vuln:
+                findings.append(self._build_fallback_finding(url, detector_message))
+
+    async def _get_session_cookies(self):
+        """Get session cookies from browser manager."""
+        from bugtrace.tools.visual.browser import browser_manager
+
+        try:
+            session_data = await browser_manager.get_session_data()
+            return session_data.get("cookies", [])
+        except Exception as e:
+            logger.debug(f"Session data fetch failed: {e}")
+            return None
+
+    def _build_sqlmap_finding(self, url: str, params: Dict[str, Any], is_vulnerable) -> dict:
+        """Build finding data from SQLMap result."""
+        if isinstance(is_vulnerable, dict):
+            evidence_msg = is_vulnerable.get("output_snippet", "SQLMap confirmed")
+            repro_cmd = is_vulnerable.get("reproduction_command", f"sqlmap -u '{url}' --batch --dbs")
+            param_name = is_vulnerable.get("parameter", params.get("parameter", "unknown"))
+
+            return {
+                "type": "SQLi",
+                "url": url,
+                "tool": "sqlmap",
+                "parameter": param_name,
+                "payload": is_vulnerable.get("type", "SQLi"),
+                "evidence": f"SQLMap Command: {repro_cmd}\n\nEvidence: {evidence_msg}",
+                "validated": True,
+                "reproduction_command": repro_cmd,
+                "severity": "CRITICAL",
+                "description": f"SQL Injection confirmed by SQLMap. Parameter: {param_name}. Type: {is_vulnerable.get('type', 'unknown')}",
+                "reproduction": repro_cmd
+            }
+
+        # Legacy boolean fallback
+        return {
+            "type": "SQLi",
+            "url": url,
+            "tool": "sqlmap",
+            "evidence": "SQLMap confirmed SQL Injection vulnerability",
+            "validated": True,
+            "severity": "CRITICAL",
+            "description": "SQL Injection vulnerability confirmed by SQLMap automated scanner.",
+            "reproduction": f"sqlmap -u '{url}' --batch --dbs"
+        }
+
+    def _build_unconfirmed_finding(self, url: str, detector_message: str) -> dict:
+        """Build finding for detector-only detection."""
+        return {
+            "type": "SQLi",
+            "url": url,
+            "evidence": f"Potential SQLi detected: {detector_message} (SQLMap could not confirm)",
+            "validated": False,
+            "severity": "MEDIUM",
+            "method": "sqli_detector",
+            "description": f"Potential SQL Injection detected by error-based analysis but not confirmed by SQLMap. May require manual verification. Evidence: {detector_message[:200] if detector_message else 'N/A'}",
+            "reproduction": f"sqlmap -u '{url}' --batch --level=5 --risk=3"
+        }
+
+    def _build_fallback_finding(self, url: str, detector_message: str) -> dict:
+        """Build fallback finding when SQLMap fails but detector found something."""
+        return {
+            "type": "SQLi",
+            "url": url,
+            "evidence": detector_message,
+            "validated": True,
+            "method": "sqli_detector",
+            "severity": "HIGH",
+            "description": f"SQL Injection detected via error-based analysis. SQLMap could not run but detector found evidence: {detector_message[:200] if detector_message else 'N/A'}",
+            "reproduction": f"sqlmap -u '{url}' --batch --dbs"
+        }
+
 
 class LFISkill(BaseSkill):
     """LFI exploitation skill - tests for Local File Inclusion vulnerabilities."""
-    
+
     description = "Test Local File Inclusion payloads on file-related parameters"
-    
+
     async def execute(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         from bugtrace.tools.visual.browser import browser_manager
         from urllib.parse import urlparse, parse_qs
-        
+
+        parsed = urlparse(url)
+        url_params = parse_qs(parsed.query)
+
         findings = []
-        
-        # LFI-specific payloads
+        try:
+            async with browser_manager.get_page() as page:
+                for param_name, values in url_params.items():
+                    if self._is_lfi_candidate_param(param_name):
+                        finding = await self._test_param_for_lfi(page, url, param_name)
+                        if finding:
+                            findings.append(finding)
+                            break
+        except Exception as e:
+            logger.error(f"LFI skill failed: {e}")
+
+        return {
+            "success": True,
+            "findings": findings,
+            "lfi_found": len(findings) > 0
+        }
+
+    def _is_lfi_candidate_param(self, param_name: str) -> bool:
+        """Check if parameter name suggests LFI vulnerability."""
+        lfi_params = ["file", "path", "page", "doc", "document", "folder", "root",
+                      "dir", "directory", "include", "img", "image", "template"]
+
+        param_lower = param_name.lower()
+        return param_lower in lfi_params or any(p in param_lower for p in lfi_params)
+
+    async def _test_param_for_lfi(self, page, url: str, param_name: str):
+        """Test a single parameter with LFI payloads."""
         lfi_payloads = [
             "../../etc/passwd",
             "../../../etc/passwd",
@@ -416,64 +463,62 @@ class LFISkill(BaseSkill):
             "/etc/passwd",
             "file:///etc/passwd"
         ]
-        
-        lfi_indicators = ["root:x:0:0", "bin:x:1:1", "daemon:x:2:2"]
-        
-        # Parameters likely to be vulnerable to LFI
-        lfi_params = ["file", "path", "page", "doc", "document", "folder", "root", 
-                      "dir", "directory", "include", "img", "image", "template"]
-        
-        parsed = urlparse(url)
-        url_params = parse_qs(parsed.query)
-        
+
+        for payload in lfi_payloads:
+            finding = await self._test_single_payload(page, url, param_name, payload)
+            if finding:
+                return finding
+
+        return None
+
+    async def _test_single_payload(self, page, url: str, param_name: str, payload: str):
+        """Test a single LFI payload."""
+        test_url = f"{url.split('?')[0]}?{param_name}={payload}"
+
         try:
-            async with browser_manager.get_page() as page:
-                for param_name, values in url_params.items():
-                    # Prioritize likely params
-                    if param_name.lower() in lfi_params or any(p in param_name.lower() for p in lfi_params):
-                        for payload in lfi_payloads:
-                            test_url = f"{url.split('?')[0]}?{param_name}={payload}"
-                            
-                            try:
-                                await page.goto(test_url, wait_until="domcontentloaded", timeout=8000)
-                                content = await page.content()
-                                
-                                for indicator in lfi_indicators:
-                                    if indicator in content:
-                                        from bugtrace.core.config import settings
-                                        screenshot_path = str(settings.LOG_DIR / f"{self.master.thread.thread_id}_lfi.png")
-                                        await page.screenshot(path=screenshot_path)
-                                        
-                                        findings.append({
-                                            "type": "LFI",
-                                            "url": url,
-                                            "parameter": param_name,
-                                            "param": param_name,
-                                            "payload": payload,
-                                            "screenshot": screenshot_path,
-                                            "validated": True,
-                                            "severity": "CRITICAL",
-                                            "description": f"Local File Inclusion (LFI) vulnerability confirmed. Parameter '{param_name}' allows reading local files. Indicator found: {indicator}",
-                                            "reproduction": f"curl '{test_url}' | grep -i '{indicator[:20]}'"
-                                        })
-                                        
-                                        self.master.thread.record_payload_attempt("LFI", payload, success=True)
-                                        logger.info(f"[{self.master.name}] ✅ LFI confirmed: {payload}")
-                                        break
-                                        
-                            except Exception as e:
-                                logger.debug(f"LFI test failed for {payload}: {e}")
-                        
-                        if findings:
-                            break
-            
+            await page.goto(test_url, wait_until="domcontentloaded", timeout=8000)
+            content = await page.content()
+
+            indicator = self._check_lfi_indicators(content)
+            if indicator:
+                return await self._build_lfi_finding(page, url, param_name, payload, indicator, test_url)
         except Exception as e:
-            logger.error(f"LFI skill failed: {e}")
-        
+            logger.debug(f"LFI test failed for {payload}: {e}")
+
+        return None
+
+    def _check_lfi_indicators(self, content: str):
+        """Check if content contains LFI success indicators."""
+        lfi_indicators = ["root:x:0:0", "bin:x:1:1", "daemon:x:2:2"]
+
+        for indicator in lfi_indicators:
+            if indicator in content:
+                return indicator
+
+        return None
+
+    async def _build_lfi_finding(self, page, url: str, param_name: str,
+                                  payload: str, indicator: str, test_url: str) -> dict:
+        """Build LFI finding with screenshot."""
+        from bugtrace.core.config import settings
+
+        screenshot_path = str(settings.LOG_DIR / f"{self.master.thread.thread_id}_lfi.png")
+        await page.screenshot(path=screenshot_path)
+
+        self.master.thread.record_payload_attempt("LFI", payload, success=True)
+        logger.info(f"[{self.master.name}] ✅ LFI confirmed: {payload}")
+
         return {
-            "success": True,
-            "findings": findings,
-            "lfi_found": len(findings) > 0
+            "type": "LFI",
+            "url": url,
+            "parameter": param_name,
+            "param": param_name,
+            "payload": payload,
+            "screenshot": screenshot_path,
+            "validated": True,
+            "severity": "CRITICAL",
+            "description": f"Local File Inclusion (LFI) vulnerability confirmed. Parameter '{param_name}' allows reading local files. Indicator found: {indicator}",
+            "reproduction": f"curl '{test_url}' | grep -i '{indicator[:20]}'"
         }
 
 
