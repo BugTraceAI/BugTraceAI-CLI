@@ -222,23 +222,33 @@ def _setup_output_directory(target: str) -> Path:
 
 def _start_stop_monitor_thread(dashboard):
     """Start daemon thread to monitor stop requests."""
-    import threading, time as _time
+    import threading
 
     def _stop_monitor_thread():
-        import os, signal as sig_mod
+        import time as _time
         while dashboard.active:
             _time.sleep(0.5)
-            if dashboard.stop_requested:
-                _time.sleep(3)  # Grace period
-                if dashboard.active:
-                    try:
-                        os.killpg(os.getpgrp(), sig_mod.SIGKILL)
-                    except Exception:
-                        os._exit(1)
+            if not dashboard.stop_requested:
+                continue
+
+            _time.sleep(3)  # Grace period
+            if not dashboard.active:
+                continue
+
+            _perform_emergency_shutdown()
 
     stop_thread = threading.Thread(target=_stop_monitor_thread, daemon=True)
     stop_thread.start()
     return stop_thread
+
+
+def _perform_emergency_shutdown():
+    """Perform emergency shutdown via SIGKILL."""
+    import os, signal as sig_mod
+    try:
+        os.killpg(os.getpgrp(), sig_mod.SIGKILL)
+    except Exception:
+        os._exit(1)
 
 
 async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Path):
@@ -402,21 +412,26 @@ def _execute_focused_agent(target: str, params, report_dir: Path, xss: bool, sql
 
     async def run_agent():
         dashboard.current_phase = "FOCUSED_TEST"
-
-        if xss:
-            return await _run_xss_agent(target, params, report_dir)
-        elif jwt:
-            return await _run_jwt_agent(target, params)
-        elif sqli:
-            return await _run_sqli_agent(target, params, report_dir)
-        elif lfi:
-            return await _run_lfi_agent(target, params, report_dir)
-        elif idor:
-            return await _run_idor_agent(target, params, report_dir)
-        elif ssrf:
-            return await _run_ssrf_agent(target, params, report_dir)
+        return await _select_and_run_agent(target, params, report_dir, xss, sqli, jwt, lfi, idor, ssrf)
 
     return run_agent()
+
+
+async def _select_and_run_agent(target: str, params, report_dir: Path, xss: bool, sqli: bool, jwt: bool, lfi: bool, idor: bool, ssrf: bool):
+    """Select and run the appropriate agent based on flags."""
+    if xss:
+        return await _run_xss_agent(target, params, report_dir)
+    if jwt:
+        return await _run_jwt_agent(target, params)
+    if sqli:
+        return await _run_sqli_agent(target, params, report_dir)
+    if lfi:
+        return await _run_lfi_agent(target, params, report_dir)
+    if idor:
+        return await _run_idor_agent(target, params, report_dir)
+    if ssrf:
+        return await _run_ssrf_agent(target, params, report_dir)
+    return None
 
 
 async def _run_xss_agent(target: str, params, report_dir: Path):
