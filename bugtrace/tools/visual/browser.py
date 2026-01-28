@@ -198,175 +198,170 @@ class BrowserManager:
         Verifies XSS by:
         1. Injecting a mock alert handler that creates a visible verification element
         2. Checking for BUGTRACE-XSS-CONFIRMED marker in DOM (per validation_system.md)
-        
+
         Returns: (screenshot_path, logs, is_valid)
         """
-        triggered = False
-        marker_found = False
+        triggered = [False]  # Use list for mutability in closure
         logs = []
         screenshot_path = ""
 
-        # Use ephemeral context for verification to avoid polluting session
         async with self.get_page() as page:
             try:
-                # 1. Setup Logic Proof (Callback)
-                async def on_xss_triggered(msg):
-                    nonlocal triggered
-                    triggered = True
-                    logs.append(f"XSS Triggered via alert(): {msg}")
-                
-                await page.expose_function("bugtrace_xss_callback", on_xss_triggered)
-                
-                # 2. Setup Visual Proof (Mock Alert)
-                # Override window.alert to render a visible banner
-                await page.add_init_script("""
-                    window.alert = function(msg) {
-                        try {
-                            // 1. Visual Proof
-                            const div = document.createElement('div');
-                            div.id = 'xss-proof-banner';
-                            div.style.position = 'fixed';
-                            div.style.top = '20px';
-                            div.style.left = '50%';
-                            div.style.transform = 'translateX(-50%)';
-                            div.style.zIndex = '2147483647';
-                            div.style.background = '#dc2626';
-                            div.style.color = 'white';
-                            div.style.padding = '20px 40px';
-                            div.style.borderRadius = '8px';
-                            div.style.fontSize = '24px';
-                            div.style.fontWeight = 'bold';
-                            div.style.fontFamily = 'monospace';
-                            div.style.boxShadow = '0 10px 25px rgba(0,0,0,0.5)';
-                            div.style.border = '4px solid white';
-                            div.innerText = '⚠️ BUGTRACE: XSS EXECUTED (' + msg + ')';
-                            document.body.appendChild(div);
-                            
-                            // 2. Logic Proof
-                            window.bugtrace_xss_callback(msg);
-                        } catch(e) { console.error(e); }
-                    };
-                """)
-                
-                logger.debug(f"Verifying XSS on {url}")
-                
-                # 3. Navigate and trigger
+                await self._setup_xss_verification_scripts(page, logs, triggered)
                 await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                await page.wait_for_timeout(3000)  # Wait for JS execution
-                
-                # 3b. Smart Interaction (Click potential triggers)
-                # If valid triggers haven't fired yet, try clicking elements that might hold the XSS
-                if not triggered:
-                    try:
-                        # Find elements with inline onclick, or buttons/links
-                        logger.debug("Attempting smart interaction to trigger XSS...")
-                        
-                        # Click on elements that look like they might process parameters
-                        candidates = await page.query_selector_all('a[onclick], button[onclick], input[type="submit"], input[type="button"], a[href^="javascript:"]')
-                        for i, el in enumerate(candidates[:5]): # Limit to first 5 to avoid chaos
-                            try:
-                                # Highlight for screenshot
-                                await el.evaluate("el => el.style.border = '5px solid red'")
-                                logger.debug(f"Clicking interaction candidate {i+1}")
-                                await el.click(timeout=2000, no_wait_after=True)
-                                await page.wait_for_timeout(1000)
-                                if triggered:
-                                    break
-                            except Exception as click_err:
-                                logger.debug(f"Failed to click candidate {i}: {click_err}")
-                                
-                        # Also generic fallback: click on any "Back" links (specific to ginandjuice case but generic enough)
-                        if not triggered:
-                            back_links = await page.query_selector_all("a:has-text('Back'), button:has-text('Back'), a:has-text('Return')")
-                            for el in back_links:
-                                try:
-                                    await el.click(timeout=2000, no_wait_after=True)
-                                    await page.wait_for_timeout(1000)
-                                    if triggered:
-                                        break
-                                except Exception as e:
-                                    logger.debug(f"Back link click failed: {e}")
-                                
-                    except Exception as interact_e:
-                        logger.warning(f"Interaction phase failed: {interact_e}")
-                        logs.append(f"Interaction error: {interact_e}")
-                
-                
-                # 4. Check for BUGTRACE marker in DOM (per validation_system.md)
-                try:
-                    marker_found = await page.evaluate("""
-                        () => {
-                            // 1. Check for the mock alert banner (Strongest proof)
-                            const banner = document.getElementById('xss-proof-banner');
-                            if (banner) return true;
+                await page.wait_for_timeout(3000)
 
-                            // 2. Check for the injected styles (Medium proof)
-                            // The payload uses style="color:red...background:yellow"
-                            // If reflected as text, it won't have these computed styles.
-                            
-                            // Iterate all elements to find one that matches our payload's distinct look
-                            const allElements = document.querySelectorAll('*');
-                            for (const el of allElements) {
-                                if (el.innerText && el.innerText.includes('BUGTRACE-XSS-CONFIRMED')) {
-                                    const style = window.getComputedStyle(el);
-                                    // Check for the specific styles defined in the payload
-                                    if ((style.backgroundColor === 'rgb(255, 255, 0)' || style.background === 'yellow') && 
-                                        (style.color === 'rgb(255, 0, 0)' || style.color === 'red') &&
-                                        style.position === 'fixed') {
-                                        return true;
-                                    }
-                                }
-                            }
-                            
-                            // 3. Fallback: REMOVED
-                            // We previously checked if 'BUGTRACE-XSS-CONFIRMED' text was present,
-                            // but this causes False Positives when the payload is reflected
-                            // as harmless text (HTML encoded).
-                            // We now ONLY accept proof of execution (Alert or Computed Styles).
-                            
-                            return false;
+                if not triggered[0]:
+                    await self._attempt_interaction_triggers(page, logs, triggered)
 
-                            return false;
-                        }
-                    """)
-                    if marker_found:
-                        logs.append("BUGTRACE marker detected (verified executable DOM element)")
-                        logger.info("XSS verified via BUGTRACE marker in DOM")
-                except Exception as eval_err:
-                    logs.append(f"DOM check error: {eval_err}")
-                
-                # 5. Capture Screenshot
-                import uuid
-                from bugtrace.core.config import settings
-                screenshot_path = str(settings.LOG_DIR / f"proof_xss_{uuid.uuid4().hex[:8]}.png")
-                await page.screenshot(path=screenshot_path)
-                
-                # 6. Determine validation result
-                is_valid = triggered or marker_found
-                
-                if is_valid:
-                    logger.info(f"XSS validated! alert={triggered}, marker={marker_found}")
-                else:
-                    logger.warning("XSS payload did not trigger alert() or inject marker.")
-                
+                marker_found = await self._check_xss_markers(page, logs)
+                screenshot_path = await self._capture_verification_screenshot(page)
+
+                is_valid = triggered[0] or marker_found
+                self._log_verification_result(is_valid, triggered[0], marker_found)
+
             except Exception as e:
-                logs.append(f"Browser Execution Error: {e}")
-                logger.error(f"Verify XSS failed: {e}")
-                
-                # Try emergency screenshot
-                try:
-                    import uuid
-                    from bugtrace.core.config import settings
-                    emergency_path = str(settings.LOG_DIR / f"error_xss_{uuid.uuid4().hex[:8]}.png")
-                    await page.screenshot(path=emergency_path)
-                    screenshot_path = emergency_path
-                    logs.append("Captured emergency screenshot during error.")
-                except Exception as screenshot_err:
-                    logs.append(f"Failed to capture emergency screenshot: {screenshot_err}")
-                
-                return screenshot_path, logs, False
-        
-        return screenshot_path, logs, triggered or marker_found
+                return await self._handle_verification_error(page, logs, e)
+
+        return screenshot_path, logs, triggered[0] or marker_found
+
+    async def _setup_xss_verification_scripts(self, page, logs, triggered):
+        """Setup callback and alert override scripts."""
+        async def on_xss_triggered(msg):
+            triggered[0] = True
+            logs.append(f"XSS Triggered via alert(): {msg}")
+
+        await page.expose_function("bugtrace_xss_callback", on_xss_triggered)
+        await page.add_init_script(self._get_alert_override_script())
+
+    def _get_alert_override_script(self) -> str:
+        """Get JavaScript to override window.alert."""
+        return """
+            window.alert = function(msg) {
+                try {
+                    const div = document.createElement('div');
+                    div.id = 'xss-proof-banner';
+                    div.style.position = 'fixed';
+                    div.style.top = '20px';
+                    div.style.left = '50%';
+                    div.style.transform = 'translateX(-50%)';
+                    div.style.zIndex = '2147483647';
+                    div.style.background = '#dc2626';
+                    div.style.color = 'white';
+                    div.style.padding = '20px 40px';
+                    div.style.borderRadius = '8px';
+                    div.style.fontSize = '24px';
+                    div.style.fontWeight = 'bold';
+                    div.style.fontFamily = 'monospace';
+                    div.style.boxShadow = '0 10px 25px rgba(0,0,0,0.5)';
+                    div.style.border = '4px solid white';
+                    div.innerText = '⚠️ BUGTRACE: XSS EXECUTED (' + msg + ')';
+                    document.body.appendChild(div);
+                    window.bugtrace_xss_callback(msg);
+                } catch(e) { console.error(e); }
+            };
+        """
+
+    async def _attempt_interaction_triggers(self, page, logs, triggered):
+        """Attempt to trigger XSS through user interactions."""
+        try:
+            logger.debug("Attempting smart interaction to trigger XSS...")
+            candidates = await page.query_selector_all(
+                'a[onclick], button[onclick], input[type="submit"], input[type="button"], a[href^="javascript:"]'
+            )
+            for i, el in enumerate(candidates[:5]):
+                if triggered[0]:
+                    break
+                await self._try_click_element(el, i, page, triggered)
+
+            if not triggered[0]:
+                await self._try_back_links(page, triggered)
+        except Exception as interact_e:
+            logger.warning(f"Interaction phase failed: {interact_e}")
+            logs.append(f"Interaction error: {interact_e}")
+
+    async def _try_click_element(self, el, index, page, triggered):
+        """Try clicking a single element."""
+        try:
+            await el.evaluate("el => el.style.border = '5px solid red'")
+            logger.debug(f"Clicking interaction candidate {index+1}")
+            await el.click(timeout=2000, no_wait_after=True)
+            await page.wait_for_timeout(1000)
+        except Exception as click_err:
+            logger.debug(f"Failed to click candidate {index}: {click_err}")
+
+    async def _try_back_links(self, page, triggered):
+        """Try clicking back/return links."""
+        back_links = await page.query_selector_all("a:has-text('Back'), button:has-text('Back'), a:has-text('Return')")
+        for el in back_links:
+            if triggered[0]:
+                break
+            try:
+                await el.click(timeout=2000, no_wait_after=True)
+                await page.wait_for_timeout(1000)
+            except Exception as e:
+                logger.debug(f"Back link click failed: {e}")
+
+    async def _check_xss_markers(self, page, logs) -> bool:
+        """Check for XSS markers in DOM."""
+        try:
+            marker_found = await page.evaluate("""
+                () => {
+                    const banner = document.getElementById('xss-proof-banner');
+                    if (banner) return true;
+
+                    const allElements = document.querySelectorAll('*');
+                    for (const el of allElements) {
+                        if (el.innerText && el.innerText.includes('BUGTRACE-XSS-CONFIRMED')) {
+                            const style = window.getComputedStyle(el);
+                            if ((style.backgroundColor === 'rgb(255, 255, 0)' || style.background === 'yellow') &&
+                                (style.color === 'rgb(255, 0, 0)' || style.color === 'red') &&
+                                style.position === 'fixed') {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if marker_found:
+                logs.append("BUGTRACE marker detected (verified executable DOM element)")
+                logger.info("XSS verified via BUGTRACE marker in DOM")
+            return marker_found
+        except Exception as eval_err:
+            logs.append(f"DOM check error: {eval_err}")
+            return False
+
+    async def _capture_verification_screenshot(self, page) -> str:
+        """Capture screenshot for verification evidence."""
+        import uuid
+        from bugtrace.core.config import settings
+        screenshot_path = str(settings.LOG_DIR / f"proof_xss_{uuid.uuid4().hex[:8]}.png")
+        await page.screenshot(path=screenshot_path)
+        return screenshot_path
+
+    def _log_verification_result(self, is_valid, triggered, marker_found):
+        """Log the verification result."""
+        if is_valid:
+            logger.info(f"XSS validated! alert={triggered}, marker={marker_found}")
+        else:
+            logger.warning("XSS payload did not trigger alert() or inject marker.")
+
+    async def _handle_verification_error(self, page, logs, error):
+        """Handle verification errors and capture emergency screenshot."""
+        logs.append(f"Browser Execution Error: {error}")
+        logger.error(f"Verify XSS failed: {error}")
+
+        try:
+            import uuid
+            from bugtrace.core.config import settings
+            emergency_path = str(settings.LOG_DIR / f"error_xss_{uuid.uuid4().hex[:8]}.png")
+            await page.screenshot(path=emergency_path)
+            logs.append("Captured emergency screenshot during error.")
+            return emergency_path, logs, False
+        except Exception as screenshot_err:
+            logs.append(f"Failed to capture emergency screenshot: {screenshot_err}")
+            return "", logs, False
 
     async def login(self, url: str, creds: Dict[str, str]) -> bool:
         """

@@ -74,15 +74,26 @@ class DOMXSSDetector:
         TASK-55: Enhanced taint tracking for DOM XSS detection.
         Monitors dangerous sinks AND tracks tainted sources.
         """
+        parts = [
+            self._build_monitor_header(),
+            self._build_source_tracking(),
+            self._build_sink_monitoring(),
+            self._build_jquery_hooks(),
+            "console.log('DOMXSS_MONITOR_INJECTED_V2');"
+        ]
+        return f"(function() {{ {' '.join(parts)} }})();"
+
+    def _build_monitor_header(self) -> str:
+        """Initialize monitoring arrays and canary constant."""
         return """
-        (function() {
             window.__domxss_findings = [];
-            window.__domxss_sources = [];  // TASK-55: Track tainted sources
-
-            // Canary value we'll look for
+            window.__domxss_sources = [];
             const CANARY = 'DOMXSS_CANARY_7x7';
+        """
 
-            // TASK-55: Source tracking - monitor when tainted sources are accessed
+    def _build_source_tracking(self) -> str:
+        """Build source tracking hooks for location.hash, .search, and document.referrer."""
+        return """
             const originalHashDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'hash');
             if (originalHashDesc && originalHashDesc.get) {
                 Object.defineProperty(Location.prototype, 'hash', {
@@ -96,7 +107,6 @@ class DOMXSSDetector:
                     set: originalHashDesc.set
                 });
             }
-
             const originalSearchDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'search');
             if (originalSearchDesc && originalSearchDesc.get) {
                 Object.defineProperty(Location.prototype, 'search', {
@@ -110,8 +120,6 @@ class DOMXSSDetector:
                     set: originalSearchDesc.set
                 });
             }
-
-            // Track document.referrer access
             const originalReferrer = Object.getOwnPropertyDescriptor(Document.prototype, 'referrer');
             if (originalReferrer && originalReferrer.get) {
                 Object.defineProperty(Document.prototype, 'referrer', {
@@ -124,8 +132,11 @@ class DOMXSSDetector:
                     }
                 });
             }
+        """
 
-            // Hook innerHTML - with source correlation
+    def _build_sink_monitoring(self) -> str:
+        """Build sink monitoring hooks for innerHTML, eval, document.write, etc."""
+        return """
             const originalInnerHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
             if (originalInnerHTMLDesc) {
                 Object.defineProperty(Element.prototype, 'innerHTML', {
@@ -135,7 +146,7 @@ class DOMXSSDetector:
                                 sink: 'innerHTML',
                                 value: value.toString().substring(0, 500),
                                 element: this.tagName,
-                                sources: [...window.__domxss_sources]  // Capture sources at time of sink
+                                sources: [...window.__domxss_sources]
                             });
                             console.error('DOMXSS_DETECTED:innerHTML:' + value.toString().substring(0, 200));
                         }
@@ -144,8 +155,6 @@ class DOMXSSDetector:
                     get: originalInnerHTMLDesc.get
                 });
             }
-
-            // Hook outerHTML - TASK-55: Additional sink
             const originalOuterHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'outerHTML');
             if (originalOuterHTMLDesc && originalOuterHTMLDesc.set) {
                 Object.defineProperty(Element.prototype, 'outerHTML', {
@@ -164,8 +173,6 @@ class DOMXSSDetector:
                     get: originalOuterHTMLDesc.get
                 });
             }
-
-            // Hook document.write
             const originalWrite = document.write;
             document.write = function(content) {
                 if (content && content.toString().includes(CANARY)) {
@@ -178,8 +185,6 @@ class DOMXSSDetector:
                 }
                 return originalWrite.apply(this, arguments);
             };
-
-            // Hook document.writeln - TASK-55: Additional sink
             const originalWriteln = document.writeln;
             document.writeln = function(content) {
                 if (content && content.toString().includes(CANARY)) {
@@ -192,8 +197,6 @@ class DOMXSSDetector:
                 }
                 return originalWriteln.apply(this, arguments);
             };
-
-            // Hook eval
             const originalEval = window.eval;
             window.eval = function(code) {
                 if (code && code.toString().includes(CANARY)) {
@@ -206,8 +209,6 @@ class DOMXSSDetector:
                 }
                 return originalEval.apply(this, arguments);
             };
-
-            // Hook Function constructor - TASK-55: Additional sink
             const OriginalFunction = window.Function;
             window.Function = function(...args) {
                 const code = args.join(',');
@@ -221,8 +222,6 @@ class DOMXSSDetector:
                 }
                 return new OriginalFunction(...args);
             };
-
-            // Hook setTimeout with string argument
             const originalSetTimeout = window.setTimeout;
             window.setTimeout = function(handler, timeout, ...args) {
                 if (typeof handler === 'string' && handler.includes(CANARY)) {
@@ -235,8 +234,6 @@ class DOMXSSDetector:
                 }
                 return originalSetTimeout.apply(this, arguments);
             };
-
-            // Hook setInterval with string argument - TASK-55: Additional sink
             const originalSetInterval = window.setInterval;
             window.setInterval = function(handler, timeout, ...args) {
                 if (typeof handler === 'string' && handler.includes(CANARY)) {
@@ -249,9 +246,13 @@ class DOMXSSDetector:
                 }
                 return originalSetInterval.apply(this, arguments);
             };
+        """
 
-            // Hook jQuery if present
+    def _build_jquery_hooks(self) -> str:
+        """Build jQuery-specific hooks if jQuery is present."""
+        return """
             if (window.jQuery) {
+                const CANARY = 'DOMXSS_CANARY_7x7';
                 const originalHtml = jQuery.fn.html;
                 jQuery.fn.html = function(value) {
                     if (value && value.toString().includes(CANARY)) {
@@ -264,8 +265,6 @@ class DOMXSSDetector:
                     }
                     return originalHtml.apply(this, arguments);
                 };
-
-                // TASK-55: Hook jQuery append
                 const originalAppend = jQuery.fn.append;
                 jQuery.fn.append = function(value) {
                     if (value && value.toString().includes(CANARY)) {
@@ -279,9 +278,6 @@ class DOMXSSDetector:
                     return originalAppend.apply(this, arguments);
                 };
             }
-
-            console.log('DOMXSS_MONITOR_INJECTED_V2');  // Version indicator
-        })();
         """
 
     def _get_dom_xss_payloads(self) -> List[Dict[str, str]]:
@@ -312,77 +308,89 @@ class DOMXSSDetector:
         payloads = self._get_dom_xss_payloads()
         sources = ["hash", "search"]
 
-        context = None
-        page = None
+        context, page = await self._setup_scan_context()
 
         try:
-            context = await self.browser.new_context()
-            page = await context.new_page()
-            await page.add_init_script(self._get_monitor_script())
-
             for source in sources:
-                for p in payloads:
-                    payload = p["payload"]
-                    if source == "hash":
-                        test_url = f"{url}#{payload}"
-                    else:
-                        sep = "&" if "?" in url else "?"
-                        test_url = f"{url}{sep}xss={payload}"
-
-                    # Setup listeners with proper cleanup
-                    dialog_messages = []
-
-                    def dialog_handler(d):
-                        dialog_messages.append(d.message)
-                        asyncio.create_task(d.dismiss())
-
-                    page.on("dialog", dialog_handler)
-
-                    try:
-                        await page.goto(test_url, wait_until="networkidle", timeout=self.timeout)
-                        await asyncio.sleep(0.5)
-
-                        # Check injected script findings
-                        js_findings = await page.evaluate("window.__domxss_findings || []")
-
-                        if dialog_messages or js_findings:
-                            evidence = dialog_messages[0] if dialog_messages else js_findings[0]["value"]
-                            sink = "alert" if dialog_messages else js_findings[0]["sink"]
-
-                            findings.append(DOMXSSFinding(
-                                url=test_url,
-                                payload=payload,
-                                sink=sink,
-                                source=f"location.{source}",
-                                evidence=evidence
-                            ))
-                            break # Found one for this source, move to next source
-                    except Exception as e:
-                        logger.debug(f"Error testing {test_url}: {e}")
-                    finally:
-                        # TASK-49/51: Remove event listener to prevent leaks
-                        try:
-                            page.remove_listener("dialog", dialog_handler)
-                        except Exception as e:
-                            logger.debug(f"Failed to remove dialog listener: {e}")
-
+                finding = await self._test_source(url, source, payloads, page)
+                if finding:
+                    findings.append(finding)
         except Exception as e:
             logger.error(f"[DOMXSSDetector] Scan error: {e}")
         finally:
-            # TASK-49: Ensure page and context are always closed
-            if page:
-                try:
-                    await page.close()
-                except Exception as e:
-                    logger.debug(f"Error closing page: {e}")
-            if context:
-                try:
-                    await context.close()
-                except Exception as e:
-                    logger.debug(f"Error closing context: {e}")
+            await self._cleanup_scan_context(page, context)
 
         self.findings.extend(findings)
         return findings
+
+    async def _setup_scan_context(self):
+        """Setup browser context and page for scanning."""
+        context = await self.browser.new_context()
+        page = await context.new_page()
+        await page.add_init_script(self._get_monitor_script())
+        return context, page
+
+    async def _test_source(self, url: str, source: str, payloads: List[Dict], page) -> Optional[DOMXSSFinding]:
+        """Test a specific source (hash or search) with all payloads."""
+        for p in payloads:
+            payload = p["payload"]
+            test_url = self._build_test_url(url, source, payload)
+
+            finding = await self._test_payload(test_url, payload, source, page)
+            if finding:
+                return finding
+        return None
+
+    def _build_test_url(self, url: str, source: str, payload: str) -> str:
+        """Build test URL with payload in specified source."""
+        if source == "hash":
+            return f"{url}#{payload}"
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}xss={payload}"
+
+    async def _test_payload(self, test_url: str, payload: str, source: str, page) -> Optional[DOMXSSFinding]:
+        """Test a single payload and check for XSS execution."""
+        dialog_messages = []
+
+        def dialog_handler(d):
+            dialog_messages.append(d.message)
+            asyncio.create_task(d.dismiss())
+
+        page.on("dialog", dialog_handler)
+
+        try:
+            await page.goto(test_url, wait_until="networkidle", timeout=self.timeout)
+            await asyncio.sleep(0.5)
+            js_findings = await page.evaluate("window.__domxss_findings || []")
+
+            if dialog_messages or js_findings:
+                evidence = dialog_messages[0] if dialog_messages else js_findings[0]["value"]
+                sink = "alert" if dialog_messages else js_findings[0]["sink"]
+                return DOMXSSFinding(
+                    url=test_url, payload=payload, sink=sink,
+                    source=f"location.{source}", evidence=evidence
+                )
+        except Exception as e:
+            logger.debug(f"Error testing {test_url}: {e}")
+        finally:
+            try:
+                page.remove_listener("dialog", dialog_handler)
+            except Exception as e:
+                logger.debug(f"Failed to remove dialog listener: {e}")
+        return None
+
+    async def _cleanup_scan_context(self, page, context):
+        """Clean up page and context resources."""
+        if page:
+            try:
+                await page.close()
+            except Exception as e:
+                logger.debug(f"Error closing page: {e}")
+        if context:
+            try:
+                await context.close()
+            except Exception as e:
+                logger.debug(f"Error closing context: {e}")
 
 
 async def detect_dom_xss(url: str, timeout: int = 10000) -> List[Dict[str, Any]]:
