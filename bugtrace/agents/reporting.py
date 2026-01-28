@@ -354,6 +354,105 @@ class ReportingAgent(BaseAgent):
         
         return deduplicated
 
+
+    def _build_triager_findings(
+        self,
+        validated: List[Dict],
+        manual_review: List[Dict],
+        i_param: int = 1
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Build triager-ready findings from validated and manual review lists."""
+        triager_findings = []
+
+        # Process validated findings
+        for i, f in enumerate(validated, i_param):
+            finding_entry = self._build_finding_entry(f, f"F-{i:03d}", "VALIDATED_CONFIRMED", "CERTAIN")
+            triager_findings.append(finding_entry)
+
+        # Process manual review findings
+        for i, f in enumerate(manual_review, len(validated) + i_param):
+            finding_entry = self._build_finding_entry(f, f"M-{i:03d}", "MANUAL_REVIEW_RECOMMENDED", "POTENTIAL")
+            triager_findings.append(finding_entry)
+
+        # Separate Nuclei findings
+        nuclei_infra = [f for f in triager_findings if f.get("type", "").startswith("NUCLEI:")]
+        vuln_findings = [f for f in triager_findings if not f.get("type", "").startswith("NUCLEI:")]
+
+        return vuln_findings, nuclei_infra
+
+    def _build_finding_entry(self, f: Dict, finding_id: str, status: str, confidence: str) -> Dict:
+        """Build a single finding entry with all required fields."""
+        entry = {
+            "id": finding_id,
+            "type": f.get("type", "Unknown"),
+            "severity": f.get("severity", "MEDIUM" if status == "VALIDATED_CONFIRMED" else "HIGH"),
+            "confidence": confidence,
+            "status": status,
+            "url": f.get("url", ""),
+            "parameter": f.get("parameter", ""),
+            "payload": f.get("payload", ""),
+            "validation": self._build_validation_section(f, status),
+            "reproduction": self._build_reproduction_section(f),
+            "description": f.get("description", ""),
+            "impact": self._get_impact_for_type(f.get("type", "")),
+            "remediation": self._get_remediation_for_type(f.get("type", "")),
+            "cvss_score": f.get("cvss_score"),
+            "cvss_vector": f.get("cvss_vector"),
+            "cvss_rationale": f.get("cvss_rationale"),
+            "cve": f.get("cve"),
+            "markdown_block": self._generate_finding_markdown(f, int(finding_id.split("-")[1]))
+        }
+
+        # Add SQLi-specific fields
+        if f.get("db_type"):
+            entry["db_type"] = f.get("db_type")
+        if f.get("tamper_used"):
+            entry["tamper_used"] = f.get("tamper_used")
+
+        # Add exploitation details if present
+        if f.get("exploitation_details"):
+            entry["exploitation_details"] = f.get("exploitation_details")
+
+        # Add screenshot path if available
+        if f.get("screenshot_path"):
+            entry["screenshot_path"] = f"captures/{Path(f.get('screenshot_path', '')).name}"
+
+        return entry
+
+    def _build_validation_section(self, f: Dict, status: str) -> Dict:
+        """Build validation section for a finding."""
+        if status == "MANUAL_REVIEW_RECOMMENDED":
+            return {
+                "method": "Manual Review Required",
+                "screenshot": f"captures/{Path(f.get('screenshot_path', '')).name}" if f.get("screenshot_path") else None,
+                "notes": f.get("validator_notes", "") or "Automated validation inconclusive. Manual verification required."
+            }
+        return {
+            "method": self._get_validation_method(f),
+            "screenshot": f"captures/{Path(f.get('screenshot_path', '')).name}" if f.get("screenshot_path") else None,
+            "notes": self._get_validation_notes(f)
+        }
+
+    def _build_reproduction_section(self, f: Dict) -> Dict:
+        """Build reproduction section for a finding."""
+        return {
+            "steps": self._generate_reproduction_steps(f),
+            "poc": self._generate_curl(f)
+        }
+
+    def _sort_findings_by_cvss(self, findings: List[Dict]) -> List[Dict]:
+        """Sort findings by CVSS score descending."""
+        severity_weights = {"CRITICAL": 10.0, "HIGH": 8.0, "MEDIUM": 5.0, "LOW": 2.0, "INFO": 0.0}
+
+        def get_score(x):
+            s = x.get("cvss_score")
+            if s is not None and isinstance(s, (int, float)):
+                return float(s)
+            sev = (x.get("severity") or "MEDIUM").upper()
+            return severity_weights.get(sev, 5.0)
+
+        return sorted(findings, key=get_score, reverse=True)
+
     def _write_engagement_json(
         self,
         all_findings: List[Dict],
@@ -383,88 +482,12 @@ class ReportingAgent(BaseAgent):
             if sev in by_severity:
                 by_severity[sev] += 1
 
-        # Build triager-ready findings (same as before)
-        triager_findings = []
-        for i, f in enumerate(validated, 1):
-            finding_entry = {
-                "id": f"F-{i:03d}",
-                "type": f.get("type", "Unknown"),
-                "severity": f.get("severity", "MEDIUM"),
-                "confidence": "CERTAIN",
-                "status": "VALIDATED_CONFIRMED",
-                "url": f.get("url", ""),
-                "parameter": f.get("parameter", ""),
-                "payload": f.get("payload", ""),
-                "screenshot_path": f"captures/{Path(f.get('screenshot_path', '')).name}" if f.get("screenshot_path") else None,
-                "validation": {
-                    "method": self._get_validation_method(f),
-                    "screenshot": f"captures/{Path(f.get('screenshot_path', '')).name}" if f.get("screenshot_path") else None,
-                    "notes": self._get_validation_notes(f)
-                },
-                "reproduction": {
-                    "steps": self._generate_reproduction_steps(f),
-                    "poc": self._generate_curl(f)
-                },
-                "description": f.get("description", ""),
-                "impact": self._get_impact_for_type(f.get("type", "")),
-                "remediation": self._get_remediation_for_type(f.get("type", "")),
-                "exploitation_details": f.get("exploitation_details", ""),
-                "cvss_score": f.get("cvss_score"),
-                "cvss_vector": f.get("cvss_vector"),
-                "cvss_rationale": f.get("cvss_rationale"),
-                "cve": f.get("cve"),
-                "markdown_block": self._generate_finding_markdown(f, i)
-            }
-            triager_findings.append(finding_entry)
+        # Build triager-ready findings using helper methods
+        vuln_findings, nuclei_infra = self._build_triager_findings(validated, manual_review)
 
-        # Add Manual Review findings to the list but mark them appropriately
-        for i, f in enumerate(manual_review, len(validated) + 1):
-            finding_entry = {
-                "id": f"M-{i:03d}",
-                "type": f.get("type", "Unknown"),
-                "severity": f.get("severity", "HIGH"), # Default to HIGH for manual review
-                "confidence": "POTENTIAL",
-                "status": "MANUAL_REVIEW_RECOMMENDED",
-                "url": f.get("url", ""),
-                "parameter": f.get("parameter", ""),
-                "payload": f.get("payload", ""),
-                "validation": {
-                    "method": "Manual Review Required",
-                    "screenshot": f"captures/{Path(f.get('screenshot_path', '')).name}" if f.get("screenshot_path") else None,
-                    "notes": f.get("validator_notes", "") or "Automated validation inconclusive. Manual verification required."
-                },
-                "reproduction": {
-                    "steps": self._generate_reproduction_steps(f),
-                    "poc": self._generate_curl(f)
-                },
-                "description": f.get("description", ""),
-                "impact": self._get_impact_for_type(f.get("type", "")),
-                "remediation": self._get_remediation_for_type(f.get("type", "")),
-                "cvss_score": f.get("cvss_score"),
-                "cvss_vector": f.get("cvss_vector"),
-                "cvss_rationale": f.get("cvss_rationale"),
-                "cve": f.get("cve"),
-                "markdown_block": self._generate_finding_markdown(f, i)
-            }
-            triager_findings.append(finding_entry)
-
-        # SORTING: Order by CVSS Score Descending (10.0 -> 0.0)
-        # Fallback to severity weights if no score
-        severity_weights = {"CRITICAL": 10.0, "HIGH": 8.0, "MEDIUM": 5.0, "LOW": 2.0, "INFO": 0.0}
-        
-        def get_score(x):
-            s = x.get("cvss_score")
-            if s is not None and isinstance(s, (int, float)):
-                return float(s)
-            # Fallback based on text severity
-            sev = (x.get("severity") or "MEDIUM").upper()
-            return severity_weights.get(sev, 5.0)
-
-        triager_findings.sort(key=get_score, reverse=True)
-
-        # Separate Nuclei findings for infrastructure section
-        nuclei_infra = [f for f in triager_findings if f.get("type", "").startswith("NUCLEI:")]
-        vuln_findings = [f for f in triager_findings if not f.get("type", "").startswith("NUCLEI:")]
+        # Sort by CVSS score
+        vuln_findings = self._sort_findings_by_cvss(vuln_findings)
+        nuclei_infra = self._sort_findings_by_cvss(nuclei_infra)
 
         output = {
             "meta": {
@@ -530,90 +553,12 @@ class ReportingAgent(BaseAgent):
             if sev in by_severity:
                 by_severity[sev] += 1
 
-        # Build triager-ready findings (duplicate logic to ensure safety)
-        triager_findings = []
-        for i, f in enumerate(validated, 1):
-            finding_entry = {
-                "id": f"F-{i:03d}",
-                "type": f.get("type", "Unknown"),
-                "severity": f.get("severity", "MEDIUM"),
-                "confidence": "CERTAIN",
-                "status": "VALIDATED_CONFIRMED",
-                "url": f.get("url", ""),
-                "parameter": f.get("parameter", ""),
-                "db_type": f.get("db_type"),  # SQLi V2
-                "tamper_used": f.get("tamper_used"),  # SQLi V2
-                "payload": f.get("payload", ""),
-                "screenshot_path": f"captures/{Path(f.get('screenshot_path', '')).name}" if f.get("screenshot_path") else None,
-                "validation": {
-                    "method": "CDP + Vision AI",
-                    "screenshot": f"captures/{Path(f.get('screenshot_path', '')).name}" if f.get("screenshot_path") else None,
-                    "notes": f.get("validator_notes", "")
-                },
-                "reproduction": {
-                    "steps": self._generate_reproduction_steps(f),
-                    "poc": self._generate_curl(f)
-                },
-                "description": f.get("description", ""),
-                "impact": self._get_impact_for_type(f.get("type", "")),
-                "remediation": self._get_remediation_for_type(f.get("type", "")),
-                "exploitation_details": f.get("exploitation_details", ""),
-                "cvss_score": f.get("cvss_score"),
-                "cvss_vector": f.get("cvss_vector"),
-                "cvss_rationale": f.get("cvss_rationale"),
-                "cve": f.get("cve"),
-                "markdown_block": self._generate_finding_markdown(f, i)
-            }
-            triager_findings.append(finding_entry)
+        # Build triager-ready findings using helper methods
+        vuln_findings, nuclei_infra = self._build_triager_findings(validated, manual_review)
 
-        # Add Manual Review findings to the list but mark them appropriately
-        for i, f in enumerate(manual_review, len(validated) + 1):
-            finding_entry = {
-                "id": f"M-{i:03d}",
-                "type": f.get("type", "Unknown"),
-                "severity": f.get("severity", "HIGH"),
-                "confidence": "POTENTIAL",
-                "status": "MANUAL_REVIEW_RECOMMENDED",
-                "url": f.get("url", ""),
-                "parameter": f.get("parameter", ""),
-                "payload": f.get("payload", ""),
-                "validation": {
-                    "method": "Manual Review Required",
-                    "screenshot": f"captures/{Path(f.get('screenshot_path', '')).name}" if f.get("screenshot_path") else None,
-                    "notes": f.get("validator_notes", "") or "Automated validation inconclusive. Manual verification required."
-                },
-                "reproduction": {
-                    "steps": self._generate_reproduction_steps(f),
-                    "poc": self._generate_curl(f)
-                },
-                "description": f.get("description", ""),
-                "impact": self._get_impact_for_type(f.get("type", "")),
-                "remediation": self._get_remediation_for_type(f.get("type", "")),
-                "cvss_score": f.get("cvss_score"),
-                "cvss_vector": f.get("cvss_vector"),
-                "cvss_rationale": f.get("cvss_rationale"),
-                "cve": f.get("cve"),
-                "markdown_block": self._generate_finding_markdown(f, i)
-            }
-            triager_findings.append(finding_entry)
-
-        # SORTING: Order by CVSS Score Descending (10.0 -> 0.0)
-        # Fallback to severity weights if no score
-        severity_weights = {"CRITICAL": 10.0, "HIGH": 8.0, "MEDIUM": 5.0, "LOW": 2.0, "INFO": 0.0}
-        
-        def get_score(x):
-            s = x.get("cvss_score")
-            if s is not None and isinstance(s, (int, float)):
-                return float(s)
-            # Fallback based on text severity
-            sev = (x.get("severity") or "MEDIUM").upper()
-            return severity_weights.get(sev, 5.0)
-
-        triager_findings.sort(key=get_score, reverse=True)
-
-        # Separate Nuclei findings for infrastructure section
-        nuclei_infra = [f for f in triager_findings if f.get("type", "").startswith("NUCLEI:")]
-        vuln_findings = [f for f in triager_findings if not f.get("type", "").startswith("NUCLEI:")]
+        # Sort by CVSS score
+        vuln_findings = self._sort_findings_by_cvss(vuln_findings)
+        nuclei_infra = self._sort_findings_by_cvss(nuclei_infra)
 
         output = {
             "meta": {
