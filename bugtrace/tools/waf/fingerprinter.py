@@ -285,23 +285,26 @@ class WAFFingerprinter:
         domain = self._extract_base_url(url)
         return hashlib.md5(domain.encode()).hexdigest()
 
+    def _score_all_signatures(self, response) -> Dict[str, float]:
+        """Score all WAF signatures against response. Returns {waf_name: score} for matches."""
+        scores = {}
+        for sig in self.signatures:
+            score = self._score_waf_signature(sig, response)
+            if score > 0:
+                scores[sig.name] = score
+        return scores
+
     async def _analyze_normal_request(self, url: str, timeout: float) -> Dict[str, float]:
         """
         Analyze headers/cookies from a normal request.
         Returns dict of {waf_name: score}
         """
-        scores: Dict[str, float] = {}
-
         ssl_verify = get_ssl_context()
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=ssl_verify) as client:
             response = await self._fetch_normal_response(client, url)
-            if response:
-                for sig in self.signatures:
-                    score = self._score_waf_signature(sig, response)
-                    if score > 0:
-                        scores[sig.name] = score
-
-        return scores
+            if not response:
+                return {}
+            return self._score_all_signatures(response)
 
     async def _fetch_normal_response(self, client, url: str):
         """Fetch response for WAF fingerprinting."""
