@@ -205,73 +205,71 @@ class ConductorV2:
         logger.debug(f"Generated prompt for {agent_name} ({len(full_prompt)} chars)")
         return full_prompt
     
+    def _validate_xss_evidence(self, evidence: Dict) -> Tuple[bool, str]:
+        """Validate XSS-specific evidence requirements."""
+        if not evidence.get('alert_triggered') and not evidence.get('vision_confirmed'):
+            return False, "XSS requires alert execution or vision confirmation proof"
+
+        if not evidence.get('screenshot'):
+            return False, "XSS requires screenshot proof"
+
+        return True, ""
+
+    def _validate_sqli_evidence(self, evidence: Dict) -> Tuple[bool, str]:
+        """Validate SQLi-specific evidence requirements."""
+        has_error = evidence.get('error_message')
+        has_time = evidence.get('time_delay')
+        has_data = evidence.get('extracted_data')
+
+        if not (has_error or has_time or has_data):
+            return False, "SQLi requires error/time/data proof"
+
+        if evidence.get('status_code') in [403, 500] and not has_error:
+            return False, "Only status code, no SQL error proof"
+
+        return True, ""
+
+    def _validate_evidence_by_type(self, vuln_type: str, evidence: Dict) -> Tuple[bool, str]:
+        """Validate type-specific evidence requirements."""
+        if vuln_type == "XSS":
+            return self._validate_xss_evidence(evidence)
+        elif vuln_type == "SQLi":
+            return self._validate_sqli_evidence(evidence)
+        elif vuln_type == "CSTI":
+            if not evidence.get('template_executed'):
+                return False, "CSTI requires template execution proof"
+
+        return True, ""
+
     def validate_finding(self, finding: Dict) -> Tuple[bool, str]:
-        """
-        Validate finding against anti-hallucination rules.
-        
-        Args:
-            finding: Finding data dict with type, url, payload, confidence, evidence
-        
-        Returns:
-            (is_valid, rejection_reason)
-        """
-        # Check if validation is disabled (for baseline testing)
+        """Validate finding against anti-hallucination rules."""
         if not self.validation_enabled:
             logger.debug("Validation DISABLED - auto-passing finding")
             return True, "Validation bypassed (disabled in config)"
-        
+
         self.stats["validations_run"] += 1
-        
+
         vuln_type = finding.get('type', 'Unknown')
         confidence = finding.get('confidence', 0.0)
         evidence = finding.get('evidence', {})
         payload = finding.get('payload', '')
-        
-        # Rule 1: Confidence threshold (from config)
+
+        # Rule 1: Confidence threshold
         if confidence < self.min_confidence:
             self.stats["findings_blocked"] += 1
             return False, f"Confidence {confidence:.2f} below threshold {self.min_confidence}"
-        
+
         # Rule 2: Type-specific evidence requirements
-        if vuln_type == "XSS":
-            if not evidence.get('alert_triggered') and not evidence.get('vision_confirmed'):
-                self.stats["findings_blocked"] += 1
-                return False, "XSS requires alert execution or vision confirmation proof"
-            
-            if not evidence.get('screenshot'):
-                self.stats["findings_blocked"] += 1
-                return False, "XSS requires screenshot proof"
-            
-            # Check for domain proof in screenshot/logs
-            screenshot_path = evidence.get('screenshot', '')
-            if screenshot_path and os.path.exists(screenshot_path):
-                # TODO: OCR or filename check for 'document.domain'
-                pass
-        
-        elif vuln_type == "SQLi":
-            has_error = evidence.get('error_message')
-            has_time = evidence.get('time_delay')
-            has_data = evidence.get('extracted_data')
-            
-            if not (has_error or has_time or has_data):
-                self.stats["findings_blocked"] += 1
-                return False, "SQLi requires error/time/data proof"
-            
-            # Check it's not just a status code
-            if evidence.get('status_code') in [403, 500] and not has_error:
-                self.stats["findings_blocked"] += 1
-                return False, "Only status code, no SQL error proof"
-        
-        elif vuln_type == "CSTI":
-            if not evidence.get('template_executed'):
-                self.stats["findings_blocked"] += 1
-                return False, "CSTI requires template execution proof"
-        
+        is_valid, error_msg = self._validate_evidence_by_type(vuln_type, evidence)
+        if not is_valid:
+            self.stats["findings_blocked"] += 1
+            return False, error_msg
+
         # Rule 3: Payload validation
         if not self.validate_payload(payload, vuln_type):
             self.stats["findings_blocked"] += 1
             return False, f"Invalid payload: {payload[:50]}"
-        
+
         # Rule 4: False positive check
         is_fp, fp_pattern = self.check_false_positive(finding)
         if is_fp:
@@ -279,124 +277,140 @@ class ConductorV2:
             self.stats["fp_blocks_by_pattern"][fp_pattern] = \
                 self.stats["fp_blocks_by_pattern"].get(fp_pattern, 0) + 1
             return False, f"Matches FP pattern: {fp_pattern}"
-        
+
         # Passed all checks
         self.stats["findings_passed"] += 1
         logger.info(f"Finding VALIDATED: {vuln_type} (confidence: {confidence:.2f})")
         return True, "Validation passed"
     
-    def validate_payload(self, payload: str, vuln_type: str) -> bool:
-        """
-        Validate payload against library and syntax rules.
-        
-        Args:
-            payload: Payload string
-            vuln_type: Vulnerability type (XSS, SQLi, etc.)
-        
-        Returns:
-            True if valid, False otherwise
-        """
+    def _validate_basic_payload_rules(self, payload: str) -> Tuple[bool, str]:
+        """Validate basic payload rules (length, conversational text)."""
         if not payload or len(payload) == 0:
-            return False
-        
-        # Check length (WAF evasion limit)
+            return False, "Empty payload"
+
         if len(payload) > 500:
-            logger.warning(f"Payload too long: {len(payload)} chars")
-            return False
-        
-        # Check for conversational text (LLM hallucination)
+            return False, f"Payload too long: {len(payload)} chars"
+
         conversational = ['here is', 'try this', 'you could', 'might work', 'consider']
-        payload_lower = payload.lower()
-        if any(phrase in payload_lower for phrase in conversational):
-            logger.warning(f"Payload contains conversational text: {payload[:50]}")
+        if any(phrase in payload.lower() for phrase in conversational):
+            return False, f"Payload contains conversational text"
+
+        return True, ""
+
+    def _validate_xss_payload(self, payload: str) -> bool:
+        """Validate XSS payload syntax."""
+        if not any(c in payload for c in '<>\'"();'):
+            logger.warning(f"XSS payload missing attack chars")
             return False
-        
-        # Type-specific validation
+
+        if 'document.domain' not in payload and 'origin' not in payload:
+            logger.warning(f"XSS payload missing domain proof")
+            # Not fatal, mutation might have changed it
+
+        return True
+
+    def _validate_sqli_payload(self, payload: str) -> bool:
+        """Validate SQLi payload syntax."""
+        sql_indicators = ['SELECT', 'UNION', 'AND', 'OR', 'SLEEP', 'WAITFOR', '--', '#', ';']
+        if not any(kw in payload.upper() for kw in sql_indicators):
+            logger.warning(f"SQLi payload missing SQL syntax")
+            return False
+
+        if not any(c in payload for c in '\'"--#;'):
+            logger.warning(f"SQLi payload missing quote/comment")
+            return False
+
+        return True
+
+    def validate_payload(self, payload: str, vuln_type: str) -> bool:
+        """Validate payload against library and syntax rules."""
+        is_valid, error_msg = self._validate_basic_payload_rules(payload)
+        if not is_valid:
+            logger.warning(error_msg)
+            return False
+
         if vuln_type == "XSS":
-            # Must contain attack chars
-            if not any(c in payload for c in '<>\'"();'):
-                logger.warning(f"XSS payload missing attack chars")
-                return False
-            
-            # Should contain proof element
-            if 'document.domain' not in payload and 'origin' not in payload:
-                logger.warning(f"XSS payload missing domain proof")
-                # Not fatal, mutation might have changed it
-        
+            return self._validate_xss_payload(payload)
         elif vuln_type == "SQLi":
-            # Must contain SQL keywords or syntax
-            sql_indicators = ['SELECT', 'UNION', 'AND', 'OR', 'SLEEP', 'WAITFOR', '--', '#', ';']
-            if not any(kw in payload.upper() for kw in sql_indicators):
-                logger.warning(f"SQLi payload missing SQL syntax")
-                return False
-            
-            # Should have quote or comment
-            if not any(c in payload for c in '\'"--#;'):
-                logger.warning(f"SQLi payload missing quote/comment")
-                return False
-        
-        # Check against library (optional - payload might be mutation)
-        # For now, if it passes syntax checks, it's valid
+            return self._validate_sqli_payload(payload)
+
         return True
     
-    def check_false_positive(self, finding: Dict) -> Tuple[bool, Optional[str]]:
-        """
-        Check finding against known false positive patterns.
-        
-        Args:
-            finding: Finding data dict
-        
-        Returns:
-            (is_fp, pattern_name) - pattern_name is None if not FP
-        """
-        evidence = finding.get('evidence', {})
-        response = evidence.get('response', {})
-        
-        if not response:
+    def _check_waf_block(self, status_code: int, body: str, headers: Dict) -> Tuple[bool, Optional[str]]:
+        """Check for WAF block patterns."""
+        if status_code not in [403, 406, 419, 429]:
             return False, None
-        
-        status_code = response.get('status_code', 0)
-        body = response.get('body', '').lower()
-        headers = response.get('headers', {})
-        
-        # Pattern 1: WAF Block
-        if status_code in [403, 406, 419, 429]:
-            waf_keywords = ['modsecurity', 'cloudflare', 'incapsula', 'blocked', 'firewall']
-            if any(kw in body for kw in waf_keywords):
-                return True, "WAF_BLOCK"
-            
-            waf_headers = ['CF-RAY', 'X-WAF-Action', 'X-Akamai']
-            if any(header in headers for header in waf_headers):
-                return True, "WAF_BLOCK"
-        
-        # Pattern 2: Generic Error
+
+        waf_keywords = ['modsecurity', 'cloudflare', 'incapsula', 'blocked', 'firewall']
+        if any(kw in body for kw in waf_keywords):
+            return True, "WAF_BLOCK"
+
+        waf_headers = ['CF-RAY', 'X-WAF-Action', 'X-Akamai']
+        if any(header in headers for header in waf_headers):
+            return True, "WAF_BLOCK"
+
+        return False, None
+
+    def _check_generic_error(self, status_code: int, body: str) -> Tuple[bool, Optional[str]]:
+        """Check for generic error patterns."""
         if status_code == 404:
             return True, "GENERIC_404"
-        
+
         if status_code == 500:
-            # Only FP if no stack trace or SQL error
             has_trace = any(kw in body for kw in ['traceback', 'exception', 'at line'])
             has_sql = any(kw in body for kw in ['sql', 'mysql', 'postgres', 'syntax error'])
-            
             if not has_trace and not has_sql:
                 return True, "GENERIC_500"
-        
-        # Pattern 3: CAPTCHA/Rate Limiting
+
+        return False, None
+
+    def _check_captcha_or_rate_limit(self, body: str) -> Tuple[bool, Optional[str]]:
+        """Check for CAPTCHA or rate limiting patterns."""
         captcha_keywords = ['recaptcha', 'hcaptcha', 'captcha', 'verify you are human']
         if any(kw in body for kw in captcha_keywords):
             return True, "CAPTCHA"
-        
+
         rate_limit_keywords = ['too many requests', 'rate limit', 'slow down']
         if any(kw in body for kw in rate_limit_keywords):
             return True, "RATE_LIMIT"
-        
-        # Pattern 4: Auth Required
-        if status_code in [401, 403]:
-            auth_keywords = ['login', 'sign in', 'unauthorized', 'authentication required']
-            if any(kw in body for kw in auth_keywords):
-                return True, "AUTH_REQUIRED"
-        
-        # No FP pattern matched
+
+        return False, None
+
+    def _check_auth_required(self, status_code: int, body: str) -> Tuple[bool, Optional[str]]:
+        """Check for auth required patterns."""
+        if status_code not in [401, 403]:
+            return False, None
+
+        auth_keywords = ['login', 'sign in', 'unauthorized', 'authentication required']
+        if any(kw in body for kw in auth_keywords):
+            return True, "AUTH_REQUIRED"
+
+        return False, None
+
+    def check_false_positive(self, finding: Dict) -> Tuple[bool, Optional[str]]:
+        """Check finding against known false positive patterns."""
+        evidence = finding.get('evidence', {})
+        response = evidence.get('response', {})
+
+        if not response:
+            return False, None
+
+        status_code = response.get('status_code', 0)
+        body = response.get('body', '').lower()
+        headers = response.get('headers', {})
+
+        # Check all FP patterns
+        checks = [
+            self._check_waf_block(status_code, body, headers),
+            self._check_generic_error(status_code, body),
+            self._check_captcha_or_rate_limit(body),
+            self._check_auth_required(status_code, body)
+        ]
+
+        for is_fp, pattern in checks:
+            if is_fp:
+                return True, pattern
+
         return False, None
     
     async def _crawl_target(self, target_url: str) -> List[str]:
@@ -461,80 +475,87 @@ class ConductorV2:
             "raw_findings": findings
         }
 
-    async def _launch_agents(self, endpoint: str):
-        """Dispatches the specialist agents to a specific endpoint."""
+    def _parse_endpoint_params(self, endpoint: str) -> Tuple[Optional[str], str]:
+        """Parse URL parameters and return first param with its value."""
         from urllib.parse import urlparse, parse_qs
-        from bugtrace.core.event_bus import event_bus
 
-        logger.info(f"[Conductor] Launching specialist agents on {endpoint}")
-
-        # Extraer parametros de la URL
         parsed = urlparse(endpoint)
         params = parse_qs(parsed.query)
-
-        # Si no hay parametros, no hay mucho que probar para agentes basados en parametros
-        # pero algunos como XXE o FileUpload podrian funcionar en el endpoint base
         first_param = list(params.keys())[0] if params else None
         first_value = params[first_param][0] if first_param and params[first_param] else "1"
 
-        all_findings = []
+        return first_param, first_value
 
-        # --- XSS Agent --- (Mandatory)
+    async def _launch_xss_agent(self, endpoint: str, first_param: Optional[str]) -> List[Dict]:
+        """Launch XSS Agent and return findings."""
         try:
             from bugtrace.agents.xss_agent import XSSAgent
             logger.info(f"[Conductor] Launching XSS Agent on {endpoint}")
-            # XSSAgent expects 'params' as a List[str]
             xss_agent = XSSAgent(url=endpoint, params=[first_param] if first_param else [])
             xss_result = await xss_agent.run_loop()
             if xss_result.get("vulnerable"):
-                all_findings.extend(xss_result.get("findings", []))
                 logger.info(f"[Conductor] XSS Agent found {len(xss_result.get('findings', []))} issues")
+                return xss_result.get("findings", [])
         except Exception as e:
             logger.error(f"[Conductor] XSS Agent failed: {e}")
+        return []
 
-        # --- SQLi Agent --- (Mandatory)
+    async def _launch_sqli_agent(self, endpoint: str, first_param: Optional[str]) -> List[Dict]:
+        """Launch SQLi Agent and return findings."""
+        if not first_param:
+            return []
         try:
             from bugtrace.agents.sqli_agent import SQLiAgent
-            if first_param:
-                logger.info(f"[Conductor] Launching SQLi Agent on {endpoint}")
-                sqli_agent = SQLiAgent(url=endpoint, param=first_param)
-                sqli_result = await sqli_agent.run_loop()
-                if sqli_result.get("vulnerable"):
-                    all_findings.extend(sqli_result.get("findings", []))
-                    logger.info(f"[Conductor] SQLi Agent found {len(sqli_result.get('findings', []))} issues")
+            logger.info(f"[Conductor] Launching SQLi Agent on {endpoint}")
+            sqli_agent = SQLiAgent(url=endpoint, param=first_param)
+            sqli_result = await sqli_agent.run_loop()
+            if sqli_result.get("vulnerable"):
+                logger.info(f"[Conductor] SQLi Agent found {len(sqli_result.get('findings', []))} issues")
+                return sqli_result.get("findings", [])
         except Exception as e:
             logger.error(f"[Conductor] SQLi Agent failed: {e}")
+        return []
 
-        # --- SSRF Agent --- (Mandatory)
+    async def _launch_ssrf_agent(self, endpoint: str, first_param: Optional[str]) -> List[Dict]:
+        """Launch SSRF Agent and return findings."""
+        if not first_param:
+            return []
         try:
             from bugtrace.agents.ssrf_agent import SSRFAgent
-            if first_param:
-                logger.info(f"[Conductor] Launching SSRF Agent on {endpoint}")
-                ssrf_agent = SSRFAgent(url=endpoint, param=first_param)
-                ssrf_result = await ssrf_agent.run_loop()
-                if ssrf_result.get("vulnerable"):
-                    all_findings.extend(ssrf_result.get("findings", []))
-                    logger.info(f"[Conductor] SSRF Agent found {len(ssrf_result.get('findings', []))} issues")
+            logger.info(f"[Conductor] Launching SSRF Agent on {endpoint}")
+            ssrf_agent = SSRFAgent(url=endpoint, param=first_param)
+            ssrf_result = await ssrf_agent.run_loop()
+            if ssrf_result.get("vulnerable"):
+                logger.info(f"[Conductor] SSRF Agent found {len(ssrf_result.get('findings', []))} issues")
+                return ssrf_result.get("findings", [])
         except Exception as e:
             logger.error(f"[Conductor] SSRF Agent failed: {e}")
+        return []
 
-        # --- IDOR Agent --- (Mandatory)
+    async def _launch_idor_agent(self, endpoint: str, first_param: Optional[str], first_value: str) -> List[Dict]:
+        """Launch IDOR Agent and return findings."""
+        if not first_param or not first_value.isdigit():
+            return []
         try:
             from bugtrace.agents.idor_agent import IDORAgent
-            if first_param and first_value.isdigit():
-                logger.info(f"[Conductor] Launching IDOR Agent on {endpoint}")
-                # IDORAgent expects params as List[Dict] with 'parameter' and 'original_value' keys
-                idor_params = [{"parameter": first_param, "original_value": first_value}]
-                idor_agent = IDORAgent(url=endpoint, params=idor_params)
-                idor_result = await idor_agent.run_loop()
-                findings = idor_result.get("findings", [])
-                if findings:
-                    all_findings.extend(findings)
-                    logger.info(f"[Conductor] IDOR Agent found {len(findings)} issues")
+            logger.info(f"[Conductor] Launching IDOR Agent on {endpoint}")
+            idor_params = [{"parameter": first_param, "original_value": first_value}]
+            idor_agent = IDORAgent(url=endpoint, params=idor_params)
+            idor_result = await idor_agent.run_loop()
+            findings = idor_result.get("findings", [])
+            if findings:
+                logger.info(f"[Conductor] IDOR Agent found {len(findings)} issues")
+            return findings
         except Exception as e:
             logger.error(f"[Conductor] IDOR Agent failed: {e}")
+        return []
 
-        # --- XXE Agent --- (Optional)
+    async def _launch_optional_agents(self, endpoint: str) -> List[Dict]:
+        """Launch XXE, JWT, and File Upload agents."""
+        from bugtrace.core.event_bus import event_bus
+        all_findings = []
+
+        # XXE Agent
         try:
             from bugtrace.agents.xxe_agent import XXEAgent
             logger.info(f"[Conductor] Launching XXE Agent on {endpoint}")
@@ -546,12 +567,11 @@ class ConductorV2:
         except Exception as e:
             logger.error(f"[Conductor] XXE Agent failed: {e}")
 
-        # --- JWT Agent --- (Optional)
+        # JWT Agent
         try:
             from bugtrace.agents.jwt_agent import JWTAgent
             logger.info(f"[Conductor] Launching JWT Agent on {endpoint}")
             jwt_agent = JWTAgent(event_bus=event_bus)
-            # JWTAgent has a check_url method that does discovery and analysis
             jwt_result = await jwt_agent.check_url(url=endpoint)
             if jwt_result.get("vulnerable"):
                 all_findings.extend(jwt_result.get("findings", []))
@@ -559,7 +579,7 @@ class ConductorV2:
         except Exception as e:
             logger.error(f"[Conductor] JWT Agent failed: {e}")
 
-        # --- File Upload Agent --- (Optional)
+        # File Upload Agent
         try:
             from bugtrace.agents.fileupload_agent import FileUploadAgent
             logger.info(f"[Conductor] Launching File Upload Agent on {endpoint}")
@@ -571,26 +591,47 @@ class ConductorV2:
         except Exception as e:
             logger.error(f"[Conductor] File Upload Agent failed: {e}")
 
-        # Guardar findings en contexto compartido
-        if all_findings:
-            # Phase 3.5: Pre-flight payload validation (Anti-Hallucination)
-            valid_findings = []
-            for f in all_findings:
-                is_valid, error_msg = self._validate_payload_format(f)
-                if is_valid:
-                    valid_findings.append(f)
-                else:
-                    logger.warning(f"[Conductor] {error_msg}")
-            
-            all_findings = valid_findings
-            
-            if all_findings:
-                existing = self.get_shared_context("agent_findings") or []
-                existing.extend(all_findings)
-                self.share_context("agent_findings", existing)
-                logger.info(f"[Conductor] Total findings so far: {len(existing)}")
-            
         return all_findings
+
+    def _validate_and_store_findings(self, all_findings: List[Dict]) -> List[Dict]:
+        """Validate payload format and store findings in shared context."""
+        if not all_findings:
+            return []
+
+        valid_findings = []
+        for f in all_findings:
+            is_valid, error_msg = self._validate_payload_format(f)
+            if is_valid:
+                valid_findings.append(f)
+            else:
+                logger.warning(f"[Conductor] {error_msg}")
+
+        if valid_findings:
+            existing = self.get_shared_context("agent_findings") or []
+            existing.extend(valid_findings)
+            self.share_context("agent_findings", existing)
+            logger.info(f"[Conductor] Total findings so far: {len(existing)}")
+
+        return valid_findings
+
+    async def _launch_agents(self, endpoint: str):
+        """Dispatches the specialist agents to a specific endpoint."""
+        logger.info(f"[Conductor] Launching specialist agents on {endpoint}")
+
+        first_param, first_value = self._parse_endpoint_params(endpoint)
+
+        # Launch mandatory agents
+        all_findings = []
+        all_findings.extend(await self._launch_xss_agent(endpoint, first_param))
+        all_findings.extend(await self._launch_sqli_agent(endpoint, first_param))
+        all_findings.extend(await self._launch_ssrf_agent(endpoint, first_param))
+        all_findings.extend(await self._launch_idor_agent(endpoint, first_param, first_value))
+
+        # Launch optional agents
+        all_findings.extend(await self._launch_optional_agents(endpoint))
+
+        # Validate and store findings
+        return self._validate_and_store_findings(all_findings)
 
     async def run(self, target: str):
         """Main entry point for the Conductor-led scan."""
