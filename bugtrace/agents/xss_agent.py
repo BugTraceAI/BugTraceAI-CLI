@@ -1726,31 +1726,9 @@ class XSSAgent(BaseAgent):
     # LLM AS BRAIN: Smart DOM Analysis (Primary Strategy)
     # =========================================================================
 
-    async def _llm_smart_dom_analysis(
-        self,
-        html: str,
-        param: str,
-        probe_string: str,
-        interactsh_url: str,
-        context_data: Dict
-    ) -> List[Dict]:
-        """
-        LLM-First Strategy: Analyze DOM structure and generate targeted payloads.
-
-        Instead of trying 50+ generic payloads, the LLM:
-        1. Parses the exact DOM structure around the reflection point
-        2. Identifies what tags/attributes need to be escaped
-        3. Generates 1-3 precision payloads for the exact context
-
-        Returns:
-            List of payload dicts with: payload, reasoning, confidence
-        """
-        import json
-
-        # Extract the DOM snippet around the reflection point (more focused than full HTML)
-        dom_snippet = self._extract_dom_around_reflection(html, probe_string)
-
-        system_prompt = """You are an elite XSS specialist. Your job is to analyze HTML and generate PRECISE payloads.
+    def _dom_build_system_prompt(self) -> str:
+        """Build system prompt for DOM XSS analysis (LLM template string)."""
+        return """You are an elite XSS specialist. Your job is to analyze HTML and generate PRECISE payloads.
 
 CRITICAL: You must understand the EXACT DOM structure to escape correctly.
 
@@ -1789,7 +1767,17 @@ RULES:
 4. If < > are filtered, use event handlers or javascript: protocol
 5. Generate 1-3 payloads ranked by likelihood of success"""
 
-        user_prompt = f"""Analyze this HTML and generate XSS payloads:
+    def _dom_build_user_prompt(
+        self,
+        html: str,
+        param: str,
+        probe_string: str,
+        interactsh_url: str,
+        context_data: Dict,
+        dom_snippet: str
+    ) -> str:
+        """Build user prompt for DOM XSS analysis (LLM template string)."""
+        return f"""Analyze this HTML and generate XSS payloads:
 
 TARGET URL: {self.url}
 PARAMETER: {param}
@@ -1828,6 +1816,43 @@ Response format (XML):
   <!-- More payloads if needed -->
 </payloads>"""
 
+    def _dom_log_generated_payloads(self, payloads: List[Dict]):
+        """Log generated payloads to dashboard."""
+        logger.info(f"[{self.name}] 🧠 LLM Brain generated {len(payloads)} precision payloads")
+        for i, p in enumerate(payloads):
+            dashboard.log(
+                f"[{self.name}] 🎯 Smart Payload #{i+1}: {p['payload'][:50]}... (conf: {p['confidence']})",
+                "INFO"
+            )
+
+    async def _llm_smart_dom_analysis(
+        self,
+        html: str,
+        param: str,
+        probe_string: str,
+        interactsh_url: str,
+        context_data: Dict
+    ) -> List[Dict]:
+        """
+        LLM-First Strategy: Analyze DOM structure and generate targeted payloads.
+
+        Instead of trying 50+ generic payloads, the LLM:
+        1. Parses the exact DOM structure around the reflection point
+        2. Identifies what tags/attributes need to be escaped
+        3. Generates 1-3 precision payloads for the exact context
+
+        Returns:
+            List of payload dicts with: payload, reasoning, confidence
+        """
+        # Extract the DOM snippet around the reflection point
+        dom_snippet = self._extract_dom_around_reflection(html, probe_string)
+
+        # Build prompts
+        system_prompt = self._dom_build_system_prompt()
+        user_prompt = self._dom_build_user_prompt(
+            html, param, probe_string, interactsh_url, context_data, dom_snippet
+        )
+
         try:
             response = await llm_client.generate(
                 prompt=user_prompt,
@@ -1835,7 +1860,7 @@ Response format (XML):
                 system_prompt=system_prompt,
                 model_override=settings.MUTATION_MODEL,
                 max_tokens=4000,
-                temperature=0.3  # Lower temperature for more precise payloads
+                temperature=0.3
             )
 
             if not response:
@@ -1846,12 +1871,7 @@ Response format (XML):
             payloads = self._parse_smart_analysis_response(response, interactsh_url)
 
             if payloads:
-                logger.info(f"[{self.name}] 🧠 LLM Brain generated {len(payloads)} precision payloads")
-                for i, p in enumerate(payloads):
-                    dashboard.log(
-                        f"[{self.name}] 🎯 Smart Payload #{i+1}: {p['payload'][:50]}... (conf: {p['confidence']})",
-                        "INFO"
-                    )
+                self._dom_log_generated_payloads(payloads)
 
             return payloads
 
