@@ -1012,6 +1012,42 @@ class XSSAgent(BaseAgent):
             sp.get("reasoning", "LLM generated specific payload for this context.")
         )
 
+    async def _smart_validate_and_build_finding(
+        self,
+        param: str,
+        sp: Dict,
+        payload: str,
+        screenshots_dir: Path,
+        reflection_type: str,
+        surviving_chars: str,
+        injection_ctx: Any
+    ) -> Optional[XSSFinding]:
+        """Validate smart payload and build finding if successful."""
+        response_html = await self._send_payload(param, payload)
+        if not response_html:
+            return None
+
+        validated, evidence = await self._validate(
+            param, payload, response_html, "interactsh", screenshots_dir
+        )
+        if not validated:
+            return None
+
+        finding_data = {
+            "evidence": evidence,
+            "screenshot_path": evidence.get("screenshot_path"),
+            "context": sp.get("reasoning", "LLM Smart Analysis"),
+            "reflection_context": reflection_type
+        }
+
+        if not self._should_create_finding(finding_data):
+            return None
+
+        return self._smart_build_finding_from_payload(
+            param, sp, payload, evidence, reflection_type,
+            surviving_chars, injection_ctx
+        )
+
     async def _test_smart_llm_payloads(
         self,
         param: str,
@@ -1030,7 +1066,6 @@ class XSSAgent(BaseAgent):
         smart_payloads = await self._smart_get_llm_payloads(
             html, param, interactsh_url, context_data
         )
-
         if not smart_payloads:
             return None
 
@@ -1041,27 +1076,12 @@ class XSSAgent(BaseAgent):
             payload = sp["payload"]
             dashboard.set_current_payload(payload[:60], "XSS Smart", "Testing")
 
-            response_html = await self._send_payload(param, payload)
-            if not response_html:
-                continue
-
-            validated, evidence = await self._validate(
-                param, payload, response_html, "interactsh", screenshots_dir
+            finding = await self._smart_validate_and_build_finding(
+                param, sp, payload, screenshots_dir, reflection_type,
+                surviving_chars, injection_ctx
             )
-
-            if validated:
-                finding_data = {
-                    "evidence": evidence,
-                    "screenshot_path": evidence.get("screenshot_path"),
-                    "context": sp.get("reasoning", "LLM Smart Analysis"),
-                    "reflection_context": reflection_type
-                }
-
-                if self._should_create_finding(finding_data):
-                    return self._smart_build_finding_from_payload(
-                        param, sp, payload, evidence, reflection_type,
-                        surviving_chars, injection_ctx
-                    )
+            if finding:
+                return finding
 
         return None
 
@@ -1564,31 +1584,19 @@ class XSSAgent(BaseAgent):
 
         return None
 
-    async def _test_parameter(
+    async def _param_test_phases_3_4_5(
         self,
         param: str,
-        interactsh_domain: str,
-        screenshots_dir: Path
+        interactsh_url: str,
+        screenshots_dir: Path,
+        reflection_type: str,
+        surviving_chars: str,
+        context_data: Dict,
+        html: str,
+        status_code: int,
+        injection_ctx: Any
     ) -> Optional[XSSFinding]:
-        """Test a single parameter for XSS."""
-        dashboard.log(f"[{self.name}] 🔬 Testing param: {param}", "INFO")
-        dashboard.set_status("XSS Analysis", f"Testing {param}")
-
-        # Phase 1: Probe and setup
-        probe_data = await self._param_probe_and_setup(param)
-        if not probe_data:
-            return None
-
-        html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx, interactsh_url = probe_data
-
-        # Phase 2: LLM Smart DOM Analysis (Primary Strategy)
-        smart_finding = await self._test_smart_llm_payloads(
-            param, html, context_data, interactsh_url, screenshots_dir,
-            reflection_type, surviving_chars, injection_ctx
-        )
-        if smart_finding:
-            return smart_finding
-
+        """Execute phases 3-5: Hybrid payloads, fragment XSS, and LLM analysis."""
         # Phase 3: Hybrid Payloads (Fallback)
         hybrid_finding = await self._test_hybrid_payloads(
             param, interactsh_url, screenshots_dir, reflection_type,
@@ -1617,6 +1625,37 @@ class XSSAgent(BaseAgent):
         return await self._param_test_llm_payload(
             param, html, interactsh_url, context_data, screenshots_dir,
             reflection_type, surviving_chars, injection_ctx
+        )
+
+    async def _test_parameter(
+        self,
+        param: str,
+        interactsh_domain: str,
+        screenshots_dir: Path
+    ) -> Optional[XSSFinding]:
+        """Test a single parameter for XSS."""
+        dashboard.log(f"[{self.name}] 🔬 Testing param: {param}", "INFO")
+        dashboard.set_status("XSS Analysis", f"Testing {param}")
+
+        # Phase 1: Probe and setup
+        probe_data = await self._param_probe_and_setup(param)
+        if not probe_data:
+            return None
+
+        html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx, interactsh_url = probe_data
+
+        # Phase 2: LLM Smart DOM Analysis (Primary Strategy)
+        smart_finding = await self._test_smart_llm_payloads(
+            param, html, context_data, interactsh_url, screenshots_dir,
+            reflection_type, surviving_chars, injection_ctx
+        )
+        if smart_finding:
+            return smart_finding
+
+        # Phases 3-5: Hybrid, Fragment, LLM Analysis
+        return await self._param_test_phases_3_4_5(
+            param, interactsh_url, screenshots_dir, reflection_type,
+            surviving_chars, context_data, html, status_code, injection_ctx
         )
 
 
@@ -2273,47 +2312,53 @@ Response Format (XML-Like):
             logger.error(f"LLM bypass generation failed: {e}", exc_info=True)
             return None
     
+    def _update_block_counter(self, status_code: int) -> None:
+        """Update consecutive block counter based on response status."""
+        if status_code == 200:
+            if self.consecutive_blocks > 0:
+                logger.info(f"[{self.name}] Target responded 200. Recovering...")
+            self.consecutive_blocks = 0
+            return
+
+        if status_code in [403, 406, 501]:
+            self.consecutive_blocks += 1
+            logger.warning(f"[{self.name}] Potential WAF Block ({status_code}). Counter: {self.consecutive_blocks}")
+
+    def _handle_send_error(self) -> None:
+        """Handle network error and potentially trigger stealth mode."""
+        self.consecutive_blocks += 1
+        logger.warning(f"[{self.name}] Network Failure / WAF TCP Reset. Counter: {self.consecutive_blocks}")
+
+        if self.consecutive_blocks >= 3 and not self.stealth_mode:
+            self.stealth_mode = True
+            dashboard.log(f"[{self.name}] 🛡️ WAF DETECTED! Entering Stealth Mode (Slown-down & Random Delay)", "WARN")
+            logger.warning(f"[{self.name}] WAF confirmed via network resets. Enabling Stealth Mode.")
+
     async def _send_payload(self, param: str, payload: str) -> str:
         """Send XSS payload to target with WAF awareness."""
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
         import aiohttp
-        
+
         parsed = urlparse(self.url)
         params = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(parsed.query).items()}
         params[param] = payload
-        
+
         attack_url = urlunparse((
             parsed.scheme, parsed.netloc, parsed.path,
             parsed.params, urlencode(params), parsed.fragment
         ))
-        
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-        
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(attack_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    # Reset block counter on success (if not a 403)
-                    if resp.status == 200:
-                        if self.consecutive_blocks > 0:
-                            logger.info(f"[{self.name}] Target responded 200. Recovering...")
-                        self.consecutive_blocks = 0
-                    elif resp.status in [403, 406, 501]:
-                        self.consecutive_blocks += 1
-                        logger.warning(f"[{self.name}] Potential WAF Block ({resp.status}). Counter: {self.consecutive_blocks}")
-                    
+                    self._update_block_counter(resp.status)
                     return await resp.text()
-        except Exception as e:
-            self.consecutive_blocks += 1
-            logger.warning(f"[{self.name}] Network Failure / WAF TCP Reset. Counter: {self.consecutive_blocks}")
-            
-            # TRIGGER STEALTH MODE
-            if self.consecutive_blocks >= 3 and not self.stealth_mode:
-                self.stealth_mode = True
-                dashboard.log(f"[{self.name}] 🛡️ WAF DETECTED! Entering Stealth Mode (Slown-down & Random Delay)", "WARN")
-                logger.warning(f"[{self.name}] WAF confirmed via network resets. Enabling Stealth Mode.")
-                
+        except Exception:
+            self._handle_send_error()
             return ""
 
     async def _fast_reflection_check(self, url: str, param: str, payloads: List[str]) -> List[Dict]:
@@ -2965,6 +3010,41 @@ Return JSON:
             reflection_context="http_header"
         )
 
+    async def _fetch_page_forms(self, url: str) -> Optional[str]:
+        """Fetch page HTML for form discovery."""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    return await resp.text()
+        except Exception as e:
+            logger.warning(f"Failed to fetch page for form discovery: {e}")
+            return None
+
+    def _extract_form_data(self, form, base_url: str) -> Tuple[str, Dict[str, str]]:
+        """Extract form action URL and parameters from form element."""
+        from urllib.parse import urljoin
+
+        method = (form.get('method') or 'get').lower()
+        if method != 'post':
+            return "", {}
+
+        action = form.get('action', '')
+        form_action = urljoin(base_url, action) if action else base_url
+
+        # Extract form inputs
+        post_params = {}
+        for inp in form.find_all(['input', 'textarea', 'select']):
+            name = inp.get('name')
+            if name:
+                value = inp.get('value', '')
+                post_params[name] = value
+
+        return form_action, post_params
+
     async def _discover_and_test_post_forms(
         self,
         interactsh_url: str,
@@ -2972,49 +3052,26 @@ Return JSON:
     ) -> List[XSSFinding]:
         """Discover POST forms and test them for XSS."""
         from bs4 import BeautifulSoup
-        from urllib.parse import urljoin
 
         findings = []
+        html = await self._fetch_page_forms(self.url)
+        if not html:
+            return findings
 
-        try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
+        soup = BeautifulSoup(html, 'html.parser')
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    html = await resp.text()
+        for form in soup.find_all('form'):
+            form_action, post_params = self._extract_form_data(form, self.url)
+            if not post_params:
+                continue
 
-            soup = BeautifulSoup(html, 'html.parser')
-
-            # Find all forms
-            for form in soup.find_all('form'):
-                method = (form.get('method') or 'get').lower()
-                if method != 'post':
-                    continue
-
-                action = form.get('action', '')
-                form_action = urljoin(self.url, action) if action else self.url
-
-                # Extract form inputs
-                post_params = {}
-                for inp in form.find_all(['input', 'textarea', 'select']):
-                    name = inp.get('name')
-                    if name:
-                        value = inp.get('value', '')
-                        post_params[name] = value
-
-                if post_params:
-                    finding = await self._test_post_params(
-                        form_action, post_params, interactsh_url, screenshots_dir
-                    )
-                    if finding:
-                        findings.append(finding)
-                        if self._max_impact_achieved:
-                            break
-
-        except Exception as e:
-            logger.warning(f"POST form discovery failed: {e}")
+            finding = await self._test_post_params(
+                form_action, post_params, interactsh_url, screenshots_dir
+            )
+            if finding:
+                findings.append(finding)
+                if self._max_impact_achieved:
+                    break
 
         return findings
     
