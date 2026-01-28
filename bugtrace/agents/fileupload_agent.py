@@ -75,7 +75,7 @@ class FileUploadAgent(BaseAgent):
             logger.info(f"[{self.name}] Discovered {len(forms)} upload forms.")
             return forms
         except Exception as e:
-            logger.error(f"Discovery failed: {e}")
+            logger.error(f"Discovery failed: {e}", exc_info=True)
             return []
 
     def _get_upload_strategy(self, attempt: int, strategy: Optional[Dict], form: Dict) -> Optional[Tuple[str, str, str]]:

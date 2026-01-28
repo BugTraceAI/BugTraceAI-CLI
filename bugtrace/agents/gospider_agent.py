@@ -123,7 +123,7 @@ class GoSpiderAgent(BaseAgent):
             return final_urls
 
         except Exception as e:
-            logger.error(f"GoSpiderAgent failed: {e}")
+            logger.error(f"GoSpiderAgent failed: {e}", exc_info=True)
             dashboard.log(f"[{self.name}] Error: {e}", "ERROR")
             return [self.target]
 
@@ -162,7 +162,7 @@ class GoSpiderAgent(BaseAgent):
             logger.info(f"[{self.name}] Fallback crawler discovered {len(discovered)} URLs (including JS discovery)")
             return list(discovered)
         except Exception as e:
-            logger.error(f"Fallback discovery failed: {e}")
+            logger.error(f"Fallback discovery failed: {e}", exc_info=True)
             return [self.target]
 
     async def _crawl_with_playwright(self, base_url: str) -> List[str]:

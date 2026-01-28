@@ -262,7 +262,7 @@ class ReportValidator(BaseAgent):
             ))
                 
         except Exception as e:
-            logger.error(f"Validation failed for {finding.get('title')}: {e}")
+            logger.error(f"Validation failed for {finding.get('title')}: {e}", exc_info=True)
             finding["validation_error"] = str(e)
             
         return finding
@@ -311,7 +311,7 @@ class ReportValidator(BaseAgent):
                 return {"validated": False, "evidence": "SQLMap did not confirm vulnerability"}
                 
         except Exception as e:
-            logger.error(f"SQLMap delegation failed: {e}")
+            logger.error(f"SQLMap delegation failed: {e}", exc_info=True)
             return {"validated": False, "evidence": f"SQLMap error: {e}"}
     
     async def _browser_test(
@@ -387,7 +387,7 @@ class ReportValidator(BaseAgent):
                 
             except Exception as e:
                 logs.append(f"Browser error: {e}")
-                logger.error(f"Browser test failed: {e}")
+                logger.error(f"Browser test failed: {e}", exc_info=True)
                 
         return screenshot_path, logs, triggered
     
@@ -420,7 +420,7 @@ class ReportValidator(BaseAgent):
             return self._parse_vision_response(response)
             
         except Exception as e:
-            logger.error(f"Vision analysis failed: {e}")
+            logger.error(f"Vision analysis failed: {e}", exc_info=True)
             return {"success": False, "confidence": 0, "evidence": str(e)}
     
     def _build_vision_prompt(

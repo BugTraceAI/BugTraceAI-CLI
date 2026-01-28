@@ -360,7 +360,7 @@ Format as JSON:
                 }
 
         except Exception as e:
-            logger.error(f"Step exploitation failed: {e}")
+            logger.error(f"Step exploitation failed: {e}", exc_info=True)
             return {
                 "success": False,
                 "step": step_name,

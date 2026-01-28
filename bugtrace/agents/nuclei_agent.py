@@ -52,7 +52,7 @@ class NucleiAgent(BaseAgent):
             return tech_profile
             
         except Exception as e:
-            logger.error(f"NucleiAgent failed: {e}")
+            logger.error(f"NucleiAgent failed: {e}", exc_info=True)
             dashboard.log(f"[{self.name}] Error: {e}", "ERROR")
             return {"error": str(e), "frameworks": []}
 

@@ -130,7 +130,7 @@ class SSRFAgent(BaseAgent):
                         "headers": dict(response.headers)
                     }
         except Exception as e:
-            logger.error(f"Error testing payload {payload}: {e}")
+            logger.error(f"Error testing payload {payload}: {e}", exc_info=True)
             return None
 
     def _determine_validation_status(self, res: Dict) -> bool:

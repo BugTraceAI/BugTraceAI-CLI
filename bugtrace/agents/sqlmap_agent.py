@@ -493,10 +493,10 @@ class EnhancedSQLMapRunner:
                 logger.error(f"SQLMap verification failed: {stderr.decode()[:200]}")
                 return False
         except asyncio.TimeoutError:
-            logger.error("SQLMap version check timed out")
+            logger.error("SQLMap version check timed out", exc_info=True)
             return False
         except FileNotFoundError:
-            logger.error("Docker/SQLMap not found in PATH")
+            logger.error("Docker/SQLMap not found in PATH", exc_info=True)
             return False
         except Exception as e:
             logger.error(f"SQLMap verification error: {e}", exc_info=True)
