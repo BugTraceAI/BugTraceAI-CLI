@@ -14,69 +14,89 @@ logger = get_logger("core.database")
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 
-def _evidence_to_description(finding_data: Dict) -> str:
-    """
-    Convert finding data to a human-readable description.
-    2026-01-24 FIX: Prevents dict becoming "{'key': 'value'}" in reports.
+def _build_csti_description(evidence: Dict, param: str, payload: str) -> List[str]:
+    """Build CSTI-specific description parts."""
+    engine = evidence.get("engine", "unknown")
+    method = evidence.get("method", "injection")
+    parts = [
+        f"Client-Side Template Injection (CSTI) detected via {method}.",
+        f"Parameter: {param}",
+        f"Template Engine: {engine}"
+    ]
+    if payload:
+        parts.append(f"Payload: {payload}")
+    if "proof" in evidence:
+        parts.append(f"Evidence: {evidence['proof']}")
+    return parts
 
-    Priority: description > note > evidence (converted) > "No description"
-    """
-    # 1. Use description if it's a proper string
+
+def _build_sqli_description(evidence: Dict, param: str) -> List[str]:
+    """Build SQLi-specific description parts."""
+    parts = [
+        f"SQL Injection vulnerability confirmed.",
+        f"Parameter: {param}"
+    ]
+    if evidence.get("db_type"):
+        parts.append(f"Database: {evidence['db_type']}")
+    if evidence.get("injection_type"):
+        parts.append(f"Type: {evidence['injection_type']}")
+    return parts
+
+
+def _build_xss_description(evidence: Dict, param: str, payload: str) -> List[str]:
+    """Build XSS-specific description parts."""
+    parts = [
+        f"Cross-Site Scripting (XSS) vulnerability detected.",
+        f"Parameter: {param}"
+    ]
+    if payload:
+        parts.append(f"Payload: {payload}")
+    if evidence.get("context"):
+        parts.append(f"Context: {evidence['context']}")
+    return parts
+
+
+def _convert_evidence_to_description(evidence: Dict, finding_data: Dict) -> str:
+    """Convert evidence dict to readable description."""
+    if isinstance(evidence, str):
+        return evidence
+
+    if not isinstance(evidence, dict):
+        return "Vulnerability detected."
+
+    vuln_type = (finding_data.get("type") or "").upper()
+    param = finding_data.get("parameter", "unknown")
+    payload = finding_data.get("payload", "")
+
+    if vuln_type in ["CSTI", "SSTI"]:
+        parts = _build_csti_description(evidence, param, payload)
+    elif vuln_type in ["SQLI", "SQL"]:
+        parts = _build_sqli_description(evidence, param)
+    elif vuln_type == "XSS":
+        parts = _build_xss_description(evidence, param, payload)
+    else:
+        # Generic fallback
+        parts = [f"{k}: {v}" for k, v in evidence.items() if isinstance(v, str) and v]
+
+    return "\n".join(parts) if parts else "Vulnerability detected."
+
+
+def _evidence_to_description(finding_data: Dict) -> str:
+    """Convert finding data to a human-readable description."""
+    # Priority: description > note > evidence (converted) > fallback
     desc = finding_data.get("description")
     if desc and isinstance(desc, str) and len(desc) > 10:
         return desc
 
-    # 2. Use note if available
     note = finding_data.get("note")
     if note and isinstance(note, str) and len(note) > 10:
         return note
 
-    # 3. Convert evidence dict to readable text
     evidence = finding_data.get("evidence")
     if evidence:
-        if isinstance(evidence, str):
-            return evidence
-        elif isinstance(evidence, dict):
-            # Build readable description from dict
-            parts = []
-            vuln_type = (finding_data.get("type") or "").upper()
-            param = finding_data.get("parameter", "unknown")
-            payload = finding_data.get("payload", "")
+        return _convert_evidence_to_description(evidence, finding_data)
 
-            # Type-specific descriptions
-            if vuln_type in ["CSTI", "SSTI"]:
-                engine = evidence.get("engine", "unknown")
-                method = evidence.get("method", "injection")
-                parts.append(f"Client-Side Template Injection (CSTI) detected via {method}.")
-                parts.append(f"Parameter: {param}")
-                parts.append(f"Template Engine: {engine}")
-                if payload:
-                    parts.append(f"Payload: {payload}")
-                if "proof" in evidence:
-                    parts.append(f"Evidence: {evidence['proof']}")
-            elif vuln_type in ["SQLI", "SQL"]:
-                parts.append(f"SQL Injection vulnerability confirmed.")
-                parts.append(f"Parameter: {param}")
-                if evidence.get("db_type"):
-                    parts.append(f"Database: {evidence['db_type']}")
-                if evidence.get("injection_type"):
-                    parts.append(f"Type: {evidence['injection_type']}")
-            elif vuln_type == "XSS":
-                parts.append(f"Cross-Site Scripting (XSS) vulnerability detected.")
-                parts.append(f"Parameter: {param}")
-                if payload:
-                    parts.append(f"Payload: {payload}")
-                if evidence.get("context"):
-                    parts.append(f"Context: {evidence['context']}")
-            else:
-                # Generic fallback for other types
-                for k, v in evidence.items():
-                    if isinstance(v, str) and v:
-                        parts.append(f"{k}: {v}")
-
-            return "\n".join(parts) if parts else "Vulnerability detected."
-
-    # 4. Fallback
+    # Fallback
     vuln_type = finding_data.get("type", "Unknown")
     param = finding_data.get("parameter", "")
     return f"{vuln_type} vulnerability detected on parameter: {param}" if param else f"{vuln_type} vulnerability detected."
@@ -211,64 +231,61 @@ class DatabaseManager:
     # PERSISTENCE METHODS - Save and load scan results
     # =========================================================================
     
-    def get_or_create_target(self, url: str, max_retries: int = 3) -> TargetTable:
-        """
-        Get existing target or create new one with race condition handling.
+    def _try_get_existing_target(self, session, url: str) -> Optional[TargetTable]:
+        """Try to get existing target from database."""
+        statement = select(TargetTable).where(TargetTable.url == url)
+        target = session.exec(statement).first()
+        if target:
+            session.expunge(target)
+        return target
 
-        Uses a retry loop pattern that is portable across SQLite and PostgreSQL:
-        1. First attempts to SELECT the target
-        2. If not found, attempts INSERT
-        3. On IntegrityError, retries the SELECT (handles race condition)
-
-        Args:
-            url: Target URL to get or create
-            max_retries: Maximum retry attempts on race condition (default: 3)
-
-        Returns:
-            TargetTable instance (either existing or newly created)
-
-        Raises:
-            RuntimeError: If unable to get or create target after max retries
-        """
+    def _try_create_target(self, session, url: str) -> Optional[TargetTable]:
+        """Try to create new target, returns None on IntegrityError."""
         from sqlalchemy.exc import IntegrityError
+        try:
+            target = TargetTable(url=url)
+            session.add(target)
+            session.commit()
+            session.refresh(target)
+            session.expunge(target)
+            logger.info(f"Created new target: {url}")
+            return target
+        except IntegrityError:
+            session.rollback()
+            logger.debug(f"Race condition: target created by another process")
+            return None
 
+    def _handle_race_condition(self, session, url: str, attempt: int, max_retries: int) -> Optional[TargetTable]:
+        """Handle race condition by fetching target created by another process."""
+        statement = select(TargetTable).where(TargetTable.url == url)
+        target = session.exec(statement).first()
+        if target:
+            session.expunge(target)
+            logger.debug(f"Target fetched after race condition: {url}")
+            return target
+
+        logger.warning(f"Target disappeared after race condition, retrying ({attempt + 1}/{max_retries})")
+        return None
+
+    def get_or_create_target(self, url: str, max_retries: int = 3) -> TargetTable:
+        """Get existing target or create new one with race condition handling."""
         for attempt in range(max_retries):
             with self.get_session() as session:
-                # Step 1: Try to get existing target
-                statement = select(TargetTable).where(TargetTable.url == url)
-                target = session.exec(statement).first()
-
+                # Try to get existing target
+                target = self._try_get_existing_target(session, url)
                 if target:
-                    # Expunge to prevent DetachedInstanceError after session closes
-                    session.expunge(target)
                     return target
 
-                # Step 2: Target not found, try to create
-                try:
-                    target = TargetTable(url=url)
-                    session.add(target)
-                    session.commit()
-                    session.refresh(target)
-                    session.expunge(target)
-                    logger.info(f"Created new target: {url}")
+                # Target not found, try to create
+                target = self._try_create_target(session, url)
+                if target:
                     return target
-                except IntegrityError:
-                    # Race condition: another process created it between our SELECT and INSERT
-                    session.rollback()
-                    logger.debug(f"Race condition on attempt {attempt + 1}: target created by another process")
 
-                    # Fetch the target that was created by the other process
-                    target = session.exec(statement).first()
-                    if target:
-                        session.expunge(target)
-                        logger.debug(f"Target fetched after race condition: {url}")
-                        return target
+                # Race condition occurred, try to fetch it
+                target = self._handle_race_condition(session, url, attempt, max_retries)
+                if target:
+                    return target
 
-                    # Target still not found (rare: deleted between our attempts)
-                    # Continue to next retry iteration
-                    logger.warning(f"Target disappeared after race condition, retrying ({attempt + 1}/{max_retries})")
-
-        # Exhausted retries - this should be extremely rare
         raise RuntimeError(f"Failed to get or create target after {max_retries} attempts: {url}")
 
     def get_active_scan(self, target_url: str) -> Optional[int]:
@@ -383,124 +400,116 @@ class DatabaseManager:
             
             return checkpoint.state_json if checkpoint else None
     
-    def save_scan_result(self, target_url: str, findings: List[Dict], scan_id: Optional[int] = None) -> int:
-        """
-        Save scan results to database.
-        
-        Args:
-            target_url: The scanned URL
-            findings: List of finding dictionaries
-            scan_id: Optional existing scan ID to add findings to
-            
-        Returns:
-            Scan ID
-        """
-        with self.get_session() as session:
-            if scan_id:
-                scan = session.get(ScanTable, scan_id)
-                if not scan:
-                    # Fallback if scan_id not found
-                    target = self.get_or_create_target(target_url)
-                    scan = ScanTable(target_id=target.id, status=ScanStatus.RUNNING)
-                    session.add(scan)
-                    session.commit()
-                    session.refresh(scan)
-            else:
-                # Get or create target
-                target = self.get_or_create_target(target_url)
+    def _get_or_create_scan(self, session, target_url: str, scan_id: Optional[int]) -> ScanTable:
+        """Get existing scan or create new one."""
+        if scan_id:
+            scan = session.get(ScanTable, scan_id)
+            if scan:
+                return scan
+            # Fallback if scan_id not found
+            target = self.get_or_create_target(target_url)
+            scan = ScanTable(target_id=target.id, status=ScanStatus.RUNNING)
+        else:
+            target = self.get_or_create_target(target_url)
+            scan = ScanTable(target_id=target.id, status=ScanStatus.COMPLETED)
 
-                # Create scan record
-                scan = ScanTable(
-                    target_id=target.id,
-                    status=ScanStatus.COMPLETED
-                )
-                session.add(scan)
-                session.commit()
-                session.refresh(scan)
-            
-            # Save findings
+        session.add(scan)
+        session.commit()
+        session.refresh(scan)
+        return scan
+
+    def _normalize_vuln_type(self, vuln_type_str: str):
+        """Normalize vulnerability type string to enum."""
+        from bugtrace.schemas.models import normalize_vuln_type, VulnType
+        try:
+            return normalize_vuln_type(vuln_type_str)
+        except Exception as e:
+            logger.warning(f"Failed to normalize type '{vuln_type_str}': {e}, using MISCONFIG")
+            return VulnType.MISCONFIG
+
+    def _update_existing_finding(self, existing_finding: FindingTable, finding_data: Dict):
+        """Update existing finding with new data."""
+        if finding_data.get("payload"):
+            existing_finding.payload_used = finding_data.get("payload")
+
+        if finding_data.get("validated") or finding_data.get("conductor_validated"):
+            existing_finding.visual_validated = True
+            existing_finding.status = FindingStatus.VALIDATED_CONFIRMED
+
+        new_conf = finding_data.get("confidence", 0.0)
+        if new_conf > existing_finding.confidence_score:
+            existing_finding.confidence_score = new_conf
+
+        new_details = _evidence_to_description(finding_data)
+        if len(new_details) > len(existing_finding.details):
+            existing_finding.details = new_details
+
+        new_screenshot = finding_data.get("screenshot_path") or finding_data.get("screenshot")
+        if new_screenshot and not existing_finding.proof_screenshot_path:
+            existing_finding.proof_screenshot_path = new_screenshot
+
+    def _create_new_finding(self, scan_id: int, vuln_type, finding_data: Dict, target_url: str) -> FindingTable:
+        """Create new finding record from data."""
+        raw_status = finding_data.get("status")
+        if raw_status:
+            try:
+                finding_status = FindingStatus(raw_status)
+            except ValueError:
+                finding_status = FindingStatus.PENDING_VALIDATION
+        else:
+            finding_status = (
+                FindingStatus.VALIDATED_CONFIRMED
+                if finding_data.get("conductor_validated")
+                else FindingStatus.PENDING_VALIDATION
+            )
+
+        return FindingTable(
+            scan_id=scan_id,
+            type=vuln_type,
+            severity=finding_data.get("severity", "MEDIUM"),
+            details=_evidence_to_description(finding_data),
+            payload_used=finding_data.get("payload") or "N/A",
+            confidence_score=finding_data.get("confidence", 0.85),
+            visual_validated=finding_data.get("validated") or finding_data.get("conductor_validated", False),
+            attack_url=finding_data.get("url", target_url),
+            vuln_parameter=finding_data.get("parameter", finding_data.get("param", "")),
+            reproduction_command=finding_data.get("reproduction") or finding_data.get("reproduction_command"),
+            status=finding_status,
+            proof_screenshot_path=finding_data.get("screenshot_path") or finding_data.get("screenshot")
+        )
+
+    def _find_existing_finding(self, session, scan_id: int, vuln_type, finding_data: Dict, target_url: str):
+        """Check if finding already exists for this scan."""
+        return session.exec(
+            select(FindingTable).where(
+                FindingTable.scan_id == scan_id,
+                FindingTable.type == vuln_type,
+                FindingTable.attack_url == finding_data.get("url", target_url),
+                FindingTable.vuln_parameter == finding_data.get("parameter", finding_data.get("param", ""))
+            )
+        ).first()
+
+    def save_scan_result(self, target_url: str, findings: List[Dict], scan_id: Optional[int] = None) -> int:
+        """Save scan results to database."""
+        with self.get_session() as session:
+            scan = self._get_or_create_scan(session, target_url, scan_id)
+
             for finding_data in findings:
-                # Normalize vulnerability type to match enum
-                from bugtrace.schemas.models import normalize_vuln_type
                 vuln_type_str = finding_data.get("type", "Unknown")
-                try:
-                    vuln_type = normalize_vuln_type(vuln_type_str)
-                except Exception as e:
-                    logger.warning(f"Failed to normalize type '{vuln_type_str}': {e}, using MISCONFIG")
-                    from bugtrace.schemas.models import VulnType
-                    vuln_type = VulnType.MISCONFIG
-                
-                # Check if this specific finding (URL+Param+Type) already exists for this scan
-                existing_finding = session.exec(
-                    select(FindingTable).where(
-                        FindingTable.scan_id == scan.id,
-                        FindingTable.type == vuln_type,
-                        FindingTable.attack_url == finding_data.get("url", target_url),
-                        FindingTable.vuln_parameter == finding_data.get("parameter", finding_data.get("param", ""))
-                    )
-                ).first()
+                vuln_type = self._normalize_vuln_type(vuln_type_str)
+
+                existing_finding = self._find_existing_finding(
+                    session, scan.id, vuln_type, finding_data, target_url
+                )
 
                 if existing_finding:
-                    # UPDATE existing finding (Upsert)
                     logger.info(f"Updating existing finding: {vuln_type} on {finding_data.get('parameter')}")
-                    
-                    # Merge payloads/details if needed, but usually newer is better/more specific
-                    if finding_data.get("payload"):
-                        existing_finding.payload_used = finding_data.get("payload")
-                    
-                    # If the new one is validated confirm, upgrade status
-                    if finding_data.get("validated") or finding_data.get("conductor_validated"):
-                        existing_finding.visual_validated = True
-                        existing_finding.status = FindingStatus.VALIDATED_CONFIRMED
-                    
-                    # Update confidence if higher
-                    new_conf = finding_data.get("confidence", 0.0)
-                    if new_conf > existing_finding.confidence_score:
-                        existing_finding.confidence_score = new_conf
-                        
-                    # Update details/evidence
-                    new_details = _evidence_to_description(finding_data)
-                    if len(new_details) > len(existing_finding.details):
-                        existing_finding.details = new_details
-
-                    # FIX: Update screenshot if provided
-                    new_screenshot = finding_data.get("screenshot_path") or finding_data.get("screenshot")
-                    if new_screenshot and not existing_finding.proof_screenshot_path:
-                        existing_finding.proof_screenshot_path = new_screenshot
-
+                    self._update_existing_finding(existing_finding, finding_data)
                     session.add(existing_finding)
                 else:
-                    # CREATE new finding
-                    # Determine status: use provided status or infer from validation state
-                    raw_status = finding_data.get("status")
-                    if raw_status:
-                        try:
-                            finding_status = FindingStatus(raw_status)
-                        except ValueError:
-                            finding_status = FindingStatus.PENDING_VALIDATION
-                    else:
-                        finding_status = (
-                            FindingStatus.VALIDATED_CONFIRMED
-                            if finding_data.get("conductor_validated")
-                            else FindingStatus.PENDING_VALIDATION
-                        )
-
-                    finding = FindingTable(
-                        scan_id=scan.id,
-                        type=vuln_type,
-                        severity=finding_data.get("severity", "MEDIUM"),
-                        details=_evidence_to_description(finding_data),
-                        payload_used=finding_data.get("payload") or "N/A",
-                        confidence_score=finding_data.get("confidence", 0.85),
-                        visual_validated=finding_data.get("validated") or finding_data.get("conductor_validated", False),
-                        attack_url=finding_data.get("url", target_url),
-                        vuln_parameter=finding_data.get("parameter", finding_data.get("param", "")),
-                        reproduction_command=finding_data.get("reproduction") or finding_data.get("reproduction_command"),
-                        status=finding_status,
-                        proof_screenshot_path=finding_data.get("screenshot_path") or finding_data.get("screenshot")
-                    )
+                    finding = self._create_new_finding(scan.id, vuln_type, finding_data, target_url)
                     session.add(finding)
-            
+
             session.commit()
             logger.info(f"Updated scan {scan.id} with {len(findings)} findings for {target_url}")
             return scan.id
@@ -757,19 +766,41 @@ class DatabaseManager:
 
         return metrics
 
+    def _validate_backup_prerequisites(self) -> tuple[bool, Optional[str], Optional[str]]:
+        """Validate that backup can proceed. Returns (can_proceed, error_msg, db_path)."""
+        if not self.db_url.startswith("sqlite"):
+            logger.warning("Backup attempted on non-SQLite database")
+            return False, "Backup only supported for SQLite databases", None
+
+        db_path = self.db_url.replace("sqlite:///", "")
+        if not os.path.exists(db_path):
+            return False, f"Database file not found: {db_path}", None
+
+        return True, None, db_path
+
+    def _prepare_backup_path(self, db_path: str, backup_dir: Optional[str]) -> str:
+        """Prepare backup directory and generate backup file path."""
+        if backup_dir is None:
+            backup_dir = os.path.join(os.path.dirname(db_path), "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"bugtrace_backup_{timestamp}.db"
+        return os.path.join(backup_dir, backup_filename)
+
+    def _perform_sqlite_backup(self, db_path: str, backup_path: str) -> int:
+        """Perform actual SQLite backup and return size."""
+        import sqlite3
+        source = sqlite3.connect(db_path)
+        dest = sqlite3.connect(backup_path)
+        with dest:
+            source.backup(dest)
+        source.close()
+        dest.close()
+        return os.path.getsize(backup_path)
+
     def backup_database(self, backup_dir: Optional[str] = None) -> Dict:
-        """
-        Create a backup of the SQLite database.
-
-        Args:
-            backup_dir: Directory to store backup. Defaults to ./backups/
-
-        Returns:
-            Dict with backup status, path, and size
-        """
-        import shutil
-        from pathlib import Path
-
+        """Create a backup of the SQLite database."""
         result = {
             "status": "failed",
             "path": None,
@@ -777,49 +808,21 @@ class DatabaseManager:
             "timestamp": datetime.utcnow().isoformat()
         }
 
-        # Only works for SQLite
-        if not self.db_url.startswith("sqlite"):
-            result["error"] = "Backup only supported for SQLite databases"
-            logger.warning("Backup attempted on non-SQLite database")
+        can_proceed, error_msg, db_path = self._validate_backup_prerequisites()
+        if not can_proceed:
+            result["error"] = error_msg
             return result
 
         try:
-            # Extract database file path from URL
-            db_path = self.db_url.replace("sqlite:///", "")
-            if not os.path.exists(db_path):
-                result["error"] = f"Database file not found: {db_path}"
-                return result
-
-            # Create backup directory
-            if backup_dir is None:
-                backup_dir = os.path.join(os.path.dirname(db_path), "backups")
-            os.makedirs(backup_dir, exist_ok=True)
-
-            # Generate backup filename with timestamp
-            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            backup_filename = f"bugtrace_backup_{timestamp}.db"
-            backup_path = os.path.join(backup_dir, backup_filename)
-
-            # Create backup using SQLite's backup API for consistency
-            import sqlite3
-            source = sqlite3.connect(db_path)
-            dest = sqlite3.connect(backup_path)
-            with dest:
-                source.backup(dest)
-            source.close()
-            dest.close()
-
-            # Get backup size
-            backup_size = os.path.getsize(backup_path)
+            backup_path = self._prepare_backup_path(db_path, backup_dir)
+            backup_size = self._perform_sqlite_backup(db_path, backup_path)
 
             result["status"] = "success"
             result["path"] = backup_path
             result["size_bytes"] = backup_size
 
             logger.info(f"Database backup created: {backup_path} ({backup_size} bytes)")
-
-            # Cleanup old backups (keep last 5)
-            self._cleanup_old_backups(backup_dir, keep=5)
+            self._cleanup_old_backups(os.path.dirname(backup_path), keep=5)
 
         except Exception as e:
             result["error"] = str(e)
