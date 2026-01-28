@@ -77,25 +77,28 @@ class SSRFSkill(BaseSkill):
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(test_url)
-
-                ssrf_indicators = ["ami-id", "instance-id", "localhost", "127.0.0.1"]
-
-                for indicator in ssrf_indicators:
-                    if indicator in response.text:
-                        logger.info(f"[{self.master.name}] ✅ SSRF detected: {indicator}")
-                        return {
-                            "type": "SSRF",
-                            "url": url,
-                            "parameter": param_name,
-                            "payload": payload,
-                            "evidence": indicator,
-                            "severity": "HIGH",
-                            "description": f"Server-Side Request Forgery (SSRF) detected. The parameter '{param_name}' allows making requests to internal resources. Indicator found: {indicator}",
-                            "reproduction": f"curl '{test_url}' | grep -i '{indicator}'"
-                        }
+                return self._check_response_for_ssrf_indicators(response, url, test_url, param_name, payload)
         except Exception as e:
             logger.debug(f"SSRF test failed: {e}")
+            return None
 
+    def _check_response_for_ssrf_indicators(self, response, url: str, test_url: str, param_name: str, payload: str):
+        """Check response text for SSRF indicators."""
+        ssrf_indicators = ["ami-id", "instance-id", "localhost", "127.0.0.1"]
+
+        for indicator in ssrf_indicators:
+            if indicator in response.text:
+                logger.info(f"[{self.master.name}] ✅ SSRF detected: {indicator}")
+                return {
+                    "type": "SSRF",
+                    "url": url,
+                    "parameter": param_name,
+                    "payload": payload,
+                    "evidence": indicator,
+                    "severity": "HIGH",
+                    "description": f"Server-Side Request Forgery (SSRF) detected. The parameter '{param_name}' allows making requests to internal resources. Indicator found: {indicator}",
+                    "reproduction": f"curl '{test_url}' | grep -i '{indicator}'"
+                }
         return None
 
 
@@ -140,9 +143,6 @@ class IDORSkill(BaseSkill):
 
     async def _test_idor_parameter(self, url: str, parsed, query_params: dict, param_name: str, original_value: str) -> list:
         """Test a parameter for IDOR vulnerabilities."""
-        from urllib.parse import urlencode, urlunparse
-        import httpx
-
         findings = []
         test_values = self._generate_idor_test_values(original_value)
 
@@ -150,26 +150,36 @@ class IDORSkill(BaseSkill):
             if test_val == original_value:
                 continue
 
-            test_params = query_params.copy()
-            test_params[param_name] = [test_val]
-
-            test_url = urlunparse((
-                parsed.scheme, parsed.netloc, parsed.path,
-                parsed.params, urlencode(test_params, doseq=True), parsed.fragment
-            ))
-
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.get(test_url)
-
-                    if response.status_code == 200:
-                        findings.append(self._build_idor_finding(url, test_url, param_name, original_value, test_val))
-                        logger.info(f"[{self.master.name}] ⚠️ Potential IDOR on {param_name}")
-                        break
-            except Exception as e:
-                logger.debug(f"IDOR test failed: {e}")
+            finding = await self._check_idor_test_value(url, parsed, query_params, param_name, original_value, test_val)
+            if finding:
+                findings.append(finding)
+                logger.info(f"[{self.master.name}] ⚠️ Potential IDOR on {param_name}")
+                break
 
         return findings
+
+    async def _check_idor_test_value(self, url: str, parsed, query_params: dict, param_name: str, original_value: str, test_val: str):
+        """Check a single IDOR test value."""
+        from urllib.parse import urlencode, urlunparse
+        import httpx
+
+        test_params = query_params.copy()
+        test_params[param_name] = [test_val]
+
+        test_url = urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, urlencode(test_params, doseq=True), parsed.fragment
+        ))
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(test_url)
+                if response.status_code == 200:
+                    return self._build_idor_finding(url, test_url, param_name, original_value, test_val)
+        except Exception as e:
+            logger.debug(f"IDOR test failed: {e}")
+
+        return None
 
     def _build_idor_finding(self, url: str, test_url: str, param_name: str, original_value: str, test_val: str) -> dict:
         """Build IDOR finding data structure."""
@@ -213,9 +223,6 @@ class OpenRedirectSkill(BaseSkill):
 
     async def _test_redirect_parameter(self, url: str, parsed, query_params: dict, param_name: str) -> list:
         """Test a parameter for open redirect vulnerabilities."""
-        from urllib.parse import urlencode, urlunparse
-        import httpx
-
         findings = []
         redirect_payloads = [
             "https://evil.com",
@@ -225,27 +232,37 @@ class OpenRedirectSkill(BaseSkill):
         ]
 
         for payload in redirect_payloads:
-            test_params = query_params.copy()
-            test_params[param_name] = [payload]
-
-            test_url = urlunparse((
-                parsed.scheme, parsed.netloc, parsed.path,
-                parsed.params, urlencode(test_params, doseq=True), parsed.fragment
-            ))
-
-            try:
-                async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-                    response = await client.get(test_url)
-
-                    location = response.headers.get("location", "")
-                    if "evil.com" in location:
-                        findings.append(self._build_redirect_finding(url, test_url, param_name, payload, location))
-                        logger.info(f"[{self.master.name}] ✅ Open Redirect: {location}")
-                        break
-            except Exception as e:
-                logger.debug(f"Open redirect test failed: {e}")
+            finding = await self._check_redirect_payload(url, parsed, query_params, param_name, payload)
+            if finding:
+                findings.append(finding)
+                logger.info(f"[{self.master.name}] ✅ Open Redirect: {finding['redirected_to']}")
+                break
 
         return findings
+
+    async def _check_redirect_payload(self, url: str, parsed, query_params: dict, param_name: str, payload: str):
+        """Check a single redirect payload."""
+        from urllib.parse import urlencode, urlunparse
+        import httpx
+
+        test_params = query_params.copy()
+        test_params[param_name] = [payload]
+
+        test_url = urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, urlencode(test_params, doseq=True), parsed.fragment
+        ))
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+                response = await client.get(test_url)
+                location = response.headers.get("location", "")
+                if "evil.com" in location:
+                    return self._build_redirect_finding(url, test_url, param_name, payload, location)
+        except Exception as e:
+            logger.debug(f"Open redirect test failed: {e}")
+
+        return None
 
     def _build_redirect_finding(self, url: str, test_url: str, param_name: str, payload: str, location: str) -> dict:
         """Build open redirect finding data structure."""
@@ -339,43 +356,55 @@ class CSRFSkill(BaseSkill):
     
     async def execute(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         findings = []
-        
+
         try:
             from bugtrace.tools.visual.crawler import VisualCrawler
             crawler = VisualCrawler()
             crawl_results = await crawler.crawl(url, max_depth=1)
-            
+
             for form in crawl_results.get("forms", []):
-                action = form.get("action", "")
-                method = form.get("method", "GET").upper()
-                inputs = form.get("inputs", [])
-                
-                # CSRF is mainly relevant for state-changing methods (POST, PUT, DELETE)
-                if method != "GET":
-                    # Check for common CSRF token names
-                    csrf_tokens = ["csrf", "xsrf", "token", "authenticity", "state"]
-                    has_token = False
-                    
-                    for inp in inputs:
-                        name = (inp.get("name") or "").lower()
-                        if any(t in name for t in csrf_tokens):
-                            has_token = True
-                            break
-                    
-                    if not has_token:
-                        findings.append({
-                            "type": "CSRF (Potential)",
-                            "url": url,
-                            "form_action": action,
-                            "method": method,
-                            "note": "Form missing apparent CSRF token",
-                            "severity": "MEDIUM",
-                            "description": f"Potential Cross-Site Request Forgery (CSRF). Form with action '{action}' uses {method} method but lacks CSRF token protection. State-changing actions may be exploitable.",
-                            "reproduction": f"# Create CSRF PoC:\n<form action='{action}' method='{method}'>\n  <!-- Add form inputs -->\n  <input type='submit' value='Submit'>\n</form>"
-                        })
-                        logger.info(f"[{self.master.name}] ⚠️ Potential CSRF on form: {action}")
-                        
+                finding = self._check_form_for_csrf(url, form)
+                if finding:
+                    findings.append(finding)
+                    logger.info(f"[{self.master.name}] ⚠️ Potential CSRF on form: {form.get('action', '')}")
+
         except Exception as e:
             logger.debug(f"CSRF skill failed: {e}")
-            
+
         return {"success": True, "findings": findings}
+
+    def _check_form_for_csrf(self, url: str, form: dict):
+        """Check a form for CSRF protection."""
+        action = form.get("action", "")
+        method = form.get("method", "GET").upper()
+        inputs = form.get("inputs", [])
+
+        # CSRF is mainly relevant for state-changing methods
+        if method == "GET":
+            return None
+
+        # Check for CSRF tokens
+        if self._has_csrf_token(inputs):
+            return None
+
+        return {
+            "type": "CSRF (Potential)",
+            "url": url,
+            "form_action": action,
+            "method": method,
+            "note": "Form missing apparent CSRF token",
+            "severity": "MEDIUM",
+            "description": f"Potential Cross-Site Request Forgery (CSRF). Form with action '{action}' uses {method} method but lacks CSRF token protection. State-changing actions may be exploitable.",
+            "reproduction": f"# Create CSRF PoC:\n<form action='{action}' method='{method}'>\n  <!-- Add form inputs -->\n  <input type='submit' value='Submit'>\n</form>"
+        }
+
+    def _has_csrf_token(self, inputs: list) -> bool:
+        """Check if inputs contain a CSRF token."""
+        csrf_tokens = ["csrf", "xsrf", "token", "authenticity", "state"]
+
+        for inp in inputs:
+            name = (inp.get("name") or "").lower()
+            if any(t in name for t in csrf_tokens):
+                return True
+
+        return False
