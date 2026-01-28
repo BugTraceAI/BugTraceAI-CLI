@@ -204,17 +204,25 @@ class DatabaseManager:
         """Run lightweight schema migrations for new columns on existing tables."""
         with self.get_session() as session:
             # Migration: Add 'origin' column to scan table (v2.1)
-            try:
-                session.exec(text("SELECT origin FROM scan LIMIT 1"))
-            except Exception:
-                session.rollback()
-                try:
-                    session.exec(text("ALTER TABLE scan ADD COLUMN origin VARCHAR DEFAULT 'cli'"))
-                    session.commit()
-                    logger.info("Migration: Added 'origin' column to scan table")
-                except Exception as e:
-                    session.rollback()
-                    logger.warning(f"Migration 'origin' column skipped: {e}")
+            self._migrate_origin_column(session)
+
+    def _migrate_origin_column(self, session):
+        """Migrate 'origin' column to scan table."""
+        try:
+            session.exec(text("SELECT origin FROM scan LIMIT 1"))
+        except Exception:
+            session.rollback()
+            self._add_origin_column(session)
+
+    def _add_origin_column(self, session):
+        """Add origin column to scan table."""
+        try:
+            session.exec(text("ALTER TABLE scan ADD COLUMN origin VARCHAR DEFAULT 'cli'"))
+            session.commit()
+            logger.info("Migration: Added 'origin' column to scan table")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"Migration 'origin' column skipped: {e}")
 
     def _init_vector_store(self):
         try:
