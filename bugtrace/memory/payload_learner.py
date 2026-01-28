@@ -2,7 +2,7 @@
 import json
 import os
 from pathlib import Path
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional
 import filelock
 from bugtrace.utils.logger import get_logger
 
@@ -43,17 +43,29 @@ class PayloadLearner:
         if not self.curated_file.exists():
             return []
         try:
-            payloads = []
-            with open(self.curated_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        payloads.append(line)
+            payloads = self._read_curated_file()
             logger.info(f"Loaded {len(payloads)} curated payloads.")
             return payloads
         except Exception as e:
             logger.error(f"Failed to load curated payloads: {e}", exc_info=True)
             return []
+
+    def _read_curated_file(self) -> List[str]:
+        """Read and parse curated payloads from file."""
+        payloads = []
+        with open(self.curated_file, 'r') as f:
+            for line in f:
+                payload = self._parse_curated_line(line)
+                if payload:
+                    payloads.append(payload)
+        return payloads
+
+    def _parse_curated_line(self, line: str) -> Optional[str]:
+        """Parse a single line from curated file."""
+        line = line.strip()
+        if not line or line.startswith('#'):
+            return None
+        return line
 
     def save_success(self, payload: str, context: str = "unknown", url: str = ""):
         """
