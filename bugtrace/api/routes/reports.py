@@ -30,6 +30,50 @@ logger = get_logger("api.routes.reports")
 router = APIRouter(tags=["reports"])
 
 
+def _validate_report_format(format: str) -> None:
+    """Validate report format parameter."""
+    if format not in ("html", "json", "markdown"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid format: {format}. Use html, json, or markdown"
+        )
+
+
+def _get_content_type_and_extension(format: str) -> tuple[str, str]:
+    """Get content type and file extension for report format."""
+    content_types = {
+        "html": "text/html",
+        "json": "application/json",
+        "markdown": "text/markdown",
+    }
+    extensions = {
+        "html": "html",
+        "json": "json",
+        "markdown": "md",
+    }
+    return content_types[format], extensions[format]
+
+
+def _build_report_response(
+    report_bytes: bytes,
+    format: str,
+    scan_id: int
+) -> Response:
+    """Build HTTP response for report download."""
+    content_type, extension = _get_content_type_and_extension(format)
+    filename = f"bugtrace_report_{scan_id}.{extension}"
+
+    logger.info(f"Serving {format} report for scan {scan_id}: {len(report_bytes)} bytes")
+
+    return Response(
+        content=report_bytes,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}"
+        }
+    )
+
+
 @router.get("/scans/{scan_id}/report/{format}")
 async def get_report(
     scan_id: int,
@@ -54,16 +98,9 @@ async def get_report(
     Solves API-06: Report download endpoint
     """
     format = format.lower()
-
-    # Validate format
-    if format not in ("html", "json", "markdown"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid format: {format}. Use html, json, or markdown"
-        )
+    _validate_report_format(format)
 
     try:
-        # Get or generate report
         report_bytes = await report_service.get_report(scan_id, format)
 
         if report_bytes is None:
@@ -72,30 +109,7 @@ async def get_report(
                 detail=f"Report not found for scan {scan_id}"
             )
 
-        # Determine content type and filename
-        content_types = {
-            "html": "text/html",
-            "json": "application/json",
-            "markdown": "text/markdown",
-        }
-        extensions = {
-            "html": "html",
-            "json": "json",
-            "markdown": "md",
-        }
-
-        content_type = content_types[format]
-        filename = f"bugtrace_report_{scan_id}.{extensions[format]}"
-
-        logger.info(f"Serving {format} report for scan {scan_id}: {len(report_bytes)} bytes")
-
-        return Response(
-            content=report_bytes,
-            media_type=content_type,
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}"
-            }
-        )
+        return _build_report_response(report_bytes, format, scan_id)
 
     except ValueError as e:
         logger.error(f"Report not found: {e}")
