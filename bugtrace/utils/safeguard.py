@@ -41,7 +41,7 @@ async def run_tool_safely(
         return default_return
         
     except Exception as e:
-        logger.error(f"[{tool_name}] 💥 CRASH: {str(e)}")
+        logger.error(f"[{tool_name}] 💥 CRASH: {str(e)}", exc_info=True)
         import traceback
         logger.debug(traceback.format_exc())
         return default_return

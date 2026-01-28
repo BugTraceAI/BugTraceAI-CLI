@@ -112,10 +112,10 @@ async def get_report(
         return _build_report_response(report_bytes, format, scan_id)
 
     except ValueError as e:
-        logger.error(f"Report not found: {e}")
+        logger.error(f"Report not found: {e}", exc_info=True)
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.error(f"Report generation failed: {e}")
+        logger.error(f"Report generation failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Report generation failed: {str(e)}"

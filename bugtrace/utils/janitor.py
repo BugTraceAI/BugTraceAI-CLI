@@ -13,7 +13,7 @@ def kill_process_by_name(name_filter: str):
             subprocess.run(["pkill", "-9", "-f", name_filter], check=False)
             return True
     except Exception as e:
-        logger.error(f"Janitor failed to kill {name_filter}: {e}")
+        logger.error(f"Janitor failed to kill {name_filter}: {e}", exc_info=True)
     return False
 
 def clean_environment():

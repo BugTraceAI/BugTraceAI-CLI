@@ -42,7 +42,7 @@ class ToolExecutor:
             return await ToolExecutor._handle_timeout(process, timeout, tool_name)
 
         except Exception as e:
-            logger.error(f"[{tool_name}] 💥 Execution Error: {e}")
+            logger.error(f"[{tool_name}] 💥 Execution Error: {e}", exc_info=True)
             return "", str(e), -1
 
         finally:
@@ -106,7 +106,7 @@ class ToolExecutor:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
             logger.info(f"[{tool_name}] 💀 Process group killed.")
         except Exception as kill_err:
-            logger.error(f"[{tool_name}] Failed to kill process: {kill_err}")
+            logger.error(f"[{tool_name}] Failed to kill process: {kill_err}", exc_info=True)
 
     @staticmethod
     def _cleanup_process(process: Optional[Process], tool_name: str) -> None:

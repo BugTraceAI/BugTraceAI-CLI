@@ -1,4 +1,4 @@
-from typing import AsyncIterator, List
+from typing import AsyncIterator, List, Optional
 import copy
 from .base import BaseSpecialist
 from ..models import MutableRequest, MutationStrategy
@@ -118,22 +118,47 @@ class EncodingAgent(BaseSpecialist):
 
         # Generate encoded variants for each parameter value
         for k, v in request.params.items():
-            # Apply SPECIFIC strategies from router (not generic WAF-based)
-            for strategy_name in self.selected_strategies:
-                try:
-                    # Get the specific encoding technique
-                    technique = encoding_techniques.get_technique_by_name(strategy_name)
-                    if technique:
-                        encoded_value = technique.encoder(str(v))
+            async for mutation in self._generate_param_mutations(request, k, v):
+                yield mutation
 
-                        if encoded_value != str(v):  # Only if encoding changed something
-                            mutation = copy.deepcopy(request)
-                            mutation.params[k] = encoded_value
-                            mutation._encoding_strategy = strategy_name
-                            yield mutation
-                except Exception as e:
-                    # Log but continue
-                    pass
+    async def _generate_param_mutations(
+        self,
+        request: MutableRequest,
+        param_key: str,
+        param_value: str
+    ) -> AsyncIterator[MutableRequest]:
+        """Generate mutations for a single parameter using selected strategies."""
+        # Apply SPECIFIC strategies from router (not generic WAF-based)
+        for strategy_name in self.selected_strategies:
+            try:
+                mutation = self._apply_encoding_strategy(request, param_key, param_value, strategy_name)
+                if mutation:
+                    yield mutation
+            except Exception:
+                # Log but continue
+                pass
+
+    def _apply_encoding_strategy(
+        self,
+        request: MutableRequest,
+        param_key: str,
+        param_value: str,
+        strategy_name: str
+    ) -> Optional[MutableRequest]:
+        """Apply encoding strategy to parameter and return mutation if successful."""
+        # Get the specific encoding technique
+        technique = encoding_techniques.get_technique_by_name(strategy_name)
+        if not technique:
+            return None
+
+        encoded_value = technique.encoder(str(param_value))
+        if encoded_value == str(param_value):
+            return None  # Only if encoding changed something
+
+        mutation = copy.deepcopy(request)
+        mutation.params[param_key] = encoded_value
+        mutation._encoding_strategy = strategy_name
+        return mutation
 
     def record_success(self, request: MutableRequest):
         """

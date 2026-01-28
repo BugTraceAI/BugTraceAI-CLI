@@ -112,44 +112,49 @@ class XSSVerifier:
         """Verify XSS using CDP."""
         try:
             from bugtrace.core.cdp_client import CDPClient
-            
+
             async with CDPClient(headless=self.headless) as cdp:
-                # Wrap with timeout to prevent infinite hangs from alert() popups
-                try:
-                    result = await asyncio.wait_for(
-                        cdp.validate_xss(
-                            url=url,
-                            xss_marker=self.XSS_MARKER,
-                            timeout=timeout,
-                            screenshot_dir=screenshot_dir,
-                            expected_marker=expected_marker
-                        ),
-                        timeout=timeout + 30.0  # Extra 30s for CDP overhead
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"CDP validation timed out after {timeout + 30}s - likely alert() popup hang")
-                    return VerificationResult(
-                        success=False,
-                        method="cdp",
-                        error=f"Timeout after {timeout + 30}s - alert() popup likely blocked CDP"
-                    )
-                
-                return VerificationResult(
-                    success=result.success,
-                    method="cdp",
-                    screenshot_path=result.screenshot_path,
-                    console_logs=result.console_logs,
-                    details=result.data,
-                    error=result.error
-                )
-                
+                return await self._execute_cdp_validation(cdp, url, screenshot_dir, timeout, expected_marker)
+
         except Exception as e:
-            logger.error(f"CDP verification error: {e}")
+            logger.error(f"CDP verification error: {e}", exc_info=True)
             return VerificationResult(
                 success=False,
                 method="cdp",
                 error=str(e)
             )
+
+    async def _execute_cdp_validation(self, cdp, url: str, screenshot_dir: Optional[str],
+                                       timeout: float, expected_marker: Optional[str]) -> VerificationResult:
+        """Execute CDP validation with timeout protection."""
+        # Wrap with timeout to prevent infinite hangs from alert() popups
+        try:
+            result = await asyncio.wait_for(
+                cdp.validate_xss(
+                    url=url,
+                    xss_marker=self.XSS_MARKER,
+                    timeout=timeout,
+                    screenshot_dir=screenshot_dir,
+                    expected_marker=expected_marker
+                ),
+                timeout=timeout + 30.0  # Extra 30s for CDP overhead
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"CDP validation timed out after {timeout + 30}s - likely alert() popup hang")
+            return VerificationResult(
+                success=False,
+                method="cdp",
+                error=f"Timeout after {timeout + 30}s - alert() popup likely blocked CDP"
+            )
+
+        return VerificationResult(
+            success=result.success,
+            method="cdp",
+            screenshot_path=result.screenshot_path,
+            console_logs=result.console_logs,
+            details=result.data,
+            error=result.error
+        )
     
     async def _verify_with_playwright(
         self,
@@ -167,35 +172,52 @@ class XSSVerifier:
 
         try:
             async with async_playwright() as p:
-                browser, context, page = await self._setup_browser(p, url)
-                console_logs = []
-                dialog_detected = await self._setup_page_handlers(page, console_logs)
-
-                await self._navigate_to_url(page, url)
-                await asyncio.sleep(min(timeout, 5.0))
-
-                if not dialog_detected[0]:
-                    early_result = await self._simulate_user_interactions(page, url, console_logs, dialog_detected)
-                    if early_result:
-                        return early_result
-
-                xss_confirmed, evaluation_data = await self._evaluate_xss_indicators(
-                    page, url, dialog_detected[0], console_logs, expected_marker
+                result = await self._run_playwright_verification(
+                    p, url, screenshot_dir, timeout, expected_marker
                 )
-
-                impact_data = await self._extract_impact_data(page, url, xss_confirmed)
-                screenshot_path = await self._capture_screenshot(page, screenshot_dir, xss_confirmed)
-
-                return self._build_verification_result(
-                    xss_confirmed, screenshot_path, console_logs,
-                    dialog_detected[0], evaluation_data, impact_data
-                )
+                browser, context, page = result.get("browser_refs", (None, None, None))
+                return result.get("verification_result")
 
         except Exception as e:
-            logger.error(f"Playwright critical error: {e}")
+            logger.error(f"Playwright critical error: {e}", exc_info=True)
             return VerificationResult(success=False, method="playwright", error=str(e))
         finally:
             await self._cleanup_browser(page, context, browser)
+
+    async def _run_playwright_verification(self, p, url: str, screenshot_dir: Optional[str],
+                                             timeout: float, expected_marker: Optional[str]) -> dict:
+        """Run Playwright verification workflow."""
+        browser, context, page = await self._setup_browser(p, url)
+        console_logs = []
+        dialog_detected = await self._setup_page_handlers(page, console_logs)
+
+        await self._navigate_to_url(page, url)
+        await asyncio.sleep(min(timeout, 5.0))
+
+        if not dialog_detected[0]:
+            early_result = await self._simulate_user_interactions(page, url, console_logs, dialog_detected)
+            if early_result:
+                return {
+                    "verification_result": early_result,
+                    "browser_refs": (browser, context, page)
+                }
+
+        xss_confirmed, evaluation_data = await self._evaluate_xss_indicators(
+            page, url, dialog_detected[0], console_logs, expected_marker
+        )
+
+        impact_data = await self._extract_impact_data(page, url, xss_confirmed)
+        screenshot_path = await self._capture_screenshot(page, screenshot_dir, xss_confirmed)
+
+        result = self._build_verification_result(
+            xss_confirmed, screenshot_path, console_logs,
+            dialog_detected[0], evaluation_data, impact_data
+        )
+
+        return {
+            "verification_result": result,
+            "browser_refs": (browser, context, page)
+        }
 
     def _build_verification_result(self, xss_confirmed, screenshot_path, console_logs,
                                    dialog_detected, evaluation_data, impact_data) -> VerificationResult:
@@ -271,18 +293,25 @@ class XSSVerifier:
         for i, inp in enumerate(inputs[:5]):
             if dialog_detected[0]:
                 return True
-            if await inp.is_visible():
-                try:
-                    logger.debug(f"Forcing focus on input {i}")
-                    await page.evaluate('''(el) => {
-                        el.focus();
-                        el.dispatchEvent(new FocusEvent('focus', { bubbles: true }));
-                        el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
-                    }''', inp)
-                    await asyncio.sleep(0.8)
-                except Exception as e:
-                    logger.debug(f"Focus event failed: {e}")
+            if not await inp.is_visible():
+                continue
+
+            await self._trigger_focus_event(page, inp, i)
+
         return dialog_detected[0]
+
+    async def _trigger_focus_event(self, page, element, index: int):
+        """Trigger focus event on a single element."""
+        try:
+            logger.debug(f"Forcing focus on input {index}")
+            await page.evaluate('''(el) => {
+                el.focus();
+                el.dispatchEvent(new FocusEvent('focus', { bubbles: true }));
+                el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
+            }''', element)
+            await asyncio.sleep(0.8)
+        except Exception as e:
+            logger.debug(f"Focus event failed: {e}")
 
     async def _simulate_hover_events(self, page, dialog_detected: List) -> bool:
         """Simulate hover events on elements."""
@@ -309,16 +338,22 @@ class XSSVerifier:
             if dialog_detected[0]:
                 return True
             elements = await page.query_selector_all(selector)
-            for i, elem in enumerate(elements[:3]):
-                if dialog_detected[0]:
-                    return True
-                try:
-                    if await elem.is_visible():
-                        logger.info(f"[{url}] Clicking: {selector} [{i}]")
-                        await elem.click(timeout=1000)
-                        await asyncio.sleep(1.0)
-                except Exception as e:
-                    logger.debug(f"Element click failed: {e}")
+            if await self._click_elements(elements, url, selector, dialog_detected):
+                return True
+        return dialog_detected[0]
+
+    async def _click_elements(self, elements, url: str, selector: str, dialog_detected: List) -> bool:
+        """Click elements and check for dialog detection."""
+        for i, elem in enumerate(elements[:3]):
+            if dialog_detected[0]:
+                return True
+            try:
+                if await elem.is_visible():
+                    logger.info(f"[{url}] Clicking: {selector} [{i}]")
+                    await elem.click(timeout=1000)
+                    await asyncio.sleep(1.0)
+            except Exception as e:
+                logger.debug(f"Element click failed: {e}")
         return dialog_detected[0]
 
     def _make_early_result(self, console_logs: List) -> VerificationResult:
@@ -413,13 +448,19 @@ class XSSVerifier:
 
         for marker in markers:
             if await page.locator(f"div:has-text('{marker}')").count() > 0:
-                pwn_divs = await page.locator(f"div:has-text('{marker}')").all()
-                for div in pwn_divs:
-                    style = await div.get_attribute("style")
-                    div_id = await div.get_attribute("id")
-                    if (style and "background:red" in style) or (div_id and "bt-pwn" in div_id):
-                        logger.info(f"[{url}] Visual Defacement Confirmed: '{marker}' banner!")
-                        return True
+                if await self._check_marker_divs(page, url, marker):
+                    return True
+        return False
+
+    async def _check_marker_divs(self, page, url: str, marker: str) -> bool:
+        """Check divs containing marker for XSS confirmation."""
+        pwn_divs = await page.locator(f"div:has-text('{marker}')").all()
+        for div in pwn_divs:
+            style = await div.get_attribute("style")
+            div_id = await div.get_attribute("id")
+            if (style and "background:red" in style) or (div_id and "bt-pwn" in div_id):
+                logger.info(f"[{url}] Visual Defacement Confirmed: '{marker}' banner!")
+                return True
         return False
 
     def _check_console_logs(self, console_logs: List) -> bool:
@@ -478,11 +519,16 @@ class XSSVerifier:
     async def _cleanup_browser(self, page, context, browser):
         """Clean up browser resources."""
         for resource, name in [(page, "Page"), (context, "Context"), (browser, "Browser")]:
-            if resource:
-                try:
-                    await resource.close()
-                except Exception as e:
-                    logger.debug(f"{name} close error: {e}")
+            if not resource:
+                continue
+            await self._close_resource(resource, name)
+
+    async def _close_resource(self, resource, name: str):
+        """Close a browser resource with error handling."""
+        try:
+            await resource.close()
+        except Exception as e:
+            logger.debug(f"{name} close error: {e}")
 
 
 # Convenience function

@@ -58,13 +58,13 @@ class RequestController:
 
         except httpx.RequestError as e:
             self.error_count += 1
-            logger.error(f"RequestController: Network error: {e}")
+            logger.error(f"RequestController: Network error: {e}", exc_info=True)
             if self.error_count >= self.max_consecutive_errors:
                 self.circuit_open = True
                 logger.critical("RequestController: Max errors reached. Opening Circuit Breaker.")
             return 0, str(e), 0.0
         except Exception as e:
-            logger.error(f"RequestController: Unexpected error: {e}")
+            logger.error(f"RequestController: Unexpected error: {e}", exc_info=True)
             return 0, str(e), 0.0
 
     async def close(self):

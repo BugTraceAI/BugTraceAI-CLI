@@ -116,7 +116,7 @@ def _parse_tool_output(output: str, max_size: int = MAX_JSON_SIZE) -> Dict:
         _check_json_depth(data)
         return data
     except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON from tool: {e}")
+        logger.error(f"Invalid JSON from tool: {e}", exc_info=True)
         raise
 
 class ExternalToolManager:
@@ -270,7 +270,7 @@ class ExternalToolManager:
 
         # Validate image against whitelist (TASK-111)
         if not _validate_docker_image(image):
-            logger.error(f"Blocked execution of untrusted image: {image}")
+            logger.error(f"Blocked execution of untrusted image: {image}", exc_info=True)
             return ""
 
         full_cmd = self._build_docker_command(image, command, memory_limit, cpu_limit, network_mode)
@@ -285,10 +285,10 @@ class ExternalToolManager:
 
             return _sanitize_output(stdout.decode())
         except asyncio.TimeoutError:
-            logger.error(f"Docker container timeout after {timeout}s: {image}")
+            logger.error(f"Docker container timeout after {timeout}s: {image}", exc_info=True)
             return ""
         except Exception as e:
-            logger.error(f"Docker subprocess error: {e}")
+            logger.error(f"Docker subprocess error: {e}", exc_info=True)
             return ""
         finally:
             await self._cleanup_docker_process(proc)
@@ -536,7 +536,7 @@ class ExternalToolManager:
                 logger.error(f"Go XSS fuzzer failed (Exit Code {process.returncode}): {stderr.decode()}")
                 return None
         except Exception as e:
-            logger.error(f"Go XSS fuzzer error: {e}")
+            logger.error(f"Go XSS fuzzer error: {e}", exc_info=True)
             return None
         finally:
             await self._cleanup_temp_file(payloads_file)
@@ -595,7 +595,7 @@ class ExternalToolManager:
                 logger.error(f"Go SSRF fuzzer failed: {stderr.decode()}")
                 return None
         except Exception as e:
-            logger.error(f"Go SSRF fuzzer error: {e}")
+            logger.error(f"Go SSRF fuzzer error: {e}", exc_info=True)
             return None
 
     async def run_go_lfi_fuzzer(self, url: str, param: str, os_hint: str = "both") -> Optional[Dict]:
@@ -645,7 +645,7 @@ class ExternalToolManager:
                 logger.error(f"Go LFI fuzzer failed: {stderr.decode()}")
                 return None
         except Exception as e:
-            logger.error(f"Go LFI fuzzer error: {e}")
+            logger.error(f"Go LFI fuzzer error: {e}", exc_info=True)
             return None
 
     async def _run_go_fuzzer(
@@ -681,7 +681,7 @@ class ExternalToolManager:
                 logger.error(f"{binary_name} failed: {stderr.decode()}")
                 return None
         except Exception as e:
-            logger.error(f"{binary_name} error: {e}")
+            logger.error(f"{binary_name} error: {e}", exc_info=True)
             return None
 
     async def run_go_idor_fuzzer(

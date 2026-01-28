@@ -455,7 +455,7 @@ class URLReporter:
                     shutil.copy2(screenshot_path, dest_path)
                     logger.debug(f"Copied XSS validation screenshot: {screenshot_path} -> {dest_path}")
                 except Exception as e:
-                    logger.error(f"Failed to copy screenshot {screenshot_path}: {e}")
+                    logger.error(f"Failed to copy screenshot {screenshot_path}: {e}", exc_info=True)
     
     def _save_metadata(self, url_dir: Path, url: str, metadata: Optional[Dict]):
         """Save metadata as JSON."""

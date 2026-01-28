@@ -81,7 +81,7 @@ class PrototypePollutionSkill(BaseSkill):
         try:
             findings = await self._test_payloads_with_browser(browser_manager, url, pp_payloads)
         except Exception as e:
-            logger.error(f"Prototype Pollution skill failed: {e}")
+            logger.error(f"Prototype Pollution skill failed: {e}", exc_info=True)
 
         return {
             "success": True,

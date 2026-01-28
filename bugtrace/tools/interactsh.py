@@ -145,11 +145,11 @@ class InteractshClient:
                 return True
                 
             except Exception as e:
-                logger.error(f"Interactsh registration error: {e}")
+                logger.error(f"Interactsh registration error: {e}", exc_info=True)
                 return False
                 
         except Exception as e:
-            logger.error(f"Interactsh registration failed: {e}")
+            logger.error(f"Interactsh registration failed: {e}", exc_info=True)
             return False
     
     async def __aenter__(self):

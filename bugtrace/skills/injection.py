@@ -42,7 +42,7 @@ class XSSSkill(BaseSkill):
                     findings.append(finding)
             await manipulator.shutdown()
         except Exception as e:
-            logger.error(f"XSS skill failed: {e}")
+            logger.error(f"XSS skill failed: {e}", exc_info=True)
 
         return {
             "success": True,
@@ -188,7 +188,7 @@ class XSSSkill(BaseSkill):
             logger.info(f"[{self.master.name}] Vision XSS Validation: {vision_confirmed}")
             return vision_confirmed
         except Exception as ve:
-            logger.error(f"[{self.master.name}] Vision validation failed: {ve}")
+            logger.error(f"[{self.master.name}] Vision validation failed: {ve}", exc_info=True)
             return False
 
     def _get_vision_prompt(self) -> str:
@@ -264,7 +264,7 @@ class SQLiSkill(BaseSkill):
             if self._should_run_sqlmap(potential_vuln):
                 await self._run_sqlmap_phase(url, params, potential_vuln, detector_message, findings)
         except Exception as e:
-            logger.error(f"SQLi Ladder Logic test failed: {e}")
+            logger.error(f"SQLi Ladder Logic test failed: {e}", exc_info=True)
 
         return {
             "success": True,
@@ -434,7 +434,7 @@ class LFISkill(BaseSkill):
                 if finding:
                     findings.append(finding)
         except Exception as e:
-            logger.error(f"LFI skill failed: {e}")
+            logger.error(f"LFI skill failed: {e}", exc_info=True)
 
         return {
             "success": True,

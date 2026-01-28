@@ -49,7 +49,7 @@ class EmbeddingManager:
                 self._model = SentenceTransformer(self.model_name)
                 logger.info(f"✅ Model loaded successfully ({self._model.get_sentence_embedding_dimension()}D)")
             except Exception as e:
-                logger.error(f"Failed to load embedding model: {e}")
+                logger.error(f"Failed to load embedding model: {e}", exc_info=True)
                 logger.warning("⚠️ Switching to Mock Embedding Model (Offline Mode)")
                 self._model = MockEmbeddingModel()
     
@@ -106,7 +106,7 @@ class EmbeddingManager:
             embedding = self._model.encode(text, convert_to_numpy=True)
             return embedding.tolist()
         except Exception as e:
-            logger.error(f"Failed to encode finding: {e}")
+            logger.error(f"Failed to encode finding: {e}", exc_info=True)
             # Return zero vector as fallback
             return [0.0] * self._model.get_sentence_embedding_dimension()
     
@@ -124,7 +124,7 @@ class EmbeddingManager:
             embedding = self._model.encode(query_text, convert_to_numpy=True)
             return embedding.tolist()
         except Exception as e:
-            logger.error(f"Failed to encode query: {e}")
+            logger.error(f"Failed to encode query: {e}", exc_info=True)
             return [0.0] * self._model.get_sentence_embedding_dimension()
     
     def batch_encode_findings(self, findings: List[Dict]) -> List[List[float]]:
@@ -151,7 +151,7 @@ class EmbeddingManager:
             embeddings = self._model.encode(texts, convert_to_numpy=True)
             return [emb.tolist() for emb in embeddings]
         except Exception as e:
-            logger.error(f"Batch encoding failed: {e}")
+            logger.error(f"Batch encoding failed: {e}", exc_info=True)
             dim = self._model.get_sentence_embedding_dimension()
             return [[0.0] * dim for _ in findings]
     

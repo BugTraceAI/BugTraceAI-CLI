@@ -161,8 +161,7 @@ def _create_generic_exception_handler():
     ) -> JSONResponse:
         """Handle unhandled exceptions as 500 errors."""
         logger.error(
-            f"Unhandled exception in {request.url.path}: {exc}", exc_info=True
-        )
+            f"Unhandled exception in {request.url.path}: {exc}", exc_info=True)
         return _error_response(
             status_code=500,
             error_code="INTERNAL_ERROR",

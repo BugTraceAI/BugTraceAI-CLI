@@ -970,6 +970,48 @@ class XSSAgent(BaseAgent):
 
         return html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx
 
+    async def _smart_get_llm_payloads(
+        self,
+        html: str,
+        param: str,
+        interactsh_url: str,
+        context_data: Dict
+    ) -> Optional[List[Dict]]:
+        """Get LLM-generated smart payloads based on DOM analysis."""
+        dashboard.log(f"[{self.name}] 🧠 LLM Brain: Analyzing DOM structure...", "INFO")
+
+        smart_payloads = await self._llm_smart_dom_analysis(
+            html=html,
+            param=param,
+            probe_string=self.PROBE_STRING,
+            interactsh_url=interactsh_url,
+            context_data=context_data
+        )
+
+        if smart_payloads:
+            dashboard.log(f"[{self.name}] 🎯 Testing {len(smart_payloads)} LLM-generated precision payloads", "INFO")
+
+        return smart_payloads
+
+    def _smart_build_finding_from_payload(
+        self,
+        param: str,
+        sp: Dict,
+        payload: str,
+        evidence: Dict,
+        reflection_type: str,
+        surviving_chars: str,
+        injection_ctx: Any
+    ) -> XSSFinding:
+        """Build XSS finding from validated smart payload."""
+        return self._create_xss_finding(
+            param, payload, sp.get("reasoning", "LLM Smart Analysis"),
+            "llm_smart_analysis", evidence, sp.get("confidence", 0.9),
+            reflection_type, surviving_chars, [payload],
+            injection_ctx, "context_aware_payload",
+            sp.get("reasoning", "LLM generated specific payload for this context.")
+        )
+
     async def _test_smart_llm_payloads(
         self,
         param: str,
@@ -985,20 +1027,12 @@ class XSSAgent(BaseAgent):
         if not context_data.get("reflected", False):
             return None
 
-        dashboard.log(f"[{self.name}] 🧠 LLM Brain: Analyzing DOM structure...", "INFO")
-
-        smart_payloads = await self._llm_smart_dom_analysis(
-            html=html,
-            param=param,
-            probe_string=self.PROBE_STRING,
-            interactsh_url=interactsh_url,
-            context_data=context_data
+        smart_payloads = await self._smart_get_llm_payloads(
+            html, param, interactsh_url, context_data
         )
 
         if not smart_payloads:
             return None
-
-        dashboard.log(f"[{self.name}] 🎯 Testing {len(smart_payloads)} LLM-generated precision payloads", "INFO")
 
         for sp in smart_payloads:
             if self._max_impact_achieved:
@@ -1024,37 +1058,25 @@ class XSSAgent(BaseAgent):
                 }
 
                 if self._should_create_finding(finding_data):
-                    return self._create_xss_finding(
-                        param, payload, sp.get("reasoning", "LLM Smart Analysis"),
-                        "llm_smart_analysis", evidence, sp.get("confidence", 0.9),
-                        reflection_type, surviving_chars, [payload],
-                        injection_ctx, "context_aware_payload",
-                        sp.get("reasoning", "LLM generated specific payload for this context.")
+                    return self._smart_build_finding_from_payload(
+                        param, sp, payload, evidence, reflection_type,
+                        surviving_chars, injection_ctx
                     )
 
         return None
 
-    async def _test_hybrid_payloads(
+    def _hybrid_build_probe_result(
         self,
-        param: str,
-        interactsh_url: str,
-        screenshots_dir: Path,
-        reflection_type: str,
-        surviving_chars: str,
         context_data: Dict,
-        status_code: int,
-        injection_ctx: Any
-    ) -> Optional[XSSFinding]:
-        """Phase 3: Test hybrid payloads (Learned + Curated + Golden)."""
-        # Get prioritized payloads
-        raw_payloads = self.payload_learner.get_prioritized_payloads(self.GOLDEN_PAYLOADS)
-        hybrid_payloads = self._filter_payloads_by_context(raw_payloads, reflection_type)
-
-        # Adaptive batching
-        from bugtrace.agents.payload_batches import payload_batcher, ProbeResult
+        surviving_chars: str,
+        reflection_type: str,
+        status_code: int
+    ):
+        """Build ProbeResult for adaptive batching."""
+        from bugtrace.agents.payload_batches import ProbeResult
 
         waf_detected = self._detected_waf is not None or context_data.get("is_blocked", False)
-        probe_result = ProbeResult(
+        return ProbeResult(
             reflected=context_data.get("reflected", False),
             surviving_chars=surviving_chars,
             waf_detected=waf_detected,
@@ -1063,7 +1085,15 @@ class XSSAgent(BaseAgent):
             status_code=status_code
         )
 
-        # Get adaptive payloads
+    def _hybrid_get_adaptive_payloads(
+        self,
+        probe_result,
+        reflection_type: str,
+        raw_payloads: List[str]
+    ) -> List[str]:
+        """Get adaptive payloads using batcher escalation."""
+        from bugtrace.agents.payload_batches import payload_batcher
+
         current_batch = "universal"
         tested_batches = set()
         hybrid_payloads = []
@@ -1080,6 +1110,30 @@ class XSSAgent(BaseAgent):
         if not hybrid_payloads:
             hybrid_payloads = self._filter_payloads_by_context(raw_payloads, reflection_type)[:50]
 
+        return hybrid_payloads
+
+    async def _test_hybrid_payloads(
+        self,
+        param: str,
+        interactsh_url: str,
+        screenshots_dir: Path,
+        reflection_type: str,
+        surviving_chars: str,
+        context_data: Dict,
+        status_code: int,
+        injection_ctx: Any
+    ) -> Optional[XSSFinding]:
+        """Phase 3: Test hybrid payloads (Learned + Curated + Golden)."""
+        raw_payloads = self.payload_learner.get_prioritized_payloads(self.GOLDEN_PAYLOADS)
+
+        probe_result = self._hybrid_build_probe_result(
+            context_data, surviving_chars, reflection_type, status_code
+        )
+
+        hybrid_payloads = self._hybrid_get_adaptive_payloads(
+            probe_result, reflection_type, raw_payloads
+        )
+
         # Q-Learning WAF bypass
         if self._detected_waf:
             original_count = len(hybrid_payloads)
@@ -1088,7 +1142,6 @@ class XSSAgent(BaseAgent):
 
         logger.info(f"[{self.name}] ⚡ Adaptive Strategy: Testing {len(hybrid_payloads)} payloads for {param}...")
 
-        # Test payloads
         return await self._test_payload_list(
             param, hybrid_payloads, interactsh_url, screenshots_dir,
             reflection_type, surviving_chars, injection_ctx
@@ -1901,6 +1954,17 @@ Response format (XML):
                 "INFO"
             )
 
+    async def _dom_call_llm(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        """Call LLM for DOM analysis."""
+        return await llm_client.generate(
+            prompt=user_prompt,
+            module_name="XSS_SMART_ANALYSIS",
+            system_prompt=system_prompt,
+            model_override=settings.MUTATION_MODEL,
+            max_tokens=4000,
+            temperature=0.3
+        )
+
     async def _llm_smart_dom_analysis(
         self,
         html: str,
@@ -1920,30 +1984,20 @@ Response format (XML):
         Returns:
             List of payload dicts with: payload, reasoning, confidence
         """
-        # Extract the DOM snippet around the reflection point
         dom_snippet = self._extract_dom_around_reflection(html, probe_string)
 
-        # Build prompts
         system_prompt = self._dom_build_system_prompt()
         user_prompt = self._dom_build_user_prompt(
             html, param, probe_string, interactsh_url, context_data, dom_snippet
         )
 
         try:
-            response = await llm_client.generate(
-                prompt=user_prompt,
-                module_name="XSS_SMART_ANALYSIS",
-                system_prompt=system_prompt,
-                model_override=settings.MUTATION_MODEL,
-                max_tokens=4000,
-                temperature=0.3
-            )
+            response = await self._dom_call_llm(system_prompt, user_prompt)
 
             if not response:
                 logger.warning(f"[{self.name}] LLM Smart Analysis returned empty response")
                 return []
 
-            # Parse the response
             payloads = self._parse_smart_analysis_response(response, interactsh_url)
 
             if payloads:
@@ -2511,6 +2565,40 @@ Return JSON:
 
         return False
     
+    def _fragment_build_url(self, payload: str) -> str:
+        """Build fragment URL with payload in hash (bypasses WAF)."""
+        from urllib.parse import urlparse
+        parsed = urlparse(self.url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}#{payload}"
+
+    def _fragment_build_finding(
+        self,
+        param: str,
+        payload: str,
+        result: Any
+    ) -> XSSFinding:
+        """Build XSS finding from validated fragment injection."""
+        evidence = result.details or {}
+        evidence["method"] = result.method
+        evidence["screenshot_path"] = result.screenshot_path
+        if result.console_logs:
+            evidence["console_logs"] = result.console_logs
+
+        return XSSFinding(
+            url=self.url,
+            parameter=f"#fragment (bypassed {param})",
+            payload=payload,
+            context="dom_xss_fragment",
+            validation_method=f"vision+{result.method}",
+            evidence=evidence,
+            confidence=1.0,
+            status="VALIDATED_CONFIRMED",
+            validated=True,
+            screenshot_path=result.screenshot_path,
+            reflection_context="location.hash → innerHTML",
+            surviving_chars="N/A (client-side)"
+        )
+
     async def _test_fragment_xss(
         self,
         param: str,
@@ -2523,57 +2611,29 @@ Return JSON:
         Level 7+ targets often use location.hash in innerHTML/eval, creating DOM XSS.
         """
         dashboard.log(f"[{self.name}] 🔗 Testing FRAGMENT XSS (bypassing WAF via location.hash)...", "INFO")
-        
+
         for fragment_template in self.FRAGMENT_PAYLOADS:
             payload = fragment_template.replace("{{interactsh_url}}", interactsh_url)
-            
-            # Build fragment URL - CRITICAL: Remove query params, payload goes in fragment ONLY
-            # Level 7's JS: if (location.hash) { innerHTML = decodeURIComponent(loc hash.substring(1)) }
-            from urllib.parse import urlparse, urlunparse
-            parsed = urlparse(self.url)
-            
-            # Construct clean URL: path only (no query), payload in fragment
-            fragment_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}#{payload}"
-            
+            fragment_url = self._fragment_build_url(payload)
+
             dashboard.set_current_payload(payload[:60], "Fragment XSS", "Testing")
             logger.info(f"[{self.name}] Testing Fragment: {fragment_url}")
-            
-            # Validate in browser (Fragment XSS requires browser execution)
+
             try:
-                # Use updated verify_xss method
                 result = await self.verifier.verify_xss(
                     url=fragment_url,
                     screenshot_dir=str(screenshots_dir),
                     timeout=10.0
                 )
-                
+
                 if result.success:
                     dashboard.log(f"[{self.name}] 🎯 FRAGMENT XSS SUCCESS! ({result.method})", "SUCCESS")
-                    
-                    evidence = result.details or {}
-                    evidence["method"] = result.method
-                    evidence["screenshot_path"] = result.screenshot_path
-                    if result.console_logs:
-                        evidence["console_logs"] = result.console_logs
+                    return self._fragment_build_finding(param, payload, result)
 
-                    return XSSFinding(
-                        url=self.url,
-                        parameter=f"#fragment (bypassed {param})",
-                        payload=payload,
-                        context="dom_xss_fragment",
-                        validation_method=f"vision+{result.method}",
-                        evidence=evidence,
-                        confidence=1.0,
-                        status="VALIDATED_CONFIRMED",  # CDP browser already confirmed execution
-                        validated=True,
-                        screenshot_path=result.screenshot_path,
-                        reflection_context="location.hash → innerHTML",
-                        surviving_chars="N/A (client-side)"
-                    )
             except Exception as e:
                 logger.debug(f"Fragment test failed for {payload[:30]}: {e}")
                 continue
-        
+
         logger.info(f"[{self.name}] No Fragment XSS found after testing {len(self.FRAGMENT_PAYLOADS)} payloads")
         return None
     
@@ -2687,6 +2747,56 @@ Return JSON:
         "Accept-Language",
     ]
 
+    async def _post_send_request(
+        self,
+        form_action: str,
+        test_data: Dict[str, str]
+    ) -> Optional[str]:
+        """Send POST request and return response HTML."""
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    form_action,
+                    data=test_data,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    allow_redirects=True
+                ) as resp:
+                    return await resp.text()
+        except Exception as e:
+            logger.debug(f"POST request failed: {e}")
+            return None
+
+    def _post_build_finding(
+        self,
+        form_action: str,
+        param: str,
+        payload: str,
+        evidence: Dict
+    ) -> XSSFinding:
+        """Build XSS finding from validated POST injection."""
+        evidence["vector"] = "POST"
+        evidence["form_action"] = form_action
+
+        return XSSFinding(
+            url=form_action,
+            parameter=f"POST:{param}",
+            payload=payload,
+            context="POST form submission",
+            validation_method="post_injection",
+            evidence=evidence,
+            confidence=0.9,
+            status="VALIDATED_CONFIRMED",
+            validated=True,
+            screenshot_path=evidence.get("screenshot_path"),
+            reflection_context="post_body"
+        )
+
     async def _test_post_params(
         self,
         form_action: str,
@@ -2701,60 +2811,27 @@ Return JSON:
             if self._max_impact_achieved:
                 break
 
-            # Test with a simple payload first
-            for payload_template in self.GOLDEN_PAYLOADS[:10]:  # Top 10 payloads
+            for payload_template in self.GOLDEN_PAYLOADS[:10]:
                 payload = payload_template.replace("{{interactsh_url}}", interactsh_url)
                 test_data = post_params.copy()
                 test_data[param] = payload
 
-                try:
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Content-Type": "application/x-www-form-urlencoded"
-                    }
-
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(
-                            form_action,
-                            data=test_data,
-                            headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=10),
-                            allow_redirects=True
-                        ) as resp:
-                            response_html = await resp.text()
-
-                    # Check reflection
-                    if payload in response_html or payload[:30] in response_html:
-                        dashboard.log(f"[{self.name}] 🎯 POST param '{param}' reflects payload!", "SUCCESS")
-
-                        # Validate with browser
-                        validated, evidence = await self._validate(
-                            param, payload, response_html, "interactsh", screenshots_dir
-                        )
-
-                        if validated:
-                            evidence["vector"] = "POST"
-                            evidence["form_action"] = form_action
-
-                            should_stop, stop_reason = self._should_stop_testing(payload, evidence, 1)
-
-                            return XSSFinding(
-                                url=form_action,
-                                parameter=f"POST:{param}",
-                                payload=payload,
-                                context="POST form submission",
-                                validation_method="post_injection",
-                                evidence=evidence,
-                                confidence=0.9,
-                                status="VALIDATED_CONFIRMED",
-                                validated=True,
-                                screenshot_path=evidence.get("screenshot_path"),
-                                reflection_context="post_body"
-                            )
-
-                except Exception as e:
-                    logger.debug(f"POST test failed for {param}: {e}")
+                response_html = await self._post_send_request(form_action, test_data)
+                if not response_html:
                     continue
+
+                # Check reflection
+                if payload not in response_html and payload[:30] not in response_html:
+                    continue
+
+                dashboard.log(f"[{self.name}] 🎯 POST param '{param}' reflects payload!", "SUCCESS")
+
+                validated, evidence = await self._validate(
+                    param, payload, response_html, "interactsh", screenshots_dir
+                )
+
+                if validated:
+                    return self._post_build_finding(form_action, param, payload, evidence)
 
         return None
 

@@ -49,7 +49,7 @@ class StateManager:
                 logger.debug(f"State saved to DB for scan {self.scan_id}")
                 return
             except Exception as e:
-                logger.error(f"Failed to save state to DB: {e}, falling back to file.")
+                logger.error(f"Failed to save state to DB: {e}, falling back to file.", exc_info=True)
         
         # Fallback to file
         try:
@@ -61,7 +61,7 @@ class StateManager:
             with open(self.state_file, 'w') as f:
                 json.dump(wrapper, f, indent=2)
         except Exception as e:
-            logger.error(f"Failed to save state to file: {e}")
+            logger.error(f"Failed to save state to file: {e}", exc_info=True)
 
     def add_finding(self, **finding_dict):
         """Proxy to save_scan_result to support legacy agent calls while using V3 DB.
@@ -83,7 +83,7 @@ class StateManager:
                 self.db.save_scan_result(self.target, [finding_dict], scan_id=self.scan_id)
                 logger.debug(f"Finding persisted to DB (PENDING_VALIDATION) via proxy.")
             except Exception as e:
-                logger.error(f"Failed to proxy finding to DB: {e}")
+                logger.error(f"Failed to proxy finding to DB: {e}", exc_info=True)
 
     def load_state(self) -> Dict[str, Any]:
         """Loads state from DB (preferred) or File."""
@@ -94,7 +94,7 @@ class StateManager:
                     logger.info(f"Loaded active state from DB for scan {self.scan_id}")
                     return json.loads(state_json)
             except Exception as e:
-                logger.error(f"Failed to load state from DB: {e}")
+                logger.error(f"Failed to load state from DB: {e}", exc_info=True)
         
         # Fallback to file
         if not self.state_file.exists():
@@ -105,7 +105,7 @@ class StateManager:
                 content = json.load(f)
                 return content.get("data", {})
         except Exception as e:
-            logger.error(f"Failed to load state: {e}")
+            logger.error(f"Failed to load state: {e}", exc_info=True)
             return {}
 
     def clear(self):
@@ -116,7 +116,7 @@ class StateManager:
                 self.db.save_checkpoint(self.scan_id, "")
                 logger.debug(f"State cleared for scan {self.scan_id}")
             except Exception as e:
-                logger.error(f"Failed to clear state: {e}")
+                logger.error(f"Failed to clear state: {e}", exc_info=True)
 
     def snapshot(self, filename: str, message: str):
         """Legacy compatibility wrapper - logs a snapshot event but doesn't use Git."""
@@ -146,7 +146,7 @@ class StateManager:
                 })
             return results
         except Exception as e:
-            logger.error(f"StateManager failed to retrieve findings: {e}")
+            logger.error(f"StateManager failed to retrieve findings: {e}", exc_info=True)
             return []
 
 def get_state_manager(target: str) -> StateManager:

@@ -294,35 +294,50 @@ class WAFFingerprinter:
 
         ssl_verify = get_ssl_context()
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=ssl_verify) as client:
-            try:
-                response = await client.get(url)
-
+            response = await self._fetch_normal_response(client, url)
+            if response:
                 for sig in self.signatures:
-                    score = 0.0
-
-                    # Check headers
-                    for header_key, header_pattern in sig.headers.items():
-                        header_value = response.headers.get(header_key, "").lower()
-                        if header_value:
-                            if header_pattern == "" or header_pattern.lower() in header_value:
-                                score += 0.3
-
-                    # Check cookies
-                    cookies = response.cookies
-                    for cookie_name in sig.cookies:
-                        # Check both exact match and prefix match
-                        for actual_cookie in cookies.keys():
-                            if actual_cookie.lower().startswith(cookie_name.lower()):
-                                score += 0.2
-                                break
-
+                    score = self._score_waf_signature(sig, response)
                     if score > 0:
                         scores[sig.name] = score
 
-            except Exception as e:
-                logger.debug(f"Normal request failed: {e}")
-
         return scores
+
+    async def _fetch_normal_response(self, client, url: str):
+        """Fetch response for WAF fingerprinting."""
+        try:
+            return await client.get(url)
+        except Exception as e:
+            logger.debug(f"Normal request failed: {e}")
+            return None
+
+    def _score_waf_signature(self, sig, response) -> float:
+        """Score a WAF signature against response headers and cookies."""
+        score = 0.0
+
+        # Check headers
+        for header_key, header_pattern in sig.headers.items():
+            header_value = response.headers.get(header_key, "").lower()
+            if not header_value:
+                continue
+            if header_pattern == "" or header_pattern.lower() in header_value:
+                score += 0.3
+
+        # Check cookies
+        cookies = response.cookies
+        for cookie_name in sig.cookies:
+            if self._has_matching_cookie(cookies, cookie_name):
+                score += 0.2
+                break
+
+        return score
+
+    def _has_matching_cookie(self, cookies, cookie_name: str) -> bool:
+        """Check if cookies contain a match for cookie_name (exact or prefix)."""
+        for actual_cookie in cookies.keys():
+            if actual_cookie.lower().startswith(cookie_name.lower()):
+                return True
+        return False
 
     async def _analyze_triggered_response(self, url: str, timeout: float) -> Dict[str, float]:
         """
@@ -341,37 +356,45 @@ class WAFFingerprinter:
         ssl_verify = get_ssl_context()
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=ssl_verify) as client:
             for payload in trigger_payloads:
-                try:
-                    # Inject in query parameter
-                    test_url = f"{url}{'&' if '?' in url else '?'}test={payload}"
-                    response = await client.get(test_url)
-
-                    # If we got blocked (403, 406, etc), analyze the response
-                    if response.status_code in [403, 406, 429, 503]:
-                        body = response.text.lower()
-
-                        for sig in self.signatures:
-                            score = scores.get(sig.name, 0.0)
-
-                            # Check body patterns
-                            for pattern in sig.body_patterns:
-                                if pattern.lower() in body:
-                                    score += 0.4
-
-                            # Check status code match
-                            if response.status_code in sig.status_codes:
-                                score += 0.1
-
-                            if score > scores.get(sig.name, 0.0):
-                                scores[sig.name] = score
-
-                        # One trigger is enough if we got blocked
-                        break
-
-                except Exception as e:
-                    logger.debug(f"Trigger request failed: {e}")
+                if await self._test_waf_trigger(client, url, payload, scores):
+                    break  # One trigger is enough if we got blocked
 
         return scores
+
+    async def _test_waf_trigger(self, client, url: str, payload: str, scores: Dict[str, float]) -> bool:
+        """Test a single WAF trigger payload."""
+        try:
+            # Inject in query parameter
+            test_url = f"{url}{'&' if '?' in url else '?'}test={payload}"
+            response = await client.get(test_url)
+
+            # If we got blocked (403, 406, etc), analyze the response
+            if response.status_code in [403, 406, 429, 503]:
+                self._analyze_blocked_response(response, scores)
+                return True
+        except Exception as e:
+            logger.debug(f"Trigger request failed: {e}")
+
+        return False
+
+    def _analyze_blocked_response(self, response, scores: Dict[str, float]):
+        """Analyze a blocked response and update WAF scores."""
+        body = response.text.lower()
+
+        for sig in self.signatures:
+            score = scores.get(sig.name, 0.0)
+
+            # Check body patterns
+            for pattern in sig.body_patterns:
+                if pattern.lower() in body:
+                    score += 0.4
+
+            # Check status code match
+            if response.status_code in sig.status_codes:
+                score += 0.1
+
+            if score > scores.get(sig.name, 0.0):
+                scores[sig.name] = score
 
     def _combine_results(
         self,

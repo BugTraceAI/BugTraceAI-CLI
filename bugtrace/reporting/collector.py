@@ -181,7 +181,7 @@ class DataCollector:
             self.context.raw_results[file_path] = data
 
         except Exception as e:
-            logger.error(f"Error ingesting {file_path}: {e}")
+            logger.error(f"Error ingesting {file_path}: {e}", exc_info=True)
 
     def add_observation(self, observation: str, metadata: Optional[Dict[str, Any]] = None):
         """Adds a generic security observation or test record to the context."""

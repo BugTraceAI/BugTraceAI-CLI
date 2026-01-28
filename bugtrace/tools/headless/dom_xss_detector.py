@@ -316,7 +316,7 @@ class DOMXSSDetector:
                 if finding:
                     findings.append(finding)
         except Exception as e:
-            logger.error(f"[DOMXSSDetector] Scan error: {e}")
+            logger.error(f"[DOMXSSDetector] Scan error: {e}", exc_info=True)
         finally:
             await self._cleanup_scan_context(page, context)
 

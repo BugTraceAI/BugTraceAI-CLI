@@ -68,7 +68,7 @@ async def create_scan(
         logger.warning(f"Concurrent scan limit reached: {e}")
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
     except ValueError as e:
-        logger.error(f"Invalid scan request: {e}")
+        logger.error(f"Invalid scan request: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
@@ -112,7 +112,7 @@ async def get_scan_status(
         return ScanStatusResponse(**status_dict)
 
     except ValueError as e:
-        logger.error(f"Scan {scan_id} not found: {e}")
+        logger.error(f"Scan {scan_id} not found: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Scan {scan_id} not found",
@@ -165,7 +165,7 @@ async def get_scan_findings(
             scan_id=scan_id,
         )
     except ValueError as e:
-        logger.error(f"Error getting findings for scan {scan_id}: {e}")
+        logger.error(f"Error getting findings for scan {scan_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
@@ -258,7 +258,7 @@ async def stop_scan(
         return StopScanResponse(**result)
 
     except ValueError as e:
-        logger.error(f"Cannot stop scan {scan_id}: {e}")
+        logger.error(f"Cannot stop scan {scan_id}: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),

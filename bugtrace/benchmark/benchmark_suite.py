@@ -178,7 +178,7 @@ class BenchmarkSuite:
                 "vuln_times": vuln_times
             }
         except Exception as e:
-            logger.error(f"Speed test failed for {target_name}: {e}")
+            logger.error(f"Speed test failed for {target_name}: {e}", exc_info=True)
             return None
 
     def _categorize_findings_by_type(self, findings: List, duration: float) -> Dict:
@@ -232,7 +232,7 @@ class BenchmarkSuite:
             await orchestrator.start()
             return llm_client.session_cost
         except Exception as e:
-            logger.error(f"Cost test failed: {e}")
+            logger.error(f"Cost test failed: {e}", exc_info=True)
             return None
 
     def _calculate_cost_averages(self, cost_results: Dict):
@@ -286,7 +286,7 @@ class BenchmarkSuite:
                 "vuln_metrics": vuln_metrics
             }
         except Exception as e:
-            logger.error(f"Accuracy test failed for {target_name}: {e}")
+            logger.error(f"Accuracy test failed for {target_name}: {e}", exc_info=True)
             return None
 
     def _count_detected_by_type(self, findings: List) -> Dict[str, int]:
@@ -376,7 +376,7 @@ class BenchmarkSuite:
             findings = await orchestrator.start()
             self._detect_features(findings, features_tested)
         except Exception as e:
-            logger.error(f"Completeness test failed: {e}")
+            logger.error(f"Completeness test failed: {e}", exc_info=True)
 
     def _detect_features(self, findings: List, features_tested: Dict):
         """Detect which features were used based on findings."""

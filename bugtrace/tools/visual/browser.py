@@ -81,9 +81,9 @@ class BrowserManager:
                 )
                 logger.info("Browser started successfully.")
             except asyncio.TimeoutError:
-                logger.error("Playwright start timed out. Headless browser will be unavailable.")
+                logger.error("Playwright start timed out. Headless browser will be unavailable.", exc_info=True)
             except Exception as e:
-                logger.error(f"Failed to start browser: {e}")
+                logger.error(f"Failed to start browser: {e}", exc_info=True)
                 # Don't raise, allowing framework to run without browser
 
     async def stop(self):
@@ -169,7 +169,7 @@ class BrowserManager:
                     "html": html_content
                 }
             except Exception as e:
-                logger.error(f"Capture failed for {url}: {e}")
+                logger.error(f"Capture failed for {url}: {e}", exc_info=True)
                 return {}
 
     async def emergency_cleanup(self):
@@ -350,7 +350,7 @@ class BrowserManager:
     async def _handle_verification_error(self, page, logs, error):
         """Handle verification errors and capture emergency screenshot."""
         logs.append(f"Browser Execution Error: {error}")
-        logger.error(f"Verify XSS failed: {error}")
+        logger.error(f"Verify XSS failed: {error}", exc_info=True)
 
         try:
             import uuid
@@ -388,7 +388,7 @@ class BrowserManager:
                 return True
                 
             except Exception as e:
-                logger.error(f"Login failed: {e}")
+                logger.error(f"Login failed: {e}", exc_info=True)
                 if self._context:
                     await self._context.close()
                     self._context = None
@@ -412,7 +412,7 @@ class BrowserManager:
                 try:
                     data["cookies"] = await self._context.cookies()
                 except Exception as e:
-                    logger.error(f"Failed to get cookies: {e}")
+                    logger.error(f"Failed to get cookies: {e}", exc_info=True)
                     
         return data
 

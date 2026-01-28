@@ -77,7 +77,7 @@ class SQLMapSkill(BaseSkill):
                 logger.info(f"[{self.master.name}] ✅ SQLMap confirmed SQLi")
 
         except Exception as e:
-            logger.error(f"SQLMap skill failed: {e}")
+            logger.error(f"SQLMap skill failed: {e}", exc_info=True)
 
         return {
             "success": True,
@@ -128,7 +128,7 @@ class NucleiSkill(BaseSkill):
                 logger.info(f"[{self.master.name}] ✅ Nuclei found {len(findings)} issues")
                 
         except Exception as e:
-            logger.error(f"Nuclei skill failed: {e}")
+            logger.error(f"Nuclei skill failed: {e}", exc_info=True)
         
         return {
             "success": True,
@@ -167,7 +167,7 @@ class GoSpiderSkill(BaseSkill):
                 logger.info(f"[{self.master.name}] ✅ GoSpider found {len(urls_found)} URLs")
                 
         except Exception as e:
-            logger.error(f"GoSpider skill failed: {e}")
+            logger.error(f"GoSpider skill failed: {e}", exc_info=True)
         
         return {
             "success": True,
@@ -194,7 +194,7 @@ class MutationSkill(BaseSkill):
             if mutations:
                 findings = await self._test_mutations_with_browser(browser_manager, url, target_param, mutations)
         except Exception as e:
-            logger.error(f"Mutation skill failed: {e}")
+            logger.error(f"Mutation skill failed: {e}", exc_info=True)
 
         return {
             "success": True,

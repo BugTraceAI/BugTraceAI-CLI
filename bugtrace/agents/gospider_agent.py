@@ -132,73 +132,94 @@ class GoSpiderAgent(BaseAgent):
         A simple BeautifulSoup discovery method if GoSpider fails.
         """
         import httpx
-        from bs4 import BeautifulSoup
-        from urllib.parse import urljoin
-        
+
         discovered = set()
         discovered.add(self.target)
-        
+
         try:
             async with httpx.AsyncClient(follow_redirects=True, timeout=10.0, verify=False) as client:
-                resp = await client.get(self.target)
-                if resp.status_code == 200:
-                    soup = BeautifulSoup(resp.text, 'html.parser')
-                    for a in soup.find_all('a', href=True):
-                        full_url = urljoin(self.target, a['href'])
-                        # Basic scope check: only same origin or relative
-                        if urlparse(full_url).netloc == urlparse(self.target).netloc:
-                            discovered.add(full_url.split('#')[0]) # Remove fragments
-                    
-                    for form in soup.find_all('form', action=True):
-                        full_url = urljoin(self.target, form['action'])
-                        if urlparse(full_url).netloc == urlparse(self.target).netloc:
-                            discovered.add(full_url.split('#')[0])
+                await self._fallback_parse_html(client, discovered)
 
             # Try Playwright for JS-heavy sites
             js_urls = await self._crawl_with_playwright(self.target)
             for u in js_urls:
                 discovered.add(u.split('#')[0])
-                            
+
             logger.info(f"[{self.name}] Fallback crawler discovered {len(discovered)} URLs (including JS discovery)")
             return list(discovered)
         except Exception as e:
             logger.error(f"Fallback discovery failed: {e}", exc_info=True)
             return [self.target]
 
+    async def _fallback_parse_html(self, client, discovered: set):
+        """Parse HTML and extract URLs from links and forms."""
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin
+
+        resp = await client.get(self.target)
+        if resp.status_code != 200:
+            return
+
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        # Extract links
+        for a in soup.find_all('a', href=True):
+            self._fallback_add_url(urljoin(self.target, a['href']), discovered)
+
+        # Extract forms
+        for form in soup.find_all('form', action=True):
+            self._fallback_add_url(urljoin(self.target, form['action']), discovered)
+
+    def _fallback_add_url(self, full_url: str, discovered: set):
+        """Add URL to discovered set if in scope."""
+        # Basic scope check: only same origin or relative
+        if urlparse(full_url).netloc == urlparse(self.target).netloc:
+            discovered.add(full_url.split('#')[0])  # Remove fragments
+
     async def _crawl_with_playwright(self, base_url: str) -> List[str]:
         """Fallback para sitios JS-heavy que GoSpider no puede crawlear."""
         from bugtrace.tools.visual.browser import browser_manager
-        from urllib.parse import urljoin
 
         urls = []
         try:
             async with browser_manager.get_page() as page:
                 await page.goto(base_url, wait_until="networkidle", timeout=30000)
-
-                # Extraer todos los hrefs
-                links = await page.query_selector_all("a[href]")
-                for link in links:
-                    href = await link.get_attribute("href")
-                    if href and not href.startswith("#"):
-                        full_url = urljoin(base_url, href)
-                        # Scope check
-                        if urlparse(full_url).netloc == urlparse(base_url).netloc:
-                            urls.append(full_url)
-
-                # Extraer forms con action
-                forms = await page.query_selector_all("form[action]")
-                for form in forms:
-                    action = await form.get_attribute("action")
-                    if action:
-                        full_url = urljoin(base_url, action)
-                        # Scope check
-                        if urlparse(full_url).netloc == urlparse(base_url).netloc:
-                            urls.append(full_url)
-
+                await self._playwright_extract_links(page, base_url, urls)
+                await self._playwright_extract_forms(page, base_url, urls)
         except Exception as e:
             logger.warning(f"Playwright crawl failed: {e}")
 
         return list(set(urls))
+
+    async def _playwright_extract_links(self, page, base_url: str, urls: list):
+        """Extract all href links from page."""
+        from urllib.parse import urljoin
+
+        links = await page.query_selector_all("a[href]")
+        for link in links:
+            href = await link.get_attribute("href")
+            if not href or href.startswith("#"):
+                continue
+
+            full_url = urljoin(base_url, href)
+            # Scope check
+            if urlparse(full_url).netloc == urlparse(base_url).netloc:
+                urls.append(full_url)
+
+    async def _playwright_extract_forms(self, page, base_url: str, urls: list):
+        """Extract all form action URLs from page."""
+        from urllib.parse import urljoin
+
+        forms = await page.query_selector_all("form[action]")
+        for form in forms:
+            action = await form.get_attribute("action")
+            if not action:
+                continue
+
+            full_url = urljoin(base_url, action)
+            # Scope check
+            if urlparse(full_url).netloc == urlparse(base_url).netloc:
+                urls.append(full_url)
 
     async def run_loop(self):
         await self.run()

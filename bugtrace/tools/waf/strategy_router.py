@@ -298,7 +298,7 @@ class StrategyRouter:
             logger.debug("Learning data saved successfully")
 
         except Exception as e:
-            logger.error(f"Failed to save learning data: {e}")
+            logger.error(f"Failed to save learning data: {e}", exc_info=True)
 
     def _cleanup_old_backups(self, keep: int = None):
         """Remove old backup files, keeping only the most recent ones (TASK-71)."""
@@ -343,7 +343,7 @@ class StrategyRouter:
             return True
 
         except Exception as e:
-            logger.error(f"Restore failed: {e}")
+            logger.error(f"Restore failed: {e}", exc_info=True)
             return False
 
     def _seed_initial_knowledge(self):
@@ -444,7 +444,7 @@ class StrategyRouter:
             waf_name = validate_name(waf_name, VALID_WAF_TYPES, "waf")
             strategy_name = validate_name(strategy_name, VALID_STRATEGIES, "strategy")
         except ValueError as e:
-            logger.error(f"Invalid input rejected: {e}")
+            logger.error(f"Invalid input rejected: {e}", exc_info=True)
             return  # Don't record invalid data
 
         if waf_name not in self.learning_data:
