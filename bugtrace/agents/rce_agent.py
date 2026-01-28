@@ -72,26 +72,55 @@ class RCEAgent(BaseAgent):
         async with aiohttp.ClientSession() as session:
             for param in self.params:
                 logger.info(f"[{self.name}] Testing RCE on {self.url} (Param: {param})")
-
-                for p in time_payloads:
-                    if "sleep" in p:
-                        dashboard.update_task(f"RCE:{param}", status=f"Testing Time: {p}")
-                        start = time.time()
-                        if await self._test_payload(session, p, param):
-                            elapsed = time.time() - start
-                            if elapsed >= 5:
-                                all_findings.append(self._create_time_based_finding(param, p, elapsed))
-                                break
-                    elif "1+1" in p:
-                        dashboard.update_task(f"RCE:{param}", status=f"Testing Eval: {p}")
-                        target = self._inject_payload(self.url, param, p)
-                        async with session.get(target) as resp:
-                            text = await resp.text()
-                            if "Result: 2" in text:
-                                all_findings.append(self._create_eval_finding(param, p, target))
-                                break
+                finding = await self._test_parameter(session, param, time_payloads)
+                if finding:
+                    all_findings.append(finding)
 
         return {"vulnerable": len(all_findings) > 0, "findings": all_findings}
+
+    async def _test_parameter(self, session, param: str, payloads: List[str]) -> Optional[Dict]:
+        """Test a single parameter with all payloads."""
+        for p in payloads:
+            finding = await self._test_single_payload(session, param, p)
+            if finding:
+                return finding
+        return None
+
+    async def _test_single_payload(self, session, param: str, payload: str) -> Optional[Dict]:
+        """Test a single payload against a parameter."""
+        if "sleep" in payload:
+            return await self._test_time_based(session, param, payload)
+        elif "1+1" in payload:
+            return await self._test_eval_based(session, param, payload)
+        return None
+
+    async def _test_time_based(self, session, param: str, payload: str) -> Optional[Dict]:
+        """Test time-based RCE payload."""
+        dashboard.update_task(f"RCE:{param}", status=f"Testing Time: {payload}")
+        start = time.time()
+
+        if not await self._test_payload(session, payload, param):
+            return None
+
+        elapsed = time.time() - start
+        if elapsed >= 5:
+            return self._create_time_based_finding(param, payload, elapsed)
+        return None
+
+    async def _test_eval_based(self, session, param: str, payload: str) -> Optional[Dict]:
+        """Test eval-based RCE payload."""
+        dashboard.update_task(f"RCE:{param}", status=f"Testing Eval: {payload}")
+        target = self._inject_payload(self.url, param, payload)
+
+        try:
+            async with session.get(target) as resp:
+                text = await resp.text()
+                if "Result: 2" in text:
+                    return self._create_eval_finding(param, payload, target)
+        except Exception as e:
+            logger.debug(f"Eval test failed: {e}")
+
+        return None
 
     async def _test_payload(self, session, payload, param) -> bool:
         """Injects payload and analyzes response."""

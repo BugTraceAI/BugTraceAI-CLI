@@ -837,74 +837,98 @@ Response format (XML):
         Performs strict verification including baseline checks.
         """
         target_url = self._inject(param, payload)
-        
+
         try:
             async with session.get(target_url, timeout=5) as resp:
                 content = await resp.text()
                 final_url = str(resp.url)
-                
-                # Logic from CSTIDetector + NEW Handoff Rules:
-                
-                # 1. Check for arithmetic evaluation: 49 from 7*7
-                if "49" in content:
-                    if "7*7" in payload:
-                        # Payload like {{7*7}} - check 49 present and payload not reflected
-                        if payload not in content:
-                            # CRITICAL: Baseline check
-                            baseline = await self._get_baseline_content(session)
-                            if "49" not in baseline:
-                                return content, final_url
-                    elif "{% if" in payload and "49" in payload:
-                        # Payload like {% if 1 %}49{% endif %} - check syntax stripped
-                        if "{%" not in content and "%}" not in content:
-                            return content, final_url
-                    elif "print" in payload:
-                        if "{%" not in content:
-                            return content, final_url
 
-                # 2. Check for string multiplication (7777777)
-                if "7777777" in content and "'7'*7" in payload:
-                    if payload not in content:
-                        return content, final_url
+                # Check all detection methods
+                if await self._check_arithmetic_evaluation(content, payload, session, final_url):
+                    return content, final_url
 
-                # 3. Check for Config reflection (Jinja2)
-                if ("Config" in content or "&lt;Config" in content) and "{{config}}" in payload:
-                    if payload not in content:
-                        return content, final_url
+                if self._check_string_multiplication(content, payload):
+                    return content, final_url
 
-                # 4. NEW: Engine Specific Signatures
-                # Twig
-                if "{{dump(app)}}" in payload or "{{app.request}}" in payload:
-                    if "Symfony" in content or "Twig" in content:
-                        return content, final_url
-                
-                # Smarty
-                if "{$smarty.version}" in payload:
-                    if re.search(r"Smarty[- ]\d", content):
-                        return content, final_url
-                        
-                # Freemarker
-                if "freemarker" in payload.lower():
-                    if "freemarker" in content.lower():
-                        return content, final_url
+                if self._check_config_reflection(content, payload):
+                    return content, final_url
 
-                # 5. NEW: Error Message Detection (Authority Expansion)
-                error_signatures = [
-                    "jinja2.exceptions",
-                    "Twig_Error_Syntax",
-                    "FreeMarker template error",
-                    "VelocityException",
-                    "org.apache.velocity",
-                    "mako.exceptions"
-                ]
-                for sig in error_signatures:
-                    if sig in content:
-                        logger.info(f"[{self.name}] 🚨 Template Error Detected: {sig}")
-                        return content, final_url
-                        
+                if self._check_engine_signatures(content, payload):
+                    return content, final_url
+
+                if self._check_error_signatures(content):
+                    return content, final_url
+
         except Exception as e:
             logger.debug(f"CSTI test error: {e}")
         return None, None
+
+    async def _check_arithmetic_evaluation(self, content: str, payload: str, session, final_url: str) -> bool:
+        """Check for arithmetic evaluation (7*7=49)."""
+        if "49" not in content:
+            return False
+
+        if "7*7" in payload:
+            # Payload like {{7*7}} - check 49 present and payload not reflected
+            if payload in content:
+                return False
+            # CRITICAL: Baseline check
+            baseline = await self._get_baseline_content(session)
+            return "49" not in baseline
+
+        if "{% if" in payload and "49" in payload:
+            # Payload like {% if 1 %}49{% endif %} - check syntax stripped
+            return "{%" not in content and "%}" not in content
+
+        if "print" in payload:
+            return "{%" not in content
+
+        return False
+
+    def _check_string_multiplication(self, content: str, payload: str) -> bool:
+        """Check for string multiplication (7777777)."""
+        if "7777777" not in content:
+            return False
+        return "'7'*7" in payload and payload not in content
+
+    def _check_config_reflection(self, content: str, payload: str) -> bool:
+        """Check for Config reflection (Jinja2)."""
+        if "{{config}}" not in payload:
+            return False
+        has_config = "Config" in content or "&lt;Config" in content
+        return has_config and payload not in content
+
+    def _check_engine_signatures(self, content: str, payload: str) -> bool:
+        """Check for engine-specific signatures."""
+        # Twig
+        if "{{dump(app)}}" in payload or "{{app.request}}" in payload:
+            return "Symfony" in content or "Twig" in content
+
+        # Smarty
+        if "{$smarty.version}" in payload:
+            return re.search(r"Smarty[- ]\d", content) is not None
+
+        # Freemarker
+        if "freemarker" in payload.lower():
+            return "freemarker" in content.lower()
+
+        return False
+
+    def _check_error_signatures(self, content: str) -> bool:
+        """Check for template error signatures."""
+        error_signatures = [
+            "jinja2.exceptions",
+            "Twig_Error_Syntax",
+            "FreeMarker template error",
+            "VelocityException",
+            "org.apache.velocity",
+            "mako.exceptions"
+        ]
+        for sig in error_signatures:
+            if sig in content:
+                logger.info(f"[{self.name}] 🚨 Template Error Detected: {sig}")
+                return True
+        return False
 
     async def _llm_probe(self, session: aiohttp.ClientSession, param: str) -> Optional[Dict]:
         """Use LLM to generate custom bypasses or target specific engines."""
