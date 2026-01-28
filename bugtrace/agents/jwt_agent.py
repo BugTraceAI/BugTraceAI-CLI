@@ -107,8 +107,6 @@ class JWTAgent(BaseAgent):
 
     async def _check_page_content_for_tokens(self, page, jwt_re, discovered):
         """Check page links and text for JWT tokens."""
-        from urllib.parse import urlparse, parse_qs
-        
         data = await page.evaluate("""
             () => ({
                 links: Array.from(document.querySelectorAll('a[href]')).map(a => a.href),
@@ -116,21 +114,37 @@ class JWTAgent(BaseAgent):
                 html: document.documentElement.innerHTML
             })
         """)
-        
+
         # Check Links
-        for link in data['links']:
-            p_link = urlparse(link)
-            l_params = parse_qs(p_link.query)
-            for val_list in l_params.values():
-                for val in val_list:
-                    if self._is_jwt(val):
-                        discovered.append((val, "link_param"))
-        
+        self._check_page_links_for_tokens(data['links'], discovered)
+
         # Check Text/HTML for JWT strings
+        self._check_page_text_for_tokens(jwt_re, data, discovered)
+
+    def _check_page_links_for_tokens(self, links: List[str], discovered: List):
+        """Check page links for JWT tokens in URL parameters."""
+        for link in links:
+            self._check_single_link_for_tokens(link, discovered)
+
+    def _check_single_link_for_tokens(self, link: str, discovered: List):
+        """Check a single link for JWT tokens in URL parameters."""
+        from urllib.parse import urlparse, parse_qs
+
+        p_link = urlparse(link)
+        l_params = parse_qs(p_link.query)
+        for val_list in l_params.values():
+            for val in val_list:
+                if not self._is_jwt(val):
+                    continue
+                discovered.append((val, "link_param"))
+
+    def _check_page_text_for_tokens(self, jwt_re, data: Dict, discovered: List):
+        """Check page text and HTML for JWT token strings."""
         matches = jwt_re.findall(data['text']) + jwt_re.findall(data['html'])
         for m in matches:
-            if self._is_jwt(m):
-                discovered.append((m, "body_text"))
+            if not self._is_jwt(m):
+                continue
+            discovered.append((m, "body_text"))
 
     async def _check_storage_for_tokens(self, page, discovered):
         """Check cookies and localStorage for JWT tokens."""
@@ -585,32 +599,57 @@ class JWTAgent(BaseAgent):
 
     async def _key_confusion_fetch_keys(self, url: str) -> Tuple[str, List]:
         """Fetch public keys from JWKS endpoint."""
-        from jwt.algorithms import RSAAlgorithm
-        import aiohttp
         from urllib.parse import urlparse
 
         parsed = urlparse(url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
         jwks_url = f"{base_url}/.well-known/jwks.json"
 
-        public_keys = []
+        public_keys = await self._key_confusion_download_jwks(jwks_url)
+        return jwks_url, public_keys
+
+    async def _key_confusion_download_jwks(self, jwks_url: str) -> List:
+        """Download and parse JWKS keys from URL."""
+        import aiohttp
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(jwks_url, timeout=5) as resp:
-                    if resp.status == 200:
-                        jwks = await resp.json()
-                        for key in jwks.get('keys', []):
-                            try:
-                                public_key = RSAAlgorithm.from_jwk(json.dumps(key))
-                                public_keys.append(public_key)
-                            except Exception as e:
-                                logger.debug(f"Failed to parse JWK: {e}")
-                        self.think(f"Found {len(public_keys)} public keys at {jwks_url}")
+                    return await self._key_confusion_process_jwks_response(resp, jwks_url)
         except Exception as e:
             logger.debug(f"Failed to fetch JWKS: {e}")
+            return []
 
-        return jwks_url, public_keys
+    async def _key_confusion_process_jwks_response(self, resp, jwks_url: str) -> List:
+        """Process JWKS HTTP response and parse keys."""
+        if resp.status != 200:
+            return []
+
+        jwks = await resp.json()
+        public_keys = self._key_confusion_parse_jwks(jwks)
+        self.think(f"Found {len(public_keys)} public keys at {jwks_url}")
+        return public_keys
+
+    def _key_confusion_parse_jwks(self, jwks: Dict) -> List:
+        """Parse JWK keys from JWKS response."""
+        from jwt.algorithms import RSAAlgorithm
+
+        public_keys = []
+        for key in jwks.get('keys', []):
+            parsed_key = self._key_confusion_parse_single_jwk(key)
+            if parsed_key:
+                public_keys.append(parsed_key)
+        return public_keys
+
+    def _key_confusion_parse_single_jwk(self, key: Dict):
+        """Parse single JWK key."""
+        from jwt.algorithms import RSAAlgorithm
+
+        try:
+            return RSAAlgorithm.from_jwk(json.dumps(key))
+        except Exception as e:
+            logger.debug(f"Failed to parse JWK: {e}")
+            return None
 
     async def _key_confusion_execute_attack(self, public_keys: List, decoded: Dict, url: str, location: str, jwks_url: str):
         """Execute key confusion attack with all keys and formats."""
@@ -737,12 +776,19 @@ class JWTAgent(BaseAgent):
 
         if "none" in step_lower:
             await self._check_none_algorithm(token, url, location)
-        elif "brute" in step_lower or "secret" in step_lower:
+            return
+
+        if "brute" in step_lower or "secret" in step_lower:
             await self._attack_brute_force(token, url, location)
-        elif "kid" in step_lower or "injection" in step_lower:
+            return
+
+        if "kid" in step_lower or "injection" in step_lower:
             await self._attack_kid_injection(token, url, location)
-        elif "confusion" in step_lower or "rsa" in step_lower or "hs256" in step_lower:
+            return
+
+        if "confusion" in step_lower or "rsa" in step_lower or "hs256" in step_lower:
             await self._attack_key_confusion(token, url, location)
+            return
 
 async def run_jwt_analysis(token: str, url: str) -> Dict:
     """Convenience function for standalone analysis."""
