@@ -40,6 +40,16 @@ class BootSequence:
         Runs all checks and displays the loading screen.
         Returns True if startup should proceed, False if aborted.
         """
+        self._display_boot_banner()
+
+        await self._execute_boot_sequence()
+
+        self._print_summary()
+
+        return self._evaluate_boot_result()
+
+    def _display_boot_banner(self) -> None:
+        """Display the initial boot banner."""
         console.clear()
         console.print(Panel.fit(
             f"[bold cyan]BugtraceAI-CLI[/bold cyan] [dim]v{settings.VERSION} Phoenix Edition[/dim]\n"
@@ -47,8 +57,9 @@ class BootSequence:
             box=box.ROUNDED,
             border_style="cyan"
         ))
-        
-        # Using a Progress bar to show overall boot progress
+
+    async def _execute_boot_sequence(self) -> None:
+        """Execute all boot checks with progress tracking."""
         with Progress(
             SpinnerColumn("dots", style="bold cyan"),
             TextColumn("[bold white]{task.description}"),
@@ -57,35 +68,49 @@ class BootSequence:
             console=console,
             expand=True
         ) as progress:
-            
-            boot_task = progress.add_task("System Boot...", total=len(self.checks))
-            
-            for name, check_func in self.checks:
-                progress.update(boot_task, description=f"Verifying: {name}...")
-                try:
-                    status, details = await check_func()
-                    if status != "OK":
-                        if "CRITICAL" in details:
-                            self.has_critical_error = True
-                            self.results.append((name, "[bold red]FAIL[/]", details))
-                        else:
-                            self.results.append((name, "[bold yellow]WARN[/]", details))
-                    else:
-                        self.results.append((name, "[bold green]OK[/]", details))
-                except Exception as e:
-                    self.has_critical_error = True
-                    self.results.append((name, "[bold red]ERROR[/]", str(e)))
-                
-                progress.advance(boot_task)
-                # Small delay for visual pacing
-                await asyncio.sleep(0.3)
 
-        self._print_summary()
-        
+            boot_task = progress.add_task("System Boot...", total=len(self.checks))
+
+            for name, check_func in self.checks:
+                await self._run_single_check(progress, boot_task, name, check_func)
+
+    async def _run_single_check(
+        self,
+        progress: Progress,
+        boot_task,
+        name: str,
+        check_func
+    ) -> None:
+        """Run a single boot check and record result."""
+        progress.update(boot_task, description=f"Verifying: {name}...")
+
+        try:
+            status, details = await check_func()
+            self._record_check_result(name, status, details)
+        except Exception as e:
+            self.has_critical_error = True
+            self.results.append((name, "[bold red]ERROR[/]", str(e)))
+
+        progress.advance(boot_task)
+        await asyncio.sleep(0.3)  # Visual pacing
+
+    def _record_check_result(self, name: str, status: str, details: str) -> None:
+        """Record the result of a boot check."""
+        if status != "OK":
+            if "CRITICAL" in details:
+                self.has_critical_error = True
+                self.results.append((name, "[bold red]FAIL[/]", details))
+            else:
+                self.results.append((name, "[bold yellow]WARN[/]", details))
+        else:
+            self.results.append((name, "[bold green]OK[/]", details))
+
+    def _evaluate_boot_result(self) -> bool:
+        """Evaluate boot results and return success status."""
         if self.has_critical_error:
             console.print("\n[bold red]System Boot Failed. Critical errors detected.[/bold red]")
             return False
-            
+
         return True
 
     def _print_summary(self):

@@ -517,17 +517,31 @@ class TeamOrchestrator:
         """Build prompt for executive summary generation."""
         import json
         system_prompt = conductor.get_full_system_prompt("ai_writer")
+
         if system_prompt:
             exec_prompt = system_prompt.split("## CISO Executive Summary Prompt (Full)")[-1].split("## ")[0].strip()
         else:
-            exec_prompt = f"""You are a CISO writing an Executive Summary for board-level stakeholders.
+            exec_prompt = self._get_fallback_executive_template()
 
-            TARGET: {report_data["scan_info"]["target"]}
-            TOTAL VULNERABILITIES: {report_data["summary"]["total_findings"]}
-            BY TYPE: {json.dumps(report_data["summary"]["by_type"])}
-            BY SEVERITY: {json.dumps(report_data["summary"]["by_severity"])}
-            ATTACK SURFACE (INPUTS): {len(report_data.get("metadata", {}).get("inputs_found", []))}
-            TECH STACK: {json.dumps(report_data.get("metadata", {}).get("tech_stack", {}))}
+        return exec_prompt.format(
+            target=report_data["scan_info"]["target"],
+            total_findings=report_data["summary"]["total_findings"],
+            by_type=json.dumps(report_data["summary"]["by_type"]),
+            by_severity=json.dumps(report_data["summary"]["by_severity"]),
+            inputs_count=len(report_data.get("metadata", {}).get("inputs_found", [])),
+            tech_stack=json.dumps(report_data.get("metadata", {}).get("tech_stack", {}))
+        )
+
+    def _get_fallback_executive_template(self) -> str:
+        """Return fallback template for executive summary when system prompt unavailable."""
+        return """You are a CISO writing an Executive Summary for board-level stakeholders.
+
+            TARGET: {target}
+            TOTAL VULNERABILITIES: {total_findings}
+            BY TYPE: {by_type}
+            BY SEVERITY: {by_severity}
+            ATTACK SURFACE (INPUTS): {inputs_count}
+            TECH STACK: {tech_stack}
 
             Write a business-focused Executive Summary in Markdown.
 
@@ -557,15 +571,6 @@ class TeamOrchestrator:
 
             TONE: Professional, business-focused. Avoid technical jargon.
             """
-
-        return exec_prompt.format(
-            target=report_data["scan_info"]["target"],
-            total_findings=report_data["summary"]["total_findings"],
-            by_type=json.dumps(report_data["summary"]["by_type"]),
-            by_severity=json.dumps(report_data["summary"]["by_severity"]),
-            inputs_count=len(report_data.get("metadata", {}).get("inputs_found", [])),
-            tech_stack=json.dumps(report_data.get("metadata", {}).get("tech_stack", {}))
-        )
 
     async def _generate_html_report(self, report_dir, tech_md: str, exec_md: str, screenshots: list, findings: list = None):
         """Generate a beautiful HTML report from the markdown."""
@@ -1205,8 +1210,7 @@ class TeamOrchestrator:
             dashboard.log(f"⏩ Skipping already processed URL: {url[:60]}", "INFO")
             return []
 
-        dashboard.log(f"🚀 Processing URL {url_index+1}/{total_urls}: {url[:60]}", "INFO")
-        dashboard.update_task("Orchestrator", status=f"Processing {url[:40]}")
+        self._log_url_processing(url, url_index, total_urls, dashboard)
 
         if dashboard.stop_requested or self._stop_event.is_set():
             return []
@@ -1215,33 +1219,63 @@ class TeamOrchestrator:
         seen_keys = set()
         url_dir = self._create_url_directory(url, analysis_dir)
 
-        # Run DAST analysis
+        # Phase 1: DAST Analysis
+        vulnerabilities = await self._run_dast_analysis(url, url_dir, dashboard)
+
+        if dashboard.stop_requested or self._stop_event.is_set():
+            return []
+
+        # Phase 2: Specialist Dispatch & Execution
+        if vulnerabilities:
+            all_validated_findings = await self._orchestrate_specialists(
+                vulnerabilities, url, url_dir, seen_keys, dashboard
+            )
+
+            if all_validated_findings is None:  # Scan stopped
+                return []
+
+        dashboard.log(f"🎯 Intelligent dispatch complete for {url[:50]}", "SUCCESS")
+
+        # Phase 3: Persistence
+        self._persist_findings(all_validated_findings, url)
+
+        return all_validated_findings
+
+    def _log_url_processing(self, url: str, url_index: int, total_urls: int, dashboard) -> None:
+        """Log URL processing start."""
+        dashboard.log(f"🚀 Processing URL {url_index+1}/{total_urls}: {url[:60]}", "INFO")
+        dashboard.update_task("Orchestrator", status=f"Processing {url[:40]}")
+
+    async def _run_dast_analysis(self, url: str, url_dir: Path, dashboard) -> list:
+        """Run DAST analysis and return vulnerabilities."""
         if dashboard.stop_requested or self._stop_event.is_set():
             return []
 
         dast = DASTySASTAgent(url, self.tech_profile, url_dir, state_manager=self.state_manager)
         analysis_result = await dast.run()
 
-        if dashboard.stop_requested or self._stop_event.is_set():
-            return []
+        return analysis_result.get("vulnerabilities", [])
 
-        vulnerabilities = analysis_result.get("vulnerabilities", [])
+    async def _orchestrate_specialists(
+        self, vulnerabilities: list, url: str, url_dir: Path, seen_keys: set, dashboard
+    ) -> Optional[list]:
+        """Orchestrate specialist agents for found vulnerabilities."""
+        dashboard.log(f"🧠 Orchestrator deciding on {len(vulnerabilities)} potential vulnerabilities...", "INFO")
 
-        if vulnerabilities:
-            dashboard.log(f"🧠 Orchestrator deciding on {len(vulnerabilities)} potential vulnerabilities...", "INFO")
+        all_validated_findings = []
+        process_result = self._create_finding_processor(seen_keys, all_validated_findings, dashboard)
+        dispatch_info = await self._dispatch_specialists(vulnerabilities, url, dashboard, process_result)
+        agent_tasks = await self._build_agent_tasks(dispatch_info, url, url_dir, process_result)
 
-            process_result = self._create_finding_processor(seen_keys, all_validated_findings, dashboard)
-            dispatch_info = await self._dispatch_specialists(vulnerabilities, url, dashboard, process_result)
-            agent_tasks = await self._build_agent_tasks(dispatch_info, url, url_dir, process_result)
+        if agent_tasks:
+            continue_scan = await self._execute_agents(agent_tasks, dashboard)
+            if not continue_scan:
+                return None  # Signal scan stopped
 
-            if agent_tasks:
-                continue_scan = await self._execute_agents(agent_tasks, dashboard)
-                if not continue_scan:
-                    return all_validated_findings
+        return all_validated_findings
 
-        dashboard.log(f"🎯 Intelligent dispatch complete for {url[:50]}", "SUCCESS")
-
-        # Save findings to DB
+    def _persist_findings(self, all_validated_findings: list, url: str) -> None:
+        """Save findings to database and checkpoint."""
         if all_validated_findings:
             try:
                 from bugtrace.core.database import get_db_manager
@@ -1251,7 +1285,6 @@ class TeamOrchestrator:
                 logger.error(f"Failed to save findings to DB: {e}")
 
         self._save_checkpoint(url)
-        return all_validated_findings
 
     async def _run_sequential_pipeline(self, dashboard):
         """Implements the V2 Sequential Pipeline Flow."""

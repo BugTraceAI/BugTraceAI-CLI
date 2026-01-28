@@ -15,66 +15,104 @@ class ToolExecutor:
 
     @staticmethod
     async def run(
-        command: List[str], 
-        timeout: float = 60.0, 
+        command: List[str],
+        timeout: float = 60.0,
         cwd: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         tool_name: str = "Unknown"
     ) -> Tuple[str, str, int]:
         """
         Runs a command asynchronously with a strict timeout.
-        
+
         Returns:
             (stdout, stderr, return_code)
         """
         process: Optional[Process] = None
-        
+
         try:
-            logger.debug(f"[{tool_name}] Executing: {' '.join(command)}")
-            
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-                env=env,
-                # Create a new session group to kill the whole tree if needed
-                start_new_session=True 
+            process = await ToolExecutor._phase_1_spawn_process(
+                command, cwd, env, tool_name
             )
 
-            # Wait with timeout
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(), 
-                timeout=timeout
+            return await ToolExecutor._phase_2_execute_with_timeout(
+                process, timeout, tool_name
             )
-            
-            stdout = stdout_bytes.decode('utf-8', errors='replace')
-            stderr = stderr_bytes.decode('utf-8', errors='replace')
-            
-            return stdout, stderr, process.returncode
 
         except asyncio.TimeoutError:
-            logger.critical(f"[{tool_name}] ⏳ TIMEOUT ({timeout}s). Killing process tree...")
-            
-            if process:
-                try:
-                    # Kill the entire process group (Process + Children)
-                    import os
-                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                    logger.info(f"[{tool_name}] 💀 Process group killed.")
-                except Exception as kill_err:
-                    logger.error(f"[{tool_name}] Failed to kill process: {kill_err}")
-            
-            return "", "TIMEOUT_EXCEEDED", -1
+            return await ToolExecutor._handle_timeout(process, timeout, tool_name)
 
         except Exception as e:
             logger.error(f"[{tool_name}] 💥 Execution Error: {e}")
             return "", str(e), -1
-        
+
         finally:
-            # Final safety net
-            if process and process.returncode is None:
-                try:
-                    process.kill()
-                except (ProcessLookupError, OSError) as e:
-                    logger.debug(f"[{tool_name}] Process cleanup: {e}")
+            ToolExecutor._cleanup_process(process, tool_name)
+
+    @staticmethod
+    async def _phase_1_spawn_process(
+        command: List[str],
+        cwd: Optional[str],
+        env: Optional[Dict[str, str]],
+        tool_name: str
+    ) -> Process:
+        """Spawn the subprocess with proper configuration."""
+        logger.debug(f"[{tool_name}] Executing: {' '.join(command)}")
+
+        return await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+            start_new_session=True  # Create new session group for tree termination
+        )
+
+    @staticmethod
+    async def _phase_2_execute_with_timeout(
+        process: Process,
+        timeout: float,
+        tool_name: str
+    ) -> Tuple[str, str, int]:
+        """Execute process and wait for completion with timeout."""
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            process.communicate(),
+            timeout=timeout
+        )
+
+        stdout = stdout_bytes.decode('utf-8', errors='replace')
+        stderr = stderr_bytes.decode('utf-8', errors='replace')
+
+        return stdout, stderr, process.returncode
+
+    @staticmethod
+    async def _handle_timeout(
+        process: Optional[Process],
+        timeout: float,
+        tool_name: str
+    ) -> Tuple[str, str, int]:
+        """Handle timeout by killing process tree."""
+        logger.critical(f"[{tool_name}] ⏳ TIMEOUT ({timeout}s). Killing process tree...")
+
+        if process:
+            ToolExecutor._kill_process_group(process, tool_name)
+
+        return "", "TIMEOUT_EXCEEDED", -1
+
+    @staticmethod
+    def _kill_process_group(process: Process, tool_name: str) -> None:
+        """Kill the entire process group (parent + children)."""
+        try:
+            import os
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            logger.info(f"[{tool_name}] 💀 Process group killed.")
+        except Exception as kill_err:
+            logger.error(f"[{tool_name}] Failed to kill process: {kill_err}")
+
+    @staticmethod
+    def _cleanup_process(process: Optional[Process], tool_name: str) -> None:
+        """Final safety net - ensure process is terminated."""
+        if process and process.returncode is None:
+            try:
+                process.kill()
+            except (ProcessLookupError, OSError) as e:
+                logger.debug(f"[{tool_name}] Process cleanup: {e}")
