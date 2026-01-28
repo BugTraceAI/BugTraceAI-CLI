@@ -100,8 +100,9 @@ class NucleiSkill(BaseSkill):
             try:
                 session_data = await browser_manager.get_session_data()
                 cookies = session_data.get("cookies", [])
-            except:
-                pass
+            except Exception as e:
+
+                logger.debug(f"Session data fetch failed: {e}")
             
             nuclei_results = await external_tools.run_nuclei(url, cookies)
             
@@ -150,8 +151,9 @@ class GoSpiderSkill(BaseSkill):
             try:
                 session_data = await browser_manager.get_session_data()
                 cookies = session_data.get("cookies", [])
-            except:
-                pass
+            except Exception as e:
+
+                logger.debug(f"Session data fetch failed: {e}")
             
             spider_urls = await external_tools.run_gospider(url, cookies)
             

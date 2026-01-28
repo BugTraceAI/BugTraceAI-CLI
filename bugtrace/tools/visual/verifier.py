@@ -446,10 +446,12 @@ class XSSVerifier:
                 logger.debug(f"Page/Context/Browser close error: {e}")
             try:
                 if context: await context.close()
-            except: pass
+            except Exception as e:
+                logger.debug(f"Context close error: {e}")
             try:
                 if browser: await browser.close()
-            except: pass
+            except Exception as e:
+                logger.debug(f"Context close error: {e}")
 
 
 # Convenience function

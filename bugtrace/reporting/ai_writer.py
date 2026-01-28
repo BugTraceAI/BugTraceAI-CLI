@@ -9,6 +9,9 @@ from bugtrace.core.conductor import conductor
 from bugtrace.core.ui import dashboard
 from bugtrace.reporting.models import ReportContext, Finding, FindingType, Severity
 from bugtrace.reporting.markdown_generator import MarkdownGenerator
+from bugtrace.utils.logger import get_logger
+
+logger = get_logger("reporting.ai_writer")
 
 class AIReportWriter(MarkdownGenerator):
     """
@@ -151,5 +154,6 @@ class AIReportWriter(MarkdownGenerator):
                 dest_path = report_dir / "captures" / img_name
                 try:
                     shutil.copy(img_path, dest_path)
-                except Exception:
-                    pass
+                except (OSError, IOError, PermissionError) as e:
+                    # Non-critical: Screenshot copy failed, report will still generate
+                    logger.warning(f"Failed to copy screenshot {img_name}: {e}")

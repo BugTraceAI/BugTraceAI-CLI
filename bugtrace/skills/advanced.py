@@ -143,7 +143,7 @@ class IDORSkill(BaseSkill):
                                 logger.info(f"[{self.master.name}] ⚠️ Potential IDOR on {param_name}")
                                 break
                     except Exception as e:
-                logger.debug(f"OOB XSS payload injection failed: {e}")
+                        logger.debug(f"IDOR test failed: {e}")
         
         return {"success": True, "findings": findings}
 
@@ -202,8 +202,8 @@ class OpenRedirectSkill(BaseSkill):
                                 })
                                 logger.info(f"[{self.master.name}] ✅ Open Redirect: {location}")
                                 break
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Open redirect test failed: {e}")
         
         return {"success": True, "findings": findings}
 
@@ -243,8 +243,8 @@ class OOBXSSSkill(BaseSkill):
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     await client.get(test_url)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"OOB XSS payload injection failed: {e}")
         
         # Log callback URLs for user reference
         if callback_urls:

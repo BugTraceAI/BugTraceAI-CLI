@@ -4,6 +4,9 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from .models import ReportContext, Finding, FindingType, Severity
+from bugtrace.utils.logger import get_logger
+
+logger = get_logger("reporting.markdown_generator")
 
 class MarkdownGenerator:
     """
@@ -186,8 +189,9 @@ class MarkdownGenerator:
                         try:
                             shutil.copy(img_path, dest_path)
                             f.write(f"\n![Visual Proof](captures/{img_name})\n")
-                        except Exception as e:
-                            pass
+                        except (OSError, IOError, PermissionError) as e:
+                            # Non-critical: Screenshot copy failed, continue without image
+                            logger.warning(f"Failed to copy screenshot {img_name}: {e}")
                     elif img_path:
                          f.write(f"\n*(Screenshot referenced but file not found: {img_path})*\n")
                     

@@ -400,5 +400,6 @@ async def websocket_scan_stream(
         logger.error(f"WebSocket error for scan {scan_id}: {e}", exc_info=True)
         try:
             await websocket.close(code=1011, reason="Internal server error")
-        except Exception:
+        except Exception as close_err:
+            # WebSocket already closed or connection lost - ignore
             pass
