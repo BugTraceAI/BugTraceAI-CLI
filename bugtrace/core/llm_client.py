@@ -202,44 +202,56 @@ class LLMClient:
             return False
 
         dashboard.log("Verifying AI Model Connectivity...", "INFO")
-        valid_models = []
-        
-        # We'll test up to 3 models to avoid long startup times
-        test_pool = self.models[:3] 
-        
-        for model in test_pool:
-            try:
-                # Lightweight "Ping" prompt
-                dashboard.log(f"Pinging model: {model}...", "INFO")
-                # Direct call to avoid the full generate() logic/logging overhead for a ping
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://bugtraceai.com",
-                }
-                payload = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": "Ping"}],
-                    "max_tokens": 5
-                }
-                
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(self.base_url, headers=headers, json=payload, timeout=5) as resp:
-                        if resp.status == 200:
-                            dashboard.log(f"Model {model} is ONLINE.", "SUCCESS")
-                            valid_models.append(model)
-                        else:
-                            dashboard.log(f"Model {model} failed health check ({resp.status}).", "WARN")
-            except Exception as e:
-                dashboard.log(f"Model {model} unreachable: {e}", "WARN")
 
-        if valid_models:
-            # Reorder self.models to prioritize verified ones, keeping others as fallback
-            # But here we just proceed if we have at least one worker.
-            return True
-        else:
-            dashboard.log("CRITICAL: No AI models are responding.", "ERROR")
+        # We'll test up to 3 models to avoid long startup times
+        test_pool = self.models[:3]
+        valid_models = []
+
+        for model in test_pool:
+            if await self._ping_model(model):
+                valid_models.append(model)
+
+        return self._report_connectivity_status(valid_models)
+
+    async def _ping_model(self, model: str) -> bool:
+        """Ping a single model to check connectivity."""
+        dashboard.log(f"Pinging model: {model}...", "INFO")
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://bugtraceai.com",
+        }
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Ping"}],
+            "max_tokens": 5
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.base_url, headers=headers, json=payload, timeout=5) as resp:
+                    return self._log_ping_result(model, resp.status)
+        except Exception as e:
+            dashboard.log(f"Model {model} unreachable: {e}", "WARN")
             return False
+
+    def _log_ping_result(self, model: str, status: int) -> bool:
+        """Log ping result and return success status."""
+        if status == 200:
+            dashboard.log(f"Model {model} is ONLINE.", "SUCCESS")
+            return True
+
+        dashboard.log(f"Model {model} failed health check ({status}).", "WARN")
+        return False
+
+    def _report_connectivity_status(self, valid_models: list) -> bool:
+        """Report overall connectivity status."""
+        if valid_models:
+            return True
+
+        dashboard.log("CRITICAL: No AI models are responding.", "ERROR")
+        return False
 
     def _build_request_payload(
         self,
@@ -405,30 +417,71 @@ class LLMClient:
             headers = self._build_headers(module_name)
             messages = self._build_messages(prompt, system_prompt)
 
-            for current_model in models_to_try:
-                payload = self._build_request_payload(current_model, messages, temperature, max_tokens)
-                start_time = time.time()
+            result = await self._try_generate_with_models(
+                models_to_try, headers, messages, module_name, prompt,
+                temperature, max_tokens, model_override, system_prompt
+            )
 
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(self.base_url, headers=headers, json=payload) as resp:
-                            latency_ms = (time.time() - start_time) * 1000
-                            result = await self._handle_api_response(
-                                resp, current_model, module_name, prompt,
-                                latency_ms, model_override, system_prompt,
-                                temperature, max_tokens
-                            )
-                            if result:
-                                return result
-                except Exception as e:
+            if not result:
+                logger.critical(f"LLM Client: All models exhausted for module {module_name}. Check connectivity or API Key.")
+
+            return result
+
+    async def _try_generate_with_models(
+        self,
+        models_to_try: List[str],
+        headers: Dict[str, str],
+        messages: List[Dict[str, str]],
+        module_name: str,
+        prompt: str,
+        temperature: float,
+        max_tokens: int,
+        model_override: Optional[str],
+        system_prompt: Optional[str]
+    ) -> Optional[str]:
+        """Try generation with each model in the list."""
+        for current_model in models_to_try:
+            result = await self._attempt_model_generation(
+                current_model, headers, messages, module_name, prompt,
+                temperature, max_tokens, model_override, system_prompt
+            )
+            if result:
+                return result
+
+            await asyncio.sleep(0.5)
+
+        return None
+
+    async def _attempt_model_generation(
+        self,
+        current_model: str,
+        headers: Dict[str, str],
+        messages: List[Dict[str, str]],
+        module_name: str,
+        prompt: str,
+        temperature: float,
+        max_tokens: int,
+        model_override: Optional[str],
+        system_prompt: Optional[str]
+    ) -> Optional[str]:
+        """Attempt generation with a single model."""
+        payload = self._build_request_payload(current_model, messages, temperature, max_tokens)
+        start_time = time.time()
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.base_url, headers=headers, json=payload) as resp:
                     latency_ms = (time.time() - start_time) * 1000
-                    self._record_model_call(current_model, success=False, latency_ms=latency_ms)
-                    await self._audit_log(module_name, current_model, prompt, f"EXCEPTION: {str(e)}")
-                    logger.error(f"LLM Shift Exception with {current_model}: {str(e)}")
-
-                await asyncio.sleep(0.5)
-
-            logger.critical(f"LLM Client: All models exhausted for module {module_name}. Check connectivity or API Key.")
+                    return await self._handle_api_response(
+                        resp, current_model, module_name, prompt,
+                        latency_ms, model_override, system_prompt,
+                        temperature, max_tokens
+                    )
+        except Exception as e:
+            latency_ms = (time.time() - start_time) * 1000
+            self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+            await self._audit_log(module_name, current_model, prompt, f"EXCEPTION: {str(e)}")
+            logger.error(f"LLM Shift Exception with {current_model}: {str(e)}", exc_info=True)
             return None
 
     async def _handle_thread_response(
@@ -485,28 +538,46 @@ class LLMClient:
     ) -> Optional[str]:
         """Try multiple models for threaded generation."""
         for current_model in models_to_try:
-            payload = {
-                "model": current_model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens
-            }
-            if settings.OPENROUTER_ONLINE:
-                payload["online"] = True
-
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(self.base_url, headers=headers, json=payload) as resp:
-                        result = await self._handle_thread_response(
-                            resp, current_model, module_name, thread, prompt
-                        )
-                        if result:
-                            return result
-            except Exception as e:
-                logger.error(f"LLM Thread Exception with {current_model}: {str(e)}")
+            result = await self._attempt_thread_model(
+                current_model, headers, messages, temperature, max_tokens,
+                module_name, thread, prompt
+            )
+            if result:
+                return result
 
             await asyncio.sleep(0.5)
         return None
+
+    async def _attempt_thread_model(
+        self,
+        current_model: str,
+        headers: Dict[str, str],
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+        module_name: str,
+        thread: "ConversationThread",
+        prompt: str
+    ) -> Optional[str]:
+        """Attempt threaded generation with a single model."""
+        payload = {
+            "model": current_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens
+        }
+        if settings.OPENROUTER_ONLINE:
+            payload["online"] = True
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.base_url, headers=headers, json=payload) as resp:
+                    return await self._handle_thread_response(
+                        resp, current_model, module_name, thread, prompt
+                    )
+        except Exception as e:
+            logger.error(f"LLM Thread Exception with {current_model}: {str(e)}", exc_info=True)
+            return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     async def generate_with_thread(
@@ -542,28 +613,40 @@ class LLMClient:
 
     async def update_balance(self):
         """Polls OpenRouter for current credit balance."""
-        if not self.api_key: return
+        if not self.api_key:
+            return
+
         try:
             headers = {"Authorization": f"Bearer {self.api_key}"}
             async with aiohttp.ClientSession() as session:
                 async with session.get("https://openrouter.ai/api/v1/auth/key", headers=headers, timeout=5) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        key_data = data.get('data', {})
-                        usage = key_data.get('usage', 0)
-                        limit = key_data.get('limit', 0)
-                        if limit is not None:
-                            balance = float(limit - usage)
-                            dashboard.credits = balance
-                            dashboard.log(f"OpenRouter Balance Checked: ${balance:.4f}", "SUCCESS")
-                        else:
-                            dashboard.credits = 999.0 # Visual indicator for unlimited
-                            dashboard.log("OpenRouter Balance: Unlimited", "SUCCESS")
-                    else:
-                        dashboard.log(f"Failed to check balance: Status {resp.status}", "ERROR")
+                    await self._process_balance_response(resp)
         except Exception as e:
             logger.debug(f"Failed to update balance telemetry: {e}")
             dashboard.log(f"Balance Check Error: {e}", "ERROR")
+
+    async def _process_balance_response(self, resp: aiohttp.ClientResponse):
+        """Process balance API response."""
+        if resp.status != 200:
+            dashboard.log(f"Failed to check balance: Status {resp.status}", "ERROR")
+            return
+
+        data = await resp.json()
+        key_data = data.get('data', {})
+        usage = key_data.get('usage', 0)
+        limit = key_data.get('limit', 0)
+
+        self._update_dashboard_credits(limit, usage)
+
+    def _update_dashboard_credits(self, limit: Optional[float], usage: float):
+        """Update dashboard with credit balance."""
+        if limit is not None:
+            balance = float(limit - usage)
+            dashboard.credits = balance
+            dashboard.log(f"OpenRouter Balance Checked: ${balance:.4f}", "SUCCESS")
+        else:
+            dashboard.credits = 999.0  # Visual indicator for unlimited
+            dashboard.log("OpenRouter Balance: Unlimited", "SUCCESS")
 
     async def analyze_visual(self, image_data: bytes, prompt: str, module_name: str = "Vision") -> Optional[str]:
         """
@@ -571,14 +654,30 @@ class LLMClient:
         """
         import base64
         base64_image = base64.b64encode(image_data).decode('utf-8')
-        
-        headers = {
+
+        headers = self._build_vision_headers(module_name)
+        payload = self._build_vision_payload(prompt, base64_image)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.base_url, headers=headers, json=payload) as resp:
+                    return await self._process_vision_response(resp, module_name, prompt)
+        except Exception as e:
+            logger.error(f"Visual Analysis failed: {e}", exc_info=True)
+            await self._audit_log(f"Vision-{module_name}", settings.VISION_MODEL, prompt, f"ERROR: {str(e)}")
+            return None
+
+    def _build_vision_headers(self, module_name: str) -> Dict[str, str]:
+        """Build headers for vision API request."""
+        return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://bugtraceai.com",
             "X-Title": f"Bugtrace-{module_name}",
         }
 
+    def _build_vision_payload(self, prompt: str, base64_image: str) -> Dict[str, Any]:
+        """Build payload for vision API request."""
         payload = {
             "model": settings.VISION_MODEL,
             "messages": [
@@ -597,24 +696,26 @@ class LLMClient:
             ],
             "max_tokens": 1500
         }
-        
-        # Add online parameter if enabled
+
         if settings.OPENROUTER_ONLINE:
             payload["online"] = True
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(self.base_url, headers=headers, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        text = data['choices'][0]['message']['content']
-                        await self._audit_log(f"Vision-{module_name}", settings.VISION_MODEL, prompt, text)
-                        return text
-        except Exception as e:
-            logger.error(f"Visual Analysis failed: {e}")
-            await self._audit_log(f"Vision-{module_name}", settings.VISION_MODEL, prompt, f"ERROR: {str(e)}")
-        
-        return None
+        return payload
+
+    async def _process_vision_response(
+        self,
+        resp: aiohttp.ClientResponse,
+        module_name: str,
+        prompt: str
+    ) -> Optional[str]:
+        """Process vision API response."""
+        if resp.status != 200:
+            return None
+
+        data = await resp.json()
+        text = data['choices'][0]['message']['content']
+        await self._audit_log(f"Vision-{module_name}", settings.VISION_MODEL, prompt, text)
+        return text
 
     async def detect_waf(self, response_text: str, response_headers: str) -> Optional[str]:
         """
@@ -669,36 +770,55 @@ class LLMClient:
         """Generate LLM response with image input (vision model). Cost-conscious: Use sparingly."""
         import base64
         from pathlib import Path
-        
+
         image_file = Path(image_path)
         if not image_file.exists():
             logger.error(f"[{module_name}] Image not found: {image_path}")
             return ""
-        
+
         with open(image_path, 'rb') as f:
             image_data = base64.b64encode(f.read()).decode('utf-8')
-        
+
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}}]}]
-        
+
         async with self.semaphore:
-            async with aiohttp.ClientSession() as session:
-                headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-                payload = {"model": model_override or "qwen/qwen3-vl-8b-thinking", "messages": messages, "temperature": temperature, "max_tokens": 100}
-                
-                try:
-                    async with session.post(self.base_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                            logger.info(f"[{module_name}] Vision response: {result[:100]}")
-                            return result
-                        else:
-                            error_text = await resp.text()
-                            logger.error(f"[{module_name}] Vision API error ({resp.status}): {error_text}")
-                            return ""
-                except Exception as e:
-                    logger.error(f"[{module_name}] Vision call failed: {e}")
-                    return ""
+            return await self._call_vision_api(messages, model_override, module_name, temperature)
+
+    async def _call_vision_api(
+        self,
+        messages: List[Dict[str, Any]],
+        model_override: Optional[str],
+        module_name: str,
+        temperature: float
+    ) -> str:
+        """Call vision API with image messages."""
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": model_override or "qwen/qwen3-vl-8b-thinking",
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": 100
+            }
+
+            try:
+                async with session.post(self.base_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    return await self._extract_vision_result(resp, module_name)
+            except Exception as e:
+                logger.error(f"[{module_name}] Vision call failed: {e}", exc_info=True)
+                return ""
+
+    async def _extract_vision_result(self, resp: aiohttp.ClientResponse, module_name: str) -> str:
+        """Extract result from vision API response."""
+        if resp.status != 200:
+            error_text = await resp.text()
+            logger.error(f"[{module_name}] Vision API error ({resp.status}): {error_text}")
+            return ""
+
+        data = await resp.json()
+        result = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        logger.info(f"[{module_name}] Vision response: {result[:100]}")
+        return result
 
     # ========== TASK-129: Response Validation ==========
     def validate_json_response(self, response: str, schema: Optional[Dict] = None) -> Optional[Dict]:
@@ -844,20 +964,33 @@ class LLMClient:
         if data_str == '[DONE]':
             return full_response, None
 
+        return self._extract_stream_chunk(data_str, full_response, on_chunk)
+
+    def _extract_stream_chunk(
+        self,
+        data_str: str,
+        full_response: str,
+        on_chunk: Optional[callable]
+    ) -> tuple[str, Optional[str]]:
+        """Extract chunk from stream data."""
         try:
             data = json.loads(data_str)
-            if 'choices' in data and len(data['choices']) > 0:
-                delta = data['choices'][0].get('delta', {})
-                chunk = delta.get('content', '')
-                if chunk:
-                    full_response += chunk
-                    if on_chunk:
-                        on_chunk(chunk)
-                    return full_response, chunk
-        except json.JSONDecodeError:
-            pass
+            if 'choices' not in data or len(data['choices']) == 0:
+                return full_response, None
 
-        return full_response, None
+            delta = data['choices'][0].get('delta', {})
+            chunk = delta.get('content', '')
+
+            if not chunk:
+                return full_response, None
+
+            full_response += chunk
+            if on_chunk:
+                on_chunk(chunk)
+            return full_response, chunk
+
+        except json.JSONDecodeError:
+            return full_response, None
 
     async def _stream_response_content(
         self,
@@ -898,32 +1031,75 @@ class LLMClient:
 
             headers = self._build_headers(module_name)
             messages = self._build_messages(prompt, system_prompt)
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                "stream": True
-            }
+            payload = self._build_stream_payload(model, messages, temperature, max_tokens)
 
-            full_response = ""
+            async for chunk, full_response in self._execute_stream_request(
+                headers, payload, on_chunk, module_name, model, prompt
+            ):
+                if chunk:
+                    yield chunk
+
+    def _build_stream_payload(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int
+    ) -> Dict[str, Any]:
+        """Build payload for streaming request."""
+        return {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True
+        }
+
+    async def _execute_stream_request(
+        self,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        on_chunk: Optional[callable],
+        module_name: str,
+        model: str,
+        prompt: str
+    ):
+        """Execute streaming API request."""
+        full_response = ""
+
+        try:
+            session = aiohttp.ClientSession()
+            resp = await session.post(self.base_url, headers=headers, json=payload)
+
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(self.base_url, headers=headers, json=payload) as resp:
-                        if resp.status != 200:
-                            error_text = await resp.text()
-                            logger.error(f"Stream error ({resp.status}): {error_text}")
-                            return
+                async for chunk, full_response in self._handle_stream_response(
+                    resp, full_response, on_chunk
+                ):
+                    yield chunk, full_response
+            finally:
+                await resp.close()
+                await session.close()
 
-                        async for chunk, full_response in self._stream_response_content(
-                            resp, full_response, on_chunk
-                        ):
-                            if chunk:
-                                yield chunk
+            await self._audit_log(module_name, model, prompt, full_response)
+        except Exception as e:
+            logger.error(f"Streaming error: {e}", exc_info=True)
 
-                await self._audit_log(module_name, model, prompt, full_response)
-            except Exception as e:
-                logger.error(f"Streaming error: {e}")
+    async def _handle_stream_response(
+        self,
+        resp: aiohttp.ClientResponse,
+        full_response: str,
+        on_chunk: Optional[callable]
+    ):
+        """Handle streaming response and yield chunks."""
+        if resp.status != 200:
+            error_text = await resp.text()
+            logger.error(f"Stream error ({resp.status}): {error_text}")
+            return
+
+        async for chunk, full_response in self._stream_response_content(
+            resp, full_response, on_chunk
+        ):
+            yield chunk, full_response
 
 
 # Singleton instance
