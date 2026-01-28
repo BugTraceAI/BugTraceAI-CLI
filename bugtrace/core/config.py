@@ -223,90 +223,125 @@ class Settings(BaseSettings):
 
 
 
+    def _load_crawler_config(self, config):
+        """Load CRAWLER section config."""
+        if "CRAWLER" not in config:
+            return
+        if "EXCLUDE_EXTENSIONS" in config["CRAWLER"]:
+            self.CRAWLER_EXCLUDE_EXTENSIONS = config["CRAWLER"]["EXCLUDE_EXTENSIONS"]
+        if "INCLUDE_EXTENSIONS" in config["CRAWLER"]:
+            self.CRAWLER_INCLUDE_EXTENSIONS = config["CRAWLER"]["INCLUDE_EXTENSIONS"]
+
+    def _load_scan_config(self, config):
+        """Load SCAN section config."""
+        if "SCAN" not in config:
+            return
+        if "MAX_DEPTH" in config["SCAN"]:
+            self.MAX_DEPTH = config["SCAN"].getint("MAX_DEPTH")
+        if "MAX_URLS" in config["SCAN"]:
+            self.MAX_URLS = config["SCAN"].getint("MAX_URLS")
+        if "MAX_CONCURRENT_URL_AGENTS" in config["SCAN"]:
+            self.MAX_CONCURRENT_URL_AGENTS = config["SCAN"].getint("MAX_CONCURRENT_URL_AGENTS")
+
+    def _load_llm_models_config(self, config):
+        """Load LLM_MODELS section config."""
+        if "LLM_MODELS" not in config:
+            return
+        section = config["LLM_MODELS"]
+        if "DEFAULT_MODEL" in section: self.DEFAULT_MODEL = section["DEFAULT_MODEL"]
+        if "PRIMARY_MODELS" in section: self.PRIMARY_MODELS = section["PRIMARY_MODELS"]
+        if "VISION_MODEL" in section: self.VISION_MODEL = section["VISION_MODEL"]
+        if "WAF_DETECTION_MODELS" in section: self.WAF_DETECTION_MODELS = section["WAF_DETECTION_MODELS"]
+        if "CODE_MODEL" in section: self.CODE_MODEL = section["CODE_MODEL"]
+        if "MUTATION_MODEL" in section: self.MUTATION_MODEL = section["MUTATION_MODEL"]
+        if "ANALYSIS_MODEL" in section: self.ANALYSIS_MODEL = section["ANALYSIS_MODEL"]
+        if "SKEPTICAL_MODEL" in section: self.SKEPTICAL_MODEL = section["SKEPTICAL_MODEL"]
+        if "MAX_CONCURRENT_REQUESTS" in section:
+            self.MAX_CONCURRENT_REQUESTS = section.getint("MAX_CONCURRENT_REQUESTS")
+
+    def _load_conductor_and_scanning_config(self, config):
+        """Load CONDUCTOR and SCANNING sections."""
+        if "OPENROUTER" in config:
+            if "ONLINE" in config["OPENROUTER"]:
+                self.OPENROUTER_ONLINE = config["OPENROUTER"].getboolean("ONLINE")
+
+        if "CONDUCTOR" in config:
+            section = config["CONDUCTOR"]
+            if "DISABLE_VALIDATION" in section:
+                self.CONDUCTOR_DISABLE_VALIDATION = section.getboolean("DISABLE_VALIDATION")
+            if "CONTEXT_REFRESH_INTERVAL" in section:
+                self.CONDUCTOR_CONTEXT_REFRESH_INTERVAL = section.getint("CONTEXT_REFRESH_INTERVAL")
+            if "MIN_CONFIDENCE" in section:
+                self.CONDUCTOR_MIN_CONFIDENCE = section.getfloat("MIN_CONFIDENCE")
+            if "ENABLE_FP_DETECTION" in section:
+                self.CONDUCTOR_ENABLE_FP_DETECTION = section.getboolean("ENABLE_FP_DETECTION")
+
+        if "SCANNING" in config:
+            section = config["SCANNING"]
+            if "STOP_ON_CRITICAL" in section:
+                self.STOP_ON_CRITICAL = section.getboolean("STOP_ON_CRITICAL")
+            if "CRITICAL_TYPES" in section: self.CRITICAL_TYPES = section["CRITICAL_TYPES"]
+            if "MANDATORY_SQLMAP_VALIDATION" in section:
+                self.MANDATORY_SQLMAP_VALIDATION = section.getboolean("MANDATORY_SQLMAP_VALIDATION")
+            if "SKIP_VALIDATED_PARAMS" in section:
+                self.SKIP_VALIDATED_PARAMS = section.getboolean("SKIP_VALIDATED_PARAMS")
+
+    def _load_analysis_and_misc_config(self, config):
+        """Load ANALYSIS, BROWSER, ADVANCED, REPORT, OPTIMIZATION sections."""
+        if "ANALYSIS" in config:
+            section = config["ANALYSIS"]
+            if "ENABLE_ANALYSIS" in section:
+                self.ANALYSIS_ENABLE = section.getboolean("ENABLE_ANALYSIS")
+            if "PENTESTER_MODEL" in section:
+                self.ANALYSIS_PENTESTER_MODEL = section["PENTESTER_MODEL"]
+            if "BUG_BOUNTY_MODEL" in section:
+                self.ANALYSIS_BUG_BOUNTY_MODEL = section["BUG_BOUNTY_MODEL"]
+            if "AUDITOR_MODEL" in section:
+                self.ANALYSIS_AUDITOR_MODEL = section["AUDITOR_MODEL"]
+            if "CONFIDENCE_THRESHOLD" in section:
+                self.ANALYSIS_CONFIDENCE_THRESHOLD = section.getfloat("CONFIDENCE_THRESHOLD")
+            if "SKIP_THRESHOLD" in section:
+                self.ANALYSIS_SKIP_THRESHOLD = section.getfloat("SKIP_THRESHOLD")
+            if "CONSENSUS_VOTES" in section:
+                self.ANALYSIS_CONSENSUS_VOTES = section.getint("CONSENSUS_VOTES")
+
+        if "BROWSER" in config:
+            if "HEADLESS" in config["BROWSER"]:
+                self.HEADLESS_BROWSER = config["BROWSER"].getboolean("HEADLESS")
+
+        if "ADVANCED" in config:
+            if "TRACING_ENABLED" in config["ADVANCED"]:
+                self.TRACING_ENABLED = config["ADVANCED"].getboolean("TRACING_ENABLED")
+            if "INTERACTSH_SERVER" in config["ADVANCED"]:
+                self.INTERACTSH_SERVER = config["ADVANCED"]["INTERACTSH_SERVER"]
+
+        if "REPORT" in config:
+            if "ONLY_VALIDATED" in config["REPORT"]:
+                self.REPORT_ONLY_VALIDATED = config["REPORT"].getboolean("ONLY_VALIDATED")
+
+        if "OPTIMIZATION" in config:
+            if "EARLY_EXIT_ON_FINDING" in config["OPTIMIZATION"]:
+                self.EARLY_EXIT_ON_FINDING = config["OPTIMIZATION"].getboolean("EARLY_EXIT_ON_FINDING")
+
+        if "SKEPTICAL_THRESHOLDS" in config:
+            for key in config["SKEPTICAL_THRESHOLDS"]:
+                self.SKEPTICAL_THRESHOLDS[key.upper()] = config["SKEPTICAL_THRESHOLDS"].getint(key)
+
     def load_from_conf(self):
         """Overrides settings with values from bugtraceaicli.conf"""
         import configparser
         config = configparser.ConfigParser()
         conf_path = self.BASE_DIR / "bugtraceaicli.conf"
-        
-        if conf_path.exists():
-            config.read(conf_path)
-            
-            # CORE
-            # ... existing parsing ...
-            
-            # CRAWLER (URL extension filtering)
-            if "CRAWLER" in config:
-                if "EXCLUDE_EXTENSIONS" in config["CRAWLER"]: self.CRAWLER_EXCLUDE_EXTENSIONS = config["CRAWLER"]["EXCLUDE_EXTENSIONS"]
-                if "INCLUDE_EXTENSIONS" in config["CRAWLER"]: self.CRAWLER_INCLUDE_EXTENSIONS = config["CRAWLER"]["INCLUDE_EXTENSIONS"]
-            
-            # SCAN
-            if "SCAN" in config:
-                if "MAX_DEPTH" in config["SCAN"]: self.MAX_DEPTH = config["SCAN"].getint("MAX_DEPTH")
-                if "MAX_URLS" in config["SCAN"]: self.MAX_URLS = config["SCAN"].getint("MAX_URLS")
-                if "MAX_CONCURRENT_URL_AGENTS" in config["SCAN"]: self.MAX_CONCURRENT_URL_AGENTS = config["SCAN"].getint("MAX_CONCURRENT_URL_AGENTS")
 
-            # LLM_MODELS
-            if "LLM_MODELS" in config:
-                if "DEFAULT_MODEL" in config["LLM_MODELS"]: self.DEFAULT_MODEL = config["LLM_MODELS"]["DEFAULT_MODEL"]
-                if "PRIMARY_MODELS" in config["LLM_MODELS"]: self.PRIMARY_MODELS = config["LLM_MODELS"]["PRIMARY_MODELS"]
-                if "VISION_MODEL" in config["LLM_MODELS"]: self.VISION_MODEL = config["LLM_MODELS"]["VISION_MODEL"]
-                if "WAF_DETECTION_MODELS" in config["LLM_MODELS"]: self.WAF_DETECTION_MODELS = config["LLM_MODELS"]["WAF_DETECTION_MODELS"]
-                if "CODE_MODEL" in config["LLM_MODELS"]: self.CODE_MODEL = config["LLM_MODELS"]["CODE_MODEL"]
-                if "MUTATION_MODEL" in config["LLM_MODELS"]: self.MUTATION_MODEL = config["LLM_MODELS"]["MUTATION_MODEL"]
-                if "ANALYSIS_MODEL" in config["LLM_MODELS"]: self.ANALYSIS_MODEL = config["LLM_MODELS"]["ANALYSIS_MODEL"]
-                if "SKEPTICAL_MODEL" in config["LLM_MODELS"]: self.SKEPTICAL_MODEL = config["LLM_MODELS"]["SKEPTICAL_MODEL"]
-                if "MAX_CONCURRENT_REQUESTS" in config["LLM_MODELS"]: self.MAX_CONCURRENT_REQUESTS = config["LLM_MODELS"].getint("MAX_CONCURRENT_REQUESTS")
-            
-            # OPENROUTER
-            if "OPENROUTER" in config:
-                if "ONLINE" in config["OPENROUTER"]: self.OPENROUTER_ONLINE = config["OPENROUTER"].getboolean("ONLINE")
-            
-            # CONDUCTOR
-            if "CONDUCTOR" in config:
-                if "DISABLE_VALIDATION" in config["CONDUCTOR"]: self.CONDUCTOR_DISABLE_VALIDATION = config["CONDUCTOR"].getboolean("DISABLE_VALIDATION")
-                if "CONTEXT_REFRESH_INTERVAL" in config["CONDUCTOR"]: self.CONDUCTOR_CONTEXT_REFRESH_INTERVAL = config["CONDUCTOR"].getint("CONTEXT_REFRESH_INTERVAL")
-                if "MIN_CONFIDENCE" in config["CONDUCTOR"]: self.CONDUCTOR_MIN_CONFIDENCE = config["CONDUCTOR"].getfloat("MIN_CONFIDENCE")
-                if "ENABLE_FP_DETECTION" in config["CONDUCTOR"]: self.CONDUCTOR_ENABLE_FP_DETECTION = config["CONDUCTOR"].getboolean("ENABLE_FP_DETECTION")
-            
-            # SCANNING
-            if "SCANNING" in config:
-                if "STOP_ON_CRITICAL" in config["SCANNING"]: self.STOP_ON_CRITICAL = config["SCANNING"].getboolean("STOP_ON_CRITICAL")
-                if "CRITICAL_TYPES" in config["SCANNING"]: self.CRITICAL_TYPES = config["SCANNING"]["CRITICAL_TYPES"]
-                if "MANDATORY_SQLMAP_VALIDATION" in config["SCANNING"]: self.MANDATORY_SQLMAP_VALIDATION = config["SCANNING"].getboolean("MANDATORY_SQLMAP_VALIDATION")
-                if "SKIP_VALIDATED_PARAMS" in config["SCANNING"]: self.SKIP_VALIDATED_PARAMS = config["SCANNING"].getboolean("SKIP_VALIDATED_PARAMS")
-            
-            # ANALYSIS
-            if "ANALYSIS" in config:
-                if "ENABLE_ANALYSIS" in config["ANALYSIS"]: self.ANALYSIS_ENABLE = config["ANALYSIS"].getboolean("ENABLE_ANALYSIS")
-                if "PENTESTER_MODEL" in config["ANALYSIS"]: self.ANALYSIS_PENTESTER_MODEL = config["ANALYSIS"]["PENTESTER_MODEL"]
-                if "BUG_BOUNTY_MODEL" in config["ANALYSIS"]: self.ANALYSIS_BUG_BOUNTY_MODEL = config["ANALYSIS"]["BUG_BOUNTY_MODEL"]
-                if "AUDITOR_MODEL" in config["ANALYSIS"]: self.ANALYSIS_AUDITOR_MODEL = config["ANALYSIS"]["AUDITOR_MODEL"]
-                if "CONFIDENCE_THRESHOLD" in config["ANALYSIS"]: self.ANALYSIS_CONFIDENCE_THRESHOLD = config["ANALYSIS"].getfloat("CONFIDENCE_THRESHOLD")
-                if "SKIP_THRESHOLD" in config["ANALYSIS"]: self.ANALYSIS_SKIP_THRESHOLD = config["ANALYSIS"].getfloat("SKIP_THRESHOLD")
-                if "CONSENSUS_VOTES" in config["ANALYSIS"]: self.ANALYSIS_CONSENSUS_VOTES = config["ANALYSIS"].getint("CONSENSUS_VOTES")
+        if not conf_path.exists():
+            return
 
-            # BROWSER
-            if "BROWSER" in config:
-                if "HEADLESS" in config["BROWSER"]: self.HEADLESS_BROWSER = config["BROWSER"].getboolean("HEADLESS")
-
-            # TRACING / OOB (v1.6)
-            if "ADVANCED" in config:
-                if "TRACING_ENABLED" in config["ADVANCED"]: self.TRACING_ENABLED = config["ADVANCED"].getboolean("TRACING_ENABLED")
-                if "INTERACTSH_SERVER" in config["ADVANCED"]: self.INTERACTSH_SERVER = config["ADVANCED"]["INTERACTSH_SERVER"]
-            
-            # REPORT
-            if "REPORT" in config:
-                if "ONLY_VALIDATED" in config["REPORT"]: self.REPORT_ONLY_VALIDATED = config["REPORT"].getboolean("ONLY_VALIDATED")
-
-            # OPTIMIZATION
-            if "OPTIMIZATION" in config:
-                if "EARLY_EXIT_ON_FINDING" in config["OPTIMIZATION"]: self.EARLY_EXIT_ON_FINDING = config["OPTIMIZATION"].getboolean("EARLY_EXIT_ON_FINDING")
-
-            # SKEPTICAL_THRESHOLDS
-            if "SKEPTICAL_THRESHOLDS" in config:
-                for key in config["SKEPTICAL_THRESHOLDS"]:
-                    self.SKEPTICAL_THRESHOLDS[key.upper()] = config["SKEPTICAL_THRESHOLDS"].getint(key)
+        config.read(conf_path)
+        self._load_crawler_config(config)
+        self._load_scan_config(config)
+        self._load_llm_models_config(config)
+        self._load_conductor_and_scanning_config(config)
+        self._load_analysis_and_misc_config(config)
 
     # --- Configuration Validation (TASK-120) ---
     def validate_config(self) -> List[str]:
