@@ -890,6 +890,319 @@ class XSSAgent(BaseAgent):
             dashboard.log(f"[{self.name}] ❌ Error: {e}", "ERROR")
             return {"findings": [], "error": str(e)}
 
+
+    async def _probe_and_analyze_context(
+        self, param: str
+    ) -> Tuple[Optional[str], Optional[str], int, Dict, str, str, Dict]:
+        """Phase 1: Probe parameter and analyze context."""
+        # Probe to get HTML with reflection and analyze context
+        html, probe_url, status_code = await self._probe_parameter(param)
+
+        # Use framework's WAF detection
+        waf_detected = self._detected_waf is not None
+        if html == "":
+            dashboard.log(f"[{self.name}] 🛡️ WAF Detected (Probe Blocked). Switching to Direct Fire Strategy.", "WARN")
+            waf_detected = True
+            html = "<html><body>WAF_BLOCKED_PROBE</body></html>"
+
+        if html is None:
+            return None, None, 0, {}, "", "", {}
+
+        # Analyze context
+        global_context = self._analyze_global_context(html)
+        dashboard.log(f"[{self.name}] 🌍 Global Context: {global_context}", "INFO")
+
+        context_data = self._analyze_reflection_context(html, self.PROBE_STRING)
+        context_data["global_context"] = global_context
+
+        # Determine reflection type
+        if not context_data.get("reflected"):
+            if context_data.get("is_blocked"):
+                reflection_type = "waf_blocked"
+                surviving_chars = "unknown"
+            else:
+                reflection_type = "unknown (potential DOM XSS)"
+                surviving_chars = "unknown"
+        else:
+            reflection_type = context_data.get("context", "unknown")
+            surviving_chars = context_data.get("surviving_chars", "")
+
+        # Get injection context for reporting
+        injection_ctx = self.detect_injection_context(html, self.PROBE_STRING)
+        server_escaping = await self.analyze_server_escaping(self.url, param)
+
+        return html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx
+
+    async def _test_smart_llm_payloads(
+        self,
+        param: str,
+        html: str,
+        context_data: Dict,
+        interactsh_url: str,
+        screenshots_dir: Path,
+        reflection_type: str,
+        surviving_chars: str,
+        injection_ctx: Any
+    ) -> Optional[XSSFinding]:
+        """Phase 2: Test LLM-generated smart payloads."""
+        if not context_data.get("reflected", False):
+            return None
+
+        dashboard.log(f"[{self.name}] 🧠 LLM Brain: Analyzing DOM structure...", "INFO")
+
+        smart_payloads = await self._llm_smart_dom_analysis(
+            html=html,
+            param=param,
+            probe_string=self.PROBE_STRING,
+            interactsh_url=interactsh_url,
+            context_data=context_data
+        )
+
+        if not smart_payloads:
+            return None
+
+        dashboard.log(f"[{self.name}] 🎯 Testing {len(smart_payloads)} LLM-generated precision payloads", "INFO")
+
+        for sp in smart_payloads:
+            if self._max_impact_achieved:
+                break
+
+            payload = sp["payload"]
+            dashboard.set_current_payload(payload[:60], "XSS Smart", "Testing")
+
+            response_html = await self._send_payload(param, payload)
+            if not response_html:
+                continue
+
+            validated, evidence = await self._validate(
+                param, payload, response_html, "interactsh", screenshots_dir
+            )
+
+            if validated:
+                finding_data = {
+                    "evidence": evidence,
+                    "screenshot_path": evidence.get("screenshot_path"),
+                    "context": sp.get("reasoning", "LLM Smart Analysis"),
+                    "reflection_context": reflection_type
+                }
+
+                if self._should_create_finding(finding_data):
+                    return self._create_xss_finding(
+                        param, payload, sp.get("reasoning", "LLM Smart Analysis"),
+                        "llm_smart_analysis", evidence, sp.get("confidence", 0.9),
+                        reflection_type, surviving_chars, [payload],
+                        injection_ctx, "context_aware_payload",
+                        sp.get("reasoning", "LLM generated specific payload for this context.")
+                    )
+
+        return None
+
+    async def _test_hybrid_payloads(
+        self,
+        param: str,
+        interactsh_url: str,
+        screenshots_dir: Path,
+        reflection_type: str,
+        surviving_chars: str,
+        context_data: Dict,
+        status_code: int,
+        injection_ctx: Any
+    ) -> Optional[XSSFinding]:
+        """Phase 3: Test hybrid payloads (Learned + Curated + Golden)."""
+        # Get prioritized payloads
+        raw_payloads = self.payload_learner.get_prioritized_payloads(self.GOLDEN_PAYLOADS)
+        hybrid_payloads = self._filter_payloads_by_context(raw_payloads, reflection_type)
+
+        # Adaptive batching
+        from bugtrace.agents.payload_batches import payload_batcher, ProbeResult
+
+        waf_detected = self._detected_waf is not None or context_data.get("is_blocked", False)
+        probe_result = ProbeResult(
+            reflected=context_data.get("reflected", False),
+            surviving_chars=surviving_chars,
+            waf_detected=waf_detected,
+            waf_name=self._detected_waf,
+            context=reflection_type,
+            status_code=status_code
+        )
+
+        # Get adaptive payloads
+        current_batch = "universal"
+        tested_batches = set()
+        hybrid_payloads = []
+
+        while current_batch and current_batch not in tested_batches and len(hybrid_payloads) < 100:
+            tested_batches.add(current_batch)
+
+            new_payloads = payload_batcher.get_batch(current_batch)
+            filtered_batch = self._filter_payloads_by_context(new_payloads, reflection_type)
+            hybrid_payloads.extend(filtered_batch)
+
+            current_batch = payload_batcher.decide_escalation(probe_result, tested_batches)
+
+        if not hybrid_payloads:
+            hybrid_payloads = self._filter_payloads_by_context(raw_payloads, reflection_type)[:50]
+
+        # Q-Learning WAF bypass
+        if self._detected_waf:
+            original_count = len(hybrid_payloads)
+            hybrid_payloads = await self._get_waf_optimized_payloads(hybrid_payloads, max_variants=3)
+            logger.info(f"[{self.name}] 🧠 Q-Learning WAF bypass: {original_count} → {len(hybrid_payloads)} payloads")
+
+        logger.info(f"[{self.name}] ⚡ Adaptive Strategy: Testing {len(hybrid_payloads)} payloads for {param}...")
+
+        # Test payloads
+        return await self._test_payload_list(
+            param, hybrid_payloads, interactsh_url, screenshots_dir,
+            reflection_type, surviving_chars, injection_ctx
+        )
+
+    async def _test_payload_list(
+        self,
+        param: str,
+        hybrid_payloads: List[str],
+        interactsh_url: str,
+        screenshots_dir: Path,
+        reflection_type: str,
+        surviving_chars: str,
+        injection_ctx: Any
+    ) -> Optional[XSSFinding]:
+        """Test a list of payloads and return first successful finding."""
+        successful_payloads = []
+        best_evidence = None
+        best_payload = None
+        best_finding_data = None
+
+        # Fast reflection check using Go fuzzer
+        valid_payloads = [p.replace("{{interactsh_url}}", interactsh_url) for p in hybrid_payloads]
+        reflection_results = await self._fast_reflection_check(self.url, param, valid_payloads)
+
+        if reflection_results:
+            for ref in reflection_results:
+                if self._max_impact_achieved:
+                    break
+
+                reflected_payload = ref["payload"]
+                is_encoded = ref.get("encoded", True)
+                ref_context = ref.get("context", "unknown")
+
+                dashboard.set_current_payload(reflected_payload[:60], "XSS Hybrid", "Validating")
+
+                # Authority check for unencoded dangerous reflections
+                if not is_encoded and ref_context in ["html_text", "attribute_unquoted"]:
+                    return self._create_authority_finding(
+                        param, reflected_payload, ref_context, injection_ctx
+                    )
+
+                # Browser validation
+                validated, evidence = await self._validate(
+                    param, reflected_payload, "", "interactsh", screenshots_dir
+                )
+
+                if validated:
+                    finding_data = {
+                        "evidence": evidence,
+                        "screenshot_path": evidence.get("screenshot_path"),
+                        "context": "hybrid_payload",
+                        "reflection_context": reflection_type
+                    }
+
+                    if self._should_create_finding(finding_data):
+                        self.payload_learner.save_success(reflected_payload, reflection_type, self.url)
+                        successful_payloads.append(reflected_payload)
+
+                        if not best_payload:
+                            best_payload = reflected_payload
+                            best_evidence = evidence
+                            best_finding_data = finding_data
+
+                        should_stop, stop_reason = self._should_stop_testing(
+                            reflected_payload, evidence, len(successful_payloads)
+                        )
+                        if should_stop:
+                            break
+
+        if successful_payloads:
+            return self._create_xss_finding(
+                param, best_payload, best_finding_data.get("context", "hybrid_payload"),
+                "interactsh", best_evidence, 1.0,
+                reflection_type, surviving_chars, successful_payloads,
+                injection_ctx, "hybrid_optimized",
+                "Hybrid strategy found a working payload from known patterns."
+            )
+
+        return None
+
+    def _create_xss_finding(
+        self, param: str, payload: str, context: str, validation_method: str,
+        evidence: Dict, confidence: float, reflection_type: str, surviving_chars: str,
+        successful_payloads: List[str], injection_ctx: Any, bypass_technique: str,
+        bypass_explanation: str
+    ) -> XSSFinding:
+        """Create an XSSFinding with all required fields."""
+        status, validated = self._determine_validation_status({"evidence": evidence})
+
+        return XSSFinding(
+            url=self.url,
+            parameter=param,
+            payload=payload,
+            context=context,
+            validation_method=validation_method,
+            evidence=evidence,
+            confidence=confidence,
+            status=status,
+            validated=validated,
+            screenshot_path=evidence.get("screenshot_path"),
+            reflection_context=reflection_type,
+            surviving_chars=surviving_chars,
+            successful_payloads=successful_payloads,
+            xss_type="reflected",
+            injection_context_type=injection_ctx.type,
+            vulnerable_code_snippet=injection_ctx.code_snippet,
+            server_escaping=getattr(self, '_last_server_escaping', {}),
+            escape_bypass_technique=bypass_technique,
+            bypass_explanation=bypass_explanation,
+            exploit_url=self.build_exploit_url(self.url, param, payload, encoded=False),
+            exploit_url_encoded=self.build_exploit_url(self.url, param, payload, encoded=True),
+            verification_methods=self.generate_verification_methods(self.url, param, injection_ctx, payload),
+            verification_warnings=self.get_verification_warnings(injection_ctx),
+            reproduction_steps=self.generate_repro_steps(self.url, param, injection_ctx, payload)
+        )
+
+    def _create_authority_finding(
+        self, param: str, payload: str, ref_context: str, injection_ctx: Any
+    ) -> XSSFinding:
+        """Create finding for authority-confirmed XSS (unencoded reflection)."""
+        evidence = {
+            "payload": payload,
+            "unencoded_reflection": True,
+            "reflection_context": ref_context,
+            "description": f"Reflected without encoding in {ref_context} context (Go Fuzzer Authority)."
+        }
+
+        return XSSFinding(
+            url=self.url,
+            parameter=param,
+            payload=payload,
+            context="reflected_unencoded",
+            validation_method="go_fuzzer_authority",
+            evidence=evidence,
+            confidence=1.0,
+            status="VALIDATED_CONFIRMED",
+            reflection_context=ref_context,
+            xss_type="reflected",
+            injection_context_type=injection_ctx.type,
+            vulnerable_code_snippet=injection_ctx.code_snippet,
+            server_escaping=getattr(self, '_last_server_escaping', {}),
+            escape_bypass_technique="none_needed",
+            bypass_explanation="Payload was reflected without encoding.",
+            exploit_url=self.build_exploit_url(self.url, param, payload, encoded=False),
+            exploit_url_encoded=self.build_exploit_url(self.url, param, payload, encoded=True),
+            verification_methods=self.generate_verification_methods(self.url, param, injection_ctx, payload),
+            verification_warnings=self.get_verification_warnings(injection_ctx),
+            reproduction_steps=self.generate_repro_steps(self.url, param, injection_ctx, payload)
+        )
+
     async def _test_parameter(
         self,
         param: str,
@@ -899,685 +1212,170 @@ class XSSAgent(BaseAgent):
         """Test a single parameter for XSS."""
         dashboard.log(f"[{self.name}] 🔬 Testing param: {param}", "INFO")
         dashboard.set_status("XSS Analysis", f"Testing {param}")
-        
-        # Step 1: Probe to get HTML with reflection and analyze context
-        html, probe_url, status_code = await self._probe_parameter(param)
 
-        # Note: CSTI detection is now handled by the dedicated CSTIAgent
+        # Phase 1: Probe and analyze context
+        probe_result = await self._probe_and_analyze_context(param)
+        if probe_result[0] is None:
+            return None
 
-        # Use framework's WAF detection (cached from run_loop Phase 0)
-        waf_detected = self._detected_waf is not None
-        if html == "":
-            dashboard.log(f"[{self.name}] 🛡️ WAF Detected (Probe Blocked). Switching to Direct Fire Strategy.", "WARN")
-            waf_detected = True
-            # Fake HTML for analysis to proceed partially
-            html = "<html><body>WAF_BLOCKED_PROBE</body></html>"
-        
-        if html is None: # Hard failure (e.g. network down), not WAF
-             return None
-            
-        # ANALYZE GLOBAL CONTEXT (SNIPER MODE)
-        global_context = self._analyze_global_context(html)
-        dashboard.log(f"[{self.name}] 🌍 Global Context: {global_context}", "INFO")
-            
-        # Analyze reflection context mapping
-        context_data = self._analyze_reflection_context(html, self.PROBE_STRING)
-        context_data["global_context"] = global_context
-        
-        if not context_data.get("reflected"):
-            if context_data.get("is_blocked"):
-                dashboard.log(f"[{self.name}] 🛡️ WAF/Block detected for '{param}'. Brute-forcing bypasses...", "WARN")
-                reflection_type = "waf_blocked"
-                surviving_chars = "unknown"
-            else:
-                dashboard.log(f"[{self.name}] ⚠️ '{param}' not reflected in raw HTML. Trying Golden Payloads for DOM/Blind XSS...", "WARN")
-                reflection_type = "unknown (potential DOM XSS)"
-                surviving_chars = "unknown"
-        else:
-            reflection_type = context_data.get("context", "unknown")
-            surviving_chars = context_data.get("surviving_chars", "")
-            dashboard.log(f"[{self.name}] ✓ Reflection found for '{param}' in <{reflection_type}> context", "INFO")
-        logger.info(f"[{self.name}] Context: {reflection_type}, Surviving: {surviving_chars}")
+        html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx = probe_result
 
-        # REPORTING IMPROVEMENTS (2026-01-24)
-        # Detailed analysis for report generation
-        injection_ctx = self.detect_injection_context(html, self.PROBE_STRING)
-        server_escaping = await self.analyze_server_escaping(self.url, param)
-        dashboard.log(f"[{self.name}] 📝 Context: {injection_ctx.type}, Escaping analyzed.", "INFO")
+        # Cache server escaping for finding creation
+        self._last_server_escaping = await self.analyze_server_escaping(self.url, param)
 
-        # Get interactsh URL for callbacks
-        label = f"xss_{param}".replace("-", "").replace("_", "")[:20]
+        # Get interactsh URL
         interactsh_url = self.interactsh.get_payload_url("xss", param)
 
-        # =========================================================================
-        # STEP 2: LLM AS BRAIN (Primary Strategy) - Smart DOM Analysis
-        # =========================================================================
-        # Instead of brute-forcing 50+ payloads, let the LLM analyze the DOM
-        # and generate 1-3 precision payloads for the exact context.
-
-        if context_data.get("reflected", False):
-            dashboard.log(f"[{self.name}] 🧠 LLM Brain: Analyzing DOM structure...", "INFO")
-
-            smart_payloads = await self._llm_smart_dom_analysis(
-                html=html,
-                param=param,
-                probe_string=self.PROBE_STRING,
-                interactsh_url=interactsh_url,
-                context_data=context_data
-            )
-
-            if smart_payloads:
-                dashboard.log(f"[{self.name}] 🎯 Testing {len(smart_payloads)} LLM-generated precision payloads", "INFO")
-
-                for sp in smart_payloads:
-                    if self._max_impact_achieved:
-                        break
-
-                    payload = sp["payload"]
-                    dashboard.set_current_payload(payload[:60], "XSS Smart", "Testing")
-
-                    # Send and validate
-                    response_html = await self._send_payload(param, payload)
-                    if not response_html:
-                        continue
-
-                    validated, evidence = await self._validate(
-                        param, payload, response_html, "interactsh", screenshots_dir
-                    )
-
-                    if validated:
-                        finding_data = {
-                            "evidence": evidence,
-                            "screenshot_path": evidence.get("screenshot_path"),
-                            "context": sp.get("reasoning", "LLM Smart Analysis"),
-                            "reflection_context": reflection_type
-                        }
-
-                        if self._should_create_finding(finding_data):
-                            dashboard.log(f"[{self.name}] 🏆 LLM SMART PAYLOAD SUCCESS!", "SUCCESS")
-                            self.payload_learner.save_success(payload, reflection_type, self.url)
-
-                            # Check victory hierarchy
-                            should_stop, stop_reason = self._should_stop_testing(
-                                payload, evidence, 1
-                            )
-
-                            status, is_validated = self._determine_validation_status(finding_data)
-                            # Generate reporting data
-                            verification_methods = self.generate_verification_methods(
-                                self.url, param, injection_ctx, payload
-                            )
-                            repro_steps = self.generate_repro_steps(self.url, param, injection_ctx, payload)
-                            exploit_url = self.build_exploit_url(self.url, param, payload, encoded=False)
-                            exploit_url_encoded = self.build_exploit_url(self.url, param, payload, encoded=True)
-
-                            finding = XSSFinding(
-                                url=self.url,
-                                parameter=param,
-                                payload=payload,
-                                context=sp.get("reasoning", "LLM Smart Analysis"),
-                                validation_method="llm_smart_analysis",
-                                evidence=evidence,
-                                confidence=sp.get("confidence", 0.9),
-                                status=status,
-                                validated=is_validated,
-                                screenshot_path=evidence.get("screenshot_path"),
-                                reflection_context=reflection_type,
-                                surviving_chars=surviving_chars,
-                                successful_payloads=[payload],
-                                # NEW REPORTING FIELDS
-                                xss_type="reflected", # Assuming reflected for now
-                                injection_context_type=injection_ctx.type,
-                                vulnerable_code_snippet=injection_ctx.code_snippet,
-                                server_escaping=server_escaping,
-                                escape_bypass_technique="context_aware_payload",
-                                bypass_explanation=sp.get("reasoning", "LLM generated specific payload for this context."),
-                                exploit_url=exploit_url,
-                                exploit_url_encoded=exploit_url_encoded,
-                                verification_methods=verification_methods,
-                                verification_warnings=self.get_verification_warnings(injection_ctx),
-                                reproduction_steps=repro_steps
-                            )
-
-                            if should_stop:
-                                dashboard.log(f"[{self.name}] {stop_reason}", "SUCCESS")
-                                return finding
-
-                            # If medium impact, continue but save this finding
-                            return finding
-
-                logger.info(f"[{self.name}] LLM Smart payloads didn't work, falling back to hybrid strategy")
-            else:
-                logger.info(f"[{self.name}] LLM couldn't generate smart payloads, using hybrid strategy")
-
-        # =========================================================================
-        # STEP 3: FALLBACK - HYBRID PAYLOADS (Learned + Curated + Golden)
-        # =========================================================================
-        # Only reach here if LLM analysis didn't produce results
-        
-        # Get prioritized list from memory
-        raw_payloads = self.payload_learner.get_prioritized_payloads(self.GOLDEN_PAYLOADS)
-        
-        # APPLY SMART CONTEXT FILTERING (Speed optimization)
-        hybrid_payloads = self._filter_payloads_by_context(raw_payloads, reflection_type)
-        
-        # Improvement #4: Limit payloads per parameter
-        # ADAPTIVE BATCHING IMPLEMENTATION (2026-01-20)
-        from bugtrace.agents.payload_batches import payload_batcher, ProbeResult
-        
-        # Build probe result from analysis phase (uses framework's WAF detection)
-        probe_result = ProbeResult(
-            reflected=context_data.get("reflected", False),
-            surviving_chars=surviving_chars,
-            waf_detected=waf_detected or context_data.get("is_blocked", False),
-            waf_name=self._detected_waf,  # Uses Q-Learning WAF detection
-            context=reflection_type,
-            status_code=status_code
+        # Phase 2: LLM Smart DOM Analysis (Primary Strategy)
+        smart_finding = await self._test_smart_llm_payloads(
+            param, html, context_data, interactsh_url, screenshots_dir,
+            reflection_type, surviving_chars, injection_ctx
         )
-        
-        # Get Adaptive Payloads
-        current_batch = "universal"
-        tested_batches = set()
-        hybrid_payloads = [] # Will accumulate payloads here
-        
-        # We fetch up to 2 batches initially to be safe, or just 1 if not promising
-        while current_batch and current_batch not in tested_batches and len(hybrid_payloads) < 100:
-            tested_batches.add(current_batch)
-            
-            new_payloads = payload_batcher.get_batch(current_batch)
-            logger.info(f"[{self.name}] Adding {len(new_payloads)} payloads from batch: {current_batch}")
-            
-            # Smart filter context for these too
-            filtered_batch = self._filter_payloads_by_context(new_payloads, reflection_type)
-            hybrid_payloads.extend(filtered_batch)
-            
-            # Decide if we should escalate immediately based on probe
-            current_batch = payload_batcher.decide_escalation(probe_result, tested_batches)
-            
-        # Fallback to legacy golden payloads if something went wrong
-        if not hybrid_payloads:
-             hybrid_payloads = self._filter_payloads_by_context(raw_payloads, reflection_type)[:50]
+        if smart_finding:
+            return smart_finding
 
-        # =========================================================================
-        # Q-LEARNING WAF BYPASS: Apply intelligent encoding to payloads
-        # =========================================================================
-        if self._detected_waf:
-            original_count = len(hybrid_payloads)
-            hybrid_payloads = await self._get_waf_optimized_payloads(hybrid_payloads, max_variants=3)
-            logger.info(f"[{self.name}] 🧠 Q-Learning WAF bypass: {original_count} → {len(hybrid_payloads)} payloads")
-            dashboard.log(f"[{self.name}] 🧠 Q-Learning: Applying {self._detected_waf} bypass encodings", "INFO")
+        # Phase 3: Hybrid Payloads (Fallback)
+        hybrid_finding = await self._test_hybrid_payloads(
+            param, interactsh_url, screenshots_dir, reflection_type,
+            surviving_chars, context_data, status_code, injection_ctx
+        )
+        if hybrid_finding:
+            return hybrid_finding
 
-        logger.info(f"[{self.name}] ⚡ Adaptive Strategy: Testing {len(hybrid_payloads)} payloads ({tested_batches}) for {param}...")
-        dashboard.log(f"[{self.name}] ⚡ Adaptive Strategy: Testing {len(hybrid_payloads)} payloads ({tested_batches}) for {param}...", "INFO")
-        
-        successful_payloads = []
-        best_evidence = None
-        best_payload = None
-        best_validation_method = "interactsh"
-        best_finding_data = None
-        
-        # OPTIMIZATION (2026-01-20): Batch reflection check using Go fuzzer
-        # Instead of testing one-by-one, we check all hybrid payloads in one go.
-        valid_payloads = [p.replace("{{interactsh_url}}", interactsh_url) for p in hybrid_payloads]
-        reflection_results = await self._fast_reflection_check(self.url, param, valid_payloads)
-        
-        if reflection_results:
-            logger.info(f"[{self.name}] Go fuzzer found {len(reflection_results)} reflections. Checking for authority.")
-            dashboard.log(f"[{self.name}] 🚀 Go fuzzer found {len(reflection_results)} reflections!", "SUCCESS")
-            
-            for ref in reflection_results:
-                # VICTORY HIERARCHY: Check if we should stop based on impact
-                if self._max_impact_achieved:
-                    dashboard.log(f"[{self.name}] 🏆 Maximum impact achieved, skipping remaining payloads", "SUCCESS")
-                    break
-
-                reflected_payload = ref["payload"]
-                is_encoded = ref.get("encoded", True)
-                ref_context = ref.get("context", "unknown")
-                
-                dashboard.set_current_payload(reflected_payload[:60], "XSS Hybrid", "Validating")
-                
-                # --- AUTHORITY CHECK (No browser needed) ---
-                # If unencoded in dangerous context -> CONFIRMED
-                if not is_encoded and ref_context in ["html_text", "attribute_unquoted"]:
-                    dashboard.log(f"[{self.name}] 🚨 AUTHORITY CONFIRMED: Unencoded in {ref_context}", "SUCCESS")
-                    
-                    evidence = {
-                        "payload": reflected_payload,
-                        "unencoded_reflection": True,
-                        "reflection_context": ref_context,
-                        "description": f"Reflected without encoding in {ref_context} context (Go Fuzzer Authority)."
-                    }
-                    
-                    finding_data = {
-                         "evidence": evidence,
-                         "screenshot_path": None,
-                         "context": "hybrid_payload",
-                         "reflection_context": ref_context,
-                         "unencoded_reflection": True
-                    }
-                    
-                    if self._should_create_finding(finding_data):
-                        # Mark as confirmed immediately
-                        return XSSFinding(
-                            url=self.url,
-                            parameter=param,
-                            payload=reflected_payload,
-                            context="reflected_unencoded",
-                            validation_method="go_fuzzer_authority",
-                            evidence=evidence,
-                            confidence=1.0,
-                            status="VALIDATED_CONFIRMED",
-                            reflection_context=ref_context,
-                            # REPORTING FIELDS
-                            xss_type="reflected",
-                            injection_context_type=injection_ctx.type,
-                            vulnerable_code_snippet=injection_ctx.code_snippet,
-                            server_escaping=server_escaping,
-                            escape_bypass_technique="none_needed",
-                            bypass_explanation="Payload was reflected without encoding.",
-                            exploit_url=self.build_exploit_url(self.url, param, reflected_payload, encoded=False),
-                            exploit_url_encoded=self.build_exploit_url(self.url, param, reflected_payload, encoded=True),
-                            verification_methods=self.generate_verification_methods(self.url, param, injection_ctx, reflected_payload),
-                            verification_warnings=self.get_verification_warnings(injection_ctx),
-                            reproduction_steps=self.generate_repro_steps(self.url, param, injection_ctx, reflected_payload)
-                        )
-
-                # --- BROWSER VALIDATION (For encoded or ambiguous cases) ---
-                validated, evidence = await self._validate(
-                    param, 
-                    reflected_payload, 
-                    "", # No response_html needed for browser validation
-                    "interactsh",
-                    screenshots_dir
-                )
-                
-                if validated:
-                    finding_data = {
-                         "evidence": evidence,
-                         "screenshot_path": evidence.get("screenshot_path"),
-                         "context": "hybrid_payload",
-                         "reflection_context": reflection_type
-                    }
-                    
-                    if self._should_create_finding(finding_data):
-                        dashboard.log(f"[{self.name}] 🏆 HYBRID PAYLOAD SUCCESS: {reflected_payload[:30]}...", "SUCCESS")
-                        self.payload_learner.save_success(reflected_payload, reflection_type, self.url)
-                        successful_payloads.append(reflected_payload)
-
-                        # Q-Learning feedback: Record successful bypass
-                        self._record_bypass_result(reflected_payload, success=True)
-
-                        if not best_payload:
-                            best_payload = reflected_payload
-                            best_evidence = evidence
-                            best_finding_data = finding_data
-
-                        # VICTORY HIERARCHY: Check if we should stop
-                        should_stop, stop_reason = self._should_stop_testing(
-                            reflected_payload, evidence, len(successful_payloads)
-                        )
-                        if should_stop:
-                            dashboard.log(f"[{self.name}] {stop_reason}", "SUCCESS")
-                            break
-        else:
-            # Fallback for individual testing (if Go fuzzer is missing or didn't find anything)
-            for gp_template in hybrid_payloads:
-                # VICTORY HIERARCHY: Check if we achieved maximum impact
-                if self._max_impact_achieved:
-                    dashboard.log(f"[{self.name}] 🏆 Maximum impact achieved, skipping remaining payloads", "SUCCESS")
-                    break
-
-                # ADAPTIVE DELAY (Stealth Mode)
-                if self.stealth_mode:
-                    import random
-                    wait_time = random.uniform(2.0, 5.0)
-                    logger.debug(f"Stealth Mode: Waiting {wait_time:.2f}s...")
-                    await asyncio.sleep(wait_time)
-
-                payload = gp_template.replace("{{interactsh_url}}", interactsh_url)
-                
-                dashboard.set_current_payload(payload[:60], "XSS Hybrid", "Fast-Checking")
-                
-                # RAPID CHECK: Send HTTP request first (Fast Fail)
-                response_html = await self._send_payload(param, payload)
-                
-                # Check 1: Reflected? (Smart check)
-                import urllib.parse
-                import html
-                p_decoded = urllib.parse.unquote(payload)
-                p_double_decoded = urllib.parse.unquote(p_decoded)
-                p_html_decoded = html.unescape(p_decoded)
-                
-                reflections = [payload, p_decoded, p_double_decoded, p_html_decoded]
-                reflected = any(ref and ref in response_html for ref in set(reflections))
-                
-                # Check 2: OOB Payload? (Always validate these)
-                is_oob_payload = "interactsh_url" in gp_template
-                
-                if reflected or is_oob_payload:
-                    dashboard.log(f"[{self.name}] 🔍 Reflection confirmed! Launching browser validation for: {payload[:40]}", "INFO")
-                    # For Reflected Payloads, we validate in browser.
-                    validated, evidence = await self._validate(
-                        param, 
-                        payload, 
-                        response_html, 
-                        "interactsh",
-                        screenshots_dir
-                    )
-                    
-                    if validated:
-                        finding_data = {
-                             "evidence": evidence,
-                             "screenshot_path": evidence.get("screenshot_path"),
-                             "context": "hybrid_payload",
-                             "reflection_context": reflection_type
-                        }
-                        
-                        # Before creating finding, check if evidence is strong enough
-                        if not self._should_create_finding(finding_data):
-                            logger.info(f"[{self.name}] Evidence too weak for '{param}', skipping finding creation")
-                            continue
-                            
-                        dashboard.log(f"[{self.name}] 🏆 HYBRID PAYLOAD SUCCESS: {payload[:30]}...", "SUCCESS")
-                        # LEARN: Save success to memory
-                        self.payload_learner.save_success(gp_template, reflection_type, self.url)
-
-                        # Q-Learning feedback: Record successful bypass
-                        self._record_bypass_result(payload, success=True)
-
-                        successful_payloads.append(payload)
-
-                        # Keep the "best" one (first one is usually simplest/best due to prioritization)
-                        if not best_payload:
-                            best_payload = payload
-                            best_evidence = evidence
-                            best_finding_data = finding_data
-
-                        # VICTORY HIERARCHY: Check if we should stop
-                        should_stop, stop_reason = self._should_stop_testing(
-                            payload, evidence, len(successful_payloads)
-                        )
-                        if should_stop:
-                            dashboard.log(f"[{self.name}] {stop_reason}", "SUCCESS")
-                            break
-
-        if successful_payloads:
-            status, validated = self._determine_validation_status(best_finding_data)
-            return XSSFinding(
-                url=self.url,
-                parameter=param,
-                payload=best_payload,
-                context=best_finding_data.get("context", "hybrid_payload"),
-                validation_method=best_validation_method,
-                evidence=best_evidence,
-                confidence=1.0,
-                status=status,
-                validated=validated,
-                screenshot_path=best_evidence.get("screenshot_path"),
-                reflection_context=reflection_type,
-                surviving_chars=surviving_chars,
-                successful_payloads=successful_payloads,
-                # REPORTING FIELDS
-                xss_type="reflected",
-                injection_context_type=injection_ctx.type,
-                vulnerable_code_snippet=injection_ctx.code_snippet,
-                server_escaping=server_escaping,
-                escape_bypass_technique="hybrid_optimized",
-                bypass_explanation="Hybrid strategy found a working payload from known patterns.",
-                exploit_url=self.build_exploit_url(self.url, param, best_payload, encoded=False),
-                exploit_url_encoded=self.build_exploit_url(self.url, param, best_payload, encoded=True),
-                verification_methods=self.generate_verification_methods(self.url, param, injection_ctx, best_payload),
-                verification_warnings=self.get_verification_warnings(injection_ctx),
-                reproduction_steps=self.generate_repro_steps(self.url, param, injection_ctx, best_payload)
-            )
-
-        # Step 2.5: Fragment-Based XSS (Level 7+ Bypass)
-        # Activate if: (1) WAF detected, (2) No reflection, OR (3) After trying most golden payloads
+        # Phase 4: Fragment XSS (Special case for WAF bypass)
         should_try_fragment = (
-            self.consecutive_blocks > 2 or 
+            self.consecutive_blocks > 2 or
             not context_data.get("reflected") or
-            waf_detected
+            self._detected_waf is not None
         )
-        
+
         if should_try_fragment:
             dashboard.log(f"[{self.name}] 🔗 Trying FRAGMENT XSS (Heuristic)...", "WARN")
-            
-            # For Hunter, we don't validate fragments in browser. 
-            # We just note them as potential findings if they look promising.
-            # For Hunter, we don't validate fragments in browser. 
-            # We just note them as potential findings if they look promising.
-            fragment_payloads = []
-            for fragment_template in self.FRAGMENT_PAYLOADS:
-                payload = fragment_template.replace("{{interactsh_url}}", interactsh_url)
-                fragment_payloads.append(payload)
-                
+
+            fragment_payloads = [
+                fp.replace("{{interactsh_url}}", interactsh_url)
+                for fp in self.FRAGMENT_PAYLOADS
+            ]
+
             if fragment_payloads:
-                # Fragment XSS requires CDP browser validation (fragment never reaches server)
-                # Mark explicitly for AgenticValidator
                 return XSSFinding(
                     url=self.url,
                     parameter=param,
-                    payload=fragment_payloads[0],  # Use first as representative
+                    payload=fragment_payloads[0],
                     context="fragment_xss_potential",
                     validation_method="cdp_pending",
                     evidence={
                         "reason": "WAF blocked query params, fragment bypass needs CDP validation",
                         "all_payloads": fragment_payloads,
-                        "needs_cdp": True  # Explicit marker for filtering
+                        "needs_cdp": True
                     },
                     confidence=0.7,
-                    status="PENDING_CDP_VALIDATION",  # Explicit: requires CDP browser validation
+                    status="PENDING_CDP_VALIDATION",
                     validated=False,
                     reflection_context="fragment",
-
                     successful_payloads=fragment_payloads,
-                    # REPORTING FIELDS
-                    xss_type="dom-based", # Fragment is usually DOM based
+                    xss_type="dom-based",
                     injection_context_type="url_fragment",
                     vulnerable_code_snippet="location.hash sink",
-                    server_escaping=server_escaping,
+                    server_escaping=self._last_server_escaping,
                     escape_bypass_technique="fragment_injection",
                     bypass_explanation="Payload injected via URL fragment to avoid server-side WAF.",
                     exploit_url=self.build_exploit_url(self.url, param, fragment_payloads[0], encoded=False),
                     exploit_url_encoded=self.build_exploit_url(self.url, param, fragment_payloads[0], encoded=True),
-                    verification_methods=[{"type": "cdp", "name": "Browser Verification", "instructions": "Must use browser", "url_encoded": self.build_exploit_url(self.url, param, fragment_payloads[0], encoded=True)}],
+                    verification_methods=[{
+                        "type": "cdp",
+                        "name": "Browser Verification",
+                        "instructions": "Must use browser",
+                        "url_encoded": self.build_exploit_url(self.url, param, fragment_payloads[0], encoded=True)
+                    }],
                     verification_warnings=["Fragment XSS requires browser interaction"],
                     reproduction_steps=["Open URL in browser", "Check for execution"]
                 )
 
-        # Step 3: LLM analyzes and generates payload (Fallback if Golden + Fragment failed)
-        
-        # OPTIMIZATION (2026-01-14): Skip expensive LLM analysis if unlikely to work
-        # Logic: If no reflection detected AND no WAF → likely not vulnerable
-        #        Don't waste time/money on LLM analysis
-        if not context_data.get("reflected") and not waf_detected:
+        # Phase 5: LLM Analysis (Expensive fallback)
+        if not context_data.get("reflected") and not self._detected_waf:
             logger.info(f"[{self.name}] ⚡ OPTIMIZATION: Skipping LLM analysis")
-            logger.info(f"[{self.name}] Reason: No reflection + no WAF + Golden payloads failed → likely not vulnerable")
-            dashboard.log(f"[{self.name}] ⚡ Optimization: Skipping LLM (no reflection)", "INFO")
             return None
-            
-        # Passing context data to LLM for precise reasoning
+
         llm_response = await self.exec_tool("LLM_Analysis", self._llm_analyze, html, param, interactsh_url, context_data, timeout=250)
-        
-        if not llm_response:
-            logger.warning(f"[{self.name}] LLM Analysis failed (returned None).")
+
+        if not llm_response or not llm_response.get("vulnerable"):
             return None
-            
-        if not llm_response.get("vulnerable"):
-            dashboard.log(f"[{self.name}] LLM says not vulnerable: {llm_response.get('reasoning', 'N/A')}", "INFO")
-            return None
-        
+
         payload = llm_response.get("payload", "")
         validation_method = llm_response.get("validation_method", "interactsh")
-        
-        dashboard.log(f"[{self.name}] 🤖 LLM generated payload ({llm_response.get('context')})", "INFO")
+
         dashboard.set_current_payload(payload[:60], "XSS", "Testing")
-        
-        # Step 3: Send payload
+
         response_html = await self._send_payload(param, payload)
         if not response_html:
-            logger.warning(f"[{self.name}] 🛡️ SENTINEL: No response from target. Target might be down or WAF killed the connection.")
             return None
-            
-        # PREDICATE CHECK: Verify artifact reflection
-        # ONLY a warning now, does NOT block execution. 
-        # We check both the full payload and the callback host.
-        callback_host = interactsh_url.split('/')[0] if '/' in interactsh_url else interactsh_url
-        sentinel_hit = payload not in response_html and callback_host not in response_html
-            
-        if sentinel_hit:
-            logger.info(f"[{self.name}] 🛡️ SENTINEL: Markers not found in raw HTML. Proceeding with browser validation (could be encoded/dynamic).")
-        else:
-            logger.info(f"[{self.name}] 🛡️ SENTINEL: Reflection confirmed in raw response.")
 
-        # Step 4: Validate
-        dashboard.log(f"[{self.name}] 🔍 Validating LLM payload...", "INFO")
         validated, evidence = await self._validate(
-            param, 
-            payload, 
-            response_html, 
-            validation_method,
-            screenshots_dir
+            param, payload, response_html, validation_method, screenshots_dir
         )
-        
+
         if validated:
             finding_data = {
-                 "evidence": evidence,
-                 "screenshot_path": evidence.get("screenshot_path"),
-                 "context": llm_response.get("context", "unknown"),
-                 "reflection_context": reflection_type
+                "evidence": evidence,
+                "screenshot_path": evidence.get("screenshot_path"),
+                "context": llm_response.get("context", "unknown"),
+                "reflection_context": reflection_type
             }
-            
-            # Before creating finding, check if evidence is strong enough
+
             if not self._should_create_finding(finding_data):
-                logger.info(f"[{self.name}] Evidence too weak for '{param}', skipping finding creation")
-                # Since LLM analysis is expensive, we might want to try bypasses anyway? 
-                # But if reflection is weak, it's probably better to move on.
                 return None
 
-            status, validated = self._determine_validation_status(finding_data)
+            return self._create_xss_finding(
+                param, payload, llm_response.get("context", "unknown"),
+                validation_method, evidence, llm_response.get("confidence", 0.9),
+                reflection_type, surviving_chars, [payload],
+                injection_ctx, "context_aware",
+                llm_response.get("reasoning", "LLM generated context-aware payload.")
+            )
 
-            return XSSFinding(
-                url=self.url,
-                parameter=param,
-                payload=payload,
-                context=llm_response.get("context", "unknown"),
-                validation_method=validation_method,
-                evidence=evidence,
-                confidence=llm_response.get("confidence", 0.9),
-                status=status,
-                validated=validated,
-                screenshot_path=evidence.get("screenshot_path"),
-                reflection_context=reflection_type,
-                surviving_chars=surviving_chars,
-                successful_payloads=[payload],
-                # REPORTING FIELDS
-                xss_type="reflected",
-                injection_context_type=injection_ctx.type,
-                vulnerable_code_snippet=injection_ctx.code_snippet,
-                server_escaping=server_escaping,
-                escape_bypass_technique="context_aware",
-                bypass_explanation=llm_response.get("reasoning", "LLM generated context-aware payload."),
-                exploit_url=self.build_exploit_url(self.url, param, payload, encoded=False),
-                exploit_url_encoded=self.build_exploit_url(self.url, param, payload, encoded=True),
-                verification_methods=self.generate_verification_methods(self.url, param, injection_ctx, payload),
-                verification_warnings=self.get_verification_warnings(injection_ctx),
-                reproduction_steps=self.generate_repro_steps(self.url, param, injection_ctx, payload)
-            )
-        
-        # Step 5: Bypass attempts if initial payload failed
-        # OPTIMIZATION (2026-01-14): Reduce bypass attempts if no WAF detected
-        # Logic: If WAF is blocking → try 6 bypasses
-        #        If no WAF → try only 2 (likely not vulnerable)
-        waf_active = self.consecutive_blocks > 2 or waf_detected
+        # Phase 6: Bypass attempts
+        waf_active = self.consecutive_blocks > 2 or self._detected_waf is not None
         max_attempts = self.MAX_BYPASS_ATTEMPTS if waf_active else 2
-        
-        logger.info(f"[{self.name}] WAF detected: {waf_active}, using {max_attempts} bypass attempts (vs {self.MAX_BYPASS_ATTEMPTS} always)")
-        
+
         for attempt in range(max_attempts):
-            dashboard.log(f"[{self.name}] 🔄 Bypass attempt {attempt + 1}/{max_attempts}", "INFO")
-            
             bypass_response = await self._llm_generate_bypass(
-                payload, 
-                response_html[:50000],
-                interactsh_url
+                payload, response_html[:50000], interactsh_url
             )
-            
+
             if not bypass_response or not bypass_response.get("bypass_payload"):
                 break
-                
+
             bypass_payload = bypass_response.get("bypass_payload")
             dashboard.set_current_payload(bypass_payload[:60], "XSS Bypass", "Testing")
-            
+
             response_html = await self._send_payload(param, bypass_payload)
             validated, evidence = await self._validate(
-                param,
-                bypass_payload,
-                response_html,
-                validation_method,
-                screenshots_dir
+                param, bypass_payload, response_html, validation_method, screenshots_dir
             )
-            
+
             if validated:
                 finding_data = {
-                     "evidence": evidence,
-                     "screenshot_path": evidence.get("screenshot_path"),
-                     "context": bypass_response.get("strategy", "bypass"),
-                     "reflection_context": reflection_type
+                    "evidence": evidence,
+                    "screenshot_path": evidence.get("screenshot_path"),
+                    "context": bypass_response.get("strategy", "bypass"),
+                    "reflection_context": reflection_type
                 }
-                
-                # Before creating finding, check if evidence is strong enough
+
                 if not self._should_create_finding(finding_data):
-                    logger.info(f"[{self.name}] Bypass evidence too weak for '{param}', skipping")
                     continue
 
-                status, validated = self._determine_validation_status(finding_data)
-                
-                return XSSFinding(
-                    url=self.url,
-                    parameter=param,
-                    payload=bypass_payload,
-                    context=bypass_response.get("strategy", "bypass"), # More accurate than generic context
-                    validation_method=validation_method,
-                    evidence=evidence,
-                    confidence=0.95,
-                    status=status,
-                    validated=validated,
-                    screenshot_path=evidence.get("screenshot_path"),
-                    reflection_context=reflection_type,
-                    surviving_chars=surviving_chars,
-                    successful_payloads=[bypass_payload], # List of 1 for now
-                    # REPORTING FIELDS
-                    xss_type="reflected",
-                    injection_context_type=injection_ctx.type,
-                    vulnerable_code_snippet=injection_ctx.code_snippet,
-                    server_escaping=server_escaping,
-                    escape_bypass_technique="waf_bypass",
-                    bypass_explanation=bypass_response.get("reasoning", "LLM generated WAF bypass."),
-                    exploit_url=self.build_exploit_url(self.url, param, bypass_payload, encoded=False),
-                    exploit_url_encoded=self.build_exploit_url(self.url, param, bypass_payload, encoded=True),
-                    verification_methods=self.generate_verification_methods(self.url, param, injection_ctx, bypass_payload),
-                    verification_warnings=self.get_verification_warnings(injection_ctx),
-                    reproduction_steps=self.generate_repro_steps(self.url, param, injection_ctx, bypass_payload)
+                return self._create_xss_finding(
+                    param, bypass_payload, bypass_response.get("strategy", "bypass"),
+                    validation_method, evidence, 0.95,
+                    reflection_type, surviving_chars, [bypass_payload],
+                    injection_ctx, "waf_bypass",
+                    bypass_response.get("reasoning", "LLM generated WAF bypass.")
                 )
-                
-        # If we reach here, we exhausted all bypass attempts.
-        dashboard.log(f"[{self.name}] ❌ No XSS on '{param}' after {self.MAX_BYPASS_ATTEMPTS} bypass attempts", "WARN")
-
-        # Q-Learning feedback: Record failed attempts (for WAF targets)
-        # This helps the system learn which encodings don't work against this WAF
-        if self._detected_waf:
-            self._record_bypass_result("generic_payload", success=False)
-
-        # FEATURE: Mark as Resilient Target if WAF was detected or context was reflected but blocked
-        if reflection_type != "unknown" and surviving_chars != "unknown":
-            dashboard.log(f"[{self.name}] 🛡️ RESILIENT TARGET IDENTIFIED: '{param}' reflected input but blocked all payloads.", "WARN")
-            logger.warning(f"RESILIENT TARGET: {param} - Context: {reflection_type}, Survivors: {surviving_chars}, Attempts: {self.MAX_BYPASS_ATTEMPTS + 1}")
-            # Optional: We could return a "Low" severity info finding here in future versions.
 
         return None
-    
+
+
     def _clean_payload(self, payload: str, param: str) -> str:
         """
         Cleans the payload by removing common hallucinations and LLM pollution.
