@@ -87,6 +87,13 @@ class ChainDiscoveryAgent(BaseAgent):
 
         These are high-value chains commonly seen in bug bounties.
         """
+        templates = []
+        templates.extend(self._get_critical_chain_templates())
+        templates.extend(self._get_high_severity_chain_templates())
+        return templates
+
+    def _get_critical_chain_templates(self) -> List[Dict]:
+        """Get critical severity chain templates."""
         return [
             {
                 "name": "SQLi to RCE",
@@ -103,13 +110,6 @@ class ChainDiscoveryAgent(BaseAgent):
                 "likelihood": 0.6
             },
             {
-                "name": "XSS to Account Takeover",
-                "steps": ["XSS", "Cookie Theft", "Session Hijack", "Account Takeover"],
-                "severity": "HIGH",
-                "impact": "User account compromise",
-                "likelihood": 0.8
-            },
-            {
                 "name": "IDOR to Mass Data Breach",
                 "steps": ["IDOR", "User Enumeration", "Admin ID Discovery", "Full DB Access"],
                 "severity": "CRITICAL",
@@ -124,18 +124,30 @@ class ChainDiscoveryAgent(BaseAgent):
                 "likelihood": 0.6
             },
             {
-                "name": "GraphQL Introspection to Data Leak",
-                "steps": ["GraphQL Discovery", "Introspection", "Sensitive Query", "Data Exfiltration"],
-                "severity": "HIGH",
-                "impact": "Sensitive data exposure",
-                "likelihood": 0.7
-            },
-            {
                 "name": "Path Traversal to Source Code Leak",
                 "steps": ["Path Traversal", "Config File Read", "Credential Extraction", "Database Access"],
                 "severity": "CRITICAL",
                 "impact": "Source code + credentials",
                 "likelihood": 0.5
+            },
+        ]
+
+    def _get_high_severity_chain_templates(self) -> List[Dict]:
+        """Get high severity chain templates."""
+        return [
+            {
+                "name": "XSS to Account Takeover",
+                "steps": ["XSS", "Cookie Theft", "Session Hijack", "Account Takeover"],
+                "severity": "HIGH",
+                "impact": "User account compromise",
+                "likelihood": 0.8
+            },
+            {
+                "name": "GraphQL Introspection to Data Leak",
+                "steps": ["GraphQL Discovery", "Introspection", "Sensitive Query", "Data Exfiltration"],
+                "severity": "HIGH",
+                "impact": "Sensitive data exposure",
+                "likelihood": 0.7
             },
             {
                 "name": "CSRF to Admin Action",
@@ -314,7 +326,19 @@ class ChainDiscoveryAgent(BaseAgent):
         url = step.get("url")
         payload = step.get("payload")
 
-        # Get LLM guidance for this step
+        try:
+            # Get exploitation guidance from LLM
+            guidance = await self._step_get_llm_guidance(template, step_name, url, payload)
+
+            # Execute and return result
+            return self._step_execute_and_validate(step_name, guidance)
+
+        except Exception as e:
+            logger.error(f"Step exploitation failed: {e}", exc_info=True)
+            return self._step_build_error(step_name, e)
+
+    async def _step_get_llm_guidance(self, template: Dict, step_name: str, url: str, payload: str) -> Dict:
+        """Get LLM guidance for exploitation step."""
         prompt = f"""
 You are an expert penetration tester. You've discovered a vulnerability chain.
 
@@ -341,35 +365,35 @@ Format as JSON:
 }}
 """
 
-        try:
-            response = await llm_client.generate(prompt, "ChainExploiter")
-            guidance = json.loads(response)
+        response = await llm_client.generate(prompt, "ChainExploiter")
+        return json.loads(response)
 
-            # Execute the action (simplified - in production, use actual HTTP client)
-            # For now, we simulate success based on vulnerability type
-            simulated_success = step_name in ["SQLi", "XSS", "IDOR", "SSRF", "JWT Analysis"]
+    def _step_execute_and_validate(self, step_name: str, guidance: Dict) -> Dict:
+        """Execute step action and validate success."""
+        # Simulate success based on vulnerability type
+        simulated_success = step_name in ["SQLi", "XSS", "IDOR", "SSRF", "JWT Analysis"]
 
-            if simulated_success:
-                return {
-                    "success": True,
-                    "step": step_name,
-                    "action": guidance.get("action"),
-                    "result": "Exploitation successful (simulated)"
-                }
-            else:
-                return {
-                    "success": False,
-                    "step": step_name,
-                    "error": "Exploitation failed - protection detected"
-                }
-
-        except Exception as e:
-            logger.error(f"Step exploitation failed: {e}", exc_info=True)
+        if simulated_success:
+            return {
+                "success": True,
+                "step": step_name,
+                "action": guidance.get("action"),
+                "result": "Exploitation successful (simulated)"
+            }
+        else:
             return {
                 "success": False,
                 "step": step_name,
-                "error": str(e)
+                "error": "Exploitation failed - protection detected"
             }
+
+    def _step_build_error(self, step_name: str, error: Exception) -> Dict:
+        """Build error result for failed step."""
+        return {
+            "success": False,
+            "step": step_name,
+            "error": str(error)
+        }
 
     async def _report_chain_exploitation(self, template: Dict, chain: List[Dict], exploit_log: List[Dict]):
         """Generate comprehensive chain exploitation report."""
