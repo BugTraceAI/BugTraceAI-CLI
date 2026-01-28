@@ -45,22 +45,22 @@ class CDPResult:
 class CDPClient:
     """
     Chrome DevTools Protocol Client.
-    
+
     Provides direct CDP access for more reliable XSS validation than Playwright.
-    
+
     Features:
     - Console log monitoring (catches all console.log, console.error, etc.)
     - JavaScript execution with proper return values
     - Screenshot capture
     - Network request monitoring
-    
+
     Usage:
         async with CDPClient() as cdp:
             result = await cdp.validate_xss("http://example.com/vuln?q=<script>alert(1)</script>")
             if result.success:
                 print("XSS confirmed!")
     """
-    
+
     def __init__(self, headless: bool = True, port: int = 9222):
         self.headless = headless
         self.port = port
@@ -85,30 +85,28 @@ class CDPClient:
             s.bind(("", 0))
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             return s.getsockname()[1]
-        
+
     async def __aenter__(self):
-        # Dynamically find a free port if default is likely busy or for robustness
-        # But respect the passed port if it was explicit (though here we default to 9222)
-        # Strategy: Try default, if busy/fails, use random
         await self.start()
         return self
-        
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # Reuse logic: don't close unless error
-        if exc_type is not None: 
+        if exc_type is not None:
             logger.warning(f"CDP exit with error: {exc_val}, cleaning up...")
             await self.stop()
-        
+
     async def _check_existing_connection(self) -> bool:
         """Check if existing connection is still healthy."""
-        if self.ws and not self.ws.closed and self.session and not self.session.closed:
-            try:
-                await self._send("Runtime.enable")
-                return True
-            except Exception:
-                logger.warning("CDP connection stale, restarting...")
-                await self.stop()
-        return False
+        if not (self.ws and not self.ws.closed and self.session and not self.session.closed):
+            return False
+
+        try:
+            await self._send("Runtime.enable")
+            return True
+        except Exception:
+            logger.warning("CDP connection stale, restarting...")
+            await self.stop()
+            return False
 
     def _select_port(self):
         """Select an available port for Chrome."""
@@ -162,9 +160,18 @@ class CDPClient:
 
     async def _connect_to_chrome_page(self) -> str:
         """Connect to Chrome page and return WebSocket URL."""
-        page_ws_url = None
-        last_error = None
+        page_ws_url = await self._try_connect_to_existing_page()
 
+        if not page_ws_url:
+            page_ws_url = await self._create_new_chrome_page()
+
+        if not page_ws_url:
+            self._handle_connection_failure()
+
+        return page_ws_url
+
+    async def _try_connect_to_existing_page(self) -> Optional[str]:
+        """Try to connect to an existing Chrome page."""
         for attempt in range(20):
             try:
                 async with self.session.get(
@@ -179,34 +186,34 @@ class CDPClient:
                                 logger.info(f"CDP connected to page: {page_ws_url[:60]}...")
                                 return page_ws_url
             except Exception as e:
-                last_error = e
                 if self.chrome_process.poll() is not None:
                     logger.error(f"Chrome process died early. Return code: {self.chrome_process.returncode}")
-                    break
+                    return None
                 logger.debug(f"Waiting for Chrome... attempt {attempt+1}: {e}")
                 await asyncio.sleep(0.5)
 
-        # Try creating new target if connection failed
-        if not page_ws_url:
-            try:
-                async with self.session.put(
-                    f"http://127.0.0.1:{self.port}/json/new?about:blank",
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as resp:
-                    target = await resp.json()
-                    page_ws_url = target.get("webSocketDebuggerUrl")
-            except Exception as e:
-                logger.error(f"Failed to create new page: {e}")
+        return None
 
-        if not page_ws_url:
-            stderr_output = ""
-            if self.chrome_process and self.chrome_process.stderr:
-                stderr_output = self.chrome_process.stderr.read()
-            logger.error(f"Chrome Start Failed. Stderr: {stderr_output}")
-            await self.stop()
-            raise RuntimeError(f"Failed to connect to Chrome CDP page on port {self.port}. Last error: {last_error}")
+    async def _create_new_chrome_page(self) -> Optional[str]:
+        """Create a new Chrome page."""
+        try:
+            async with self.session.put(
+                f"http://127.0.0.1:{self.port}/json/new?about:blank",
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                target = await resp.json()
+                return target.get("webSocketDebuggerUrl")
+        except Exception as e:
+            logger.error(f"Failed to create new page: {e}")
+            return None
 
-        return page_ws_url
+    def _handle_connection_failure(self):
+        """Handle Chrome connection failure."""
+        stderr_output = ""
+        if self.chrome_process and self.chrome_process.stderr:
+            stderr_output = self.chrome_process.stderr.read()
+        logger.error(f"Chrome Start Failed. Stderr: {stderr_output}")
+        raise RuntimeError(f"Failed to connect to Chrome CDP page on port {self.port}")
 
     async def _inject_xss_polyfill(self):
         """Inject Visual XSS polyfill for alert() detection."""
@@ -244,6 +251,15 @@ class CDPClient:
             raise RuntimeError("Chrome/Chromium not found. Please install Chrome.")
 
         # Launch Chrome
+        await self._launch_chrome(chrome_path)
+
+        # Connect and enable domains
+        await self._connect_and_enable_domains()
+
+        logger.info("CDP Client ready")
+
+    async def _launch_chrome(self, chrome_path: str):
+        """Launch Chrome browser process."""
         chrome_args = self._build_chrome_args(chrome_path)
         logger.info(f"Starting Chrome on port {self.port}...")
         self.chrome_process = subprocess.Popen(
@@ -252,9 +268,10 @@ class CDPClient:
             stderr=subprocess.PIPE,
             text=True
         )
-
         await asyncio.sleep(4.0)
 
+    async def _connect_and_enable_domains(self):
+        """Connect to Chrome and enable CDP domains."""
         self.session = aiohttp.ClientSession()
 
         # Connect to page
@@ -275,56 +292,85 @@ class CDPClient:
         self._add_listener("Console.messageAdded", self._on_console_message)
         self._add_listener("Runtime.consoleAPICalled", self._on_runtime_console)
 
-        logger.info("CDP Client ready")
-        
     async def stop(self):
         """Stop Chrome and cleanup."""
         logger.info("Stopping CDP Client (Releasing port)...")
 
-        # TASK-51: Clear pending responses to prevent memory leaks
+        # Clear pending responses and listeners
+        self._clear_pending_resources()
+
+        # Cancel receiver task
+        await self._cancel_receiver_task()
+
+        # Close connections
+        await self._close_connections()
+
+        # Stop Chrome process
+        self._stop_chrome_process()
+
+        # Cleanup temp directory
+        self._cleanup_temp_directory()
+
+        # Clear internal state
+        self._clear_internal_state()
+
+        logger.info("CDP Client stopped")
+
+    def _clear_pending_resources(self):
+        """Clear pending responses and listeners to prevent memory leaks."""
         for future in self._pending_responses.values():
             if not future.done():
                 future.cancel()
         self._pending_responses.clear()
-
-        # TASK-51: Clear listeners to prevent callback leaks
         self._listeners.clear()
 
-        if self._receive_task:
-            self._receive_task.cancel()
-            try:
-                await self._receive_task
-            except asyncio.CancelledError:
-                pass
+    async def _cancel_receiver_task(self):
+        """Cancel the message receiver task."""
+        if not self._receive_task:
+            return
 
+        self._receive_task.cancel()
+        try:
+            await self._receive_task
+        except asyncio.CancelledError:
+            pass
+
+    async def _close_connections(self):
+        """Close WebSocket and HTTP session connections."""
         if self.ws:
             await self.ws.close()
 
         if self.session:
             await self.session.close()
 
-        if self.chrome_process:
-            self.chrome_process.terminate()
-            try:
-                self.chrome_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.chrome_process.kill()
+    def _stop_chrome_process(self):
+        """Stop the Chrome browser process."""
+        if not self.chrome_process:
+            return
 
-        # Cleanup temp directory
-        if self._temp_dir and self._temp_dir.exists():
-            try:
-                shutil.rmtree(self._temp_dir)
-            except Exception as e:
-                logger.warning(f"Failed to cleanup temp dir: {e}")
+        self.chrome_process.terminate()
+        try:
+            self.chrome_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.chrome_process.kill()
 
-        # Clear internal state
+    def _cleanup_temp_directory(self):
+        """Cleanup temporary directory."""
+        if not (self._temp_dir and self._temp_dir.exists()):
+            return
+
+        try:
+            shutil.rmtree(self._temp_dir)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup temp dir: {e}")
+
+    def _clear_internal_state(self):
+        """Clear internal tracking state."""
         self._console_logs.clear()
         self._network_requests.clear()
         self._alert_detected = False
         self._last_alert_message = None
 
-        logger.info("CDP Client stopped")
-    
     def _find_chrome(self) -> Optional[str]:
         """Find Chrome/Chromium executable."""
         candidates = [
@@ -335,66 +381,49 @@ class CDPClient:
             "/snap/bin/chromium",
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         ]
-        
+
         for path in candidates:
             if Path(path).exists():
                 return path
-        
+
         # Try 'which'
         result = subprocess.run(["which", "google-chrome"], capture_output=True, text=True)
         if result.returncode == 0:
             return result.stdout.strip()
-            
+
         return None
-    
+
     async def _send(self, method: str, params: Optional[Dict] = None) -> Dict:
         """Send CDP command and wait for response."""
         self._message_id += 1
         msg_id = self._message_id
-        
+
         message = {
             "id": msg_id,
             "method": method,
             "params": params or {}
         }
-        
+
         # Create future for response
         future = asyncio.get_event_loop().create_future()
         self._pending_responses[msg_id] = future
-        
+
         await self.ws.send_json(message)
-        
+
         try:
             response = await asyncio.wait_for(future, timeout=30.0)
             return response
         except asyncio.TimeoutError:
             del self._pending_responses[msg_id]
             raise RuntimeError(f"CDP command timed out: {method}")
-    
+
     async def _receive_messages(self):
         """Background task to receive and dispatch CDP messages."""
         try:
             async for msg in self.ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     data = json.loads(msg.data)
-                    
-                    # Handle response to our command
-                    if "id" in data:
-                        msg_id = data["id"]
-                        if msg_id in self._pending_responses:
-                            self._pending_responses[msg_id].set_result(data)
-                            del self._pending_responses[msg_id]
-                    
-                    # Handle events
-                    elif "method" in data:
-                        method = data["method"]
-                        if method in self._listeners:
-                            for listener in self._listeners[method]:
-                                try:
-                                    listener(data.get("params", {}))
-                                except Exception as e:
-                                    logger.error(f"Listener error: {e}")
-                                    
+                    self._handle_cdp_message(data)
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     logger.error(f"WebSocket error: {msg.data}")
                     break
@@ -402,13 +431,32 @@ class CDPClient:
             pass
         except Exception as e:
             logger.error(f"CDP receive error: {e}")
-    
+
+    def _handle_cdp_message(self, data: dict):
+        """Handle received CDP message."""
+        # Handle response to our command
+        if "id" in data:
+            msg_id = data["id"]
+            if msg_id in self._pending_responses:
+                self._pending_responses[msg_id].set_result(data)
+                del self._pending_responses[msg_id]
+
+        # Handle events
+        elif "method" in data:
+            method = data["method"]
+            if method in self._listeners:
+                for listener in self._listeners[method]:
+                    try:
+                        listener(data.get("params", {}))
+                    except Exception as e:
+                        logger.error(f"Listener error: {e}")
+
     def _add_listener(self, event: str, callback: Callable):
         """Add event listener."""
         if event not in self._listeners:
             self._listeners[event] = []
         self._listeners[event].append(callback)
-    
+
     def _on_console_message(self, params: Dict):
         """Handle Console.messageAdded events."""
         message = params.get("message", {})
@@ -418,30 +466,18 @@ class CDPClient:
             "source": "console",
             "timestamp": message.get("timestamp")
         })
-    
+
     def _on_runtime_console(self, params: Dict):
         """Handle Runtime.consoleAPICalled events."""
-        args = params.get("args", [])
-        if not args:
-            return
-            
-        text_parts = []
-        for arg in args:
-            val = arg.get("value")
-            if val is not None:
-                text_parts.append(str(val))
-            elif "description" in arg:
-                text_parts.append(arg["description"])
-                
-        msg = " ".join(text_parts)
-        
+        msg = self._extract_console_message(params)
+
         # Detect Visual Polyfill Alert
         if "BUGTRACE_ALERT_HIT::" in msg:
             self._alert_detected = True
             clean_msg = msg.split("BUGTRACE_ALERT_HIT::")[1]
             self._last_alert_message = clean_msg
             logger.info(f"CDP: JS Dialog detected (Visual Polyfill): {clean_msg}")
-        
+
         # Original logging of runtime console messages
         log_type = params.get("type", "log")
         self._console_logs.append({
@@ -451,31 +487,42 @@ class CDPClient:
             "timestamp": params.get("timestamp")
         })
 
-    
-    # Deprecated: Native dialog handling removed in favor of Visual Polyfill
-    # def _on_dialog_opening(self, params: Dict):
-    #     pass
-    
+    def _extract_console_message(self, params: Dict) -> str:
+        """Extract message text from console API params."""
+        args = params.get("args", [])
+        if not args:
+            return ""
+
+        text_parts = []
+        for arg in args:
+            val = arg.get("value")
+            if val is not None:
+                text_parts.append(str(val))
+            elif "description" in arg:
+                text_parts.append(arg["description"])
+
+        return " ".join(text_parts)
+
     async def navigate(self, url: str) -> bool:
         """Navigate to URL and wait for page load."""
-        self._console_logs.clear()  # Clear logs for new page
-        
+        self._console_logs.clear()
+
         try:
             result = await self._send("Page.navigate", {"url": url})
-            
+
             if "error" in result:
                 logger.error(f"Navigation error: {result['error']}")
                 return False
-            
+
             # Wait for page load
             await self._send("Page.loadEventFired")
-            await asyncio.sleep(1.0)  # Extra time for JS execution
-            
+            await asyncio.sleep(1.0)
+
             return True
         except Exception as e:
             logger.error(f"Navigation failed: {e}")
             return False
-    
+
     async def execute_js(self, expression: str) -> Any:
         """Execute JavaScript and return result."""
         result = await self._send("Runtime.evaluate", {
@@ -483,50 +530,59 @@ class CDPClient:
             "returnByValue": True,
             "awaitPromise": True
         })
-        
+
         if "result" in result and "result" in result["result"]:
             return result["result"]["result"].get("value")
         return None
-    
+
     async def screenshot(self, path: str) -> str:
         """Take screenshot and save to path."""
         try:
-            # Use shorter timeout for screenshot
-            self._message_id += 1
-            msg_id = self._message_id
-            
-            message = {
-                "id": msg_id,
-                "method": "Page.captureScreenshot",
-                "params": {"format": "png"}
-            }
-            
-            future = asyncio.get_event_loop().create_future()
-            self._pending_responses[msg_id] = future
-            
-            await self.ws.send_json(message)
-            
-            # Shorter timeout for screenshot
-            result = await asyncio.wait_for(future, timeout=10.0)
-            
+            result = await self._send_screenshot_command()
+
             if "result" in result and "data" in result["result"]:
-                import base64
-                image_data = base64.b64decode(result["result"]["data"])
-                
-                Path(path).parent.mkdir(parents=True, exist_ok=True)
-                with open(path, "wb") as f:
-                    f.write(image_data)
-                
+                self._save_screenshot_data(result["result"]["data"], path)
                 return path
         except asyncio.TimeoutError:
-            if msg_id in self._pending_responses:
-                del self._pending_responses[msg_id]
             logger.warning("Screenshot timed out (10s)")
         except Exception as e:
             logger.warning(f"Screenshot error: {e}")
-        
+
         raise RuntimeError("Screenshot failed")
-    
+
+    async def _send_screenshot_command(self) -> dict:
+        """Send screenshot capture command with shorter timeout."""
+        self._message_id += 1
+        msg_id = self._message_id
+
+        message = {
+            "id": msg_id,
+            "method": "Page.captureScreenshot",
+            "params": {"format": "png"}
+        }
+
+        future = asyncio.get_event_loop().create_future()
+        self._pending_responses[msg_id] = future
+
+        await self.ws.send_json(message)
+
+        # Shorter timeout for screenshot
+        try:
+            return await asyncio.wait_for(future, timeout=10.0)
+        except asyncio.TimeoutError:
+            if msg_id in self._pending_responses:
+                del self._pending_responses[msg_id]
+            raise
+
+    def _save_screenshot_data(self, data: str, path: str):
+        """Save base64 screenshot data to file."""
+        import base64
+        image_data = base64.b64decode(data)
+
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(image_data)
+
     async def _check_xss_in_console(self, xss_marker: str) -> bool:
         """Check if XSS marker appears in console logs."""
         return any(xss_marker in log.get("text", "") for log in self._console_logs)
@@ -597,22 +653,11 @@ class CDPClient:
         2. Monitors console for XSS marker (logged via injected payload)
         3. Checks DOM for marker element
         4. Takes screenshot as evidence
-
-        Args:
-            url: URL to test (with XSS payload in params)
-            xss_marker: Marker to look for in console/DOM
-            timeout: Time to wait for XSS execution
-            screenshot_dir: Directory to save screenshot
-
-        Returns:
-            CDPResult with validation outcome
         """
         logger.info(f"CDP: Validating XSS at {url[:80]}...")
 
         # Reset state
-        self._console_logs.clear()
-        self._alert_detected = False
-        self._last_alert_message = None
+        self._reset_validation_state()
 
         # Navigate
         nav_success = await self.navigate(url)
@@ -627,6 +672,24 @@ class CDPClient:
         await asyncio.sleep(timeout)
 
         # Perform checks
+        check_results = await self._perform_xss_checks(xss_marker, expected_marker)
+
+        # Take screenshot
+        screenshot_path = await self._capture_validation_screenshot(screenshot_dir)
+
+        # Log results
+        self._log_validation_results(check_results)
+
+        return self._build_validation_result(check_results, screenshot_path, url)
+
+    def _reset_validation_state(self):
+        """Reset validation state before new check."""
+        self._console_logs.clear()
+        self._alert_detected = False
+        self._last_alert_message = None
+
+    async def _perform_xss_checks(self, xss_marker: str, expected_marker: Optional[str]) -> dict:
+        """Perform all XSS validation checks."""
         xss_in_console = await self._check_xss_in_console(xss_marker)
         xss_in_dom_raw = await self.execute_js(f'document.body.innerHTML.includes("{xss_marker}")')
         xss_in_dom_executed = await self._check_xss_in_dom_executed()
@@ -635,7 +698,6 @@ class CDPClient:
         if expected_marker:
             marker_found = await self._check_expected_marker(expected_marker)
 
-        # Determine if XSS confirmed
         xss_confirmed = self._determine_xss_confirmed(
             xss_in_console, xss_in_dom_raw, xss_in_dom_executed, marker_found, expected_marker
         )
@@ -643,41 +705,63 @@ class CDPClient:
         if xss_in_dom_raw and not xss_confirmed:
             logger.info("NOTE: Marker found in DOM but no JS execution - may be HTML injection, not XSS")
 
-        # Take screenshot
-        screenshot_path = None
-        if screenshot_dir:
-            import time
-            screenshot_path = f"{screenshot_dir}/cdp_xss_{int(time.time())}.png"
-            try:
-                await self.screenshot(screenshot_path)
-            except Exception as e:
-                logger.warning(f"Screenshot failed: {e}")
+        return {
+            "xss_in_console": xss_in_console,
+            "xss_in_dom_raw": xss_in_dom_raw,
+            "xss_in_dom_executed": xss_in_dom_executed,
+            "marker_found": marker_found,
+            "xss_confirmed": xss_confirmed
+        }
 
-        logger.info(f"CDP XSS Result: alert={self._alert_detected}, console={xss_in_console}, dom_raw={xss_in_dom_raw}, dom_executed={xss_in_dom_executed}, marker_found={marker_found}")
+    async def _capture_validation_screenshot(self, screenshot_dir: Optional[str]) -> Optional[str]:
+        """Capture screenshot if directory specified."""
+        if not screenshot_dir:
+            return None
 
+        import time
+        screenshot_path = f"{screenshot_dir}/cdp_xss_{int(time.time())}.png"
+        try:
+            await self.screenshot(screenshot_path)
+            return screenshot_path
+        except Exception as e:
+            logger.warning(f"Screenshot failed: {e}")
+            return None
+
+    def _log_validation_results(self, check_results: dict):
+        """Log XSS validation results."""
+        logger.info(
+            f"CDP XSS Result: alert={self._alert_detected}, "
+            f"console={check_results['xss_in_console']}, "
+            f"dom_raw={check_results['xss_in_dom_raw']}, "
+            f"dom_executed={check_results['xss_in_dom_executed']}, "
+            f"marker_found={check_results['marker_found']}"
+        )
+
+    def _build_validation_result(self, check_results: dict, screenshot_path: Optional[str], url: str) -> CDPResult:
+        """Build CDPResult from validation checks."""
         return CDPResult(
-            success=xss_confirmed,
+            success=check_results["xss_confirmed"],
             data={
                 "alert_detected": self._alert_detected,
-                "xss_in_console": xss_in_console,
-                "xss_in_dom_raw": xss_in_dom_raw,
-                "xss_in_dom_executed": xss_in_dom_executed,
-                "marker_found": marker_found,
+                "xss_in_console": check_results["xss_in_console"],
+                "xss_in_dom_raw": check_results["xss_in_dom_raw"],
+                "xss_in_dom_executed": check_results["xss_in_dom_executed"],
+                "marker_found": check_results["marker_found"],
                 "url": url
             },
             console_logs=self._console_logs.copy(),
             screenshot_path=screenshot_path,
-            marker_found=marker_found
+            marker_found=check_results["marker_found"]
         )
-    
+
     async def get_console_logs(self) -> List[Dict]:
         """Get all console logs captured since last navigation."""
         return self._console_logs.copy()
-    
+
     async def inject_xss_payload(self, payload: str) -> bool:
         """
         Inject XSS payload directly into page.
-        
+
         Useful for testing if context allows XSS execution.
         """
         try:
@@ -696,18 +780,18 @@ _cdp_client: Optional[CDPClient] = None
 async def get_cdp_client(headless: bool = True) -> CDPClient:
     """Get or create CDP client instance."""
     global _cdp_client
-    
+
     if _cdp_client is None:
         _cdp_client = CDPClient(headless=headless)
         await _cdp_client.start()
-    
+
     return _cdp_client
 
 
 async def close_cdp_client():
     """Close the CDP client if open."""
     global _cdp_client
-    
+
     if _cdp_client is not None:
         await _cdp_client.stop()
         _cdp_client = None
