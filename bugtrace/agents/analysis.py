@@ -381,19 +381,35 @@ class AnalysisAgent(BaseAgent):
 
     def _build_prompt(self, context: Dict, persona: str) -> str:
         """Build analysis prompt for specific persona."""
-        # Format parameters
-        params_str = ", ".join(context["params"]) if context["params"] else "None"
-        tech_str = " + ".join(context["tech_stack"])
-        
-        # Format headers (limit to important ones)
+        # Format context data
+        params_str = self._prompt_format_params(context)
+        tech_str = self._prompt_format_tech(context)
+        headers_str = self._prompt_format_headers(context)
+
+        # Build and return full prompt
+        return self._prompt_template(context, params_str, tech_str, headers_str)
+
+    def _prompt_format_params(self, context: Dict) -> str:
+        """Format parameters for prompt."""
+        return ", ".join(context["params"]) if context["params"] else "None"
+
+    def _prompt_format_tech(self, context: Dict) -> str:
+        """Format technology stack for prompt."""
+        return " + ".join(context["tech_stack"])
+
+    def _prompt_format_headers(self, context: Dict) -> str:
+        """Format important HTTP headers for prompt."""
         important_headers = ["Server", "X-Powered-By", "Content-Type", "Set-Cookie"]
-        headers_str = "\n".join([
+        headers = [
             f"  {k}: {v}"
             for k, v in context["headers"].items()
             if k in important_headers
-        ])
-        
-        prompt = f"""Analyze this web application URL for potential security vulnerabilities.
+        ]
+        return "\n".join(headers)
+
+    def _prompt_template(self, context: Dict, params_str: str, tech_str: str, headers_str: str) -> str:
+        """Generate complete analysis prompt template."""
+        return f"""Analyze this web application URL for potential security vulnerabilities.
 
 **URL**: {context['url']}
 **Path**: {context['path']}
@@ -446,8 +462,6 @@ Return valid XML-like tags. Do NOT use markdown code blocks.
 - High confidence (> 0.8) for clear indicators
 - Use <vulnerability> tag for EACH finding.
 - NO markdown formatting (```xml). Just raw tags."""
-        
-        return prompt
     
     def _consolidate_analyses(self, analyses: List[Dict], context: Dict) -> Dict[str, Any]:
         """Consolidate multiple model analyses into single report using consensus voting."""
