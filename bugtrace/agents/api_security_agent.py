@@ -166,27 +166,35 @@ class APISecurityAgent(BaseAgent):
                     json=introspection_query,
                     headers={"Content-Type": "application/json"}
                 )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    if "data" in data and "__schema" in data.get("data", {}):
-                        schema = data["data"]["__schema"]
-                        type_count = len(schema.get("types", []))
-
-                        dashboard.log(
-                            f"  ⚠️  GraphQL Introspection ENABLED: {type_count} types exposed",
-                            "CRITICAL"
-                        )
-
-                        return {
-                            "enabled": True,
-                            "schema": schema,
-                            "type_count": type_count
-                        }
+                return self._graphql_parse_introspection_response(response)
         except Exception as e:
             logger.warning(f"GraphQL introspection test failed: {e}")
+            return {"enabled": False}
 
-        return {"enabled": False}
+    def _graphql_parse_introspection_response(self, response) -> Dict:
+        """Parse GraphQL introspection response."""
+        if response.status_code != 200:
+            return {"enabled": False}
+
+        data = response.json()
+        if "data" not in data:
+            return {"enabled": False}
+        if "__schema" not in data.get("data", {}):
+            return {"enabled": False}
+
+        schema = data["data"]["__schema"]
+        type_count = len(schema.get("types", []))
+
+        dashboard.log(
+            f"  ⚠️  GraphQL Introspection ENABLED: {type_count} types exposed",
+            "CRITICAL"
+        )
+
+        return {
+            "enabled": True,
+            "schema": schema,
+            "type_count": type_count
+        }
 
     async def _test_graphql_injection(self, endpoint: str) -> Dict:
         """Test for injection vulnerabilities in GraphQL queries."""
@@ -199,36 +207,47 @@ class APISecurityAgent(BaseAgent):
         ]
 
         for payload in injection_payloads:
-            query = {
-                "query": "query GetUser($id: ID!) { user(id: $id) { id name email } }",
-                "variables": payload
-            }
-
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    response = await client.post(endpoint, json=query)
-
-                    # Check for SQL error messages in response
-                    error_patterns = [
-                        "sql", "mysql", "postgresql", "syntax error",
-                        "unclosed quotation", "unexpected", "exception"
-                    ]
-
-                    response_text = response.text.lower()
-                    if any(pattern in response_text for pattern in error_patterns):
-                        dashboard.log(
-                            f"  🚨 GraphQL Injection: Error-based vulnerability found!",
-                            "CRITICAL"
-                        )
-                        return {
-                            "vulnerable": True,
-                            "payload": json.dumps(payload),
-                            "response": response.text
-                        }
-            except Exception as e:
-                logger.debug(f"operation failed: {e}")
+            result = await self._graphql_test_single_injection(endpoint, payload)
+            if result.get("vulnerable"):
+                return result
 
         return {"vulnerable": False}
+
+    async def _graphql_test_single_injection(self, endpoint: str, payload: Dict) -> Dict:
+        """Test a single GraphQL injection payload."""
+        query = {
+            "query": "query GetUser($id: ID!) { user(id: $id) { id name email } }",
+            "variables": payload
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(endpoint, json=query)
+                return self._graphql_check_injection_response(response, payload)
+        except Exception as e:
+            logger.debug(f"operation failed: {e}")
+            return {"vulnerable": False}
+
+    def _graphql_check_injection_response(self, response, payload: Dict) -> Dict:
+        """Check GraphQL response for injection indicators."""
+        error_patterns = [
+            "sql", "mysql", "postgresql", "syntax error",
+            "unclosed quotation", "unexpected", "exception"
+        ]
+
+        response_text = response.text.lower()
+        if not any(pattern in response_text for pattern in error_patterns):
+            return {"vulnerable": False}
+
+        dashboard.log(
+            f"  🚨 GraphQL Injection: Error-based vulnerability found!",
+            "CRITICAL"
+        )
+        return {
+            "vulnerable": True,
+            "payload": json.dumps(payload),
+            "response": response.text
+        }
 
     async def _test_graphql_dos(self, endpoint: str) -> Dict:
         """Test for Nested Query DoS vulnerability."""
@@ -332,31 +351,52 @@ class APISecurityAgent(BaseAgent):
 
         try:
             async with httpx.AsyncClient(timeout=5) as client:
-                # Get baseline response with no auth
-                baseline = await client.get(endpoint, timeout=5)
-
-                for technique in bypass_techniques:
-                    response = await client.get(endpoint, **technique, timeout=5)
-
-                    # If we get 200 instead of 401/403, auth is bypassed
-                    if response.status_code == 200 and baseline.status_code in [401, 403]:
-                        dashboard.log(
-                            f"  🚨 AUTH BYPASS: {endpoint} accessible without valid token!",
-                            "CRITICAL"
-                        )
-                        return {
-                            "vulnerable": True,
-                            "type": "Authentication Bypass",
-                            "severity": "CRITICAL",
-                            "technique": str(technique),
-                            "url": endpoint,
-                            "description": f"Authentication bypass vulnerability. The endpoint returns 200 OK without valid credentials using technique: {technique}. Original response was {baseline.status_code}.",
-                            "reproduction": f"curl -X GET '{endpoint}' # Returns 200 instead of 401/403"
-                        }
+                return await self._auth_test_techniques(client, endpoint, bypass_techniques)
         except Exception as e:
             logger.debug(f"operation failed: {e}")
+            return {"vulnerable": False}
+
+    async def _auth_test_techniques(self, client, endpoint: str, bypass_techniques: List[Dict]) -> Dict:
+        """Test all authentication bypass techniques."""
+        # Get baseline response with no auth
+        baseline = await client.get(endpoint, timeout=5)
+
+        for technique in bypass_techniques:
+            result = await self._auth_test_single_bypass(client, endpoint, baseline, technique)
+            if result.get("vulnerable"):
+                return result
 
         return {"vulnerable": False}
+
+    async def _auth_test_single_bypass(self, client, endpoint: str, baseline, technique: Dict) -> Dict:
+        """Test a single authentication bypass technique."""
+        try:
+            response = await client.get(endpoint, **technique, timeout=5)
+            return self._auth_check_bypass_response(response, baseline, endpoint, technique)
+        except Exception:
+            return {"vulnerable": False}
+
+    def _auth_check_bypass_response(self, response, baseline, endpoint: str, technique: Dict) -> Dict:
+        """Check if authentication was bypassed."""
+        # If we get 200 instead of 401/403, auth is bypassed
+        if response.status_code != 200:
+            return {"vulnerable": False}
+        if baseline.status_code not in [401, 403]:
+            return {"vulnerable": False}
+
+        dashboard.log(
+            f"  🚨 AUTH BYPASS: {endpoint} accessible without valid token!",
+            "CRITICAL"
+        )
+        return {
+            "vulnerable": True,
+            "type": "Authentication Bypass",
+            "severity": "CRITICAL",
+            "technique": str(technique),
+            "url": endpoint,
+            "description": f"Authentication bypass vulnerability. The endpoint returns 200 OK without valid credentials using technique: {technique}. Original response was {baseline.status_code}.",
+            "reproduction": f"curl -X GET '{endpoint}' # Returns 200 instead of 401/403"
+        }
 
     def _create_idor_finding(self, endpoint: str, original_id: int, test_id: int, test_endpoint: str) -> Dict:
         """Create IDOR vulnerability finding."""
@@ -385,27 +425,53 @@ class APISecurityAgent(BaseAgent):
 
         try:
             async with httpx.AsyncClient(timeout=5) as client:
-                original_response = await client.get(endpoint, timeout=5)
-                if original_response.status_code != 200:
-                    return {"vulnerable": False}
-
-                original_data = original_response.text
-
-                for test_id in test_ids:
-                    if test_id == original_id:
-                        continue
-
-                    test_endpoint = re.sub(id_pattern, f'/{test_id}/', endpoint)
-                    test_response = await client.get(test_endpoint, timeout=5)
-
-                    if test_response.status_code == 200 and test_response.text != original_data:
-                        dashboard.log(f"  🚨 IDOR: Can access other user data at {test_endpoint}", "CRITICAL")
-                        return self._create_idor_finding(endpoint, original_id, test_id, test_endpoint)
-
+                return await self._idor_test_ids(client, endpoint, original_id, test_ids, id_pattern)
         except Exception as e:
             logger.debug(f"operation failed: {e}")
+            return {"vulnerable": False}
+
+    async def _idor_test_ids(self, client, endpoint: str, original_id: int, test_ids: List[int], id_pattern: str) -> Dict:
+        """Test all ID values for IDOR vulnerability."""
+        original_response = await client.get(endpoint, timeout=5)
+        if original_response.status_code != 200:
+            return {"vulnerable": False}
+
+        original_data = original_response.text
+
+        for test_id in test_ids:
+            result = await self._idor_test_single_id(
+                client, endpoint, original_id, test_id, original_data, id_pattern
+            )
+            if result.get("vulnerable"):
+                return result
 
         return {"vulnerable": False}
+
+    async def _idor_test_single_id(
+        self, client, endpoint: str, original_id: int, test_id: int, original_data: str, id_pattern: str
+    ) -> Dict:
+        """Test a single ID for IDOR vulnerability."""
+        if test_id == original_id:
+            return {"vulnerable": False}
+
+        test_endpoint = re.sub(id_pattern, f'/{test_id}/', endpoint)
+        try:
+            test_response = await client.get(test_endpoint, timeout=5)
+            return self._idor_check_response(test_response, original_data, endpoint, original_id, test_id, test_endpoint)
+        except Exception:
+            return {"vulnerable": False}
+
+    def _idor_check_response(
+        self, test_response, original_data: str, endpoint: str, original_id: int, test_id: int, test_endpoint: str
+    ) -> Dict:
+        """Check IDOR test response."""
+        if test_response.status_code != 200:
+            return {"vulnerable": False}
+        if test_response.text == original_data:
+            return {"vulnerable": False}
+
+        dashboard.log(f"  🚨 IDOR: Can access other user data at {test_endpoint}", "CRITICAL")
+        return self._create_idor_finding(endpoint, original_id, test_id, test_endpoint)
 
     async def _test_http_verb_tampering(self, endpoint: str) -> Dict:
         """Test HTTP method override vulnerabilities."""
@@ -414,34 +480,46 @@ class APISecurityAgent(BaseAgent):
 
         try:
             async with httpx.AsyncClient(timeout=5) as client:
-                results_by_method = {}
-
-                for method in methods:
-                    try:
-                        response = await client.request(method, endpoint, timeout=5)
-                        results_by_method[method] = response.status_code
-                    except Exception as e:
-                        logger.debug(f"operation failed: {e}")
-
-                # Check for verb tampering (e.g., DELETE allowed when it shouldn't be)
-                if "DELETE" in results_by_method and results_by_method["DELETE"] in [200, 204]:
-                    dashboard.log(
-                        f"  ⚠️  HTTP Verb Tampering: DELETE method allowed on {endpoint}",
-                        "HIGH"
-                    )
-                    return {
-                        "vulnerable": True,
-                        "type": "HTTP Verb Tampering",
-                        "severity": "HIGH",
-                        "allowed_methods": list(results_by_method.keys()),
-                        "url": endpoint,
-                        "description": f"HTTP Verb Tampering vulnerability. The DELETE method is allowed on this endpoint, potentially allowing unauthorized resource deletion. Allowed methods: {list(results_by_method.keys())}",
-                        "reproduction": f"curl -X DELETE '{endpoint}' # Returns {results_by_method['DELETE']}"
-                    }
+                results_by_method = await self._verb_test_all_methods(client, endpoint, methods)
+                return self._verb_check_tampering(endpoint, results_by_method)
         except Exception as e:
             logger.debug(f"operation failed: {e}")
+            return {"vulnerable": False}
 
-        return {"vulnerable": False}
+    async def _verb_test_all_methods(self, client, endpoint: str, methods: List[str]) -> Dict[str, int]:
+        """Test all HTTP methods and collect status codes."""
+        results_by_method = {}
+
+        for method in methods:
+            try:
+                response = await client.request(method, endpoint, timeout=5)
+                results_by_method[method] = response.status_code
+            except Exception as e:
+                logger.debug(f"operation failed: {e}")
+
+        return results_by_method
+
+    def _verb_check_tampering(self, endpoint: str, results_by_method: Dict[str, int]) -> Dict:
+        """Check if DELETE verb tampering is present."""
+        # Check for verb tampering (e.g., DELETE allowed when it shouldn't be)
+        if "DELETE" not in results_by_method:
+            return {"vulnerable": False}
+        if results_by_method["DELETE"] not in [200, 204]:
+            return {"vulnerable": False}
+
+        dashboard.log(
+            f"  ⚠️  HTTP Verb Tampering: DELETE method allowed on {endpoint}",
+            "HIGH"
+        )
+        return {
+            "vulnerable": True,
+            "type": "HTTP Verb Tampering",
+            "severity": "HIGH",
+            "allowed_methods": list(results_by_method.keys()),
+            "url": endpoint,
+            "description": f"HTTP Verb Tampering vulnerability. The DELETE method is allowed on this endpoint, potentially allowing unauthorized resource deletion. Allowed methods: {list(results_by_method.keys())}",
+            "reproduction": f"curl -X DELETE '{endpoint}' # Returns {results_by_method['DELETE']}"
+        }
 
     # ==================== WEBSOCKET TESTING ====================
 
