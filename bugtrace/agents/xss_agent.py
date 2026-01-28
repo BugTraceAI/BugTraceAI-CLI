@@ -1094,6 +1094,107 @@ class XSSAgent(BaseAgent):
             reflection_type, surviving_chars, injection_ctx
         )
 
+    async def _payload_test_single(
+        self,
+        param: str,
+        reflected_payload: str,
+        is_encoded: bool,
+        ref_context: str,
+        screenshots_dir: Path,
+        injection_ctx: Any
+    ) -> Tuple[bool, Optional[Dict], Optional[Dict]]:
+        """Test a single payload and return validation result."""
+        dashboard.set_current_payload(reflected_payload[:60], "XSS Hybrid", "Validating")
+
+        # Authority check for unencoded dangerous reflections
+        if not is_encoded and ref_context in ["html_text", "attribute_unquoted"]:
+            finding = self._create_authority_finding(
+                param, reflected_payload, ref_context, injection_ctx
+            )
+            return True, None, {"finding": finding}
+
+        # Browser validation
+        validated, evidence = await self._validate(
+            param, reflected_payload, "", "interactsh", screenshots_dir
+        )
+
+        if validated:
+            finding_data = {
+                "evidence": evidence,
+                "screenshot_path": evidence.get("screenshot_path"),
+                "context": "hybrid_payload",
+                "reflection_context": ref_context
+            }
+            return True, evidence, finding_data
+
+        return False, None, None
+
+    def _payload_check_early_stop(
+        self,
+        reflected_payload: str,
+        evidence: Dict,
+        successful_count: int
+    ) -> bool:
+        """Check if testing should stop early after successful payload."""
+        should_stop, stop_reason = self._should_stop_testing(
+            reflected_payload, evidence, successful_count
+        )
+        return should_stop
+
+    def _payload_process_validation_result(
+        self,
+        validated: bool,
+        finding_data: Optional[Dict],
+        reflected_payload: str,
+        evidence: Optional[Dict],
+        reflection_type: str,
+        successful_payloads: List[str],
+        best_state: Dict
+    ) -> Tuple[List[str], Dict]:
+        """Process validation result and update tracking state."""
+        if not validated or not self._should_create_finding(finding_data):
+            return successful_payloads, best_state
+
+        self.payload_learner.save_success(reflected_payload, reflection_type, self.url)
+        successful_payloads.append(reflected_payload)
+
+        if not best_state.get("payload"):
+            best_state = {
+                "payload": reflected_payload,
+                "evidence": evidence,
+                "finding_data": finding_data
+            }
+
+        return successful_payloads, best_state
+
+    async def _payload_run_reflection_checks(
+        self,
+        param: str,
+        hybrid_payloads: List[str],
+        interactsh_url: str
+    ) -> Optional[List[Dict]]:
+        """Prepare payloads and run fast reflection check."""
+        valid_payloads = [p.replace("{{interactsh_url}}", interactsh_url) for p in hybrid_payloads]
+        return await self._fast_reflection_check(self.url, param, valid_payloads)
+
+    def _payload_build_final_finding(
+        self,
+        param: str,
+        best_state: Dict,
+        reflection_type: str,
+        surviving_chars: str,
+        successful_payloads: List[str],
+        injection_ctx: Any
+    ) -> XSSFinding:
+        """Build final XSS finding from successful payloads."""
+        return self._create_xss_finding(
+            param, best_state["payload"], best_state["finding_data"].get("context", "hybrid_payload"),
+            "interactsh", best_state["evidence"], 1.0,
+            reflection_type, surviving_chars, successful_payloads,
+            injection_ctx, "hybrid_optimized",
+            "Hybrid strategy found a working payload from known patterns."
+        )
+
     async def _test_payload_list(
         self,
         param: str,
@@ -1106,66 +1207,41 @@ class XSSAgent(BaseAgent):
     ) -> Optional[XSSFinding]:
         """Test a list of payloads and return first successful finding."""
         successful_payloads = []
-        best_evidence = None
-        best_payload = None
-        best_finding_data = None
+        best_state = {}
 
-        # Fast reflection check using Go fuzzer
-        valid_payloads = [p.replace("{{interactsh_url}}", interactsh_url) for p in hybrid_payloads]
-        reflection_results = await self._fast_reflection_check(self.url, param, valid_payloads)
+        reflection_results = await self._payload_run_reflection_checks(
+            param, hybrid_payloads, interactsh_url
+        )
 
-        if reflection_results:
-            for ref in reflection_results:
-                if self._max_impact_achieved:
-                    break
+        if not reflection_results:
+            return None
 
-                reflected_payload = ref["payload"]
-                is_encoded = ref.get("encoded", True)
-                ref_context = ref.get("context", "unknown")
+        for ref in reflection_results:
+            if self._max_impact_achieved:
+                break
 
-                dashboard.set_current_payload(reflected_payload[:60], "XSS Hybrid", "Validating")
+            reflected_payload = ref["payload"]
+            validated, evidence, finding_data = await self._payload_test_single(
+                param, reflected_payload, ref.get("encoded", True),
+                ref.get("context", "unknown"), screenshots_dir, injection_ctx
+            )
 
-                # Authority check for unencoded dangerous reflections
-                if not is_encoded and ref_context in ["html_text", "attribute_unquoted"]:
-                    return self._create_authority_finding(
-                        param, reflected_payload, ref_context, injection_ctx
-                    )
+            # Handle authority finding (early return)
+            if validated and finding_data and "finding" in finding_data:
+                return finding_data["finding"]
 
-                # Browser validation
-                validated, evidence = await self._validate(
-                    param, reflected_payload, "", "interactsh", screenshots_dir
-                )
+            successful_payloads, best_state = self._payload_process_validation_result(
+                validated, finding_data, reflected_payload, evidence,
+                reflection_type, successful_payloads, best_state
+            )
 
-                if validated:
-                    finding_data = {
-                        "evidence": evidence,
-                        "screenshot_path": evidence.get("screenshot_path"),
-                        "context": "hybrid_payload",
-                        "reflection_context": reflection_type
-                    }
-
-                    if self._should_create_finding(finding_data):
-                        self.payload_learner.save_success(reflected_payload, reflection_type, self.url)
-                        successful_payloads.append(reflected_payload)
-
-                        if not best_payload:
-                            best_payload = reflected_payload
-                            best_evidence = evidence
-                            best_finding_data = finding_data
-
-                        should_stop, stop_reason = self._should_stop_testing(
-                            reflected_payload, evidence, len(successful_payloads)
-                        )
-                        if should_stop:
-                            break
+            if validated and self._payload_check_early_stop(reflected_payload, evidence, len(successful_payloads)):
+                break
 
         if successful_payloads:
-            return self._create_xss_finding(
-                param, best_payload, best_finding_data.get("context", "hybrid_payload"),
-                "interactsh", best_evidence, 1.0,
-                reflection_type, surviving_chars, successful_payloads,
-                injection_ctx, "hybrid_optimized",
-                "Hybrid strategy found a working payload from known patterns."
+            return self._payload_build_final_finding(
+                param, best_state, reflection_type, surviving_chars,
+                successful_payloads, injection_ctx
             )
 
         return None
@@ -1982,11 +2058,8 @@ Response format (XML):
 
         return payloads
 
-    async def _llm_analyze(self, html: str, param: str, interactsh_url: str, context_data: Dict = None) -> Optional[Dict]:
-        """Ask LLM to analyze HTML and generate payload."""
-        import json
-        context_str = json.dumps(context_data or {}, indent=2)
-        
+    def _analyze_build_system_prompt(self, interactsh_url: str, context_str: str) -> str:
+        """Build system prompt for LLM XSS analysis."""
         master_prompt = """You are an elite XSS (Cross-Site Scripting) expert.
 Analyze the provided HTML and the reflection context metadata.
 Your goal is to generate a payload that will execute JavaScript.
@@ -2011,16 +2084,55 @@ Response Format (XML-Like):
 """
 
         if self.system_prompt:
-             parts = self.system_prompt.split("# XSS Bypass Prompt")
-             master_prompt = parts[0].replace("# Master XSS Analysis Prompt", "").strip()
-             master_prompt += f"\n\nREFLECTION CONTEXT METADATA:\n{context_str}"
+            parts = self.system_prompt.split("# XSS Bypass Prompt")
+            master_prompt = parts[0].replace("# Master XSS Analysis Prompt", "").strip()
+            master_prompt += f"\n\nREFLECTION CONTEXT METADATA:\n{context_str}"
 
-        # Safer generic replacement
-        system_prompt = master_prompt.replace("{interactsh_url}", interactsh_url) \
-                                     .replace("{probe}", self.PROBE_STRING) \
-                                     .replace("{PROBE}", self.PROBE_STRING) \
-                                     .replace("{context_data}", context_str)
-        
+        return master_prompt.replace("{interactsh_url}", interactsh_url) \
+                           .replace("{probe}", self.PROBE_STRING) \
+                           .replace("{PROBE}", self.PROBE_STRING) \
+                           .replace("{context_data}", context_str)
+
+    def _analyze_parse_response(self, response: str, param: str) -> Optional[Dict]:
+        """Parse LLM response and extract payload data."""
+        # Robust XML Parsing
+        from bugtrace.utils.parsers import XmlParser
+        tags = ["payload", "validation_method", "context", "confidence"]
+        data = XmlParser.extract_tags(response, tags)
+
+        if data.get("payload"):
+            cleaned_payload = self._clean_payload(data["payload"], param)
+            return {
+                "vulnerable": True,
+                "payload": cleaned_payload,
+                "validation_method": data.get("validation_method", "interactsh"),
+                "context": data.get("context", "LLM Generated"),
+                "confidence": float(data.get("confidence", 0.9))
+            }
+
+        # Fallback for non-XML compliant models
+        if "alert(" in response or "fetch(" in response:
+            logger.warning(f"[{self.name}] LLM failed XML tags but returned code. Attempting to extract payload manually.")
+            lines = [l.strip() for l in response.strip().split("\n") if l.strip()]
+            for line in reversed(lines):
+                if "alert(" in line or "fetch(" in line:
+                    cleaned = self._clean_payload(line, param)
+                    return {
+                        "vulnerable": True,
+                        "payload": cleaned,
+                        "validation_method": "interactsh",
+                        "context": "Heuristic Extraction",
+                        "confidence": 0.5
+                    }
+        return None
+
+    async def _llm_analyze(self, html: str, param: str, interactsh_url: str, context_data: Dict = None) -> Optional[Dict]:
+        """Ask LLM to analyze HTML and generate payload."""
+        import json
+        context_str = json.dumps(context_data or {}, indent=2)
+
+        system_prompt = self._analyze_build_system_prompt(interactsh_url, context_str)
+
         user_prompt = f"""Target URL: {self.url}
 Parameter: {param}
 Probe: {self.PROBE_STRING}
@@ -2033,51 +2145,19 @@ HTML Reflection Source (truncated):
 
 Generate the OPTIMAL XSS payload based on the metadata and HTML.
 """
-        
+
         try:
             response = await llm_client.generate(
                 prompt=user_prompt,
                 module_name="XSS_AGENT",
                 system_prompt=system_prompt,
                 model_override=settings.MUTATION_MODEL,
-                max_tokens=8000 # Increased for reasoning models
+                max_tokens=8000  # Increased for reasoning models
             )
-            
-            # DEBUG: Log raw response to see what LLM is actually generating
+
             logger.info(f"LLM Raw Response ({len(response)} chars)")
-            
-            # Robust XML Parsing
-            from bugtrace.utils.parsers import XmlParser
-            tags = ["payload", "validation_method", "context", "confidence"]
-            data = XmlParser.extract_tags(response, tags)
-            
-            if data.get("payload"):
-                cleaned_payload = self._clean_payload(data["payload"], param)
-                return {
-                    "vulnerable": True,
-                    "payload": cleaned_payload,
-                    "validation_method": data.get("validation_method", "interactsh"),
-                    "context": data.get("context", "LLM Generated"),
-                    "confidence": float(data.get("confidence", 0.9))
-                }
-            
-            # Fallback for non-XML compliant models (Regex-based search for common patterns)
-            if "alert(" in response or "fetch(" in response:
-                logger.warning(f"[{self.name}] LLM failed XML tags but returned code. Attempting to extract payload manually.")
-                # Look for the last line that looks like a payload
-                lines = [l.strip() for l in response.strip().split("\n") if l.strip()]
-                for line in reversed(lines):
-                    if "alert(" in line or "fetch(" in line:
-                        cleaned = self._clean_payload(line, param)
-                        return {
-                            "vulnerable": True,
-                            "payload": cleaned,
-                            "validation_method": "interactsh",
-                            "context": "Heuristic Extraction",
-                            "confidence": 0.5
-                        }
-            return None
-            
+            return self._analyze_parse_response(response, param)
+
         except Exception as e:
             logger.error(f"LLM analysis failed: {e}", exc_info=True)
             return None
