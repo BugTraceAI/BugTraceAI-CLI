@@ -298,7 +298,7 @@ Return ONLY valid XML tags. Do not add markdown code blocks.
                     try:
                         conf = int(float(conf_str))
                         conf = max(0, min(10, conf))  # Clamp to 0-10
-                    except:
+                    except (ValueError, TypeError):
                         conf = 5
                         
                     vulnerabilities.append({
@@ -332,8 +332,10 @@ Return ONLY valid XML tags. Do not add markdown code blocks.
         merged = {}
         
         def to_float(val, default=0.5):
-            try: return float(val)
-            except: return default
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return default
 
         for analysis in analyses:
             for vuln in analysis.get("vulnerabilities", []):

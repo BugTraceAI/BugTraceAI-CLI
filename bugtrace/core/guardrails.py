@@ -240,8 +240,8 @@ class OutputGuardrails:
                 for pattern, _ in self.PROMPT_INJECTION_PATTERNS:
                     if re.search(pattern, decoded.lower()):
                         return True
-            except:
-                pass
+            except (ValueError, UnicodeDecodeError) as e:
+                logger.debug(f"Base64 decode failed: {e}")
         
         return False
     

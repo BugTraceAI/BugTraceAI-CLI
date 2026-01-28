@@ -2,6 +2,9 @@ import json
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from .models import ReportContext, Finding, FindingType, Severity, Evidence
+from bugtrace.utils.logger import get_logger
+
+logger = get_logger("reporting.collector")
 
 class DataCollector:
     """

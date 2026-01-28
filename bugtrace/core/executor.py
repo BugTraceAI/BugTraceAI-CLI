@@ -76,5 +76,5 @@ class ToolExecutor:
             if process and process.returncode is None:
                 try:
                     process.kill()
-                except: 
-                    pass
+                except (ProcessLookupError, OSError) as e:
+                    logger.debug(f"[{tool_name}] Process cleanup: {e}")

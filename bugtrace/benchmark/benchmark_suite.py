@@ -506,7 +506,9 @@ BugTraceAI achieves:
             async with httpx.AsyncClient(timeout=5) as client:
                 response = await client.get(url, timeout=5)
                 return response.status_code < 500
-        except:
+        except Exception as e:
+            # Target unreachable (connection error, timeout, etc.)
+            logger.debug(f"Target {url} unavailable: {e}")
             return False
 
 

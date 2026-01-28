@@ -61,8 +61,8 @@ class ValidationEngine:
                 text = record["message"]
                 if level in ["INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"]:
                     dashboard.log(text, level)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Dashboard sink error: {e}")
         
         # Add sink only if it's the standalone run (avoid duplicates)
         sink_id = None

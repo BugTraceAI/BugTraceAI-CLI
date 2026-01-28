@@ -52,8 +52,9 @@ class DiagnosticSystem:
                 async with session.get("https://openrouter.ai/api/v1/models", timeout=5) as resp:
                     self.results["connectivity"] = resp.status == 200
                     dashboard.log("Network Connectivity to AI: OK", "SUCCESS")
-        except:
+        except Exception as e:
             self.results["connectivity"] = False
+            logger.warning(f"Connectivity check failed: {e}")
             dashboard.log("Connectivity to AI: FAILED", "ERROR")
 
         # 5. Check OpenRouter Credits

@@ -130,8 +130,8 @@ class TeamOrchestrator:
                 text = record["message"]
                 if level in ["INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"]:
                     dashboard.log(text, level)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Dashboard sink error: {e}")
         
         # Signal Management with HITL (Human-In-The-Loop)
         loop = asyncio.get_running_loop()
@@ -317,8 +317,8 @@ class TeamOrchestrator:
                 if file.name not in linked_screenshots:
                     try:
                         file.unlink() # Delete unreferenced to save space
-                    except:
-                        pass
+                    except OSError as e:
+                        logger.debug(f"Failed to delete screenshot {file}: {e}")
 
             # 2. Invoke AI Report Generation
             await reporting_agent.generate_final_report(findings, urls_scanned, metadata, report_dir)
@@ -333,8 +333,8 @@ class TeamOrchestrator:
                              shutil.move(str(file), str(report_dir / "logs" / file.name))
                     try:
                         p.rmdir() # Only if empty now
-                    except:
-                        pass
+                    except OSError as e:
+                        logger.debug(f"Failed to remove directory {p}: {e}")
 
             print(f"\n{'='*60}")
             print(f"[✓] SCAN COMPLETE - V1.6.1 Phoenix")
@@ -699,8 +699,8 @@ class TeamOrchestrator:
         try:
             old_settings = termios.tcgetattr(sys.stdin)
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
-        except:
-            pass
+        except (termios.error, AttributeError) as e:
+            logger.debug(f"Terminal settings restoration failed: {e}")
         
         print("\n" + "="*60)
         print("⏸️  SCAN PAUSED - Human-In-The-Loop Mode")
