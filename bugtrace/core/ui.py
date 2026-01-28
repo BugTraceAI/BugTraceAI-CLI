@@ -40,10 +40,15 @@ class Dashboard:
     def __init__(self):
         self.console = Console()
         self.layout = Layout()
-        self._lock = threading.RLock() # Thread safety first!
+        self._lock = threading.RLock()
         self.active = False
-        
-        # Compact layout: cleaner design without extra separators
+
+        self._init_layout()
+        self._init_state()
+        self._init_metrics()
+
+    def _init_layout(self):
+        """Initialize dashboard layout."""
         self.layout.split(
             Layout(name="header1", size=1),
             Layout(name="header2", size=1),
@@ -53,8 +58,9 @@ class Dashboard:
             Layout(name="findings", ratio=1, minimum_size=5),
             Layout(name="footer", size=1)
         )
-        
-        # Internal state
+
+    def _init_state(self):
+        """Initialize dashboard state."""
         self.target: str = "Unknown"
         self.phase: str = "IDLE"
         self.status_msg: str = "Initializing..."
@@ -63,15 +69,13 @@ class Dashboard:
         self.findings: List[tuple] = []
         self.active_tasks: Dict[str, Dict] = {}
         self.start_time = datetime.now()
-        
-        # Telemetry & Control
+
         self.credits: float = 0.0
         self.total_requests: int = 0
         self.session_cost: float = 0.0
         self.paused: bool = False
         self.stop_requested: bool = False
-        
-        # Payload tracking
+
         self.current_payload: str = ""
         self.current_vector: str = ""
         self.current_payload_status: str = "Idle"
@@ -81,15 +85,15 @@ class Dashboard:
         self.payloads_success: int = 0
         self.payloads_failed: int = 0
         self.payload_rate: float = 0.0
-        
-        # System metrics
+
+    def _init_metrics(self):
+        """Initialize system metrics tracking."""
         self.cpu_usage: float = 0.0
         self.ram_usage: float = 0.0
         self.threads_count: int = 0
         self.network_download: float = 0.0
         self.network_upload: float = 0.0
-        
-        # Start system metrics thread
+
         if PSUTIL_AVAILABLE:
             self._metrics_thread = threading.Thread(target=self._update_system_metrics_loop, daemon=True)
             self._metrics_thread.start()
@@ -121,63 +125,76 @@ class Dashboard:
     def _keyboard_loop(self):
         """Non-blocking keyboard listener."""
         import sys
-        import select
         import time as _time
 
-        # Only works on Unix-like systems
         try:
             import tty
             import termios
         except ImportError:
             return
 
-        # Wait for dashboard to become active (set after Live starts)
-        for _ in range(100):  # up to 10 seconds
-            if self.active:
-                break
-            _time.sleep(0.1)
-        if not self.active:
-            return  # Dashboard never activated
+        if not self._wait_for_active(_time):
+            return
 
         try:
             fd = sys.stdin.fileno()
             if not sys.stdin.isatty():
-                # Non-TTY Fallback (Useful for pipes, automated tests, or redirected output)
-                while self.active:
-                    # Blocking read on stdin
-                    char = sys.stdin.read(1)
-                    if not char:
-                        _time.sleep(0.5)
-                        continue
-                    if char.lower() == 'q':
-                        with self._lock:
-                            self.stop_requested = True
-                        break
-                    elif char.lower() == 'p':
-                        with self._lock:
-                            self.paused = not self.paused
-                return
-
-            old_settings = termios.tcgetattr(fd)
-            try:
-                tty.setcbreak(fd)
-                while self.active:
-                    dr, dw, de = select.select([sys.stdin], [], [], 0.1)
-                    if dr:
-                        char = sys.stdin.read(1)
-                        if char.lower() == 'q':
-                            with self._lock:
-                                self.stop_requested = True
-                            break
-                        elif char.lower() == 'p':
-                            with self._lock:
-                                self.paused = not self.paused
-                    if self.stop_requested:
-                        break
-            finally:
-                termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+                self._keyboard_loop_non_tty(sys.stdin, _time)
+            else:
+                self._keyboard_loop_tty(sys.stdin, termios, tty)
         except Exception:
-            pass  # Terminal settings restoration — safe to ignore on non-TTY
+            pass
+
+    def _wait_for_active(self, time_module) -> bool:
+        """Wait for dashboard to become active."""
+        for _ in range(100):
+            if self.active:
+                return True
+            time_module.sleep(0.1)
+        return False
+
+    def _keyboard_loop_non_tty(self, stdin, time_module):
+        """Handle keyboard input for non-TTY environments."""
+        while self.active:
+            char = stdin.read(1)
+            if not char:
+                time_module.sleep(0.5)
+                continue
+            if char.lower() == 'q':
+                with self._lock:
+                    self.stop_requested = True
+                break
+            elif char.lower() == 'p':
+                with self._lock:
+                    self.paused = not self.paused
+
+    def _keyboard_loop_tty(self, stdin, termios, tty):
+        """Handle keyboard input for TTY environments."""
+        import select
+        import sys
+
+        fd = stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while self.active:
+                dr, dw, de = select.select([stdin], [], [], 0.1)
+                if dr:
+                    char = stdin.read(1)
+                    self._handle_key_press(char)
+                if self.stop_requested:
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+
+    def _handle_key_press(self, char: str):
+        """Handle single key press."""
+        if char.lower() == 'q':
+            with self._lock:
+                self.stop_requested = True
+        elif char.lower() == 'p':
+            with self._lock:
+                self.paused = not self.paused
 
     def _update_system_metrics_loop(self):
         """Background thread to update system metrics safely"""
@@ -298,91 +315,76 @@ class Dashboard:
 
     def update_payload_section(self):
         with self._lock:
-             payload = self.current_payload
-             vector = self.current_vector
-             tested = self.payloads_tested
-             status = self.current_payload_status
-             agent = self.current_agent
-             retry = self.payload_retry_count
-             success = self.payloads_success
-             failed = self.payloads_failed
-             rate = self.payload_rate
-             phase = self.phase
-             status_msg = self.status_msg
+             payload_data = self._capture_payload_data()
 
-        # Calculate available width for proper alignment
+        panel_width = self._get_panel_width()
+        status_content = self._build_status_content(payload_data)
+        payload_content = self._build_payload_content(payload_data, panel_width)
+
+        combined_table = self._build_payload_table(status_content, payload_content)
+        self.layout["payloads"].update(combined_table)
+
+    def _capture_payload_data(self) -> dict:
+        """Capture current payload state."""
+        return {
+            "payload": self.current_payload,
+            "vector": self.current_vector,
+            "tested": self.payloads_tested,
+            "status": self.current_payload_status,
+            "agent": self.current_agent,
+            "retry": self.payload_retry_count,
+            "success": self.payloads_success,
+            "failed": self.payloads_failed,
+            "rate": self.payload_rate,
+            "phase": self.phase,
+            "status_msg": self.status_msg
+        }
+
+    def _get_panel_width(self) -> int:
+        """Calculate panel width for proper alignment."""
         try:
             total_width = self.console.size.width
         except Exception:
             total_width = 120
-        
-        # Each panel gets half the width minus borders/padding
-        panel_width = max(30, (total_width - 4) // 2)
+        return max(30, (total_width - 4) // 2)
 
-        # LEFT COLUMN: STATUS - Build content with fixed 4 lines
-        status_lines = []
-        status_lines.append(Text.assemble(
-            ("📍 Phase: ", "white"),
-            (phase or "IDLE", "bright_cyan bold")
-        ))
-        status_lines.append(Text.assemble(
-            ("🤖 Agent: ", "white"),
-            (agent or "Idle", "bright_magenta bold")
-        ))
-        status_lines.append(Text.assemble(
-            ("📊 Status: ", "white"),
-            (status_msg[:30] if status_msg else "Ready", "bright_yellow")
-        ))
-        status_lines.append(Text.assemble(
-            ("⏱️  Progress: ", "white"),
-            (f"{tested} tested | {success}✓ | {failed}✗", "white dim")
-        ))
-        status_content = Text("\n").join(status_lines)
+    def _build_status_content(self, data: dict) -> Text:
+        """Build status column content."""
+        lines = [
+            Text.assemble(("📍 Phase: ", "white"), (data["phase"] or "IDLE", "bright_cyan bold")),
+            Text.assemble(("🤖 Agent: ", "white"), (data["agent"] or "Idle", "bright_magenta bold")),
+            Text.assemble(("📊 Status: ", "white"), (data["status_msg"][:30] if data["status_msg"] else "Ready", "bright_yellow")),
+            Text.assemble(("⏱️  Progress: ", "white"), (f"{data['tested']} tested | {data['success']}✓ | {data['failed']}✗", "white dim"))
+        ]
+        return Text("\n").join(lines)
 
-        # RIGHT COLUMN: PAYLOAD - Build content with fixed 4 lines
-        payload_lines = []
-        if payload:
-            test_num = f"[#{tested}]" if tested > 0 else "[#0]"
-            payload_lines.append(Text.assemble(
-                (test_num, "white dim"),
-                (" ", "white"),
-                (vector or "unknown", "bright_yellow bold")
-            ))
-            max_payload_len = panel_width - 10
-            payload_display = payload[:max_payload_len] + "..." if len(payload) > max_payload_len else payload
-            payload_lines.append(Text(payload_display, style="white"))
-            
-            payload_status_style = "bright_green" if "Success" in status else ("bright_red" if "Failed" in status else "bright_yellow")
-            payload_lines.append(Text.assemble(
-                ("Result: ", "white"),
-                (status, payload_status_style)
-            ))
+    def _build_payload_content(self, data: dict, panel_width: int) -> Text:
+        """Build payload column content."""
+        lines = []
+        if data["payload"]:
+            test_num = f"[#{data['tested']}]" if data['tested'] > 0 else "[#0]"
+            lines.append(Text.assemble((test_num, "white dim"), (" ", "white"), (data["vector"] or "unknown", "bright_yellow bold")))
+
+            max_len = panel_width - 10
+            display = data["payload"][:max_len] + "..." if len(data["payload"]) > max_len else data["payload"]
+            lines.append(Text(display, style="white"))
+
+            style = "bright_green" if "Success" in data["status"] else ("bright_red" if "Failed" in data["status"] else "bright_yellow")
+            lines.append(Text.assemble(("Result: ", "white"), (data["status"], style)))
         else:
-            payload_lines.append(Text("No active payload", style="white dim"))
-            payload_lines.append(Text("Waiting for tasks...", style="white dim"))
-            payload_lines.append(Text("", style="white"))
-        
-        payload_lines.append(Text.assemble(
-            ("Rate: ", "white"),
-            (f"{rate:.1f}/s", "bright_green")
-        ))
-        payload_content = Text("\n").join(payload_lines)
+            lines.extend([Text("No active payload", style="white dim"), Text("Waiting for tasks...", style="white dim"), Text("", style="white")])
 
-        # Create a unified table with internal divider instead of separate panels
-        # This ensures borders align perfectly
-        combined_table = Table(
-            show_header=True,
-            header_style="bold",
-            box=ROUNDED,
-            expand=True,
-            border_style="bright_cyan",
-            padding=(0, 1)
-        )
-        combined_table.add_column("📌 STATUS", style="bright_cyan", ratio=1)
-        combined_table.add_column("🧪 PAYLOAD", style="bright_yellow", ratio=1)
-        combined_table.add_row(status_content, payload_content)
-        
-        self.layout["payloads"].update(combined_table)
+        lines.append(Text.assemble(("Rate: ", "white"), (f"{data['rate']:.1f}/s", "bright_green")))
+        return Text("\n").join(lines)
+
+    def _build_payload_table(self, status_content: Text, payload_content: Text) -> Table:
+        """Build combined payload section table."""
+        table = Table(show_header=True, header_style="bold", box=ROUNDED, expand=True,
+                     border_style="bright_cyan", padding=(0, 1))
+        table.add_column("📌 STATUS", style="bright_cyan", ratio=1)
+        table.add_column("🧪 PAYLOAD", style="bright_yellow", ratio=1)
+        table.add_row(status_content, payload_content)
+        return table
 
     def update_log_section(self):
         with self._lock:
