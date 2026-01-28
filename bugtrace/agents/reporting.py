@@ -53,137 +53,170 @@ class ReportingAgent(BaseAgent):
         dashboard.update_task("reporting", name="Reporting Agent", status="Generating deliverables...")
         logger.info(f"[{self.name}] Starting report generation for scan {self.scan_id}")
 
-        # Ensure output directory exists
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        captures_dir = self.output_dir / "captures"
-        captures_dir.mkdir(exist_ok=True)
+        # Phase 1: Setup and data collection
+        self._setup_output_directories()
+        all_findings, tech_stack = await self._collect_all_findings()
 
-        # 1. Pull ALL findings from DB for this scan
+        # Phase 2: Categorize and enrich findings
+        categorized = self._categorize_findings(all_findings)
+        await self._enrich_findings_batch(categorized["validated"] + categorized["manual_review"])
+
+        # Phase 3: Calculate statistics
+        stats = self._calculate_scan_stats(all_findings)
+
+        # Phase 4: Generate all report deliverables
+        paths = self._generate_json_reports(all_findings, categorized)
+        paths.update(self._generate_markdown_reports(categorized))
+        paths.update(self._generate_data_files(all_findings, categorized, stats, tech_stack))
+        paths.update(self._generate_html_report(paths))
+
+        # Phase 5: Organize artifacts
+        self._copy_screenshots(all_findings, self.output_dir / "captures")
+
+        dashboard.log(f"[{self.name}] Generated {len(paths)} deliverables in {self.output_dir}", "SUCCESS")
+        return paths
+
+    def _setup_output_directories(self):
+        """Create necessary output directories."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "captures").mkdir(exist_ok=True)
+
+    async def _collect_all_findings(self) -> tuple[List[Dict], Dict]:
+        """Collect all findings from DB and Nuclei."""
         all_findings = self._get_findings_from_db()
         logger.info(f"[{self.name}] Retrieved {len(all_findings)} findings from DB")
 
-        # 1.5 Load Nuclei findings and tech stack
         nuclei_findings, tech_stack = self._load_nuclei_findings()
         if nuclei_findings:
             all_findings.extend(nuclei_findings)
             logger.info(f"[{self.name}] Added {len(nuclei_findings)} Nuclei findings")
 
-        # 2. Separate by validation status
-        raw_findings = [f for f in all_findings]  # All findings
-        validated_findings = [f for f in all_findings if f.get("status") == "VALIDATED_CONFIRMED"]
-        manual_review = [f for f in all_findings if f.get("status") == "MANUAL_REVIEW_RECOMMENDED"]
-        false_positives = [f for f in all_findings if f.get("status") == "VALIDATED_FALSE_POSITIVE"]
-        pending = [f for f in all_findings if f.get("status") == "PENDING_VALIDATION"]
-        
-        # 2.5 Enrich validated findings with LLM-based CVSS Analysis
-        # This asks Gemini to calculate realistic CVSS scores/vectors
-        await self._enrich_findings_batch(validated_findings + manual_review)
+        return all_findings, tech_stack
 
-        # 2.6 Calculate Stats (URLs, Duration)
+    def _categorize_findings(self, all_findings: List[Dict]) -> Dict[str, List[Dict]]:
+        """Categorize findings by validation status."""
+        return {
+            "raw": [f for f in all_findings],
+            "validated": [f for f in all_findings if f.get("status") == "VALIDATED_CONFIRMED"],
+            "manual_review": [f for f in all_findings if f.get("status") == "MANUAL_REVIEW_RECOMMENDED"],
+            "false_positives": [f for f in all_findings if f.get("status") == "VALIDATED_FALSE_POSITIVE"],
+            "pending": [f for f in all_findings if f.get("status") == "PENDING_VALIDATION"]
+        }
+
+    def _calculate_scan_stats(self, all_findings: List[Dict]) -> Dict:
+        """Calculate scan statistics (duration, URLs scanned)."""
         stats = {"urls_scanned": 0, "duration": "Unknown"}
         try:
-            # Duration
-            with self.db.get_session() as session:
-                scan = session.get(ScanTable, self.scan_id)
-                if scan and scan.timestamp:
-                    duration = datetime.utcnow() - scan.timestamp
-                    hours, remainder = divmod(int(duration.total_seconds()), 3600)
-                    minutes, seconds = divmod(remainder, 60)
-                    stats["duration"] = f"{hours}h {minutes}m {seconds}s"
-                    stats["duration_seconds"] = int(duration.total_seconds())
-            
-            # URLs
-            # Priority: File on disk (persistent) > Shared Context (memory)
-            recon_dir = self.output_dir / "recon"
-            urls_file = recon_dir / "urls.txt"
-            
-            if urls_file.exists():
-                with open(urls_file, "r") as f:
-                    urls = [line.strip() for line in f if line.strip()]
-                stats["urls_scanned"] = len(urls)
-            else:
-                from bugtrace.core.conductor import conductor
-                urls = conductor.get_shared_context("discovered_urls") or []
-                stats["urls_scanned"] = len(urls)
-                
-            if stats["urls_scanned"] == 0:
-                # Fallback to counting unique finding URLs if file/memory empty
-                unique_urls = set(f.get("url") for f in all_findings if f.get("url"))
-                stats["urls_scanned"] = len(unique_urls)
-                
+            # Calculate duration
+            stats.update(self._calculate_scan_duration())
+            # Count URLs scanned
+            stats["urls_scanned"] = self._count_urls_scanned(all_findings)
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to calc stats: {e}")
+        return stats
 
-        # 3. Generate each deliverable
-        paths = {}
+    def _calculate_scan_duration(self) -> Dict:
+        """Calculate scan duration from database."""
+        with self.db.get_session() as session:
+            scan = session.get(ScanTable, self.scan_id)
+            if scan and scan.timestamp:
+                duration = datetime.utcnow() - scan.timestamp
+                hours, remainder = divmod(int(duration.total_seconds()), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                return {
+                    "duration": f"{hours}h {minutes}m {seconds}s",
+                    "duration_seconds": int(duration.total_seconds())
+                }
+        return {}
 
-        # Deliverable 1: raw_findings.json
-        paths["raw_findings"] = self._write_json(
-            raw_findings,
-            "raw_findings.json",
-            "All findings before/after AgenticValidator"
-        )
+    def _count_urls_scanned(self, all_findings: List[Dict]) -> int:
+        """Count URLs scanned from file, memory, or findings."""
+        # Priority: File on disk (persistent) > Shared Context (memory) > Findings
+        urls_file = self.output_dir / "recon" / "urls.txt"
 
-        # Deliverable 2: validated_findings.json
-        paths["validated_findings"] = self._write_json(
-            validated_findings,
-            "validated_findings.json",
-            "Only VALIDATED_CONFIRMED findings"
-        )
+        if urls_file.exists():
+            with open(urls_file, "r") as f:
+                return len([line.strip() for line in f if line.strip()])
 
-        # Deliverable 3: final_report.md
-        paths["final_report"] = self._write_markdown_report(
-            validated=validated_findings,
-            manual_review=manual_review,
-            pending=pending
-        )
+        from bugtrace.core.conductor import conductor
+        urls = conductor.get_shared_context("discovered_urls") or []
+        if urls:
+            return len(urls)
 
-        # Deliverable 4: engagement_data.js (structured for HTML/JS)
-        paths["engagement_data"] = self._write_engagement_js(
-            all_findings=all_findings,
-            validated=validated_findings,
-            false_positives=false_positives,
-            manual_review=manual_review,
-            stats=stats,
-            tech_stack=tech_stack  # Include tech stack from Nuclei
-        )
+        # Fallback to counting unique finding URLs
+        unique_urls = set(f.get("url") for f in all_findings if f.get("url"))
+        return len(unique_urls)
 
-        # Deliverable 4b: engagement_data.json (Ensure JSON exists for fetch)
+    def _generate_json_reports(self, all_findings: List[Dict], categorized: Dict) -> Dict[str, Path]:
+        """Generate JSON report files."""
+        return {
+            "raw_findings": self._write_json(
+                categorized["raw"],
+                "raw_findings.json",
+                "All findings before/after AgenticValidator"
+            ),
+            "validated_findings": self._write_json(
+                categorized["validated"],
+                "validated_findings.json",
+                "Only VALIDATED_CONFIRMED findings"
+            )
+        }
+
+    def _generate_markdown_reports(self, categorized: Dict) -> Dict[str, Path]:
+        """Generate Markdown report files."""
+        return {
+            "final_report": self._write_markdown_report(
+                validated=categorized["validated"],
+                manual_review=categorized["manual_review"],
+                pending=categorized["pending"]
+            ),
+            "raw_findings_md": self._write_raw_markdown(findings=categorized["raw"]),
+            "validated_findings_md": self._write_validated_markdown(
+                validated=categorized["validated"],
+                manual_review=categorized["manual_review"]
+            )
+        }
+
+    def _generate_data_files(
+        self,
+        all_findings: List[Dict],
+        categorized: Dict,
+        stats: Dict,
+        tech_stack: Dict
+    ) -> Dict[str, Path]:
+        """Generate engagement data files (JS and JSON)."""
+        # Generate both JS and JSON engagement data files
         self._write_engagement_json(
             all_findings=all_findings,
-            validated=validated_findings,
-            false_positives=false_positives,
-            manual_review=manual_review,
+            validated=categorized["validated"],
+            false_positives=categorized["false_positives"],
+            manual_review=categorized["manual_review"],
             stats=stats,
-            tech_stack=tech_stack  # Include tech stack from Nuclei
+            tech_stack=tech_stack
         )
 
-        # Deliverable 5: raw_findings.md (Pre-Audit)
-        paths["raw_findings_md"] = self._write_raw_markdown(
-            findings=raw_findings
-        )
+        return {
+            "engagement_data": self._write_engagement_js(
+                all_findings=all_findings,
+                validated=categorized["validated"],
+                false_positives=categorized["false_positives"],
+                manual_review=categorized["manual_review"],
+                stats=stats,
+                tech_stack=tech_stack
+            )
+        }
 
-        # Deliverable 6: validated_findings.md (Post-Audit)
-        paths["validated_findings_md"] = self._write_validated_markdown(
-            validated=validated_findings,
-            manual_review=manual_review
-        )
-
-        # Deliverable 5: report.html (using static viewer generator)
+    def _generate_html_report(self, paths: Dict[str, Path]) -> Dict[str, Path]:
+        """Generate HTML report using HTMLGenerator."""
         from bugtrace.reporting.generator import HTMLGenerator
-        from bugtrace.reporting.models import ReportContext, ScanStats
-        
+
         generator = HTMLGenerator()
-        # Create a ReportContext to pass to the generator
-        # Note: We already wrote engagement_data.json, but HTMLGenerator can handle it
-        paths["report_html"] = Path(generator.generate(paths["engagement_data"], self.output_dir / "report.html"))
-
-        # Copy screenshots to captures folder
-        self._copy_screenshots(all_findings, captures_dir)
-
-        dashboard.log(f"[{self.name}] Generated {len(paths)} deliverables in {self.output_dir}", "SUCCESS")
-
-        return paths
+        return {
+            "report_html": Path(generator.generate(
+                paths.get("engagement_data"),
+                self.output_dir / "report.html"
+            ))
+        }
 
     def _get_findings_from_db(self) -> List[Dict]:
         """Pull findings from database for this scan_id."""
@@ -464,64 +497,14 @@ class ReportingAgent(BaseAgent):
     ) -> Path:
         """Write the structured engagement_data.json for HTML viewer."""
         path = self.output_dir / "engagement_data.json"
-
-        stats = stats or {"urls_scanned": 0, "duration": "0s"}
-        tech_stack = tech_stack or {}
-
-        # =====================================================================
-        # DEDUPLICATION: Group findings by (type, parameter)
-        # This prevents showing 4 SQLi findings for productId when it's the same vuln
-        # =====================================================================
-        validated = self._deduplicate_findings(validated)
-        manual_review = self._deduplicate_findings(manual_review)
-
-        # Count by severity
-        by_severity = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
-        for f in validated:
-            sev = (f.get("severity") or "medium").lower()
-            if sev in by_severity:
-                by_severity[sev] += 1
-
-        # Build triager-ready findings using helper methods
-        vuln_findings, nuclei_infra = self._build_triager_findings(validated, manual_review)
-
-        # Sort by CVSS score
-        vuln_findings = self._sort_findings_by_cvss(vuln_findings)
-        nuclei_infra = self._sort_findings_by_cvss(nuclei_infra)
-
-        output = {
-            "meta": {
-                "scan_id": self.scan_id,
-                "target": self.target_url,
-                "scan_date": datetime.now().isoformat(),
-                "tool_version": settings.VERSION,
-                "validation_engine": "AgenticValidator + CDP + Vision AI",
-                "report_signature": "BUGTRACE_AI_REPORT_V5"
-            },
-            "stats": {
-                "urls_scanned": stats.get("urls_scanned", 0),
-                "duration": stats.get("duration", "N/A"),
-                "duration_seconds": stats.get("duration_seconds", 0),
-                "validation_coverage": "100%"
-            },
-            "summary": {
-                "total_findings": len(all_findings),
-                "validated": len(validated),
-                "false_positives": len(false_positives),
-                "manual_review": len(manual_review),
-                "by_severity": by_severity
-            },
-            "findings": vuln_findings,  # Only vulnerability findings
-            "infrastructure": {
-                "tech_stack": tech_stack,
-                "nuclei_findings": nuclei_infra  # Nuclei detections in separate section
-            }
-        }
+        output = self._build_engagement_data(
+            all_findings, validated, false_positives, manual_review, stats, tech_stack
+        )
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2, default=str)
 
-        logger.info(f"[{self.name}] Wrote engagement_data.json ({len(vuln_findings)} vuln findings, {len(nuclei_infra)} nuclei findings)")
+        logger.info(f"[{self.name}] Wrote engagement_data.json ({len(output['findings'])} vuln findings, {len(output['infrastructure']['nuclei_findings'])} nuclei findings)")
         return path
 
     def _write_engagement_js(
@@ -535,32 +518,45 @@ class ReportingAgent(BaseAgent):
     ) -> Path:
         """Write the structured engagement_data.js for HTML viewer (JSONP style)."""
         path = self.output_dir / "engagement_data.js"
+        output = self._build_engagement_data(
+            all_findings, validated, false_positives, manual_review, stats, tech_stack
+        )
 
+        # Write as JS assignment
+        js_content = f"window.BUGTRACE_REPORT_DATA = {json.dumps(output, indent=2, default=str)};"
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(js_content)
+
+        logger.info(f"[{self.name}] Wrote engagement_data.js ({len(output['findings'])} vuln findings, {len(output['infrastructure']['nuclei_findings'])} nuclei findings)")
+        return path
+
+    def _build_engagement_data(
+        self,
+        all_findings: List[Dict],
+        validated: List[Dict],
+        false_positives: List[Dict],
+        manual_review: List[Dict],
+        stats: Dict = None,
+        tech_stack: Dict = None
+    ) -> Dict:
+        """Build engagement data structure (shared between JSON and JS outputs)."""
         stats = stats or {"urls_scanned": 0, "duration": "0s"}
         tech_stack = tech_stack or {}
 
-        # =====================================================================
-        # DEDUPLICATION: Group findings by (type, parameter)
-        # This prevents showing 4 SQLi findings for productId when it's the same vuln
-        # =====================================================================
+        # Deduplicate findings
         validated = self._deduplicate_findings(validated)
         manual_review = self._deduplicate_findings(manual_review)
 
         # Count by severity
-        by_severity = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
-        for f in validated:
-            sev = (f.get("severity") or "medium").lower()
-            if sev in by_severity:
-                by_severity[sev] += 1
+        by_severity = self._count_by_severity(validated)
 
-        # Build triager-ready findings using helper methods
+        # Build and sort findings
         vuln_findings, nuclei_infra = self._build_triager_findings(validated, manual_review)
-
-        # Sort by CVSS score
         vuln_findings = self._sort_findings_by_cvss(vuln_findings)
         nuclei_infra = self._sort_findings_by_cvss(nuclei_infra)
 
-        output = {
+        return {
             "meta": {
                 "scan_id": self.scan_id,
                 "target": self.target_url,
@@ -582,21 +578,21 @@ class ReportingAgent(BaseAgent):
                 "manual_review": len(manual_review),
                 "by_severity": by_severity
             },
-            "findings": vuln_findings,  # Only vulnerability findings
+            "findings": vuln_findings,
             "infrastructure": {
                 "tech_stack": tech_stack,
-                "nuclei_findings": nuclei_infra  # Nuclei detections in separate section
+                "nuclei_findings": nuclei_infra
             }
         }
 
-        # Write as JS assignment
-        js_content = f"window.BUGTRACE_REPORT_DATA = {json.dumps(output, indent=2, default=str)};"
-
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(js_content)
-
-        logger.info(f"[{self.name}] Wrote engagement_data.js ({len(vuln_findings)} vuln findings, {len(nuclei_infra)} nuclei findings)")
-        return path
+    def _count_by_severity(self, validated: List[Dict]) -> Dict[str, int]:
+        """Count findings by severity level."""
+        by_severity = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+        for f in validated:
+            sev = (f.get("severity") or "medium").lower()
+            if sev in by_severity:
+                by_severity[sev] += 1
+        return by_severity
 
     def _write_markdown_report(
         self,
@@ -711,7 +707,16 @@ class ReportingAgent(BaseAgent):
 
     def _create_minimal_html(self, path: Path):
         """Create minimal HTML that loads JSON dynamically."""
-        html = '''<!DOCTYPE html>
+        html = self._build_html_template()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html)
+
+    def _build_html_template(self) -> str:
+        """
+        Build HTML template string for dynamic report viewer.
+        Note: HTML template strings >50 lines are acceptable per 08-03 decision.
+        """
+        return '''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -803,7 +808,7 @@ class ReportingAgent(BaseAgent):
                                     ${f.reproduction.steps.map(s => '<li>' + s + '</li>').join('')}
                                 </ol>
 
-                                ${(f.reproduction.poc && !f.reproduction.poc.trim().startsWith('#')) ? 
+                                ${(f.reproduction.poc && !f.reproduction.poc.trim().startsWith('#')) ?
                                 `<h4 class="font-bold mt-4 mb-2">Proof of Concept</h4>
                                 <pre class="whitespace-pre-wrap">${f.reproduction.poc}</pre>` : ''}
 
@@ -824,10 +829,7 @@ class ReportingAgent(BaseAgent):
         loadReport();
     </script>
 </body>
-</html>''';
-
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(html)
+</html>'''
 
     def _copy_screenshots(self, findings: List[Dict], captures_dir: Path):
         """Copy all screenshots to the captures folder."""
@@ -958,112 +960,141 @@ class ReportingAgent(BaseAgent):
         These steps tell the triager EXACTLY what to do and what to observe.
         """
         vuln_type = (finding.get("type") or "").upper()
+
+        if vuln_type == "XXE":
+            return self._build_xxe_steps(finding)
+        elif vuln_type in ["SQLI", "SQL_INJECTION"]:
+            return self._build_sqli_steps(finding)
+        elif vuln_type in ["XSS", "STORED_XSS", "REFLECTED_XSS"]:
+            return self._build_xss_steps(finding)
+        elif vuln_type == "SSRF":
+            return self._build_ssrf_steps(finding)
+        elif vuln_type in ["CSRF", "SECURITY_MISCONFIGURATION"]:
+            return self._build_csrf_steps(finding)
+        elif vuln_type == "OPEN_REDIRECT":
+            return self._build_open_redirect_steps(finding)
+        else:
+            return self._build_generic_steps(finding)
+
+    def _build_xxe_steps(self, finding: Dict) -> List[str]:
+        """Build reproduction steps for XXE vulnerabilities."""
+        from urllib.parse import urlparse
+        url = finding.get("url", "")
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        post_endpoint = f"{base_url}/catalog/product/stock"
+
+        return [
+            f"1. Navigate to the product page: {url}",
+            "2. Open browser DevTools (F12) → Network tab",
+            "3. Click the 'Check stock' button to observe the normal XML request",
+            f"4. Intercept the POST request to: {post_endpoint}",
+            "5. Replace the XML body with the malicious payload containing the XXE entity",
+            "6. Forward the request and observe the out-of-band callback on your server",
+            "7. **Expected Result:** Your OOB server receives a DNS/HTTP callback from the target server"
+        ]
+
+    def _build_sqli_steps(self, finding: Dict) -> List[str]:
+        """Build reproduction steps for SQLi vulnerabilities."""
         url = finding.get("url", "")
         param = finding.get("parameter", "")
         payload = finding.get("payload", "")
 
-        if vuln_type == "XXE":
-            # Determine the stock check endpoint
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            base_url = f"{parsed.scheme}://{parsed.netloc}"
-            post_endpoint = f"{base_url}/catalog/product/stock"
+        is_time_based = any(kw in payload.lower() for kw in ["sleep", "benchmark", "pg_sleep", "waitfor", "delay"])
+        is_error_based = any(kw in payload.lower() for kw in ["cast", "convert", "extractvalue", "updatexml"])
 
-            return [
-                f"1. Navigate to the product page: {url}",
-                "2. Open browser DevTools (F12) → Network tab",
-                "3. Click the 'Check stock' button to observe the normal XML request",
-                f"4. Intercept the POST request to: {post_endpoint}",
-                "5. Replace the XML body with the malicious payload containing the XXE entity",
-                "6. Forward the request and observe the out-of-band callback on your server",
-                "7. **Expected Result:** Your OOB server receives a DNS/HTTP callback from the target server"
-            ]
-
-        elif vuln_type in ["SQLI", "SQL_INJECTION"]:
-            is_time_based = any(kw in payload.lower() for kw in ["sleep", "benchmark", "pg_sleep", "waitfor", "delay"])
-            is_error_based = any(kw in payload.lower() for kw in ["cast", "convert", "extractvalue", "updatexml"])
-
-            if is_time_based:
-                return [
-                    f"1. Navigate to: {url}",
-                    f"2. Locate the `{param}` parameter in the URL/form",
-                    f"3. Inject the time-based payload: `{payload}`",
-                    "4. Submit the request and start a timer",
-                    "5. **Expected Result:** Response takes 5+ seconds (indicating SQL SLEEP executed)",
-                    "6. Compare with normal request time (should be <1 second)",
-                    "7. Difference in response time confirms blind SQL injection"
-                ]
-            elif is_error_based:
-                return [
-                    f"1. Navigate to: {url}",
-                    f"2. Locate the `{param}` parameter",
-                    f"3. Inject the error-based payload: `{payload}`",
-                    "4. Submit the request",
-                    "5. **Expected Result:** Response contains database data in error message",
-                    "6. Look for extracted values (usernames, passwords, etc.) in the error output"
-                ]
-            else:
-                return [
-                    f"1. Navigate to: {url}",
-                    f"2. Locate the `{param}` parameter",
-                    f"3. Inject the payload: `{payload}`",
-                    "4. Submit the request",
-                    "5. **Expected Result:** SQL error message or altered response indicating injection",
-                    f"6. For further exploitation, use SQLMap: `sqlmap -u \"{url}\" -p {param} --batch`"
-                ]
-
-        elif vuln_type in ["XSS", "STORED_XSS", "REFLECTED_XSS"]:
-            return [
-                f"1. Copy the full exploit URL with payload",
-                f"2. Open a new browser window/incognito session",
-                f"3. Paste the URL and navigate to it",
-                "4. **Expected Result:** JavaScript alert box appears OR payload executes in DOM",
-                f"5. Open DevTools Console (F12) to verify payload execution",
-                "6. For stored XSS: Navigate to where the payload is stored and verify execution",
-                "7. Screenshot the alert/execution as proof"
-            ]
-
-        elif vuln_type == "SSRF":
-            return [
-                f"1. Set up an out-of-band callback server (Burp Collaborator, interactsh, or webhook.site)",
-                f"2. Navigate to: {url}",
-                f"3. Locate the `{param}` parameter",
-                f"4. Inject your callback URL as the payload",
-                "5. Submit the request",
-                "6. **Expected Result:** Your callback server receives a request from the target server",
-                "7. For internal network access, try: http://169.254.169.254/latest/meta-data/ (AWS metadata)"
-            ]
-
-        elif vuln_type in ["CSRF", "SECURITY_MISCONFIGURATION"]:
-            return [
-                "1. Save the HTML PoC form to a local file (csrf_poc.html)",
-                "2. Log into the target application in your browser",
-                "3. Open the csrf_poc.html file in the same browser (file:// or hosted)",
-                "4. The form will auto-submit after 1 second",
-                "5. **Expected Result:** Action is performed without user consent (e.g., item added to cart)",
-                "6. Check the target application to verify the unauthorized action occurred"
-            ]
-
-        elif vuln_type == "OPEN_REDIRECT":
-            return [
-                f"1. Copy the exploit URL with the redirect parameter",
-                "2. Open a new browser window",
-                "3. Paste and navigate to the URL",
-                "4. **Expected Result:** Browser redirects to the external attacker domain",
-                "5. Check the address bar to confirm redirection occurred",
-                "6. This can be used for phishing: redirect users to fake login pages"
-            ]
-
-        else:
-            # Generic steps
+        if is_time_based:
             return [
                 f"1. Navigate to: {url}",
-                f"2. Locate the vulnerable parameter: `{param}`",
+                f"2. Locate the `{param}` parameter in the URL/form",
+                f"3. Inject the time-based payload: `{payload}`",
+                "4. Submit the request and start a timer",
+                "5. **Expected Result:** Response takes 5+ seconds (indicating SQL SLEEP executed)",
+                "6. Compare with normal request time (should be <1 second)",
+                "7. Difference in response time confirms blind SQL injection"
+            ]
+        elif is_error_based:
+            return [
+                f"1. Navigate to: {url}",
+                f"2. Locate the `{param}` parameter",
+                f"3. Inject the error-based payload: `{payload}`",
+                "4. Submit the request",
+                "5. **Expected Result:** Response contains database data in error message",
+                "6. Look for extracted values (usernames, passwords, etc.) in the error output"
+            ]
+        else:
+            return [
+                f"1. Navigate to: {url}",
+                f"2. Locate the `{param}` parameter",
                 f"3. Inject the payload: `{payload}`",
                 "4. Submit the request",
-                "5. Observe the application response for vulnerability indicators",
-                "6. Document any security-relevant behavior"
+                "5. **Expected Result:** SQL error message or altered response indicating injection",
+                f"6. For further exploitation, use SQLMap: `sqlmap -u \"{url}\" -p {param} --batch`"
             ]
+
+    def _build_xss_steps(self, finding: Dict) -> List[str]:
+        """Build reproduction steps for XSS vulnerabilities."""
+        return [
+            f"1. Copy the full exploit URL with payload",
+            f"2. Open a new browser window/incognito session",
+            f"3. Paste the URL and navigate to it",
+            "4. **Expected Result:** JavaScript alert box appears OR payload executes in DOM",
+            f"5. Open DevTools Console (F12) to verify payload execution",
+            "6. For stored XSS: Navigate to where the payload is stored and verify execution",
+            "7. Screenshot the alert/execution as proof"
+        ]
+
+    def _build_ssrf_steps(self, finding: Dict) -> List[str]:
+        """Build reproduction steps for SSRF vulnerabilities."""
+        url = finding.get("url", "")
+        param = finding.get("parameter", "")
+
+        return [
+            f"1. Set up an out-of-band callback server (Burp Collaborator, interactsh, or webhook.site)",
+            f"2. Navigate to: {url}",
+            f"3. Locate the `{param}` parameter",
+            f"4. Inject your callback URL as the payload",
+            "5. Submit the request",
+            "6. **Expected Result:** Your callback server receives a request from the target server",
+            "7. For internal network access, try: http://169.254.169.254/latest/meta-data/ (AWS metadata)"
+        ]
+
+    def _build_csrf_steps(self, finding: Dict) -> List[str]:
+        """Build reproduction steps for CSRF vulnerabilities."""
+        return [
+            "1. Save the HTML PoC form to a local file (csrf_poc.html)",
+            "2. Log into the target application in your browser",
+            "3. Open the csrf_poc.html file in the same browser (file:// or hosted)",
+            "4. The form will auto-submit after 1 second",
+            "5. **Expected Result:** Action is performed without user consent (e.g., item added to cart)",
+            "6. Check the target application to verify the unauthorized action occurred"
+        ]
+
+    def _build_open_redirect_steps(self, finding: Dict) -> List[str]:
+        """Build reproduction steps for Open Redirect vulnerabilities."""
+        return [
+            f"1. Copy the exploit URL with the redirect parameter",
+            "2. Open a new browser window",
+            "3. Paste and navigate to the URL",
+            "4. **Expected Result:** Browser redirects to the external attacker domain",
+            "5. Check the address bar to confirm redirection occurred",
+            "6. This can be used for phishing: redirect users to fake login pages"
+        ]
+
+    def _build_generic_steps(self, finding: Dict) -> List[str]:
+        """Build generic reproduction steps for unknown vulnerability types."""
+        url = finding.get("url", "")
+        param = finding.get("parameter", "")
+        payload = finding.get("payload", "")
+
+        return [
+            f"1. Navigate to: {url}",
+            f"2. Locate the vulnerable parameter: `{param}`",
+            f"3. Inject the payload: `{payload}`",
+            "4. Submit the request",
+            "5. Observe the application response for vulnerability indicators",
+            "6. Document any security-relevant behavior"
+        ]
 
     def _get_impact_for_type(self, vuln_type: str) -> str:
         """Get standard impact description for vulnerability type."""
