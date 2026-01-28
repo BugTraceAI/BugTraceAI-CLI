@@ -509,40 +509,52 @@ class URLReporter:
     def generate_master_index(self) -> Path:
         """Generate master index of all URL reports."""
         index_path = self.url_reports_dir / "INDEX.md"
-        
+
         # Collect all URL reports
         url_dirs = [d for d in self.url_reports_dir.iterdir() if d.is_dir()]
-        
+
         with open(index_path, 'w', encoding='utf-8') as f:
-            f.write("# URL Reports Index\n\n")
-            f.write(f"**Total URLs Analyzed:** {len(url_dirs)}\n\n")
-            f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            f.write("---\n\n")
-            
-            f.write("## 📊 Reports by URL\n\n")
-            
-            for url_dir in sorted(url_dirs, key=lambda x: x.name):
-                # Read metadata to get original URL
-                metadata_file = url_dir / "metadata.json"
-                if metadata_file.exists():
-                    with open(metadata_file, 'r') as mf:
-                        metadata = json.load(mf)
-                        url = metadata.get('url', 'Unknown')
-                else:
-                    url = url_dir.name
-                
-                # Read summary stats
-                vulns_file = url_dir / "vulnerabilities.json"
-                vuln_count = 0
-                if vulns_file.exists():
-                    with open(vulns_file, 'r') as vf:
-                        vulns_data = json.load(vf)
-                        vuln_count = vulns_data.get('total_vulnerabilities', 0)
-                
-                status_emoji = "🔴" if vuln_count > 0 else "✅"
-                f.write(f"### {status_emoji} [{url}]({url_dir.name}/README.md)\n\n")
-                f.write(f"- **Folder:** `{url_dir.name}`\n")
-                f.write(f"- **Vulnerabilities:** {vuln_count}\n\n")
-        
+            self._write_master_index_header(f, len(url_dirs))
+            self._write_master_index_urls(f, url_dirs)
+
         logger.info(f"✅ Master index created: {index_path}")
         return index_path
+
+    def _write_master_index_header(self, f, url_count: int):
+        """Write master index header."""
+        f.write("# URL Reports Index\n\n")
+        f.write(f"**Total URLs Analyzed:** {url_count}\n\n")
+        f.write(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write("---\n\n")
+        f.write("## 📊 Reports by URL\n\n")
+
+    def _write_master_index_urls(self, f, url_dirs: list):
+        """Write URL entries in master index."""
+        for url_dir in sorted(url_dirs, key=lambda x: x.name):
+            url = self._read_url_from_metadata(url_dir)
+            vuln_count = self._read_vuln_count(url_dir)
+
+            status_emoji = "🔴" if vuln_count > 0 else "✅"
+            f.write(f"### {status_emoji} [{url}]({url_dir.name}/README.md)\n\n")
+            f.write(f"- **Folder:** `{url_dir.name}`\n")
+            f.write(f"- **Vulnerabilities:** {vuln_count}\n\n")
+
+    def _read_url_from_metadata(self, url_dir: Path) -> str:
+        """Read original URL from metadata file."""
+        metadata_file = url_dir / "metadata.json"
+        if not metadata_file.exists():
+            return url_dir.name
+
+        with open(metadata_file, 'r') as mf:
+            metadata = json.load(mf)
+            return metadata.get('url', 'Unknown')
+
+    def _read_vuln_count(self, url_dir: Path) -> int:
+        """Read vulnerability count from vulnerabilities.json."""
+        vulns_file = url_dir / "vulnerabilities.json"
+        if not vulns_file.exists():
+            return 0
+
+        with open(vulns_file, 'r') as vf:
+            vulns_data = json.load(vf)
+            return vulns_data.get('total_vulnerabilities', 0)

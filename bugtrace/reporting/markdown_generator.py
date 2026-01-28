@@ -243,21 +243,30 @@ class MarkdownGenerator:
         validator_notes = vuln.metadata.get("validator_notes")
         validation_status = vuln.metadata.get("status", "")
 
-        if validator_notes or validation_status:
-            f.write(f"#### 🛡️ Validation Audit (Manager Review)\n")
+        if not (validator_notes or validation_status):
+            return
 
-            # Status badge
-            if validation_status == "VALIDATED_CONFIRMED":
-                f.write(f"**Status:** ✅ CONFIRMED\n\n")
-            elif validation_status == "MANUAL_REVIEW_RECOMMENDED":
-                f.write(f"**Status:** ⚠️ NEEDS MANUAL REVIEW\n\n")
-            elif validation_status == "VALIDATED_FALSE_POSITIVE":
-                f.write(f"**Status:** ❌ FALSE POSITIVE\n\n")
+        f.write(f"#### 🛡️ Validation Audit (Manager Review)\n")
+        self._write_validation_status_badge(f, validation_status)
+        self._write_validator_notes(f, validator_notes)
 
-            # Reasoning from AgenticValidator
-            if validator_notes:
-                f.write(f"**AI Validator Comment:**\n")
-                f.write(f"> {validator_notes}\n\n")
+    def _write_validation_status_badge(self, f, validation_status: str):
+        """Write validation status badge."""
+        status_badges = {
+            "VALIDATED_CONFIRMED": "**Status:** ✅ CONFIRMED\n\n",
+            "MANUAL_REVIEW_RECOMMENDED": "**Status:** ⚠️ NEEDS MANUAL REVIEW\n\n",
+            "VALIDATED_FALSE_POSITIVE": "**Status:** ❌ FALSE POSITIVE\n\n"
+        }
+
+        badge = status_badges.get(validation_status)
+        if badge:
+            f.write(badge)
+
+    def _write_validator_notes(self, f, validator_notes: str):
+        """Write validator notes if present."""
+        if validator_notes:
+            f.write(f"**AI Validator Comment:**\n")
+            f.write(f"> {validator_notes}\n\n")
 
     def _write_executive_summary(self, context: ReportContext, path: Path):
         # Calculate Matrix

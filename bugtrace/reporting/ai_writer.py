@@ -64,19 +64,27 @@ class AIReportWriter(MarkdownGenerator):
             "urls_crawled_count": 0,
             "vulnerabilities": []
         }
-        
-        # Extract meaningful Recon Data (Inputs)
+
+        # Extract meaningful data from findings
         for f in context.findings:
-            if f.type == FindingType.OBSERVATION:
-                 meta = f.metadata
-                 if meta.get('type') == 'Input':
-                     summary["inputs_found"].append(f"{meta.get('name')} ({meta.get('element_type')})")
-                 elif meta.get('type') == 'URL':
-                     summary["urls_crawled_count"] += 1
-            elif f.type == FindingType.VULNERABILITY:
-                summary["vulnerabilities"].append(f"{f.title} ({f.severity.value})")
+            self._extract_finding_data(f, summary)
 
         return json.dumps(summary, indent=2)
+
+    def _extract_finding_data(self, finding, summary: dict):
+        """Extract relevant data from a single finding."""
+        if finding.type == FindingType.OBSERVATION:
+            self._extract_observation_data(finding, summary)
+        elif finding.type == FindingType.VULNERABILITY:
+            summary["vulnerabilities"].append(f"{finding.title} ({finding.severity.value})")
+
+    def _extract_observation_data(self, finding, summary: dict):
+        """Extract data from observation findings."""
+        meta = finding.metadata
+        if meta.get('type') == 'Input':
+            summary["inputs_found"].append(f"{meta.get('name')} ({meta.get('element_type')})")
+        elif meta.get('type') == 'URL':
+            summary["urls_crawled_count"] += 1
 
     async def _generate_technical_assessment(self, context: ReportContext, summary: str) -> str:
         dashboard.update_task("Reporting", status="Generating Technical Report (AI)...")

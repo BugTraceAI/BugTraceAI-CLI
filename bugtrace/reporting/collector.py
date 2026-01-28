@@ -202,32 +202,29 @@ class DataCollector:
         import json
         with open(file_path, "r") as f:
             data = json.load(f)
-            # Reconstruct ReportContext
-            self.context = ReportContext(**data)
-            # Reconstruct Findings which might be dicts now
-            # Pydantic v2 usually handles this if we pass the dict to constructor,
-            # but if ReportContext is a Pydantic model it has model_validate.
-            # Assuming ReportContext is a Pydantic model:
-            # self.context = ReportContext.model_validate(data)
-            # Or if it's a simple class, we might need manual reconstruction.
-            # Based on view_file models.py it seemed like Pydantic.
-            # Let's try simple Pydantic parsing if possible, or manual.
-            if hasattr(ReportContext, "model_validate"):
-                 self.context = ReportContext.model_validate(data)
-            else:
-                 # Fallback manual reconstruction if not Pydantic v2
-                 self.context = ReportContext(target_url=data.get("target_url", "unknown"))
-                 self.context.scan_date = datetime.fromisoformat(data.get("scan_date")) if data.get("scan_date") else datetime.now()
-                 self.context.start_time = datetime.fromisoformat(data.get("start_time")) if data.get("start_time") else datetime.now()
-                 self.context.end_time = datetime.fromisoformat(data.get("end_time")) if data.get("end_time") else datetime.now()
-                 
-                 findings = []
-                 for f_data in data.get("findings", []):
-                     # Reconstruct Enum fields
-                     if "type" in f_data and isinstance(f_data["type"], str):
-                         # Map string back to FindingType enum if needed, or Pydantic handles it
-                         # We'll assume Pydantic handles str -> Enum conversion in constructor
-                         pass
-                     findings.append(Finding(**f_data))
-                 self.context.findings = findings
+
+        # Try Pydantic v2 model_validate first
+        if hasattr(ReportContext, "model_validate"):
+            self.context = ReportContext.model_validate(data)
+        else:
+            # Fallback to manual reconstruction
+            self.context = self._manual_reconstruct_context(data)
+
+    def _manual_reconstruct_context(self, data: dict) -> ReportContext:
+        """Manually reconstruct ReportContext from dictionary."""
+        context = ReportContext(target_url=data.get("target_url", "unknown"))
+        context.scan_date = datetime.fromisoformat(data.get("scan_date")) if data.get("scan_date") else datetime.now()
+        context.start_time = datetime.fromisoformat(data.get("start_time")) if data.get("start_time") else datetime.now()
+        context.end_time = datetime.fromisoformat(data.get("end_time")) if data.get("end_time") else datetime.now()
+
+        context.findings = self._reconstruct_findings(data.get("findings", []))
+        return context
+
+    def _reconstruct_findings(self, findings_data: list) -> list:
+        """Reconstruct Finding objects from dictionary list."""
+        findings = []
+        for f_data in findings_data:
+            # Pydantic handles str -> Enum conversion in constructor
+            findings.append(Finding(**f_data))
+        return findings
 
