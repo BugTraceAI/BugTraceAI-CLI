@@ -1439,6 +1439,20 @@ class XSSAgent(BaseAgent):
             reproduction_steps=["Open URL in browser", "Check for execution"]
         )
 
+    def _llm_prepare_finding_data(
+        self,
+        evidence: Dict,
+        llm_response: Dict,
+        reflection_type: str
+    ) -> Dict:
+        """Prepare finding data from LLM response."""
+        return {
+            "evidence": evidence,
+            "screenshot_path": evidence.get("screenshot_path"),
+            "context": llm_response.get("context", "unknown"),
+            "reflection_context": reflection_type
+        }
+
     async def _param_test_llm_payload(
         self,
         param: str,
@@ -1451,9 +1465,8 @@ class XSSAgent(BaseAgent):
         injection_ctx: InjectionContext
     ) -> Optional[XSSFinding]:
         """Phase 5: LLM analysis and payload testing."""
-        llm_response = await self.exec_tool(
-            "LLM_Analysis", self._llm_analyze, html, param,
-            interactsh_url, context_data, timeout=250
+        llm_response = await self._llm_get_payload_from_response(
+            html, param, interactsh_url, context_data
         )
 
         if not llm_response or not llm_response.get("vulnerable"):
@@ -1475,12 +1488,7 @@ class XSSAgent(BaseAgent):
         if not validated:
             return None
 
-        finding_data = {
-            "evidence": evidence,
-            "screenshot_path": evidence.get("screenshot_path"),
-            "context": llm_response.get("context", "unknown"),
-            "reflection_context": reflection_type
-        }
+        finding_data = self._llm_prepare_finding_data(evidence, llm_response, reflection_type)
 
         if not self._should_create_finding(finding_data):
             return None
@@ -1492,6 +1500,20 @@ class XSSAgent(BaseAgent):
             injection_ctx, "context_aware",
             llm_response.get("reasoning", "LLM generated context-aware payload.")
         )
+
+    def _bypass_prepare_finding_data(
+        self,
+        evidence: Dict,
+        bypass_response: Dict,
+        reflection_type: str
+    ) -> Dict:
+        """Prepare finding data from bypass response."""
+        return {
+            "evidence": evidence,
+            "screenshot_path": evidence.get("screenshot_path"),
+            "context": bypass_response.get("strategy", "bypass"),
+            "reflection_context": reflection_type
+        }
 
     async def _param_try_bypass_attempts(
         self,
@@ -1506,8 +1528,7 @@ class XSSAgent(BaseAgent):
         injection_ctx: InjectionContext
     ) -> Optional[XSSFinding]:
         """Phase 6: Bypass attempts if initial payload failed."""
-        waf_active = self.consecutive_blocks > 2 or self._detected_waf is not None
-        max_attempts = self.MAX_BYPASS_ATTEMPTS if waf_active else 2
+        max_attempts = self._bypass_determine_max_attempts()
 
         for attempt in range(max_attempts):
             bypass_response = await self._llm_generate_bypass(
@@ -1528,12 +1549,7 @@ class XSSAgent(BaseAgent):
             if not validated:
                 continue
 
-            finding_data = {
-                "evidence": evidence,
-                "screenshot_path": evidence.get("screenshot_path"),
-                "context": bypass_response.get("strategy", "bypass"),
-                "reflection_context": reflection_type
-            }
+            finding_data = self._bypass_prepare_finding_data(evidence, bypass_response, reflection_type)
 
             if not self._should_create_finding(finding_data):
                 continue
