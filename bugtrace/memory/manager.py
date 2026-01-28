@@ -65,7 +65,7 @@ class MemoryManager:
                 self.graph = nx.read_gml(str(self.graph_path))
                 logger.info(f"Memory: Restored Knowledge Graph ({self.graph.number_of_nodes()} nodes).")
             except Exception as e:
-                logger.error(f"Failed to load graph: {e}. Starting fresh.")
+                logger.error(f"Failed to load graph: {e}. Starting fresh.", exc_info=True)
     
     def _save_graph(self):
         """Persists the graph to disk."""
@@ -74,7 +74,7 @@ class MemoryManager:
             # For simplicity in this tool, we assume basic types are used in props
             nx.write_gml(self.graph, str(self.graph_path))
         except Exception as e:
-            logger.error(f"Failed to save graph: {e}")
+            logger.error(f"Failed to save graph: {e}", exc_info=True)
 
     def _init_vector_table(self):
         """Initializes the LanceDB table with proper schema."""
@@ -96,7 +96,7 @@ class MemoryManager:
                 exist_ok=True # Use existing if present
             )
         except Exception as e:
-            logger.error(f"Failed to init vector table: {e}")
+            logger.error(f"Failed to init vector table: {e}", exc_info=True)
             try:
                 self.obs_table = self.vector_db.open_table("observations")
             except Exception as e:
@@ -231,7 +231,7 @@ class MemoryManager:
             results = self.obs_table.search(query_vec).limit(limit).to_list()
             return results
         except Exception as e:
-            logger.error(f"Vector search failed: {e}")
+            logger.error(f"Vector search failed: {e}", exc_info=True)
             return []
 
 # Global Memory Singleton

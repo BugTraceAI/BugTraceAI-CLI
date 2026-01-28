@@ -35,7 +35,7 @@ class PayloadLearner:
             with open(self.proven_file, 'r') as f:
                 return json.load(f)
         except Exception as e:
-            logger.error(f"Failed to load proven payloads: {e}")
+            logger.error(f"Failed to load proven payloads: {e}", exc_info=True)
             return []
 
     def _load_curated(self) -> List[str]:
@@ -52,7 +52,7 @@ class PayloadLearner:
             logger.info(f"Loaded {len(payloads)} curated payloads.")
             return payloads
         except Exception as e:
-            logger.error(f"Failed to load curated payloads: {e}")
+            logger.error(f"Failed to load curated payloads: {e}", exc_info=True)
             return []
 
     def save_success(self, payload: str, context: str = "unknown", url: str = ""):
@@ -94,7 +94,7 @@ class PayloadLearner:
         except filelock.Timeout:
             logger.warning("Could not acquire lock for payload file, skipping save")
         except Exception as e:
-            logger.error(f"Failed to save proven payloads: {e}")
+            logger.error(f"Failed to save proven payloads: {e}", exc_info=True)
 
     def _get_score(self, payload: str) -> int:
         for p in self.proven_payloads:
