@@ -137,18 +137,9 @@ class ValidationEngine:
         unvalidated_sqli = []
 
         for f in pending:
-            if f.status == "VALIDATED_CONFIRMED":
-                already_confirmed.append(f)
-            elif f.status == "PENDING_CDP_VALIDATION":
-                needs_cdp.append(f)
-            elif f.status in ["PENDING_VALIDATION", "PENDING"]:
-                vuln_type = self._get_vuln_type_str(f)
-                if vuln_type in ["XSS", "CSTI", "SSTI"]:
-                    needs_cdp.append(f)
-                elif vuln_type in ["SQLI", "SQL"]:
-                    self._classify_sqli_finding(f, specialist_authority, unvalidated_sqli)
-                else:
-                    specialist_authority.append(f)
+            self._categorize_finding(
+                f, already_confirmed, needs_cdp, specialist_authority, unvalidated_sqli
+            )
 
         return {
             "already_confirmed": already_confirmed,
@@ -156,6 +147,45 @@ class ValidationEngine:
             "specialist_authority": specialist_authority,
             "unvalidated_sqli": unvalidated_sqli
         }
+
+    def _categorize_finding(
+        self,
+        f,
+        already_confirmed: List,
+        needs_cdp: List,
+        specialist_authority: List,
+        unvalidated_sqli: List
+    ):
+        """Categorize a single finding based on status and type."""
+        if f.status == "VALIDATED_CONFIRMED":
+            already_confirmed.append(f)
+            return
+
+        if f.status == "PENDING_CDP_VALIDATION":
+            needs_cdp.append(f)
+            return
+
+        if f.status not in ["PENDING_VALIDATION", "PENDING"]:
+            return
+
+        self._categorize_pending_finding(f, needs_cdp, specialist_authority, unvalidated_sqli)
+
+    def _categorize_pending_finding(
+        self,
+        f,
+        needs_cdp: List,
+        specialist_authority: List,
+        unvalidated_sqli: List
+    ):
+        """Categorize a pending finding by vulnerability type."""
+        vuln_type = self._get_vuln_type_str(f)
+
+        if vuln_type in ["XSS", "CSTI", "SSTI"]:
+            needs_cdp.append(f)
+        elif vuln_type in ["SQLI", "SQL"]:
+            self._classify_sqli_finding(f, specialist_authority, unvalidated_sqli)
+        else:
+            specialist_authority.append(f)
 
     def _process_unvalidated_sqli(self, unvalidated_sqli: List):
         """Mark unvalidated SQLi findings as false positives."""
@@ -237,38 +267,59 @@ class ValidationEngine:
             if dashboard.stop_requested:
                 self._cancellation_token["cancelled"] = True
                 break
-            batch = findings_dicts[i:i + self.BATCH_SIZE]
-            batch_num = (i // self.BATCH_SIZE) + 1
-            total_batches = (total + self.BATCH_SIZE - 1) // self.BATCH_SIZE
 
-            dashboard.log(f"🚀 Processing batch {batch_num}/{total_batches} ({len(batch)} findings)...", "INFO")
+            processed = await self._process_single_batch(
+                findings_dicts, i, total, processed
+            )
 
-            # Run parallel batch validation with timeout
-            try:
-                # 5 minutes max per batch (individual findings have their own timeouts)
-                results = await asyncio.wait_for(
-                    self.validator.validate_batch(batch),
-                    timeout=300.0
+    async def _process_single_batch(
+        self,
+        findings_dicts: List[Dict],
+        batch_start: int,
+        total: int,
+        processed: int
+    ) -> int:
+        """Process a single batch of findings."""
+        batch = findings_dicts[batch_start:batch_start + self.BATCH_SIZE]
+        batch_num = (batch_start // self.BATCH_SIZE) + 1
+        total_batches = (total + self.BATCH_SIZE - 1) // self.BATCH_SIZE
+
+        dashboard.log(f"🚀 Processing batch {batch_num}/{total_batches} ({len(batch)} findings)...", "INFO")
+
+        try:
+            # 5 minutes max per batch (individual findings have their own timeouts)
+            results = await asyncio.wait_for(
+                self.validator.validate_batch(batch),
+                timeout=300.0
+            )
+
+            processed = self._update_batch_results(results, processed)
+        except Exception as e:
+            logger.error(f"Batch {batch_num} failed: {e}", exc_info=True)
+            processed = self._mark_batch_as_error(batch, processed, e)
+
+        dashboard.log(f"📊 Progress: {processed}/{total} findings processed", "INFO")
+        return processed
+
+    def _update_batch_results(self, results: List[Dict], processed: int) -> int:
+        """Update database with batch validation results."""
+        for result in results:
+            finding_id = result.get("id")
+            if not finding_id:
+                continue
+
+            self._update_db_from_result(finding_id, result)
+            processed += 1
+        return processed
+
+    def _mark_batch_as_error(self, batch: List[Dict], processed: int, error: Exception) -> int:
+        """Mark all findings in a failed batch as errors."""
+        for f in batch:
+            if f.get("id"):
+                self.db.update_finding_status(
+                    f["id"], FindingStatus.ERROR, notes=f"Batch error: {str(error)}"
                 )
-
-                # Update DB with results
-                for result in results:
-                    finding_id = result.get("id")
-                    if not finding_id:
-                        continue
-
-                    self._update_db_from_result(finding_id, result)
-                    processed += 1
-
-            except Exception as e:
-                logger.error(f"Batch {batch_num} failed: {e}")
-                # Mark all in batch as error
-                for f in batch:
-                    if f.get("id"):
-                        self.db.update_finding_status(f["id"], FindingStatus.ERROR, notes=f"Batch error: {str(e)}")
-                processed += len(batch)
-
-            dashboard.log(f"📊 Progress: {processed}/{total} findings processed", "INFO")
+        return processed + len(batch)
 
     async def _validate_sequential(self, findings_objects: List):
         """

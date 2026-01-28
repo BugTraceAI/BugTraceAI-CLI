@@ -137,11 +137,15 @@ class BootSequence:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get("https://openrouter.ai", timeout=3) as resp:
-                    if resp.status < 500:
-                        return "OK", "Internet reachable."
-                    return "WARN", f"OpenRouter status {resp.status}."
+                    return self._evaluate_network_response(resp.status)
         except Exception as e:
             return "FAIL", f"CRITICAL: No Internet ({str(e)})"
+
+    def _evaluate_network_response(self, status: int) -> Tuple[str, str]:
+        """Evaluate network check response status."""
+        if status < 500:
+            return "OK", "Internet reachable."
+        return "WARN", f"OpenRouter status {status}."
 
     async def _check_ai(self) -> Tuple[str, str]:
         """Uses llm_client to verify connectivity."""

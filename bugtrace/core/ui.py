@@ -160,11 +160,13 @@ class Dashboard:
             if not char:
                 time_module.sleep(0.5)
                 continue
+
             if char.lower() == 'q':
                 with self._lock:
                     self.stop_requested = True
                 break
-            elif char.lower() == 'p':
+
+            if char.lower() == 'p':
                 with self._lock:
                     self.paused = not self.paused
 
@@ -392,11 +394,7 @@ class Dashboard:
 
         lines = []
         for timestamp, level, msg in recent_logs:
-            if "SUCCESS" in level or "✓" in str(msg): icon, color = "✓", "bright_green"
-            elif "WARN" in level or "⚠" in str(msg): icon, color = "⚠", "bright_yellow"
-            elif "ERROR" in level or "CRITICAL" in level: icon, color = "✗", "bright_red"
-            else: icon, color = "", "white"
-
+            icon, color = self._get_log_icon_and_color(level, msg)
             display_msg = str(msg)[:75] + "..." if len(str(msg)) > 75 else str(msg)
             lines.append(Text.assemble((f"[{timestamp}] ", "white dim"), (f"{icon} " if icon else "", color), (display_msg, "white")))
 
@@ -404,6 +402,16 @@ class Dashboard:
         content = Text("\n").join(lines)
         panel = Panel(content, title="[bright_yellow bold]📋 LOG[/bright_yellow bold]", border_style="cyan", padding=(0, 1))
         self.layout["log"].update(panel)
+
+    def _get_log_icon_and_color(self, level: str, msg) -> tuple:
+        """Get icon and color for log message."""
+        if "SUCCESS" in level or "✓" in str(msg):
+            return "✓", "bright_green"
+        if "WARN" in level or "⚠" in str(msg):
+            return "⚠", "bright_yellow"
+        if "ERROR" in level or "CRITICAL" in level:
+            return "✗", "bright_red"
+        return "", "white"
 
     def update_tasks_section(self):
         """Render active tasks with spinner for running tasks."""
@@ -442,18 +450,14 @@ class Dashboard:
         with self._lock:
             # Sort copy
             current_findings = list(self.findings)
-        
+
         severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
         sorted_findings = sorted(current_findings, key=lambda x: severity_order.get(x[2], 99))[:4]
-        
+
         lines = []
         if sorted_findings:
             for finding_type, details, severity in sorted_findings:
-                if severity == "CRITICAL": emoji, color = "🚨", "bright_red bold blink"
-                elif severity == "HIGH": emoji, color = "🔴", "bright_red bold"
-                elif severity == "MEDIUM": emoji, color = "🟡", "bright_yellow"
-                else: emoji, color = "⚪", "white dim"
-                
+                emoji, color = self._get_severity_icon_and_color(severity)
                 details_display = details[:45] + "..." if len(details) > 45 else details
                 lines.append(Text.assemble((emoji + " ", color), (f"[{severity}] ", color), (f"{finding_type} @ ", "white"), (details_display, "white")))
         else:
@@ -463,6 +467,16 @@ class Dashboard:
         content = Text("\n").join(lines)
         panel = Panel(content, title=f"[bright_yellow bold]🔍 FINDINGS ({len(current_findings)} total)[/bright_yellow bold]", border_style="magenta", padding=(0, 1))
         self.layout["findings"].update(panel)
+
+    def _get_severity_icon_and_color(self, severity: str) -> tuple:
+        """Get icon and color for severity level."""
+        if severity == "CRITICAL":
+            return "🚨", "bright_red bold blink"
+        if severity == "HIGH":
+            return "🔴", "bright_red bold"
+        if severity == "MEDIUM":
+            return "🟡", "bright_yellow"
+        return "⚪", "white dim"
 
     def update_footer(self):
         text = Text.assemble(("[p] Pause", "bright_yellow"), (" | ", "white dim"), ("[q] Quit", "bright_red"), (" | ", "white dim"), ("[h] Help", "white"))
