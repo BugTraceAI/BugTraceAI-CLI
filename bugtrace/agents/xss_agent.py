@@ -751,6 +751,137 @@ class XSSAgent(BaseAgent):
         except Exception as e:
             logger.debug(f"[{self.name}] Failed to record bypass: {e}")
 
+    async def _loop_setup_waf_and_interactsh(self) -> str:
+        """Phase 0-1: WAF detection and Interactsh registration."""
+        # Phase 0: WAF Detection
+        dashboard.log(f"[{self.name}] 🛡️ Detecting WAF...", "INFO")
+        logger.info(f"[{self.name}] Phase 0: WAF Detection using Q-Learning fingerprinter")
+        waf_name, waf_confidence = await self._detect_waf_async()
+
+        if self._detected_waf:
+            dashboard.log(f"[{self.name}] 🛡️ WAF: {waf_name} ({waf_confidence:.0%}) - Activating Q-Learning bypass strategies", "WARN")
+            self.stealth_mode = True  # Auto-enable stealth for WAF targets
+        else:
+            dashboard.log(f"[{self.name}] ✓ No WAF detected", "SUCCESS")
+
+        # Phase 1: Setup Interactsh
+        dashboard.log(f"[{self.name}] 📡 Registering with Interactsh...", "INFO")
+        logger.info(f"[{self.name}] Phase 1: Registering with Interactsh")
+        self.interactsh = InteractshClient()
+        await self.exec_tool("Interactsh_Register", self.interactsh.register, timeout=30)
+        interactsh_domain = self.interactsh.get_url("xss_agent_base")
+        dashboard.log(f"[{self.name}] ✓ Interactsh ready: {interactsh_domain}", "SUCCESS")
+
+        return interactsh_domain
+
+    async def _loop_discover_params(self) -> bool:
+        """Phase 2: Discover parameters if not provided. Returns True if params available."""
+        if not self.params:
+            dashboard.log(f"[{self.name}] 🔎 Discovering parameters...", "INFO")
+            logger.info(f"[{self.name}] Phase 2: Discovering parameters")
+            self.params = await self._discover_params()
+            logger.info(f"[{self.name}] Discovered {len(self.params)} params")
+
+        if not self.params:
+            dashboard.log(f"[{self.name}] ⚠️ No parameters found to test", "WARN")
+            return False
+
+        dashboard.log(f"[{self.name}] Testing {len(self.params)} params: {', '.join(self.params[:5])}", "INFO")
+        logger.info(f"[{self.name}] Params List (Raw): {self.params}")
+        return True
+
+    async def _loop_test_params(self, interactsh_domain: str, screenshots_dir: Path):
+        """Phase 3: Test each parameter for XSS."""
+        logger.info(f"[{self.name}] Phase 3: Testing each parameter")
+        for param in self.params:
+            # TASK-50: Thread-safe deduplication check
+            async with self._tested_params_lock:
+                if param in self._tested_params:
+                    logger.info(f"[{self.name}] Skipping {param} - already tested")
+                    continue
+                self._tested_params.add(param)
+
+            logger.info(f"[{self.name}] Testing param: {param}")
+
+            finding = await self._test_parameter(param, interactsh_domain, screenshots_dir)
+
+            if not finding:
+                continue
+
+            self.findings.append(finding)
+            dashboard.log(f"[{self.name}] 🎯 XSS CONFIRMED on '{param}'!", "SUCCESS")
+
+            # OPTIMIZATION: Early exit after first finding
+            from bugtrace.core.config import settings
+            if settings.EARLY_EXIT_ON_FINDING:
+                remaining = len(self.params) - (self.params.index(param) + 1)
+                if remaining > 0:
+                    logger.info(f"[{self.name}] ⚡ OPTIMIZATION: Early exit enabled (config)")
+                    logger.info(f"[{self.name}] Skipping {remaining} remaining params (URL already vulnerable)")
+                    dashboard.log(f"[{self.name}] ⚡ Early exit: Skipping {remaining} params (optimization)", "INFO")
+                break
+
+    async def _loop_test_dom_xss(self):
+        """Phase 3.5: DOM XSS Headless scan."""
+        dashboard.log(f"[{self.name}] 🎭 Starting DOM XSS Headless Scan...", "INFO")
+        logger.info(f"[{self.name}] Phase 3.5: DOM XSS Headless Scan")
+        try:
+            dom_findings = await detect_dom_xss(self.url)
+            for df in dom_findings:
+                # Convert to XSSFinding
+                self.findings.append(XSSFinding(
+                    url=df["url"],
+                    parameter=df["source"],
+                    payload=df["payload"],
+                    context="dom_xss",
+                    validation_method="headless_playwright",
+                    evidence={"sink": df["sink"], "evidence": df["evidence"]},
+                    confidence=1.0,
+                    status="VALIDATED_CONFIRMED",
+                    validated=True,
+                    reflection_context=df["source"],
+                    successful_payloads=[df["payload"]]
+                ))
+            if dom_findings:
+                dashboard.log(f"[{self.name}] 🎯 DOM XSS CONFIRMED ({len(dom_findings)} hits)!", "SUCCESS")
+                logger.info(f"[{self.name}] DOM XSS Headless Scan found {len(dom_findings)} vulnerabilities")
+        except Exception as e:
+            logger.error(f"[{self.name}] DOM XSS Headless Scan failed: {e}", exc_info=True)
+            dashboard.log(f"[{self.name}] ⚠️ DOM XSS Scan skipped: Headless error", "WARN")
+
+    async def _loop_test_additional_vectors(self, interactsh_domain: str, screenshots_dir: Path):
+        """Phase 4: Additional attack vectors (POST, Headers)."""
+        if self._max_impact_achieved:
+            return
+
+        # 4.1: Test POST forms
+        dashboard.log(f"[{self.name}] 📝 Phase 4.1: Testing POST forms...", "INFO")
+        try:
+            post_findings = await self._discover_and_test_post_forms(
+                interactsh_domain, screenshots_dir
+            )
+            for pf in post_findings:
+                self.findings.append(pf)
+                if self._max_impact_achieved:
+                    break
+            if post_findings:
+                dashboard.log(f"[{self.name}] 🎯 POST XSS found: {len(post_findings)} hits!", "SUCCESS")
+        except Exception as e:
+            logger.debug(f"POST form testing failed: {e}")
+
+        # 4.2: Test Header Injection
+        if not self._max_impact_achieved:
+            dashboard.log(f"[{self.name}] 🔧 Phase 4.2: Testing header injection...", "INFO")
+            try:
+                header_finding = await self._test_header_injection(
+                    interactsh_domain, screenshots_dir
+                )
+                if header_finding:
+                    self.findings.append(header_finding)
+                    dashboard.log(f"[{self.name}] 🎯 Header XSS found!", "SUCCESS")
+            except Exception as e:
+                logger.debug(f"Header injection testing failed: {e}")
+
     async def run_loop(self) -> Dict:
         """Main entry point for XSS scanning."""
         dashboard.current_agent = self.name
@@ -760,142 +891,37 @@ class XSSAgent(BaseAgent):
         screenshots_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # Phase 0: WAF Detection (Q-Learning Intelligence)
-            dashboard.log(f"[{self.name}] 🛡️ Detecting WAF...", "INFO")
-            logger.info(f"[{self.name}] Phase 0: WAF Detection using Q-Learning fingerprinter")
-            waf_name, waf_confidence = await self._detect_waf_async()
+            # Phase 0-1: WAF detection and Interactsh setup
+            interactsh_domain = await self._loop_setup_waf_and_interactsh()
 
-            if self._detected_waf:
-                dashboard.log(f"[{self.name}] 🛡️ WAF: {waf_name} ({waf_confidence:.0%}) - Activating Q-Learning bypass strategies", "WARN")
-                self.stealth_mode = True  # Auto-enable stealth for WAF targets
-            else:
-                dashboard.log(f"[{self.name}] ✓ No WAF detected", "SUCCESS")
-
-            # Phase 1: Setup Interactsh
-            dashboard.log(f"[{self.name}] 📡 Registering with Interactsh...", "INFO")
-            logger.info(f"[{self.name}] Phase 1: Registering with Interactsh")
-            self.interactsh = InteractshClient()
-            # Safety Wrapper: Registering Interactsh
-            await self.exec_tool("Interactsh_Register", self.interactsh.register, timeout=30)
-            interactsh_domain = self.interactsh.get_url("xss_agent_base")
-            dashboard.log(f"[{self.name}] ✓ Interactsh ready: {interactsh_domain}", "SUCCESS")
-            # logger.info(f"[{self.name}] Interactsh ready: {interactsh_domain}")
-
-            # Phase 2: Discover params if not provided
-            if not self.params:
-                dashboard.log(f"[{self.name}] 🔎 Discovering parameters...", "INFO")
-                logger.info(f"[{self.name}] Phase 2: Discovering parameters")
-                self.params = await self._discover_params()
-                logger.info(f"[{self.name}] Discovered {len(self.params)} params")
-                
-            if not self.params:
-                dashboard.log(f"[{self.name}] ⚠️ No parameters found to test", "WARN")
+            # Phase 2: Discover parameters
+            if not await self._loop_discover_params():
                 return {"findings": [], "message": "No parameters found"}
-            
-            dashboard.log(f"[{self.name}] Testing {len(self.params)} params: {', '.join(self.params[:5])}", "INFO")
-            logger.info(f"[{self.name}] Params List (Raw): {self.params}")
-            logger.info(f"[{self.name}] Phase 3: Testing each parameter")
-            for param in self.params:
-                # TASK-50: Thread-safe deduplication check
-                async with self._tested_params_lock:
-                    if param in self._tested_params:
-                        logger.info(f"[{self.name}] Skipping {param} - already tested")
-                        continue
-                    self._tested_params.add(param)
 
-                logger.info(f"[{self.name}] Testing param: {param}")
+            # Phase 3: Test parameters
+            await self._loop_test_params(interactsh_domain, screenshots_dir)
 
-                finding = await self._test_parameter(param, interactsh_domain, screenshots_dir)
-                
-                if finding:
-                    self.findings.append(finding)
-                    dashboard.log(f"[{self.name}] 🎯 XSS CONFIRMED on '{param}'!", "SUCCESS")
-                    
-                    # OPTIMIZATION (2026-01-14): Early exit after first finding
-                    # Reason: If we found XSS in one param, the URL is vulnerable
-                    # No need to test remaining params (saves 70% scan time)
-                    # Configurable via EARLY_EXIT_ON_FINDING in bugtraceaicli.conf
-                    from bugtrace.core.config import settings
-                    if settings.EARLY_EXIT_ON_FINDING:
-                        remaining = len(self.params) - (self.params.index(param) + 1)
-                        if remaining > 0:
-                            logger.info(f"[{self.name}] ⚡ OPTIMIZATION: Early exit enabled (config)")
-                            logger.info(f"[{self.name}] Skipping {remaining} remaining params (URL already vulnerable)")
-                            dashboard.log(f"[{self.name}] ⚡ Early exit: Skipping {remaining} params (optimization)", "INFO")
-                        break
+            # Phase 3.5: DOM XSS
+            await self._loop_test_dom_xss()
 
-            # Phase 3.5: DOM XSS (Headless Playwright)
-            dashboard.log(f"[{self.name}] 🎭 Starting DOM XSS Headless Scan...", "INFO")
-            logger.info(f"[{self.name}] Phase 3.5: DOM XSS Headless Scan")
-            try:
-                dom_findings = await detect_dom_xss(self.url)
-                for df in dom_findings:
-                    # Convert to XSSFinding
-                    self.findings.append(XSSFinding(
-                        url=df["url"],
-                        parameter=df["source"],
-                        payload=df["payload"],
-                        context="dom_xss",
-                        validation_method="headless_playwright",
-                        evidence={"sink": df["sink"], "evidence": df["evidence"]},
-                        confidence=1.0,
-                        status="VALIDATED_CONFIRMED",
-                        validated=True,
-                        reflection_context=df["source"],
-                        successful_payloads=[df["payload"]]
-                    ))
-                if dom_findings:
-                    dashboard.log(f"[{self.name}] 🎯 DOM XSS CONFIRMED ({len(dom_findings)} hits)!", "SUCCESS")
-                    logger.info(f"[{self.name}] DOM XSS Headless Scan found {len(dom_findings)} vulnerabilities")
-            except Exception as e:
-                logger.error(f"[{self.name}] DOM XSS Headless Scan failed: {e}", exc_info=True)
-                dashboard.log(f"[{self.name}] ⚠️ DOM XSS Scan skipped: Headless error", "WARN")
-
-            # Phase 4: Additional Attack Vectors (POST, Headers)
-            if not self._max_impact_achieved:
-                # 4.1: Test POST forms
-                dashboard.log(f"[{self.name}] 📝 Phase 4.1: Testing POST forms...", "INFO")
-                try:
-                    post_findings = await self._discover_and_test_post_forms(
-                        interactsh_domain, screenshots_dir
-                    )
-                    for pf in post_findings:
-                        self.findings.append(pf)
-                        if self._max_impact_achieved:
-                            break
-                    if post_findings:
-                        dashboard.log(f"[{self.name}] 🎯 POST XSS found: {len(post_findings)} hits!", "SUCCESS")
-                except Exception as e:
-                    logger.debug(f"POST form testing failed: {e}")
-
-                # 4.2: Test Header Injection
-                if not self._max_impact_achieved:
-                    dashboard.log(f"[{self.name}] 🔧 Phase 4.2: Testing header injection...", "INFO")
-                    try:
-                        header_finding = await self._test_header_injection(
-                            interactsh_domain, screenshots_dir
-                        )
-                        if header_finding:
-                            self.findings.append(header_finding)
-                            dashboard.log(f"[{self.name}] 🎯 Header XSS found!", "SUCCESS")
-                    except Exception as e:
-                        logger.debug(f"Header injection testing failed: {e}")
+            # Phase 4: Additional vectors
+            await self._loop_test_additional_vectors(interactsh_domain, screenshots_dir)
 
             # Phase 5: Cleanup
             if self.interactsh:
                 await self.interactsh.deregister()
-            
+
             # Return results
             validated_count = len(self.findings)
             logger.info(f"[{self.name}] Returning {validated_count} findings.")
             dashboard.log(f"[{self.name}] ✅ Scan complete. {validated_count} XSS found.", "SUCCESS")
-            
+
             return {
                 "findings": [self._finding_to_dict(f) for f in self.findings],
                 "validated_count": validated_count,
                 "params_tested": len(self.params)
             }
-            
+
         except Exception as e:
             logger.exception(f"XSSAgent error: {e}")
             dashboard.log(f"[{self.name}] ❌ Error: {e}", "ERROR")
