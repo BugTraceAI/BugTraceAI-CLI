@@ -248,67 +248,71 @@ class InteractshClient:
         return payload, url
             
     async def poll(self, timeout: float = 5.0) -> List[Interaction]:
-        """
-        Poll for new interactions.
-        """
+        """Poll for new interactions."""
         if not self.registered:
             return []
-            
-        new_interactions = []
-        
+
         try:
-            # Poll URL construction (standard Interactsh pattern)
             poll_url = f"https://{self.server}/poll?id={self.correlation_id}&secret={self.secret_key}"
-            
             async with httpx.AsyncClient(timeout=timeout, verify=True) as client:
                 response = await client.get(poll_url)
-                
+
                 if response.status_code == 200:
-                    data = response.json()
-                    # Data layout: {"data": [...], "aes_key": ...} or list of interactions
-                    
-                    # Handle different response formats robustly
-                    interactions_list = data.get("data", []) if isinstance(data, dict) else data
-                    
-                    if isinstance(interactions_list, list):
-                        for entry in interactions_list:
-                            try:
-                                # Extract key fields
-                                full_id = entry.get("full-id", "") or entry.get("unique-id", "")
-                                protocol = entry.get("protocol", "unknown")
-                                remote_addr = entry.get("remote-address", "unknown")
-                                raw = entry.get("raw-request", "")
-                                
-                                # Check if it matches one of our active payloads
-                                if isinstance(full_id, str):
-                                    # Match against our tracked IDs
-                                    # Tracked ID is either full_id or label
-                                    for key, meta in self.urls.items():
-                                        target_id = meta["full_id"] if isinstance(meta, dict) else key
-                                        if target_id in full_id or full_id in target_id:
-                                            vuln_type = meta["vuln_type"] if isinstance(meta, dict) else meta
-                                            interaction = Interaction(
-                                                protocol=protocol,
-                                                unique_id=key,
-                                                full_id=full_id,
-                                                raw_request=raw,
-                                                remote_address=remote_addr,
-                                                timestamp=datetime.now()
-                                            )
-                                            new_interactions.append(interaction)
-                                            self.interactions.append(interaction)
-                                            
-                                            dashboard.log(f"🚨 OOB INTERACTION DETECTED! ({vuln_type})", "CRITICAL")
-                                            logger.warning(f"OOB Hit: {vuln_type} via {protocol} from {remote_addr}")
-                            except Exception as parse_err:
-                                logger.debug(f"Failed to parse interaction entry: {parse_err}")
-                                
+                    return self._process_poll_response(response.json())
         except Exception as e:
-            # Don't spam logs on timeout/connection error
             if "timeout" not in str(e).lower():
                 logger.debug(f"Interactsh poll error: {e}")
-        
+
+        return []
+
+    def _process_poll_response(self, data: any) -> List[Interaction]:
+        """Process poll response and extract interactions."""
+        new_interactions = []
+        interactions_list = data.get("data", []) if isinstance(data, dict) else data
+
+        if isinstance(interactions_list, list):
+            for entry in interactions_list:
+                interaction = self._parse_interaction_entry(entry)
+                if interaction:
+                    new_interactions.append(interaction)
+
         return new_interactions
+
+    def _parse_interaction_entry(self, entry: Dict) -> Optional[Interaction]:
+        """Parse a single interaction entry from poll response."""
+        try:
+            full_id = entry.get("full-id", "") or entry.get("unique-id", "")
+            protocol = entry.get("protocol", "unknown")
+            remote_addr = entry.get("remote-address", "unknown")
+            raw = entry.get("raw-request", "")
+
+            if isinstance(full_id, str):
+                return self._match_interaction_to_url(full_id, protocol, remote_addr, raw)
+        except Exception as parse_err:
+            logger.debug(f"Failed to parse interaction entry: {parse_err}")
+
+        return None
+
+    def _match_interaction_to_url(self, full_id: str, protocol: str, remote_addr: str, raw: str) -> Optional[Interaction]:
+        """Match interaction to tracked URL and create Interaction object."""
+        for key, meta in self.urls.items():
+            target_id = meta["full_id"] if isinstance(meta, dict) else key
+            if target_id in full_id or full_id in target_id:
+                vuln_type = meta["vuln_type"] if isinstance(meta, dict) else meta
+                interaction = Interaction(
+                    protocol=protocol,
+                    unique_id=key,
+                    full_id=full_id,
+                    raw_request=raw,
+                    remote_address=remote_addr,
+                    timestamp=datetime.now()
+                )
+                self.interactions.append(interaction)
+                dashboard.log(f"🚨 OOB INTERACTION DETECTED! ({vuln_type})", "CRITICAL")
+                logger.warning(f"OOB Hit: {vuln_type} via {protocol} from {remote_addr}")
+                return interaction
+
+        return None
 
     async def poll_interactions(
         self,
