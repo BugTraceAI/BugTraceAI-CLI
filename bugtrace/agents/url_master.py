@@ -11,7 +11,7 @@ Created: 2026-01-02
 import asyncio
 import json
 import re
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
 
@@ -308,92 +308,124 @@ Response format:
             return self.system_prompt.split("# Iteration Directive Prompt")[1].strip()
 
         return default_template
-    
+
+    def _parse_action(self, response: str) -> Dict:
+        """Parse LLM response to extract action directive."""
         from bugtrace.utils.parsers import XmlParser
-        
-        # 1. Structured XML Parse (Primary)
+
+        # Try XML parsing first
+        xml_action = self._parse_xml_action(response)
+        if xml_action:
+            return xml_action
+
+        # Fallback to text-based inference
+        return self._infer_action_from_text(response)
+
+    def _parse_xml_action(self, response: str) -> Optional[Dict]:
+        """Parse structured XML action from response."""
+        from bugtrace.utils.parsers import XmlParser
+
         action_xml = XmlParser.extract_tag(response, "action")
-        if action_xml:
-            action_type = XmlParser.extract_tag(action_xml, "type")
-            if action_type == "complete":
-                return {"type": "complete", "summary": XmlParser.extract_tag(action_xml, "summary") or "Analysis finished"}
-            
-            elif action_type == "skill":
-                skill_name = XmlParser.extract_tag(action_xml, "skill")
-                params_raw = XmlParser.extract_tag(action_xml, "params")
-                
-                # Parse params as key=value or JSON
-                params_dict = {}
-                if params_raw:
-                    try:
-                        if "=" in params_raw:
-                            for item in params_raw.split(","):
-                                if "=" in item:
-                                    k, v = item.split("=", 1)
-                                    params_dict[k.strip()] = v.strip()
-                        else:
-                            params_dict = json.loads(params_raw)
-                    except Exception as e:
-                        logger.debug(f"operation failed: {e}")
-                
-                return {
-                    "type": "skill",
-                    "skill": skill_name or "analyze",
-                    "params": params_dict
-                }
-        
-        # 2. Legacy/Fallback JSON Parser (Secondary)
-        # Try to find JSON in response (more aggressive matching)
-        
-        # Fallback: intelligently infer action from text
-        response_lower = clean_response.lower()
-        original_lower = response.lower()  # Check original too
-        
-        # Check for completion signals
-        if "complete" in response_lower and "analysis" in response_lower:
-            return {"type": "complete", "summary": "Analysis complete"}
-        
-        if "finished" in response_lower or "done analyzing" in response_lower:
-            return {"type": "complete", "summary": "Analysis complete"}
-        
-        # Smart inference based on context and what was already used
-        recon_done = "recon" in self.skills_used
-        
-        # If recon was done, don't repeat it - move to exploitation
-        if recon_done:
-            # Check what the LLM was thinking about
-            if "xss" in original_lower or "searchfor" in original_lower or "script" in original_lower:
-                logger.info(f"[{self.name}] Inferred XSS test from context")
-                return {
-                    "type": "skill", 
-                    "skill": "exploit_xss", 
-                    "params": {"param": "searchFor"}
-                }
-            
-            if "sql" in original_lower or "injection" in original_lower:
-                logger.info(f"[{self.name}] Inferred SQLi test from context")
-                return {"type": "skill", "skill": "exploit_sqli", "params": {}}
-            
-            if "analyze" in original_lower and "analyze" not in self.skills_used:
-                return {"type": "skill", "skill": "analyze", "params": {}}
-            
-            # Default progression: analyze -> exploit_xss -> exploit_sqli -> complete
-            if "analyze" not in self.skills_used:
-                return {"type": "skill", "skill": "analyze", "params": {}}
-            elif "exploit_xss" not in self.skills_used:
-                return {"type": "skill", "skill": "exploit_xss", "params": {"param": "searchFor"}}
-            elif "exploit_sqli" not in self.skills_used:
-                return {"type": "skill", "skill": "exploit_sqli", "params": {}}
+        if not action_xml:
+            return None
+
+        action_type = XmlParser.extract_tag(action_xml, "type")
+        if action_type == "complete":
+            return {
+                "type": "complete",
+                "summary": XmlParser.extract_tag(action_xml, "summary") or "Analysis finished"
+            }
+
+        if action_type == "skill":
+            skill_name = XmlParser.extract_tag(action_xml, "skill")
+            params_raw = XmlParser.extract_tag(action_xml, "params")
+            params_dict = self._parse_params(params_raw)
+
+            return {
+                "type": "skill",
+                "skill": skill_name or "analyze",
+                "params": params_dict
+            }
+
+        return None
+
+    def _parse_params(self, params_raw: str) -> Dict:
+        """Parse parameters from string (key=value or JSON format)."""
+        params_dict = {}
+        if not params_raw:
+            return params_dict
+
+        try:
+            if "=" in params_raw:
+                for item in params_raw.split(","):
+                    if "=" in item:
+                        k, v = item.split("=", 1)
+                        params_dict[k.strip()] = v.strip()
             else:
-                return {"type": "complete", "summary": "All skills tested"}
-        
+                params_dict = json.loads(params_raw)
+        except Exception as e:
+            logger.debug(f"Param parsing failed: {e}")
+
+        return params_dict
+
+    def _infer_action_from_text(self, response: str) -> Dict:
+        """Infer action from text when XML parsing fails."""
+        clean_response = response
+        response_lower = clean_response.lower()
+        original_lower = response.lower()
+
+        # Check for completion signals
+        if self._is_completion_signal(response_lower):
+            return {"type": "complete", "summary": "Analysis complete"}
+
+        # Infer based on skills already used
+        recon_done = "recon" in self.skills_used
+        if recon_done:
+            return self._infer_post_recon_action(original_lower, response_lower)
+
         # First iteration - do recon
         if "recon" in response_lower or not self.skills_used:
             return {"type": "skill", "skill": "recon", "params": {}}
-        
+
         # Default to analyze
         return {"type": "skill", "skill": "analyze", "params": {}}
-    
+
+    def _is_completion_signal(self, response_lower: str) -> bool:
+        """Check if response indicates analysis is complete."""
+        return (
+            ("complete" in response_lower and "analysis" in response_lower) or
+            "finished" in response_lower or
+            "done analyzing" in response_lower
+        )
+
+    def _infer_post_recon_action(self, original_lower: str, response_lower: str) -> Dict:
+        """Infer action after recon has been completed."""
+        # Check what the LLM was thinking about
+        if "xss" in original_lower or "searchfor" in original_lower or "script" in original_lower:
+            logger.info(f"[{self.name}] Inferred XSS test from context")
+            return {"type": "skill", "skill": "exploit_xss", "params": {"param": "searchFor"}}
+
+        if "sql" in original_lower or "injection" in original_lower:
+            logger.info(f"[{self.name}] Inferred SQLi test from context")
+            return {"type": "skill", "skill": "exploit_sqli", "params": {}}
+
+        if "analyze" in original_lower and "analyze" not in self.skills_used:
+            return {"type": "skill", "skill": "analyze", "params": {}}
+
+        # Default progression
+        return self._get_default_next_skill()
+
+    def _get_default_next_skill(self) -> Dict:
+        """Get default next skill based on progression: analyze → exploit_xss → exploit_sqli → complete."""
+        if "analyze" not in self.skills_used:
+            return {"type": "skill", "skill": "analyze", "params": {}}
+        elif "exploit_xss" not in self.skills_used:
+            return {"type": "skill", "skill": "exploit_xss", "params": {"param": "searchFor"}}
+        elif "exploit_sqli" not in self.skills_used:
+            return {"type": "skill", "skill": "exploit_sqli", "params": {}}
+        else:
+            return {"type": "complete", "summary": "All skills tested"}
+
     async def _execute_skill(self, skill_name: str, params: Dict) -> Dict:
         """Execute a skill and return results."""
         if skill_name not in self.skills:
@@ -538,7 +570,21 @@ Response format:
     
     def _generate_summary(self) -> Dict:
         """Generate summary of the analysis and create individual URL report."""
-        summary = {
+        summary = self._build_summary_dict()
+
+        # Generate individual URL report if we have a valid report directory
+        if self.orchestrator and hasattr(self.orchestrator, 'report_dir'):
+            self._generate_url_report(summary)
+
+        # Database persistence
+        if self.findings:
+            self._persist_findings_to_database(summary)
+
+        return summary
+
+    def _build_summary_dict(self) -> Dict:
+        """Build basic summary dictionary with analysis results."""
+        return {
             "url": self.url,
             "thread_id": self.thread.thread_id,
             "iterations": self.iteration,
@@ -548,148 +594,160 @@ Response format:
             "metadata": self.thread.metadata,
             "complete": self.is_complete
         }
-        
-        # Generate individual URL report if we have a valid report directory
-        if self.orchestrator and hasattr(self.orchestrator, 'report_dir'):
-            try:
-                from bugtrace.reporting.url_reporter import URLReporter
-                
-                url_reporter = URLReporter(str(self.orchestrator.report_dir))
-                
-                # Prepare analysis results (DAST/SAST combined)
-                analysis_results = {
-                    'dast': {
-                        'status': 'COMPLETED',
-                        'confidence': 85,
-                        'findings': []
-                    },
-                    'sast': {
-                        'patterns': [],
-                        'risk_level': 'UNKNOWN'
-                    },
-                    'overall_risk': 'UNKNOWN',
-                    'recommendations': []
-                }
-                
-                # Populate from thread metadata (if AnalyzeSkill was used)
-                if 'analysis_report' in self.thread.metadata:
-                    report = self.thread.metadata['analysis_report']
-                    analysis_results['overall_risk'] = report.get('risk_level', 'UNKNOWN')
-                    if 'vulnerabilities' in report:
-                        analysis_results['dast']['findings'] = report['vulnerabilities']
-                
-                # Prepare vulnerabilities for reporting
-                vulnerabilities = []
-                screenshots_paths = []
-                
-                for finding in self.findings:
-                    vuln = {
-                        'type': finding.get('type', 'Unknown'),
-                        'parameter': finding.get('param', finding.get('parameter', 'N/A')),
-                        'payload': finding.get('payload', ''),
-                        'confidence': int(finding.get('confidence', 0) * 100) if isinstance(finding.get('confidence'), float) else finding.get('confidence', 0),
-                        'severity': finding.get('severity', 'INFORMATIONAL'),
-                        'validated': finding.get('validated', False),
-                        'details': finding.get('note', finding.get('evidence', ''))
-                    }
-                    
-                    # Add screenshot if available
-                    if finding.get('screenshot'):
-                        vuln['screenshot'] = finding['screenshot']
-                        screenshots_paths.append(finding['screenshot'])
-                    
-                    vulnerabilities.append(vuln)
-                
-                # Calculate overall risk based on findings
-                if vulnerabilities:
-                    severities = [v['severity'] for v in vulnerabilities]
-                    if 'CRITICAL' in severities:
-                        analysis_results['overall_risk'] = 'CRITICAL'
-                    elif 'HIGH' in severities:
-                        analysis_results['overall_risk'] = 'HIGH'
-                    elif 'MEDIUM' in severities:
-                        analysis_results['overall_risk'] = 'MEDIUM'
-                    else:
-                        analysis_results['overall_risk'] = 'LOW'
-                else:
-                    analysis_results['overall_risk'] = 'NONE'
-                
-                # Prepare metadata
-                metadata = {
-                    'params': self._get_params(),
-                    'tech_stack': self.thread.metadata.get('tech_stack', []),
-                    'duration': summary['duration_seconds'],
-                    'iterations': summary['iterations'],
-                    'thread_id': summary['thread_id']
-                }
-                
-                # Create the URL-specific report
-                report_path = url_reporter.create_url_report(
-                    url=self.url,
-                    analysis_results=analysis_results,
-                    vulnerabilities=vulnerabilities,
-                    screenshots=screenshots_paths if screenshots_paths else None,
-                    metadata=metadata
-                )
-                
-                logger.info(f"[{self.name}] 📝 Individual URL report created: {report_path}")
-                summary['url_report_path'] = str(report_path)
-                
-            except Exception as e:
-                logger.error(f"[{self.name}] Failed to create URL report: {e}", exc_info=True)
-        
-        # =====================================================================
-        # DATABASE PERSISTENCE: Save individual URL scan to database
-        # =====================================================================
-        if self.findings:
-            try:
-                from bugtrace.core.database import get_db_manager
-                db = get_db_manager()
-                
-                # Save this URL's scan independently
-                scan_id = db.save_scan_result(
-                    target_url=self.url,
-                    findings=self.findings
-                )
-                
-                logger.info(f"[{self.name}] 💾 Saved {len(self.findings)} findings to DB (scan_id: {scan_id})")
-                summary['db_scan_id'] = scan_id
-                
-                # =========================================================
-                # VECTOR EMBEDDINGS: Store findings for semantic search
-                # =========================================================
-                try:
-                    logger.info(f"[{self.name}] 🔮 Generating embeddings for {len(self.findings)} findings...")
-                    
-                    for idx, finding in enumerate(self.findings):
-                        try:
-                            # Store with automatic embedding generation
-                            db.store_finding_embedding(finding)
-                            
-                            if (idx + 1) % 5 == 0:
-                                logger.debug(f"[{self.name}] Embedded {idx + 1}/{len(self.findings)} findings")
-                        except Exception as e:
-                            logger.warning(f"[{self.name}] Failed to embed finding #{idx}: {e}")
-                    
-                    logger.info(f"[{self.name}] ✅ All findings embedded for semantic search")
-                    summary['embeddings_stored'] = len(self.findings)
-                    
-                except Exception as e:
-                    logger.warning(f"[{self.name}] Embedding storage failed (non-critical): {e}")
-                
-                # Check for historical findings for context
-                historical = db.get_findings_for_target(self.url)
-                if historical:
-                    logger.info(f"[{self.name}] 📚 Found {len(historical)} historical findings for this URL")
-                    summary['historical_findings_count'] = len(historical)
 
-                
-            except Exception as e:
-                logger.error(f"[{self.name}] Failed to save to database: {e}", exc_info=True)
-                import traceback
-                logger.debug(traceback.format_exc())
-        
-        return summary
+    def _generate_url_report(self, summary: Dict):
+        """Generate individual URL report."""
+        try:
+            from bugtrace.reporting.url_reporter import URLReporter
+
+            url_reporter = URLReporter(str(self.orchestrator.report_dir))
+            analysis_results = self._prepare_analysis_results()
+            vulnerabilities, screenshots_paths = self._prepare_vulnerabilities()
+            metadata = self._prepare_report_metadata(summary)
+
+            report_path = url_reporter.create_url_report(
+                url=self.url,
+                analysis_results=analysis_results,
+                vulnerabilities=vulnerabilities,
+                screenshots=screenshots_paths if screenshots_paths else None,
+                metadata=metadata
+            )
+
+            logger.info(f"[{self.name}] 📝 Individual URL report created: {report_path}")
+            summary['url_report_path'] = str(report_path)
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to create URL report: {e}", exc_info=True)
+
+    def _prepare_analysis_results(self) -> Dict:
+        """Prepare analysis results structure for reporting."""
+        analysis_results = {
+            'dast': {'status': 'COMPLETED', 'confidence': 85, 'findings': []},
+            'sast': {'patterns': [], 'risk_level': 'UNKNOWN'},
+            'overall_risk': 'UNKNOWN',
+            'recommendations': []
+        }
+
+        # Populate from thread metadata if AnalyzeSkill was used
+        if 'analysis_report' in self.thread.metadata:
+            report = self.thread.metadata['analysis_report']
+            analysis_results['overall_risk'] = report.get('risk_level', 'UNKNOWN')
+            if 'vulnerabilities' in report:
+                analysis_results['dast']['findings'] = report['vulnerabilities']
+
+        return analysis_results
+
+    def _prepare_vulnerabilities(self) -> Tuple[List[Dict], List[str]]:
+        """Prepare vulnerabilities list and screenshots for reporting."""
+        vulnerabilities = []
+        screenshots_paths = []
+
+        for finding in self.findings:
+            vuln = self._build_vulnerability_dict(finding)
+            vulnerabilities.append(vuln)
+
+            if finding.get('screenshot'):
+                vuln['screenshot'] = finding['screenshot']
+                screenshots_paths.append(finding['screenshot'])
+
+        # Calculate overall risk
+        self._update_overall_risk_from_vulnerabilities(vulnerabilities)
+
+        return vulnerabilities, screenshots_paths
+
+    def _build_vulnerability_dict(self, finding: Dict) -> Dict:
+        """Build vulnerability dictionary from finding."""
+        confidence = finding.get('confidence', 0)
+        if isinstance(confidence, float):
+            confidence = int(confidence * 100)
+
+        return {
+            'type': finding.get('type', 'Unknown'),
+            'parameter': finding.get('param', finding.get('parameter', 'N/A')),
+            'payload': finding.get('payload', ''),
+            'confidence': confidence,
+            'severity': finding.get('severity', 'INFORMATIONAL'),
+            'validated': finding.get('validated', False),
+            'details': finding.get('note', finding.get('evidence', ''))
+        }
+
+    def _update_overall_risk_from_vulnerabilities(self, vulnerabilities: List[Dict]):
+        """Calculate overall risk based on vulnerability severities."""
+        if not vulnerabilities:
+            return 'NONE'
+
+        severities = [v['severity'] for v in vulnerabilities]
+        if 'CRITICAL' in severities:
+            return 'CRITICAL'
+        elif 'HIGH' in severities:
+            return 'HIGH'
+        elif 'MEDIUM' in severities:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+
+    def _prepare_report_metadata(self, summary: Dict) -> Dict:
+        """Prepare metadata for URL report."""
+        return {
+            'params': self._get_params(),
+            'tech_stack': self.thread.metadata.get('tech_stack', []),
+            'duration': summary['duration_seconds'],
+            'iterations': summary['iterations'],
+            'thread_id': summary['thread_id']
+        }
+
+    def _persist_findings_to_database(self, summary: Dict):
+        """Save findings to database with embeddings."""
+        try:
+            from bugtrace.core.database import get_db_manager
+            db = get_db_manager()
+
+            # Save scan result
+            scan_id = db.save_scan_result(
+                target_url=self.url,
+                findings=self.findings
+            )
+
+            logger.info(f"[{self.name}] 💾 Saved {len(self.findings)} findings to DB (scan_id: {scan_id})")
+            summary['db_scan_id'] = scan_id
+
+            # Generate and store embeddings
+            self._store_finding_embeddings(db, summary)
+
+            # Check historical findings
+            self._log_historical_findings(db, summary)
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to save to database: {e}", exc_info=True)
+            import traceback
+            logger.debug(traceback.format_exc())
+
+    def _store_finding_embeddings(self, db, summary: Dict):
+        """Generate and store vector embeddings for findings."""
+        try:
+            logger.info(f"[{self.name}] 🔮 Generating embeddings for {len(self.findings)} findings...")
+
+            for idx, finding in enumerate(self.findings):
+                try:
+                    db.store_finding_embedding(finding)
+
+                    if (idx + 1) % 5 == 0:
+                        logger.debug(f"[{self.name}] Embedded {idx + 1}/{len(self.findings)} findings")
+                except Exception as e:
+                    logger.warning(f"[{self.name}] Failed to embed finding #{idx}: {e}")
+
+            logger.info(f"[{self.name}] ✅ All findings embedded for semantic search")
+            summary['embeddings_stored'] = len(self.findings)
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Embedding storage failed (non-critical): {e}")
+
+    def _log_historical_findings(self, db, summary: Dict):
+        """Check and log historical findings for context."""
+        historical = db.get_findings_for_target(self.url)
+        if historical:
+            logger.info(f"[{self.name}] 📚 Found {len(historical)} historical findings for this URL")
+            summary['historical_findings_count'] = len(historical)
     
     # =========================================================================
     # EXHAUSTIVE MODE - Automatically test common vulns on all parameters
