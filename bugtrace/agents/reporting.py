@@ -22,6 +22,12 @@ from bugtrace.core.ui import dashboard
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.llm_client import llm_client
 from bugtrace.schemas.db_models import ScanTable
+from bugtrace.reporting.standards import (
+    get_cwe_for_vuln,
+    get_remediation_for_vuln,
+    normalize_severity,
+    format_cve,
+)
 import asyncio
 import re
 
@@ -687,46 +693,163 @@ class ReportingAgent(BaseAgent):
         for i, f in enumerate(validated_sorted, 1):
             self._md_build_finding_entry(lines, f, i)
 
-    def _md_build_finding_entry(self, lines: List[str], f: Dict, index: int):
-        """Build a single finding entry in markdown report."""
-        lines.append(f"### {index}. {f.get('type', 'Unknown Vulnerability')}\n")
+    def _generate_standardized_finding(self, finding: Dict, index: int) -> str:
+        """
+        Generate a standardized finding entry using the finding template.
+
+        Args:
+            finding: Finding dictionary with all data
+            index: Finding number (1-based)
+
+        Returns:
+            Formatted markdown string for the finding
+        """
+        # Load template
+        template_path = Path(__file__).parent.parent / "reporting" / "templates" / "finding_template.md"
+        try:
+            with open(template_path, "r") as f:
+                template = f.read()
+        except FileNotFoundError:
+            logger.warning(f"[{self.name}] Template not found, falling back to inline format")
+            return self._md_build_finding_entry_inline(finding, index)
+
+        # Extract finding data
+        vuln_type = finding.get("type", "Unknown")
+        severity = finding.get("severity", "MEDIUM")
+        url = finding.get("url", "")
+        parameter = finding.get("parameter", "")
+        payload = finding.get("payload", "")
+        description = finding.get("description", "")
+
+        # Get CWE reference
+        cwe_id = get_cwe_for_vuln(vuln_type) or "N/A"
+        cwe_num = cwe_id.replace("CWE-", "") if cwe_id != "N/A" else "0"
+
+        # Format CVE reference
+        cve_raw = finding.get("cve")
+        if cve_raw:
+            try:
+                cve_reference = f"[{format_cve(cve_raw)}](https://nvd.nist.gov/vuln/detail/{format_cve(cve_raw)})"
+            except ValueError:
+                cve_reference = "N/A"
+        else:
+            cve_reference = "N/A"
+
+        # Get remediation (prefer from finding, fallback to standards)
+        remediation = finding.get("remediation") or get_remediation_for_vuln(vuln_type)
+
+        # Get impact
+        impact = self._get_impact_for_type(vuln_type)
+
+        # Format CVSS score
+        cvss_score = finding.get("cvss_score")
+        cvss_score_str = f"{cvss_score:.1f}" if cvss_score else "N/A"
+
+        # Severity badge (emoji-based)
+        severity_badges = {
+            "CRITICAL": "🔴 CRITICAL",
+            "HIGH": "🟠 HIGH",
+            "MEDIUM": "🟡 MEDIUM",
+            "LOW": "🔵 LOW",
+            "INFO": "⚪ INFO"
+        }
+        severity_badge = severity_badges.get(severity, severity)
+
+        # Status badge
+        status_badge = "✅ CONFIRMED"
+
+        # Build HTTP request (if available)
+        http_request = self._generate_curl(finding)
+
+        # Build HTTP response excerpt (first 500 chars of validator_notes or description)
+        validator_notes = finding.get("validator_notes", "")
+        http_response_excerpt = validator_notes[:500] if validator_notes else description[:500]
+
+        # Screenshot section
+        screenshot_section = ""
+        if finding.get("screenshot_path"):
+            img_name = Path(finding.get("screenshot_path")).name
+            screenshot_section = f"**Screenshot:**\n\n![Evidence](captures/{img_name})"
+
+        # Reproduction steps
+        reproduction_steps_list = self._generate_reproduction_steps(finding)
+        reproduction_steps = "\n".join(reproduction_steps_list)
+
+        # Fill template
+        filled = template.format(
+            index=index,
+            title=vuln_type,
+            severity_badge=severity_badge,
+            cwe_id=cwe_id,
+            cwe_num=cwe_num,
+            cve_reference=cve_reference,
+            status_badge=status_badge,
+            cvss_score=cvss_score_str,
+            url=url,
+            parameter=parameter,
+            payload=payload,
+            description=description,
+            impact=impact,
+            remediation=remediation,
+            http_request=http_request,
+            http_response_excerpt=http_response_excerpt,
+            screenshot_section=screenshot_section,
+            reproduction_steps=reproduction_steps
+        )
+
+        return filled
+
+    def _md_build_finding_entry_inline(self, finding: Dict, index: int) -> str:
+        """
+        Fallback method to build finding entry inline (used when template not found).
+        Returns markdown string instead of appending to lines list.
+        """
+        lines = []
+        lines.append(f"### {index}. {finding.get('type', 'Unknown Vulnerability')}\n")
         lines.append(f"| Field | Value |")
         lines.append(f"|-------|-------|")
-        lines.append(f"| **Severity** | {f.get('severity', 'MEDIUM')} |")
+        lines.append(f"| **Severity** | {finding.get('severity', 'MEDIUM')} |")
         lines.append(f"| **Status** | ✅ CONFIRMED |")
-        lines.append(f"| **URL** | `{f.get('url', '')}` |")
-        lines.append(f"| **Parameter** | `{f.get('parameter', '')}` |")
-        if f.get("db_type"):
-            lines.append(f"| **DB Type** | {f.get('db_type')} |")
-        if f.get("tamper_used"):
-            lines.append(f"| **Tamper Script** | {f.get('tamper_used')} |")
+        lines.append(f"| **URL** | `{finding.get('url', '')}` |")
+        lines.append(f"| **Parameter** | `{finding.get('parameter', '')}` |")
+        if finding.get("db_type"):
+            lines.append(f"| **DB Type** | {finding.get('db_type')} |")
+        if finding.get("tamper_used"):
+            lines.append(f"| **Tamper Script** | {finding.get('tamper_used')} |")
         lines.append("")
 
         # Steps to Reproduce (type-specific)
         lines.append("#### Steps to Reproduce\n")
-        for step in self._generate_reproduction_steps(f):
+        for step in self._generate_reproduction_steps(finding):
             lines.append(step)
         lines.append("")
 
         # PoC (Only for SQLi where we have SQLMap command)
-        if "SQL" in f.get("type", "").upper() and not self._generate_curl(f).startswith("#"):
+        if "SQL" in finding.get("type", "").upper() and not self._generate_curl(finding).startswith("#"):
             lines.append("#### Proof of Concept\n")
             lines.append("```bash")
-            lines.append(self._generate_curl(f))
+            lines.append(self._generate_curl(finding))
             lines.append("```\n")
 
         # Validator Notes
-        if f.get("validator_notes"):
+        if finding.get("validator_notes"):
             lines.append("#### Validation Notes\n")
-            lines.append(f"> {f.get('validator_notes')}\n")
+            lines.append(f"> {finding.get('validator_notes')}\n")
 
         # Screenshot
-        if f.get("screenshot_path"):
-            img_name = Path(f.get("screenshot_path")).name
+        if finding.get("screenshot_path"):
+            img_name = Path(finding.get("screenshot_path")).name
             lines.append(f"#### Screenshot\n")
             lines.append(f"![Evidence](captures/{img_name})\n")
 
         lines.append("---\n")
+        return "\n".join(lines)
+
+    def _md_build_finding_entry(self, lines: List[str], f: Dict, index: int):
+        """Build a single finding entry in markdown report using standardized template."""
+        # Use new standardized generation
+        finding_md = self._generate_standardized_finding(f, index)
+        lines.append(finding_md)
 
     def _md_build_manual_review(self, lines: List[str], manual_review: List[Dict]):
         """Build manual review section of markdown report."""
@@ -1482,17 +1605,18 @@ Be PRECISE. Imagine the reader has no context about the scan tool."""
             f['validator_notes'] = enrichment_text.strip()
 
     def _get_remediation_for_type(self, vuln_type: str) -> str:
-        """Get standard remediation for vulnerability type."""
-        remediations = {
-            "XSS": "Implement proper output encoding and Content Security Policy (CSP). Use context-aware escaping.",
-            "SQLI": "Use parameterized queries or prepared statements. Never concatenate user input into SQL queries.",
-            "SQLi": "Use parameterized queries or prepared statements. Never concatenate user input into SQL queries.",
-            "LFI": "Validate and sanitize file paths. Use allowlists for permitted files. Avoid user input in file operations.",
-            "RCE": "Never execute user-controlled input. Use allowlists for permitted commands. Implement strict input validation.",
-            "SSRF": "Validate and sanitize URLs. Use allowlists for permitted domains. Block internal IP ranges.",
-            "IDOR": "Implement proper authorization checks. Use indirect references. Validate user permissions for each request.",
-        }
-        return remediations.get(vuln_type.upper(), "Follow security best practices for this vulnerability type.")
+        """
+        Get standard remediation for vulnerability type.
+        Delegates to centralized standards module for consistency.
+        """
+        return get_remediation_for_vuln(vuln_type)
+
+    def _get_cwe_for_type(self, vuln_type: str) -> str:
+        """
+        Get CWE reference for vulnerability type.
+        Delegates to centralized standards module.
+        """
+        return get_cwe_for_vuln(vuln_type) or "N/A"
 
     def _write_raw_markdown(self, findings: List[Dict]) -> Path:
         """Write raw findings to a markdown file (Pre-Audit)."""
