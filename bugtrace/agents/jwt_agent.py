@@ -9,8 +9,11 @@ from pathlib import Path
 from loguru import logger
 
 from bugtrace.agents.base import BaseAgent
+from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
 from bugtrace.core.llm_client import llm_client
 from bugtrace.core.ui import dashboard
+from bugtrace.core.queue import queue_manager
+from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
@@ -29,6 +32,11 @@ class JWTAgent(BaseAgent):
         self.intercepted_tokens = []
         self.findings = []
         self.max_brute_attempts = 1000 # Configurable
+
+        # Queue consumption mode (Phase 20)
+        self._queue_mode = False
+        self._worker_pool: Optional[WorkerPool] = None
+        self._scan_context: str = ""
         
     def _setup_event_subscriptions(self):
         """Subscribe to token discovery events."""
@@ -819,6 +827,115 @@ class JWTAgent(BaseAgent):
         if "confusion" in step_lower or "rsa" in step_lower or "hs256" in step_lower:
             await self._attack_key_confusion(token, url, location)
             return
+
+    # ========================================
+    # Queue Consumer Mode (Phase 20)
+    # ========================================
+
+    async def start_queue_consumer(self, scan_context: str) -> None:
+        """Start JWTAgent in queue consumer mode."""
+        self._queue_mode = True
+        self._scan_context = scan_context
+
+        config = WorkerConfig(
+            specialist="jwt",
+            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,
+            process_func=self._process_queue_item,
+            on_result=self._handle_queue_result,
+            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
+        )
+
+        self._worker_pool = WorkerPool(config)
+
+        if self.event_bus:
+            self.event_bus.subscribe(
+                EventType.WORK_QUEUED_JWT.value,
+                self._on_work_queued
+            )
+
+        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
+        await self._worker_pool.start()
+
+    async def _process_queue_item(self, item: dict) -> Optional[Dict]:
+        """Process a single item from the jwt queue."""
+        finding = item.get("finding", {})
+        url = finding.get("url")
+        token = finding.get("token")
+
+        if not url and not token:
+            logger.warning(f"[{self.name}] Invalid queue item: missing url or token")
+            return None
+
+        return await self._test_single_item_from_queue(url, token, finding)
+
+    async def _test_single_item_from_queue(self, url: str, token: str, finding: dict) -> Optional[Dict]:
+        """Test a single item from queue for JWT vulnerabilities."""
+        try:
+            if token:
+                # Analyze provided token
+                await self._analyze_and_exploit(token, url, "queue")
+                if self.findings:
+                    return self.findings[-1]  # Return most recent finding
+            elif url:
+                # Discover tokens from URL
+                result = await self.check_url(url)
+                if result.get("vulnerable") and result.get("findings"):
+                    return result["findings"][0]
+            return None
+        except Exception as e:
+            logger.error(f"[{self.name}] Queue item test failed: {e}")
+            return None
+
+    async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
+        """Handle completed queue item processing."""
+        if result is None:
+            return
+
+        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "jwt",
+                "finding": {
+                    "type": "JWT",
+                    "url": result.get("url"),
+                    "vulnerability": result.get("vulnerability_type", result.get("type")),
+                    "severity": result.get("severity"),
+                },
+                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "scan_context": self._scan_context,
+            })
+
+        logger.info(f"[{self.name}] Confirmed JWT vulnerability: {result.get('vulnerability_type', result.get('type', 'unknown'))}")
+
+    async def _on_work_queued(self, data: dict) -> None:
+        """Handle work_queued_jwt notification (logging only)."""
+        logger.debug(f"[{self.name}] Work queued: {data.get('finding', {}).get('url', 'unknown')}")
+
+    async def stop_queue_consumer(self) -> None:
+        """Stop queue consumer mode gracefully."""
+        if self._worker_pool:
+            await self._worker_pool.stop()
+            self._worker_pool = None
+
+        if self.event_bus:
+            self.event_bus.unsubscribe(
+                EventType.WORK_QUEUED_JWT.value,
+                self._on_work_queued
+            )
+
+        self._queue_mode = False
+        logger.info(f"[{self.name}] Queue consumer stopped")
+
+    def get_queue_stats(self) -> dict:
+        """Get queue consumer statistics."""
+        if not self._worker_pool:
+            return {"mode": "direct", "queue_mode": False}
+
+        return {
+            "mode": "queue",
+            "queue_mode": True,
+            "worker_stats": self._worker_pool.get_stats(),
+        }
+
 
 async def run_jwt_analysis(token: str, url: str) -> Dict:
     """Convenience function for standalone analysis."""
