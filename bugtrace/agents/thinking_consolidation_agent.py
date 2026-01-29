@@ -299,6 +299,10 @@ class ThinkingConsolidationAgent(BaseAgent):
         """
         Handle url_analyzed event from DASTySASTAgent.
 
+        Processing depends on THINKING_MODE:
+        - streaming: Process each finding immediately
+        - batch: Buffer findings, process when batch is full or timeout
+
         Event payload:
         - url: The analyzed URL
         - scan_context: Context for ordering
@@ -313,9 +317,22 @@ class ThinkingConsolidationAgent(BaseAgent):
 
         self._stats["total_received"] += len(findings)
 
-        # Process each finding
-        for finding in findings:
-            await self._process_finding(finding, scan_context)
+        if self._mode == "streaming":
+            # Process each finding immediately
+            for finding in findings:
+                await self._process_finding(finding, scan_context)
+        else:
+            # Batch mode: buffer findings for batch processing
+            async with self._batch_lock:
+                for finding in findings:
+                    # Add scan_context to finding for batch processing
+                    finding_with_context = finding.copy()
+                    finding_with_context["_scan_context"] = scan_context
+                    self._batch_buffer.append(finding_with_context)
+
+                # Check if batch is full
+                if len(self._batch_buffer) >= settings.THINKING_BATCH_SIZE:
+                    await self._process_batch()
 
     def _classify_finding(self, finding: Dict[str, Any]) -> Optional[str]:
         """
@@ -584,10 +601,82 @@ class ThinkingConsolidationAgent(BaseAgent):
             except asyncio.CancelledError:
                 pass
 
+    async def _process_batch(self) -> None:
+        """
+        Process a batch of findings.
+
+        Called when:
+        - Batch buffer reaches THINKING_BATCH_SIZE
+        - Batch timeout expires (in _batch_processor)
+        - Explicitly flushed (flush_batch)
+
+        Processes findings in priority order within the batch.
+        """
+        if not self._batch_buffer:
+            return
+
+        # Extract batch (already holding lock from caller or timeout handler)
+        batch = self._batch_buffer[:settings.THINKING_BATCH_SIZE]
+        self._batch_buffer = self._batch_buffer[settings.THINKING_BATCH_SIZE:]
+
+        logger.info(f"[{self.name}] Processing batch of {len(batch)} findings")
+
+        # Pre-process all findings to get priority scores
+        prioritized_batch: List[PrioritizedFinding] = []
+
+        for finding in batch:
+            scan_context = finding.pop("_scan_context", self.scan_context)
+
+            # FP filter
+            fp_confidence = finding.get("fp_confidence", 0.5)
+            if fp_confidence < settings.THINKING_FP_THRESHOLD:
+                self._stats["fp_filtered"] += 1
+                continue
+
+            # Dedup check
+            is_duplicate, _ = await self._dedup_cache.check_and_add(finding, scan_context)
+            if is_duplicate:
+                self._stats["duplicates_filtered"] += 1
+                continue
+
+            # Classify and prioritize
+            prioritized = await self._classify_and_prioritize(finding, scan_context)
+            if prioritized:
+                prioritized_batch.append(prioritized)
+            else:
+                self._stats.setdefault("unclassified", 0)
+                self._stats["unclassified"] += 1
+
+        # Sort by priority (highest first) for optimal specialist utilization
+        prioritized_batch.sort(key=lambda p: p.priority, reverse=True)
+
+        # Distribute all in batch
+        for prioritized in prioritized_batch:
+            success = await self._distribute_to_queue(prioritized)
+            if success:
+                await self._emit_work_queued_event(prioritized)
+
+        logger.info(f"[{self.name}] Batch complete: {len(prioritized_batch)} distributed")
+
+    async def flush_batch(self) -> int:
+        """
+        Flush any remaining findings in the batch buffer.
+
+        Returns:
+            Number of findings flushed
+        """
+        async with self._batch_lock:
+            initial_count = len(self._batch_buffer)
+            while self._batch_buffer:
+                await self._process_batch()
+            return initial_count
+
     async def _batch_processor(self):
         """
         Background task for batch mode processing.
-        Collects findings and processes in batches.
+
+        Processes accumulated batches on timeout even if not full.
+        This ensures findings don't sit in buffer indefinitely.
         """
         while self.running:
             try:
@@ -595,23 +684,50 @@ class ThinkingConsolidationAgent(BaseAgent):
 
                 async with self._batch_lock:
                     if self._batch_buffer:
-                        batch = self._batch_buffer[:settings.THINKING_BATCH_SIZE]
-                        self._batch_buffer = self._batch_buffer[settings.THINKING_BATCH_SIZE:]
-
-                        logger.info(f"[{self.name}] Processing batch of {len(batch)} findings")
-                        # Process batch (implemented in Plan 02/03)
+                        logger.debug(
+                            f"[{self.name}] Batch timeout: processing {len(self._batch_buffer)} buffered"
+                        )
+                        await self._process_batch()
 
             except asyncio.CancelledError:
+                # Flush remaining on shutdown
+                async with self._batch_lock:
+                    if self._batch_buffer:
+                        logger.info(f"[{self.name}] Shutdown: flushing {len(self._batch_buffer)} buffered")
+                        while self._batch_buffer:
+                            await self._process_batch()
                 break
             except Exception as e:
                 logger.error(f"[{self.name}] Batch processor error: {e}")
+
+    def set_mode(self, mode: str) -> None:
+        """
+        Change processing mode at runtime.
+
+        Args:
+            mode: "streaming" or "batch"
+
+        Note: Changing to streaming while batch buffer has items
+              will trigger immediate processing.
+        """
+        if mode not in ("streaming", "batch"):
+            raise ValueError(f"Invalid mode: {mode}. Must be 'streaming' or 'batch'")
+
+        old_mode = self._mode
+        self._mode = mode
+        logger.info(f"[{self.name}] Mode changed: {old_mode} -> {mode}")
+
+        # If switching from batch to streaming, flush buffer
+        if old_mode == "batch" and mode == "streaming" and self._batch_buffer:
+            asyncio.create_task(self.flush_batch())
 
     def get_stats(self) -> Dict[str, Any]:
         """Get processing statistics."""
         return {
             **self._stats,
             "dedup_cache": self._dedup_cache.get_stats(),
-            "mode": self._mode
+            "mode": self._mode,
+            "batch_buffer_size": len(self._batch_buffer) if self._mode == "batch" else 0,
         }
 
     def reset_stats(self) -> None:
