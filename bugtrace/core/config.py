@@ -104,6 +104,11 @@ class Settings(BaseSettings):
     WORKER_POOL_DEQUEUE_TIMEOUT: float = 5.0  # Seconds to wait for queue item
     WORKER_POOL_EMIT_EVENTS: bool = True  # Emit vulnerability_detected events
 
+    # --- Validation Optimization Configuration (Phase 21: v2.3) ---
+    VALIDATION_METRICS_ENABLED: bool = True  # Track validation load metrics
+    CDP_LOAD_TARGET: float = 0.01  # Target <1% findings go to CDP validation
+    VALIDATION_LOG_INTERVAL: int = 100  # Log metrics every N findings
+
     def get_threshold_for_type(self, vuln_type: str) -> int:
         """Get the skeptical threshold for a vulnerability type."""
         vuln_upper = vuln_type.upper()
