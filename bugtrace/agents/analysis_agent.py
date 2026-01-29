@@ -7,6 +7,7 @@ from bugtrace.core.llm_client import llm_client
 from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
 from bugtrace.utils.parsers import XmlParser
+from bugtrace.core.event_bus import event_bus, EventType
 
 from bugtrace.agents.base import BaseAgent
 
@@ -17,13 +18,14 @@ class DASTySASTAgent(BaseAgent):
     Phase 2 (Part A) of the Sequential Pipeline.
     """
     
-    def __init__(self, url: str, tech_profile: Dict, report_dir: Path, state_manager: Any = None):
+    def __init__(self, url: str, tech_profile: Dict, report_dir: Path, state_manager: Any = None, scan_context: str = None):
         super().__init__("DASTySASTAgent", "Security Analysis", agent_id="analysis_agent")
         self.url = url
         self.tech_profile = tech_profile
         self.report_dir = report_dir
         self.state_manager = state_manager
-        
+        self.scan_context = scan_context or f"scan_{id(self)}"  # Default scan context
+
         # 6 different analysis approaches for maximum coverage
         # 5 core LLM approaches + 1 skeptical approach for early FP elimination
         self.approaches = ["pentester", "bug_bounty", "code_auditor", "red_team", "researcher", "skeptical_agent"]
@@ -876,6 +878,69 @@ Return XML:
                 logger.info(f"[{self.name}] ❌ REJECTED #{idx+1} {vuln_type} (score: {final_score}/10 < {threshold}): {reasoning[:60]}")
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to parse finding: {e}")
+
+    async def _emit_url_analyzed(self, vulnerabilities: List[Dict]):
+        """
+        Emit url_analyzed event with filtered findings.
+
+        Event payload:
+        - url: The analyzed URL
+        - scan_context: Context for ordering guarantees
+        - findings: List of findings with fp_confidence
+        - stats: Summary statistics
+
+        This event is consumed by:
+        - ThinkingConsolidationAgent (Phase 18): For deduplication and queue distribution
+        - Dashboard: For real-time progress updates
+        """
+        # Prepare findings payload with essential fields
+        findings_payload = []
+        for v in vulnerabilities:
+            findings_payload.append({
+                "type": v.get("type", "Unknown"),
+                "parameter": v.get("parameter", "unknown"),
+                "url": self.url,
+                "fp_confidence": v.get("fp_confidence", 0.5),
+                "skeptical_score": v.get("skeptical_score", 5),
+                "confidence_score": v.get("confidence_score", 5),
+                "votes": v.get("votes", 1),
+                "severity": v.get("severity", "Medium"),
+                "reasoning": v.get("reasoning", "")[:500],  # Truncate for event size
+                "payload": v.get("exploitation_strategy", v.get("payload", ""))[:200],
+                "fp_reason": v.get("fp_reason", "")[:200]
+            })
+
+        # Build event data
+        event_data = {
+            "url": self.url,
+            "scan_context": self.scan_context,
+            "findings": findings_payload,
+            "stats": {
+                "total": len(findings_payload),
+                "high_confidence": len([f for f in findings_payload if f.get("fp_confidence", 0) >= 0.7]),
+                "by_type": self._count_by_type(findings_payload)
+            },
+            "tech_profile": {
+                "frameworks": self.tech_profile.get("frameworks", [])[:5]  # Limit for event size
+            },
+            "timestamp": __import__('time').time()
+        }
+
+        # Emit event
+        try:
+            await event_bus.emit(EventType.URL_ANALYZED, event_data)
+            logger.info(f"[{self.name}] Emitted url_analyzed: {len(findings_payload)} findings for {self.url[:50]}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to emit url_analyzed event: {e}")
+
+
+    def _count_by_type(self, findings: List[Dict]) -> Dict[str, int]:
+        """Count findings by vulnerability type."""
+        counts = {}
+        for f in findings:
+            v_type = f.get("type", "Unknown")
+            counts[v_type] = counts.get(v_type, 0) + 1
+        return counts
 
     def _save_markdown_report(self, path: Path, vulnerabilities: List[Dict]):
         """Saves markdown report with FP confidence scores."""
