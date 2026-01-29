@@ -81,24 +81,252 @@ class PrototypePollutionAgent(BaseAgent):
         Hunter Phase: Discover all potential prototype pollution vectors.
 
         Scans for:
-        - Query parameters matching known config/object merge patterns
-        - JSON body endpoints that accept POST/PUT requests
-        - URL paths that suggest object/config modification
-        - JavaScript merge/extend patterns in response
+        - Query parameters that match vulnerable patterns
+        - JSON body acceptance (POST/PUT endpoints)
+        - Existing parameters that suggest object merging
+        - Response content indicating merge operations
 
         Returns:
-            List of vectors with type, parameter/method, and source
+            List of vectors with type, method, source, and confidence
         """
         dashboard.log(f"[{self.name}] Hunter: Scanning for pollution vectors", "INFO")
+
+        # Early exit if no URL
+        if not self.url:
+            logger.warning(f"[{self.name}] No URL provided")
+            return []
+
         vectors = []
 
-        # TODO (Plan 02): Implement parameter discovery
-        # - Check existing query parameters for config-related names
-        # - Test if endpoint accepts JSON body (POST/PUT)
-        # - Analyze URL paths for object modification patterns
+        # 1. Check if endpoint accepts JSON body (most common vector)
+        json_vector = await self._discover_json_body_vector()
+        if json_vector:
+            vectors.append(json_vector)
 
-        dashboard.log(f"[{self.name}] Hunter found {len(vectors)} potential vectors", "INFO")
+        # 2. Check existing query parameters for vulnerable names
+        param_vectors = self._discover_param_vectors()
+        vectors.extend(param_vectors)
+
+        # 3. Check for query parameter pollution acceptance
+        query_vectors = await self._discover_query_pollution_vectors()
+        vectors.extend(query_vectors)
+
+        # 4. Analyze response for vulnerable patterns
+        content_vectors = await self._analyze_response_patterns()
+        vectors.extend(content_vectors)
+
+        # Deduplicate vectors by creating unique keys
+        seen = set()
+        unique_vectors = []
+        for v in vectors:
+            key = f"{v['type']}:{v.get('param', '')}:{v.get('pattern', '')}"
+            if key not in seen:
+                seen.add(key)
+                unique_vectors.append(v)
+
+        # Sort vectors by confidence (HIGH > MEDIUM > LOW)
+        confidence_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        unique_vectors.sort(key=lambda v: confidence_order.get(v.get("confidence", "LOW"), 2))
+
+        dashboard.log(f"[{self.name}] Hunter found {len(unique_vectors)} unique vectors", "INFO")
+        return unique_vectors
+
+    async def _discover_json_body_vector(self) -> Optional[Dict]:
+        """
+        Check if endpoint accepts JSON POST requests.
+
+        Most prototype pollution occurs via JSON body, so this is priority check.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Test with empty JSON object to check acceptance
+                async with session.post(
+                    self.url,
+                    json={"test": "probe"},
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    # 415 = Unsupported Media Type (doesn't accept JSON)
+                    # 405 = Method Not Allowed (doesn't accept POST)
+                    if response.status not in (415, 405):
+                        return {
+                            "type": "JSON_BODY",
+                            "method": "POST",
+                            "source": "ENDPOINT_PROBE",
+                            "confidence": "HIGH",
+                            "status_code": response.status,
+                        }
+
+        except aiohttp.ClientError as e:
+            logger.debug(f"[{self.name}] JSON body probe failed: {e}")
+        except asyncio.TimeoutError:
+            logger.debug(f"[{self.name}] JSON body probe timeout")
+
+        return None
+
+    def _discover_param_vectors(self) -> List[Dict]:
+        """Discover pollution vectors in existing query parameters."""
+        vectors = []
+        parsed = urlparse(self.url)
+        existing_params = parse_qs(parsed.query)
+
+        # Check if any existing params match vulnerable patterns
+        for param in existing_params.keys():
+            param_lower = param.lower()
+
+            # Check against known vulnerable parameter names
+            if any(vuln_param in param_lower for vuln_param in VULNERABLE_PARAMS):
+                vectors.append({
+                    "type": "QUERY_PARAM",
+                    "param": param,
+                    "value": existing_params[param][0] if existing_params[param] else "",
+                    "source": "URL_EXISTING",
+                    "confidence": "MEDIUM",
+                    "reason": "Parameter name suggests object merging",
+                })
+
+        # Also include params provided to agent
+        if self.params:
+            for param in self.params:
+                if not any(v.get("param") == param for v in vectors):
+                    vectors.append({
+                        "type": "QUERY_PARAM",
+                        "param": param,
+                        "value": "",
+                        "source": "AGENT_INPUT",
+                        "confidence": "HIGH",
+                    })
+
         return vectors
+
+    async def _discover_query_pollution_vectors(self) -> List[Dict]:
+        """
+        Test if endpoint processes __proto__ in query parameters.
+
+        Some endpoints parse query strings with vulnerable libraries (qs, querystring).
+        """
+        vectors = []
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Test basic __proto__ query pollution
+                test_url = f"{self.url}{'&' if '?' in self.url else '?'}__proto__[test]=probe"
+
+                async with session.get(
+                    test_url,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    # If we get a valid response (not 400 Bad Request), query parsing is happening
+                    if response.status < 400:
+                        vectors.append({
+                            "type": "QUERY_PROTO",
+                            "method": "GET",
+                            "source": "QUERY_PROBE",
+                            "confidence": "MEDIUM",
+                            "test_url": test_url,
+                        })
+
+        except aiohttp.ClientError as e:
+            logger.debug(f"[{self.name}] Query pollution probe failed: {e}")
+        except asyncio.TimeoutError:
+            logger.debug(f"[{self.name}] Query pollution probe timeout")
+
+        return vectors
+
+    async def _analyze_response_patterns(self) -> List[Dict]:
+        """
+        Analyze response content for vulnerable merge/extend patterns.
+
+        Looks for:
+        - JavaScript code with Object.assign, lodash.merge, $.extend
+        - Error messages revealing merge operations
+        - Response structure suggesting object manipulation
+        """
+        vectors = []
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    self.url,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    content = await response.text()
+                    content_lower = content.lower()
+
+                    # Check for vulnerable JavaScript patterns
+                    js_patterns = [
+                        ("object.assign", "Object.assign usage detected"),
+                        ("lodash.merge", "Lodash merge detected"),
+                        ("_.merge", "Lodash merge (underscore) detected"),
+                        ("$.extend", "jQuery extend detected"),
+                        ("deep-extend", "deep-extend package detected"),
+                        ("merge-deep", "merge-deep package detected"),
+                        ("deepmerge", "deepmerge package detected"),
+                    ]
+
+                    for pattern, reason in js_patterns:
+                        if pattern in content_lower:
+                            vectors.append({
+                                "type": "JS_PATTERN",
+                                "pattern": pattern,
+                                "source": "RESPONSE_ANALYSIS",
+                                "confidence": "LOW",
+                                "reason": reason,
+                            })
+                            break  # One pattern is enough
+
+                    # Check for server error messages that reveal merge operations
+                    error_patterns = [
+                        "cannot read property",
+                        "undefined is not an object",
+                        "cannot convert undefined",
+                        "merge",
+                        "deep copy",
+                        "prototype",
+                    ]
+
+                    for pattern in error_patterns:
+                        if pattern in content_lower:
+                            vectors.append({
+                                "type": "ERROR_PATTERN",
+                                "pattern": pattern,
+                                "source": "ERROR_MESSAGE",
+                                "confidence": "LOW",
+                                "reason": f"Error message suggests object manipulation: {pattern}",
+                            })
+                            break
+
+        except aiohttp.ClientError as e:
+            logger.debug(f"[{self.name}] Response analysis failed: {e}")
+        except asyncio.TimeoutError:
+            logger.debug(f"[{self.name}] Response analysis timeout")
+
+        return vectors
+
+    async def _test_hunter_phase(self) -> Dict:
+        """
+        Self-test method for Hunter phase verification.
+        Uses httpbin.org which accepts JSON bodies.
+        """
+        test_results = {
+            "json_body": False,
+            "query_params": False,
+            "response_analysis": False,
+        }
+
+        # Test JSON body detection
+        json_vector = await self._discover_json_body_vector()
+        test_results["json_body"] = json_vector is not None
+
+        # Test param discovery
+        param_vectors = self._discover_param_vectors()
+        test_results["query_params"] = len(param_vectors) > 0
+
+        # Test full hunter phase
+        all_vectors = await self._hunter_phase()
+        test_results["total_vectors"] = len(all_vectors)
+
+        return test_results
 
     async def _auditor_phase(self, vectors: List[Dict]) -> List[Dict]:
         """
