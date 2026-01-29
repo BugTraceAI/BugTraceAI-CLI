@@ -27,6 +27,101 @@ from bugtrace.core.queue import queue_manager, SPECIALIST_QUEUES
 from bugtrace.core.config import settings
 
 
+# Vulnerability type to specialist queue mapping
+# Maps finding['type'] values to SPECIALIST_QUEUES names
+VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
+    # XSS variants
+    "xss": "xss",
+    "cross-site scripting": "xss",
+    "reflected xss": "xss",
+    "stored xss": "xss",
+    "dom xss": "xss",
+    "dom-based xss": "xss",
+
+    # SQL Injection variants
+    "sql injection": "sqli",
+    "sqli": "sqli",
+    "sql": "sqli",
+    "blind sql injection": "sqli",
+    "boolean-based sqli": "sqli",
+    "time-based sqli": "sqli",
+    "error-based sqli": "sqli",
+
+    # Template injection
+    "ssti": "csti",
+    "csti": "csti",
+    "server-side template injection": "csti",
+    "client-side template injection": "csti",
+    "template injection": "csti",
+
+    # File inclusion
+    "lfi": "lfi",
+    "local file inclusion": "lfi",
+    "path traversal": "lfi",
+    "directory traversal": "lfi",
+    "file read": "lfi",
+
+    # Access control
+    "idor": "idor",
+    "insecure direct object reference": "idor",
+    "broken access control": "idor",
+    "authorization bypass": "idor",
+    "privilege escalation": "idor",
+
+    # Remote code execution
+    "rce": "rce",
+    "remote code execution": "rce",
+    "command injection": "rce",
+    "os command injection": "rce",
+    "code injection": "rce",
+    "deserialization": "rce",
+
+    # Server-side request forgery
+    "ssrf": "ssrf",
+    "server-side request forgery": "ssrf",
+    "url injection": "ssrf",
+
+    # XML vulnerabilities
+    "xxe": "xxe",
+    "xml external entity": "xxe",
+    "xml injection": "xxe",
+
+    # JWT vulnerabilities
+    "jwt": "jwt",
+    "jwt vulnerability": "jwt",
+    "jwt bypass": "jwt",
+    "jwt manipulation": "jwt",
+    "authentication bypass": "jwt",
+
+    # Open redirect
+    "open redirect": "openredirect",
+    "openredirect": "openredirect",
+    "url redirect": "openredirect",
+    "redirect": "openredirect",
+
+    # Prototype pollution
+    "prototype pollution": "prototype_pollution",
+    "prototype_pollution": "prototype_pollution",
+    "__proto__ pollution": "prototype_pollution",
+
+    # Header injection (maps to XSS specialist as similar validation)
+    "header injection": "xss",
+    "crlf injection": "xss",
+    "http response splitting": "xss",
+}
+
+
+# Severity to base priority score mapping
+SEVERITY_PRIORITY: Dict[str, int] = {
+    "critical": 100,
+    "high": 75,
+    "medium": 50,
+    "low": 25,
+    "info": 10,
+    "information": 10,
+}
+
+
 @dataclass
 class FindingRecord:
     """Record of a finding for deduplication and processing."""
