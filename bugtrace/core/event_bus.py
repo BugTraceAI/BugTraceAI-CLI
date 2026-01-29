@@ -81,6 +81,20 @@ class EventType(str, Enum):
     FINDING_VALIDATED = "finding_validated"
     FINDING_REJECTED = "finding_rejected"
 
+    # Phase Completion Events (Pipeline Orchestration)
+    PHASE_COMPLETE_DISCOVERY = "phase_complete_discovery"
+    PHASE_COMPLETE_EVALUATION = "phase_complete_evaluation"
+    PHASE_COMPLETE_EXPLOITATION = "phase_complete_exploitation"
+    PHASE_COMPLETE_VALIDATION = "phase_complete_validation"
+    PHASE_COMPLETE_REPORTING = "phase_complete_reporting"
+
+    # Pipeline Control Events
+    PIPELINE_STARTED = "pipeline_started"
+    PIPELINE_COMPLETE = "pipeline_complete"
+    PIPELINE_ERROR = "pipeline_error"
+    PIPELINE_PAUSED = "pipeline_paused"
+    PIPELINE_RESUMED = "pipeline_resumed"
+
     # Legacy
     NEW_INPUT_DISCOVERED = "new_input_discovered"
     WAF_DETECTED = "waf_detected"
