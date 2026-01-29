@@ -2687,6 +2687,52 @@ Return JSON:
 
         return False
 
+    def _requires_browser_validation(self, payload: str, response_html: str) -> bool:
+        """
+        Determine if Playwright browser validation is required.
+
+        Returns True for:
+        - DOM-based XSS (location.hash, postMessage, innerHTML sinks)
+        - Event handlers requiring interaction (autofocus, onblur)
+        - Complex sink patterns that need JS execution
+
+        Returns False if HTTP analysis or reflection check is sufficient.
+        """
+        # 1. DOM-based sink patterns in payload
+        dom_sinks = [
+            "location.hash", "location.search", "document.URL",
+            "document.referrer", "postMessage", "innerHTML",
+            "outerHTML", "document.write"
+        ]
+        for sink in dom_sinks:
+            if sink.lower() in payload.lower():
+                return True
+
+        # 2. Event handlers requiring interaction
+        interaction_patterns = [
+            r'autofocus.*onfocus',
+            r'onfocus.*autofocus',
+            r'onblur\s*=',
+            r'onmouseover\s*=',
+            r'onmouseenter\s*='
+        ]
+        for pattern in interaction_patterns:
+            if re.search(pattern, payload, re.IGNORECASE):
+                return True
+
+        # 3. Complex sink analysis in response (not payload)
+        complex_sinks = [
+            r'eval\s*\(',
+            r'Function\s*\(',
+            r'setTimeout\s*\([^)]*["\']',
+            r'setInterval\s*\([^)]*["\']'
+        ]
+        for pattern in complex_sinks:
+            if re.search(pattern, response_html):
+                return True
+
+        return False
+
     def _fragment_build_url(self, payload: str) -> str:
         """Build fragment URL with payload in hash (bypasses WAF)."""
         from urllib.parse import urlparse
