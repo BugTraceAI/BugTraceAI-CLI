@@ -23,6 +23,7 @@ from bugtrace.agents.base import BaseAgent
 from bugtrace.core.llm_client import llm_client
 from bugtrace.core.ui import dashboard
 from bugtrace.core.config import settings
+from bugtrace.core.event_bus import EventType
 
 
 class ChainDiscoveryAgent(BaseAgent):
@@ -57,15 +58,27 @@ class ChainDiscoveryAgent(BaseAgent):
     def _setup_event_subscriptions(self):
         """Subscribe to vulnerability discovery events."""
         if self.event_bus:
+            # Legacy subscriptions (backward compatibility)
             self.event_bus.subscribe("vulnerability_detected", self.handle_vulnerability)
             self.event_bus.subscribe("finding_verified", self.handle_verified_finding)
-            logger.info(f"[{self.name}] Subscribed to vulnerability events")
+
+            # New Phase 20: Subscribe to specialist vulnerability_detected events
+            self.event_bus.subscribe(
+                EventType.VULNERABILITY_DETECTED.value,
+                self.handle_specialist_finding
+            )
+
+            logger.info(f"[{self.name}] Subscribed to vulnerability events (including specialist findings)")
 
     async def handle_vulnerability(self, data: Dict[str, Any]):
-        """Triggered when any agent finds a vulnerability."""
+        """Triggered when any agent finds a vulnerability (legacy handler)."""
         vuln = data.get("vulnerability", {})
-        self.discovered_vulns.append(vuln)
 
+        # Skip if this looks like a specialist finding (avoid duplicates)
+        if data.get("specialist"):
+            return  # Let handle_specialist_finding process it
+
+        self.discovered_vulns.append(vuln)
         self.think(f"New vulnerability: {vuln.get('type')} - analyzing chains...")
 
         # Add to graph
@@ -73,6 +86,91 @@ class ChainDiscoveryAgent(BaseAgent):
 
         # Look for exploitable chains
         await self._analyze_chains()
+
+    async def handle_specialist_finding(self, data: Dict[str, Any]):
+        """
+        Handle vulnerability_detected events from specialist agents.
+
+        These come from Phase 20 specialists (XSS, SQLi, CSTI, LFI, IDOR,
+        RCE, SSRF, XXE, JWT, OpenRedirect, PrototypePollution) after they
+        confirm vulnerabilities from queue processing.
+
+        Args:
+            data: Event data containing specialist, finding, status, scan_context
+        """
+        specialist = data.get("specialist", "unknown")
+        finding = data.get("finding", {})
+        status = data.get("status", "PENDING_VALIDATION")
+
+        # Only process confirmed findings
+        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+            logger.debug(f"[{self.name}] Skipping unconfirmed finding from {specialist}")
+            return
+
+        # Convert to internal vulnerability format
+        vuln = self._convert_specialist_finding(specialist, finding, status)
+
+        if vuln:
+            self.discovered_vulns.append(vuln)
+            self.think(f"New {specialist} vulnerability: analyzing chains...")
+
+            # Add to graph and analyze
+            await self._add_vulnerability_to_graph(vuln)
+            await self._analyze_chains()
+
+    def _convert_specialist_finding(self, specialist: str, finding: Dict, status: str) -> Optional[Dict]:
+        """
+        Convert specialist finding to internal vulnerability format.
+
+        Args:
+            specialist: Specialist agent name (xss, sqli, csti, etc.)
+            finding: Finding data from specialist
+            status: Validation status
+
+        Returns:
+            Vulnerability dict compatible with chain analysis
+        """
+        vuln_type_map = {
+            "xss": "XSS",
+            "sqli": "SQLi",
+            "csti": "CSTI",
+            "lfi": "LFI",
+            "idor": "IDOR",
+            "rce": "RCE",
+            "ssrf": "SSRF",
+            "xxe": "XXE",
+            "jwt": "JWT",
+            "openredirect": "Open Redirect",
+            "prototype_pollution": "Prototype Pollution",
+        }
+
+        vuln_type = vuln_type_map.get(specialist.lower(), finding.get("type", "Unknown"))
+
+        return {
+            "type": vuln_type,
+            "url": finding.get("url"),
+            "parameter": finding.get("parameter"),
+            "payload": finding.get("payload"),
+            "severity": finding.get("severity", self._infer_severity(vuln_type)),
+            "status": status,
+            "source": f"specialist:{specialist}",
+            "exploitable": status == "VALIDATED_CONFIRMED",
+            "specialist_data": finding,  # Keep original data for chain analysis
+        }
+
+    def _infer_severity(self, vuln_type: str) -> str:
+        """Infer severity from vulnerability type."""
+        critical_types = {"RCE", "SQLi", "SSRF", "XXE"}
+        high_types = {"XSS", "CSTI", "LFI", "JWT", "IDOR", "Prototype Pollution"}
+        medium_types = {"Open Redirect"}
+
+        if vuln_type in critical_types:
+            return "CRITICAL"
+        elif vuln_type in high_types:
+            return "HIGH"
+        elif vuln_type in medium_types:
+            return "MEDIUM"
+        return "LOW"
 
     async def handle_verified_finding(self, data: Dict[str, Any]):
         """Triggered when SkepticalAgent verifies a finding."""
