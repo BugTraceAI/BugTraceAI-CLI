@@ -15,6 +15,7 @@ from bugtrace.core.llm_client import llm_client
 from bugtrace.core.config import settings
 from dataclasses import dataclass, field
 from bugtrace.schemas.validation_feedback import ValidationFeedback, FailureReason
+from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 
 @dataclass
 class CSTIFinding:
@@ -1505,9 +1506,20 @@ Response format (XML):
         Handle completed queue item processing.
 
         Emits vulnerability_detected event on confirmed findings.
+        Uses centralized validation status to determine if CDP validation is needed.
         """
         if result is None:
             return
+
+        # Use centralized validation status for proper tagging
+        # Client-side CSTI (Angular, Vue) may need browser validation
+        finding_data = {
+            "context": result.engine_type,
+            "payload": result.payload,
+            "validation_method": result.template_engine,
+            "evidence": result.evidence,
+        }
+        needs_cdp = requires_cdp_validation(finding_data)
 
         # Emit vulnerability_detected event
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
@@ -1521,6 +1533,7 @@ Response format (XML):
                     "template_engine": result.template_engine,
                 },
                 "status": result.status,
+                "validation_requires_cdp": needs_cdp,
                 "scan_context": self._scan_context,
             })
 

@@ -38,6 +38,7 @@ from bugtrace.reporting.standards import (
     get_remediation_for_vuln,
     normalize_severity,
 )
+from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 
 
 # =============================================================================
@@ -1999,12 +2000,23 @@ Write the exploitation explanation section for the report."""
         Handle completed queue item processing.
 
         Emits vulnerability_detected event on confirmed findings.
+        Uses centralized validation status to determine if CDP validation is needed.
         """
         if result is None:
             return
 
         # Convert to dict if needed
         finding_dict = self._finding_to_dict(result)
+
+        # Use centralized validation status for proper tagging
+        # Time-based blind SQLi may need additional verification
+        finding_data = {
+            "context": result.injection_type,
+            "payload": result.working_payload,
+            "validation_method": result.technique,
+            "evidence": result.evidence,
+        }
+        needs_cdp = requires_cdp_validation(finding_data)
 
         # Emit vulnerability_detected event
         if settings.WORKER_POOL_EMIT_EVENTS:
@@ -2019,6 +2031,7 @@ Write the exploitation explanation section for the report."""
                     "dbms": result.dbms_detected,
                 },
                 "status": result.status,
+                "validation_requires_cdp": needs_cdp,
                 "scan_context": self._scan_context,
             })
 

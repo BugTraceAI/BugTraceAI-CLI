@@ -47,6 +47,7 @@ from bugtrace.reporting.standards import (
     normalize_severity,
     get_default_severity,
 )
+from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation, get_validation_status
 
 logger = get_logger("agents.xss_v4")
 
@@ -1190,12 +1191,24 @@ class XSSAgent(BaseAgent):
         Handle completed queue item processing.
 
         Emits vulnerability_detected event on confirmed findings.
+        Uses centralized validation status to determine if CDP validation is needed.
         """
         if result is None:
             return
 
         # Add to findings list
         self.findings.append(result)
+
+        # Use centralized validation status for proper tagging
+        finding_data = {
+            "context": result.context,
+            "payload": result.payload,
+            "validation_method": result.validation_method,
+            "reflection_context": result.reflection_context,
+            "evidence": result.evidence,
+        }
+        validation_status = get_validation_status(finding_data, result.confidence)
+        needs_cdp = requires_cdp_validation(finding_data)
 
         # Emit vulnerability_detected event
         if settings.WORKER_POOL_EMIT_EVENTS:
@@ -1210,7 +1223,8 @@ class XSSAgent(BaseAgent):
                     "confidence": result.confidence,
                     "validation_method": result.validation_method,
                 },
-                "status": result.status,
+                "status": validation_status.value,
+                "validation_requires_cdp": needs_cdp,
                 "scan_context": self._scan_context,
             })
 
