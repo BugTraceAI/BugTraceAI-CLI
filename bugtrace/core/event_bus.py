@@ -94,6 +94,7 @@ class EventType(str, Enum):
     PIPELINE_ERROR = "pipeline_error"
     PIPELINE_PAUSED = "pipeline_paused"
     PIPELINE_RESUMED = "pipeline_resumed"
+    PIPELINE_SHUTDOWN = "pipeline_shutdown"
 
     # Legacy
     NEW_INPUT_DISCOVERED = "new_input_discovered"
