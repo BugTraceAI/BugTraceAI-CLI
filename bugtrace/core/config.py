@@ -92,6 +92,9 @@ class Settings(BaseSettings):
     THINKING_BATCH_TIMEOUT: float = 5.0  # Seconds to wait before processing incomplete batch
     THINKING_DEDUP_WINDOW: int = 1000  # Max dedup keys to track (LRU eviction)
     THINKING_FP_THRESHOLD: float = 0.5  # Min fp_confidence to forward to specialists
+    THINKING_BACKPRESSURE_RETRIES: int = 3  # Max retries on queue full
+    THINKING_BACKPRESSURE_DELAY: float = 0.5  # Seconds between retries
+    THINKING_EMIT_EVENTS: bool = True  # Emit work_queued events
 
     def get_threshold_for_type(self, vuln_type: str) -> int:
         """Get the skeptical threshold for a vulnerability type."""
