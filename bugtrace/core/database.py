@@ -1,6 +1,7 @@
 from typing import Optional, List, Dict
 import os
 from datetime import datetime
+from dataclasses import dataclass
 from sqlmodel import SQLModel, create_engine, Session, select
 from sqlalchemy import Engine, text, event
 from sqlalchemy.pool import QueuePool, StaticPool
@@ -12,6 +13,16 @@ from bugtrace.schemas.db_models import (
 from bugtrace.utils.logger import get_logger
 logger = get_logger("core.database")
 from tenacity import retry, stop_after_attempt, wait_fixed
+
+
+@dataclass
+class ScanInfo:
+    """Metadata about a scan."""
+    scan_id: int
+    target_url: str
+    timestamp: datetime
+    status: ScanStatus
+    progress_percent: int
 
 
 def _build_csti_description(evidence: Dict, param: str, payload: str) -> List[str]:
@@ -324,6 +335,30 @@ class DatabaseManager:
             
             scan = session.exec(scan_query).first()
             return scan.id if scan else None
+
+    def get_most_recent_scan_id(self) -> Optional[int]:
+        """Get the most recent scan ID across all targets."""
+        with self.get_session() as session:
+            scan_query = select(ScanTable).order_by(ScanTable.id.desc())
+            scan = session.exec(scan_query).first()
+            return scan.id if scan else None
+
+    def get_scan_info(self, scan_id: int) -> Optional[ScanInfo]:
+        """Get scan metadata including target URL."""
+        with self.get_session() as session:
+            scan = session.get(ScanTable, scan_id)
+            if not scan:
+                return None
+
+            target = session.get(TargetTable, scan.target_id)
+            return ScanInfo(
+                scan_id=scan.id,
+                target_url=target.url if target else "Unknown",
+                timestamp=scan.timestamp,
+                status=scan.status,
+                progress_percent=scan.progress_percent
+            )
+
     def create_new_scan(self, target_url: str, origin: str = "cli") -> int:
         """Create a new scan record with RUNNING status.
 
