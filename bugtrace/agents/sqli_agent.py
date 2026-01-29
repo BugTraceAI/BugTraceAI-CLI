@@ -30,6 +30,11 @@ from bugtrace.agents.base import BaseAgent
 from bugtrace.tools.external import external_tools
 from bugtrace.core.ui import dashboard
 from bugtrace.core.config import settings
+from bugtrace.reporting.standards import (
+    get_cwe_for_vuln,
+    get_remediation_for_vuln,
+    normalize_severity,
+)
 
 
 # =============================================================================
@@ -296,7 +301,10 @@ class SQLiAgent(BaseAgent):
             "type": finding.type,
             "url": finding.url,
             "parameter": finding.parameter,
-            "severity": finding.severity,
+            "severity": finding.severity,  # Already uppercase CRITICAL
+            "cwe_id": get_cwe_for_vuln("SQLI"),  # CWE-89
+            "cve_id": "N/A",  # SQLi vulnerabilities are class-based, not specific CVEs
+            "remediation": get_remediation_for_vuln("SQLI"),
             "injection_type": finding.injection_type,
             "working_payload": finding.working_payload,
             "payload": finding.working_payload, # Backwards compatibility
@@ -318,6 +326,9 @@ class SQLiAgent(BaseAgent):
             "status": finding.status,
             "description": finding.exploitation_explanation or f"SQL Injection confirmed in parameter '{finding.parameter}'. Technique: {finding.injection_type}. Payload: {finding.working_payload}",
             "reproduction": "\n".join(finding.reproduction_steps),
+            # HTTP evidence fields
+            "http_request": finding.evidence.get("http_request", finding.curl_command),
+            "http_response": finding.evidence.get("http_response", finding.evidence.get("raw_output", "")[:500] if finding.evidence.get("raw_output") else ""),
             "sqli_metadata": {
                 "technique": finding.injection_type,
                 "database_type": finding.dbms_detected,
