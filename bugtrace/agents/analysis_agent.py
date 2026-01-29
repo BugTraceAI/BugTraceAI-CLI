@@ -415,6 +415,122 @@ For EACH potential vulnerability, assign a SKEPTICAL_SCORE:
 
 REMEMBER: Being skeptical SAVES TIME. False positives waste specialist agent resources."""
 
+    def _calculate_fp_confidence(self, finding: Dict) -> float:
+        """
+        Calculate false positive confidence score for a finding.
+
+        FP Confidence Scale (0.0-1.0):
+        - 0.0: Almost certainly a FALSE POSITIVE
+        - 0.5: Uncertain - needs specialist investigation
+        - 1.0: Almost certainly a TRUE POSITIVE
+
+        Formula:
+        fp_confidence = (skeptical_component + votes_component + evidence_component)
+
+        Where:
+        - skeptical_component = (skeptical_score / 10) * FP_SKEPTICAL_WEIGHT
+        - votes_component = (votes / max_votes) * FP_VOTES_WEIGHT
+        - evidence_component = evidence_quality * FP_EVIDENCE_WEIGHT
+
+        Args:
+            finding: Vulnerability finding dict
+
+        Returns:
+            float: FP confidence score between 0.0 and 1.0
+        """
+        # Get weights from config
+        skeptical_weight = getattr(settings, 'FP_SKEPTICAL_WEIGHT', 0.4)
+        votes_weight = getattr(settings, 'FP_VOTES_WEIGHT', 0.3)
+        evidence_weight = getattr(settings, 'FP_EVIDENCE_WEIGHT', 0.3)
+
+        # 1. Skeptical component (0.0 - 0.4)
+        skeptical_score = finding.get('skeptical_score', 5)
+        skeptical_component = (skeptical_score / 10.0) * skeptical_weight
+
+        # 2. Votes component (0.0 - 0.3)
+        votes = finding.get('votes', 1)
+        max_votes = len([a for a in self.approaches if a != 'skeptical_agent'])  # 5 core approaches
+        votes_component = min(votes / max_votes, 1.0) * votes_weight
+
+        # 3. Evidence component (0.0 - 0.3)
+        evidence_quality = self._assess_evidence_quality(finding)
+        evidence_component = evidence_quality * evidence_weight
+
+        # Sum components (max = 1.0)
+        fp_confidence = skeptical_component + votes_component + evidence_component
+
+        # Clamp to 0.0-1.0
+        return max(0.0, min(1.0, fp_confidence))
+
+    def _assess_evidence_quality(self, finding: Dict) -> float:
+        """
+        Assess the quality of evidence for a finding.
+
+        Evidence Quality Scale (0.0-1.0):
+        - 0.0: No concrete evidence (parameter name only)
+        - 0.5: Some patterns/indicators
+        - 1.0: Concrete proof (error messages, reflection, OOB callback)
+
+        Args:
+            finding: Vulnerability finding dict
+
+        Returns:
+            float: Evidence quality score between 0.0 and 1.0
+        """
+        evidence_score = 0.0
+        reasoning = str(finding.get('reasoning', '')).lower()
+        payload = str(finding.get('exploitation_strategy', finding.get('payload', ''))).lower()
+        vuln_type = str(finding.get('type', '')).lower()
+
+        # Strong evidence indicators (+0.3 each, max 1.0)
+        strong_indicators = [
+            # SQL error patterns
+            ('sql' in vuln_type and any(err in reasoning for err in ['syntax error', 'mysql', 'postgresql', 'sqlite', 'ora-'])),
+            # XSS reflection
+            ('xss' in vuln_type and any(ind in reasoning for ind in ['unescaped', 'reflected', 'rendered', 'executed'])),
+            # Error messages
+            any(err in reasoning for err in ['stack trace', 'exception', 'error message', 'debug']),
+            # OOB callback
+            'callback' in reasoning or 'oob' in reasoning or 'interactsh' in reasoning,
+            # Validated/confirmed
+            finding.get('validated', False) or 'confirmed' in reasoning,
+        ]
+
+        for indicator in strong_indicators:
+            if indicator:
+                evidence_score += 0.3
+
+        # Medium evidence indicators (+0.15 each)
+        medium_indicators = [
+            # Has specific payload
+            len(payload) > 10 and any(c in payload for c in ["'", '"', '<', '>', '{', '}']),
+            # Has confidence score >= 7
+            finding.get('confidence_score', 5) >= 7,
+            # Multiple votes
+            finding.get('votes', 1) >= 3,
+        ]
+
+        for indicator in medium_indicators:
+            if indicator:
+                evidence_score += 0.15
+
+        # Weak evidence penalty (-0.2 each)
+        weak_indicators = [
+            # Parameter name only
+            'parameter name' in reasoning or 'common parameter' in reasoning,
+            # Speculation
+            'could be' in reasoning or 'might be' in reasoning or 'potentially' in reasoning,
+            # No payload
+            len(payload) < 5,
+        ]
+
+        for indicator in weak_indicators:
+            if indicator:
+                evidence_score -= 0.2
+
+        return max(0.0, min(1.0, evidence_score))
+
+
     async def _run_skeptical_approach(self, context: Dict, prior_analyses: List[Dict]) -> Dict:
         """
         Run skeptical_agent approach to review findings from core approaches.
@@ -512,50 +628,106 @@ Be RUTHLESS. False positives waste resources."""
         return {"vulnerabilities": scored_findings, "approach": "skeptical_agent"}
 
     def _consolidate(self, analyses: List[Dict]) -> List[Dict]:
-        """Consolidate findings from different approaches using simple voting/merging."""
+        """
+        Consolidate findings from different approaches using voting/merging.
+
+        Now incorporates skeptical_agent scores to reduce false positives early.
+        Findings with low skeptical_score (<=3) are filtered BEFORE specialist dispatch.
+        """
         merged = {}
-        
+        skeptical_data = {}  # Track skeptical scores separately
+
         def to_float(val, default=0.5):
             try:
                 return float(val)
             except (ValueError, TypeError):
                 return default
 
+        # First pass: collect all findings
         for analysis in analyses:
+            is_skeptical = analysis.get("approach") == "skeptical_agent"
+
             for vuln in analysis.get("vulnerabilities", []):
                 v_type = vuln.get("type", vuln.get("vulnerability", "Unknown"))
                 v_param = vuln.get("parameter", "none")
                 key = f"{v_type}:{v_param}"
-                
+
                 conf = int(vuln.get("confidence_score", 5))
-                
-                if key not in merged:
-                    merged[key] = vuln
-                    merged[key]["votes"] = 1
-                    merged[key]["confidence_score"] = conf
+
+                if is_skeptical:
+                    # Store skeptical data for later merge
+                    skeptical_data[key] = {
+                        "skeptical_score": vuln.get("skeptical_score", 5),
+                        "fp_reason": vuln.get("fp_reason", "")
+                    }
                 else:
-                    merged[key]["votes"] += 1
-                    # Average confidence
-                    merged[key]["confidence_score"] = int((merged[key]["confidence_score"] + conf) / 2)
-        
+                    # Standard consolidation for core approaches
+                    if key not in merged:
+                        merged[key] = vuln.copy()
+                        merged[key]["votes"] = 1
+                        merged[key]["confidence_score"] = conf
+                    else:
+                        merged[key]["votes"] += 1
+                        # Average confidence
+                        merged[key]["confidence_score"] = int((merged[key]["confidence_score"] + conf) / 2)
+
+        # Second pass: merge skeptical scores into findings
+        for key, vuln in merged.items():
+            if key in skeptical_data:
+                vuln["skeptical_score"] = skeptical_data[key]["skeptical_score"]
+                vuln["fp_reason"] = skeptical_data[key]["fp_reason"]
+            else:
+                # No skeptical review for this finding - default to uncertain
+                vuln["skeptical_score"] = 5
+                vuln["fp_reason"] = "Not reviewed by skeptical agent"
+
         # Apply consensus filter - require at least 4 votes to reduce false positives
         min_votes = getattr(settings, "ANALYSIS_CONSENSUS_VOTES", 4)
-        return [v for v in merged.values() if v.get("votes", 1) >= min_votes]
+        filtered = [v for v in merged.values() if v.get("votes", 1) >= min_votes]
+
+        # Log skeptical filtering stats
+        low_skeptical = [v for v in filtered if v.get("skeptical_score", 5) <= 3]
+        if low_skeptical:
+            logger.info(f"[{self.name}] Skeptical filter: {len(low_skeptical)} findings flagged as likely FP")
+
+        return filtered
 
     async def _skeptical_review(self, vulnerabilities: List[Dict]) -> List[Dict]:
         """
         Use a skeptical LLM (Claude Haiku) to review findings and filter false positives.
         This is the final gate before findings reach specialist agents.
+
+        Now enhanced with skeptical_agent approach scores from consolidation phase.
+        Findings with skeptical_score <= 3 are pre-filtered before this review.
         """
-        # 1. Deduplicate
-        vulnerabilities = self._review_deduplicate(vulnerabilities)
+        # 1. Pre-filter based on skeptical_agent scores (Phase 17 enhancement)
+        pre_filtered = []
+        rejected_count = 0
+        for v in vulnerabilities:
+            skeptical_score = v.get("skeptical_score", 5)
+            if skeptical_score <= 3:
+                # Likely FP from skeptical_agent - reject early
+                logger.info(f"[{self.name}] Pre-filtered FP: {v.get('type')} on '{v.get('parameter')}' "
+                           f"(skeptical_score: {skeptical_score}, reason: {v.get('fp_reason', 'N/A')[:50]})")
+                rejected_count += 1
+            else:
+                pre_filtered.append(v)
+
+        if rejected_count > 0:
+            logger.info(f"[{self.name}] Skeptical pre-filter: {rejected_count} FPs removed, {len(pre_filtered)} remaining")
+
+        if not pre_filtered:
+            return []
+
+        # 2. Deduplicate
+        vulnerabilities = self._review_deduplicate(pre_filtered)
         if not vulnerabilities:
             return []
 
-        # 2. Build prompt
+        # 3. Build prompt
         prompt = self._review_build_prompt(vulnerabilities)
 
-        # 3. Execute review
+        # 4. Execute review
         try:
             response = await llm_client.generate(
                 prompt=prompt,
