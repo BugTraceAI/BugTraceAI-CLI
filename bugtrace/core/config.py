@@ -116,6 +116,10 @@ class Settings(BaseSettings):
     PIPELINE_DISCOVERY_COMPLETION_DELAY: float = 2.0  # Wait for late findings
     PIPELINE_AUTO_TRANSITION: bool = True  # Automatic phase transitions
 
+    # --- Performance Metrics Configuration (Phase 24: v2.3) ---
+    PERF_DEDUP_LOG_ENABLED: bool = True  # Log deduplication metrics during and after scans
+    PERF_DEDUP_LOG_INTERVAL: int = 25  # Log dedup stats every N duplicates (0 to disable)
+
     def get_threshold_for_type(self, vuln_type: str) -> int:
         """Get the skeptical threshold for a vulnerability type."""
         vuln_upper = vuln_type.upper()
