@@ -703,3 +703,348 @@ class PipelineLifecycle:
 
         await self.event_bus.emit(event_type, event_data)
         logger.info(f"[Pipeline] Phase complete: {phase.value}")
+
+
+class PipelineOrchestrator:
+    """
+    Event-driven pipeline coordinator for 5-phase execution model.
+
+    Subscribes to phase completion events and automatically advances
+    the pipeline state. Supports manual override via direct phase control.
+
+    Completion Detection:
+    - DISCOVERY: All URLs analyzed (url_count == processed_count)
+    - EVALUATION: ThinkingAgent buffer empty + queues receiving work
+    - EXPLOITATION: All specialist queues empty + no active workers
+    - VALIDATION: AgenticValidator queue empty + validation complete
+    - REPORTING: Report generation complete event received
+    """
+
+    def __init__(self, scan_id: str, event_bus: "EventBus" = None):
+        """
+        Initialize pipeline orchestrator.
+
+        Args:
+            scan_id: Unique identifier for this scan
+            event_bus: EventBus instance (uses global singleton if None)
+        """
+        self.scan_id = scan_id
+        self.state = PipelineState(scan_id)
+
+        # Lazy import to avoid circular dependency
+        if event_bus is None:
+            from bugtrace.core.event_bus import event_bus as global_event_bus
+            self.event_bus = global_event_bus
+        else:
+            self.event_bus = event_bus
+
+        self._subscribed = False
+        self._completion_checks: Dict[PipelinePhase, Callable] = {}
+        self._lock = asyncio.Lock()
+        self._handlers: List[tuple] = []  # Store (event_type, handler) for unsubscribe
+
+    async def start(self) -> None:
+        """
+        Start the pipeline orchestrator.
+
+        Subscribes to phase completion events and transitions to DISCOVERY phase.
+        Emits PIPELINE_STARTED event.
+        """
+        from bugtrace.core.event_bus import EventType
+
+        self.subscribe_to_events()
+
+        # Transition to DISCOVERY
+        self.state.transition(PipelinePhase.DISCOVERY, "Pipeline started")
+
+        # Emit pipeline started event
+        await self.event_bus.emit(EventType.PIPELINE_STARTED, {
+            "scan_context": self.scan_id,
+            "scan_id": self.scan_id,
+            "phase": PipelinePhase.DISCOVERY.value
+        })
+
+        logger.info(f"Pipeline orchestrator started for scan {self.scan_id}")
+
+    async def stop(self) -> None:
+        """
+        Stop the pipeline orchestrator.
+
+        Unsubscribes from all events and transitions to COMPLETE if not already.
+        Emits PIPELINE_COMPLETE event.
+        """
+        from bugtrace.core.event_bus import EventType
+
+        self.unsubscribe_from_events()
+
+        # Transition to COMPLETE if not already terminal
+        if self.state.current_phase not in (PipelinePhase.COMPLETE, PipelinePhase.ERROR):
+            try:
+                # Check if we can transition directly to COMPLETE
+                if self.state.can_transition(PipelinePhase.COMPLETE):
+                    self.state.transition(PipelinePhase.COMPLETE, "Pipeline stopped")
+                elif self.state.can_transition(PipelinePhase.REPORTING):
+                    # Need to go through REPORTING first
+                    self.state.transition(PipelinePhase.REPORTING, "Pipeline stopping")
+                    self.state.transition(PipelinePhase.COMPLETE, "Pipeline stopped")
+            except ValueError:
+                # Can't transition cleanly, log but don't fail
+                logger.warning(f"Could not transition to COMPLETE from {self.state.current_phase}")
+
+        # Emit pipeline complete event
+        await self.event_bus.emit(EventType.PIPELINE_COMPLETE, {
+            "scan_context": self.scan_id,
+            "scan_id": self.scan_id,
+            "final_phase": self.state.current_phase.value,
+            "total_duration": self.state.get_total_duration(),
+            "transitions": len(self.state.transitions)
+        })
+
+        logger.info(f"Pipeline orchestrator stopped for scan {self.scan_id}")
+
+    def subscribe_to_events(self) -> None:
+        """Subscribe to all phase completion events."""
+        from bugtrace.core.event_bus import EventType
+
+        if self._subscribed:
+            return
+
+        # Map event types to handlers
+        event_handlers = [
+            (EventType.PHASE_COMPLETE_DISCOVERY, self._handle_discovery_complete),
+            (EventType.PHASE_COMPLETE_EVALUATION, self._handle_evaluation_complete),
+            (EventType.PHASE_COMPLETE_EXPLOITATION, self._handle_exploitation_complete),
+            (EventType.PHASE_COMPLETE_VALIDATION, self._handle_validation_complete),
+            (EventType.PHASE_COMPLETE_REPORTING, self._handle_reporting_complete),
+        ]
+
+        for event_type, handler in event_handlers:
+            self.event_bus.subscribe(event_type.value, handler)
+            self._handlers.append((event_type.value, handler))
+
+        self._subscribed = True
+        logger.debug(f"Subscribed to {len(event_handlers)} phase completion events")
+
+    def unsubscribe_from_events(self) -> None:
+        """Unsubscribe from all phase completion events."""
+        if not self._subscribed:
+            return
+
+        for event_type, handler in self._handlers:
+            self.event_bus.unsubscribe(event_type, handler)
+
+        self._handlers.clear()
+        self._subscribed = False
+        logger.debug("Unsubscribed from all phase completion events")
+
+    async def _handle_discovery_complete(self, data: Dict[str, Any]) -> None:
+        """Handle discovery phase completion event."""
+        # Ignore events from other scans
+        if data.get("scan_context") != self.scan_id:
+            return
+
+        # Only process if in DISCOVERY phase
+        if self.state.current_phase != PipelinePhase.DISCOVERY:
+            logger.debug(f"Ignoring discovery complete (current phase: {self.state.current_phase})")
+            return
+
+        metrics = {
+            "urls_analyzed": data.get("urls_analyzed", 0),
+            "findings_count": data.get("findings_count", 0)
+        }
+        await self._advance_phase(
+            PipelinePhase.EVALUATION,
+            "Discovery complete - all URLs analyzed",
+            metrics
+        )
+
+    async def _handle_evaluation_complete(self, data: Dict[str, Any]) -> None:
+        """Handle evaluation phase completion event."""
+        if data.get("scan_context") != self.scan_id:
+            return
+
+        if self.state.current_phase != PipelinePhase.EVALUATION:
+            logger.debug(f"Ignoring evaluation complete (current phase: {self.state.current_phase})")
+            return
+
+        metrics = {
+            "deduplicated_count": data.get("deduplicated_count", 0),
+            "queued_count": data.get("queued_count", 0)
+        }
+        await self._advance_phase(
+            PipelinePhase.EXPLOITATION,
+            "Evaluation complete - work distributed to specialists",
+            metrics
+        )
+
+    async def _handle_exploitation_complete(self, data: Dict[str, Any]) -> None:
+        """Handle exploitation phase completion event."""
+        if data.get("scan_context") != self.scan_id:
+            return
+
+        if self.state.current_phase != PipelinePhase.EXPLOITATION:
+            logger.debug(f"Ignoring exploitation complete (current phase: {self.state.current_phase})")
+            return
+
+        metrics = {
+            "vulnerabilities_found": data.get("vulnerabilities_found", 0),
+            "pending_validation": data.get("pending_validation", 0)
+        }
+        await self._advance_phase(
+            PipelinePhase.VALIDATION,
+            "Exploitation complete - specialist queues drained",
+            metrics
+        )
+
+    async def _handle_validation_complete(self, data: Dict[str, Any]) -> None:
+        """Handle validation phase completion event."""
+        if data.get("scan_context") != self.scan_id:
+            return
+
+        if self.state.current_phase != PipelinePhase.VALIDATION:
+            logger.debug(f"Ignoring validation complete (current phase: {self.state.current_phase})")
+            return
+
+        metrics = {
+            "validated_count": data.get("validated_count", 0),
+            "rejected_count": data.get("rejected_count", 0),
+            "cdp_load_percent": data.get("cdp_load_percent", 0)
+        }
+        await self._advance_phase(
+            PipelinePhase.REPORTING,
+            "Validation complete - all findings processed",
+            metrics
+        )
+
+    async def _handle_reporting_complete(self, data: Dict[str, Any]) -> None:
+        """Handle reporting phase completion event."""
+        if data.get("scan_context") != self.scan_id:
+            return
+
+        if self.state.current_phase != PipelinePhase.REPORTING:
+            logger.debug(f"Ignoring reporting complete (current phase: {self.state.current_phase})")
+            return
+
+        metrics = {
+            "reports_generated": data.get("reports_generated", 0),
+            "output_path": data.get("output_path", "")
+        }
+        await self._advance_phase(
+            PipelinePhase.COMPLETE,
+            "Reporting complete - pipeline finished",
+            metrics
+        )
+
+    async def _advance_phase(
+        self,
+        to_phase: PipelinePhase,
+        reason: str,
+        metrics: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Advance to the next phase with lock protection.
+
+        Args:
+            to_phase: Target phase
+            reason: Transition reason
+            metrics: Optional metrics from completed phase
+
+        Returns:
+            True if transition succeeded, False otherwise
+        """
+        from bugtrace.core.event_bus import EventType
+
+        async with self._lock:
+            if not self.state.can_transition(to_phase):
+                logger.warning(
+                    f"Cannot transition {self.state.current_phase.value} -> {to_phase.value}"
+                )
+                return False
+
+            from_phase = self.state.current_phase
+            self.state.transition(to_phase, reason, metrics)
+
+            # Emit appropriate event for the new phase
+            event_map = {
+                PipelinePhase.EVALUATION: None,  # No specific event needed
+                PipelinePhase.EXPLOITATION: None,
+                PipelinePhase.VALIDATION: None,
+                PipelinePhase.REPORTING: None,
+                PipelinePhase.COMPLETE: EventType.PIPELINE_COMPLETE,
+            }
+
+            if to_phase in event_map and event_map[to_phase]:
+                await self.event_bus.emit(event_map[to_phase], {
+                    "scan_context": self.scan_id,
+                    "scan_id": self.scan_id,
+                    "from_phase": from_phase.value,
+                    "to_phase": to_phase.value,
+                    "metrics": metrics or {}
+                })
+
+            logger.info(f"Advanced pipeline: {from_phase.value} -> {to_phase.value}")
+            return True
+
+    async def force_transition(
+        self,
+        to_phase: PipelinePhase,
+        reason: str
+    ) -> bool:
+        """
+        Force transition to a phase, bypassing normal checks.
+
+        WARNING: Use with caution. For testing/debugging only.
+
+        Args:
+            to_phase: Target phase
+            reason: Reason for force transition
+
+        Returns:
+            True if transition succeeded
+        """
+        async with self._lock:
+            from_phase = self.state.current_phase
+
+            # Directly modify state without can_transition check
+            self.state.previous_phase = from_phase
+            self.state.current_phase = to_phase
+            self.state.phase_started_at = time.monotonic()
+
+            transition = PipelineTransition(
+                from_phase=from_phase,
+                to_phase=to_phase,
+                reason=f"FORCED: {reason}",
+                metrics={"forced": True}
+            )
+            self.state.transitions.append(transition)
+
+            logger.warning(
+                f"FORCED pipeline transition: {from_phase.value} -> {to_phase.value} ({reason})"
+            )
+            return True
+
+    def get_state(self) -> Dict[str, Any]:
+        """
+        Get current pipeline state as dictionary.
+
+        Returns:
+            Dictionary representation of pipeline state
+        """
+        return self.state.to_dict()
+
+    def register_completion_check(
+        self,
+        phase: PipelinePhase,
+        check_fn: Callable[[], bool]
+    ) -> None:
+        """
+        Register a custom completion check for a phase.
+
+        Use for phases that don't emit completion events naturally.
+
+        Args:
+            phase: Phase to register check for
+            check_fn: Callable that returns True when phase is complete
+        """
+        self._completion_checks[phase] = check_fn
+        logger.debug(f"Registered completion check for {phase.value}")
