@@ -52,7 +52,7 @@ logger = get_logger("pipeline")
 
 __all__ = [
     "PipelinePhase", "PipelineState", "PipelineTransition",
-    "VALID_TRANSITIONS", "PipelineLifecycle"
+    "VALID_TRANSITIONS", "PipelineLifecycle", "PipelineOrchestrator"
 ]
 
 
@@ -637,3 +637,69 @@ class PipelineLifecycle:
             "registered_pools": len(self._worker_pools),
             "current_phase": self.state.current_phase.value,
         }
+
+    async def check_pause_point(self) -> bool:
+        """
+        Check if pause was requested and wait if so.
+
+        Agents should call this between processing units (e.g., between URLs,
+        between findings) to allow clean pausing at boundaries.
+
+        Returns:
+            True if paused (caller should stop processing)
+            False if not paused (caller continues)
+
+        Example usage in agent:
+            for url in urls_to_process:
+                if await lifecycle.check_pause_point():
+                    return  # Paused, stop processing
+                await process_url(url)
+        """
+        if not self._pause_requested:
+            return False
+
+        # Log that we're pausing
+        logger.info("[Pipeline] Pause requested, entering pause state")
+
+        # Wait until resumed or shutdown
+        while self._pause_requested and not self._shutdown_requested:
+            await asyncio.sleep(settings.PIPELINE_PAUSE_CHECK_INTERVAL)
+
+        return self._shutdown_requested  # Return True only if shutting down
+
+    async def signal_phase_complete(
+        self, phase: PipelinePhase, metrics: Dict[str, Any] = None
+    ) -> None:
+        """
+        Signal that a phase has completed its work.
+
+        Emits the appropriate PHASE_COMPLETE_* event for the phase.
+
+        Args:
+            phase: The phase that completed
+            metrics: Optional metrics dict (items_processed, duration, etc.)
+        """
+        from bugtrace.core.event_bus import EventType
+
+        event_map = {
+            PipelinePhase.DISCOVERY: EventType.PHASE_COMPLETE_DISCOVERY,
+            PipelinePhase.EVALUATION: EventType.PHASE_COMPLETE_EVALUATION,
+            PipelinePhase.EXPLOITATION: EventType.PHASE_COMPLETE_EXPLOITATION,
+            PipelinePhase.VALIDATION: EventType.PHASE_COMPLETE_VALIDATION,
+            PipelinePhase.REPORTING: EventType.PHASE_COMPLETE_REPORTING,
+        }
+
+        event_type = event_map.get(phase)
+        if not event_type:
+            logger.warning(f"[Pipeline] No completion event for phase: {phase}")
+            return
+
+        event_data = {
+            "scan_context": self.state.scan_id,
+            "phase": phase.value,
+            "timestamp": time.time(),
+            **(metrics or {})
+        }
+
+        await self.event_bus.emit(event_type, event_data)
+        logger.info(f"[Pipeline] Phase complete: {phase.value}")
