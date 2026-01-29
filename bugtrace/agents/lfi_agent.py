@@ -6,6 +6,11 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from bugtrace.agents.base import BaseAgent
 from bugtrace.core.ui import dashboard
 from bugtrace.tools.external import external_tools
+from bugtrace.reporting.standards import (
+    get_cwe_for_vuln,
+    get_remediation_for_vuln,
+    normalize_severity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +88,15 @@ class LFIAgent(BaseAgent):
             "parameter": param,
             "payload": hit["payload"],
             "description": f"Local File Inclusion success: Found {hit['file_found']}. File content leaked in response.",
-            "severity": hit["severity"],
+            "severity": normalize_severity(hit["severity"]).value,  # Normalize to uppercase
+            "cwe_id": get_cwe_for_vuln("LFI"),  # CWE-22
+            "cve_id": "N/A",  # LFI vulnerabilities are class-based, not specific CVEs
+            "remediation": get_remediation_for_vuln("LFI"),
             "validated": True,
             "status": "VALIDATED_CONFIRMED",
             "evidence": hit["evidence"],
+            "http_request": f"GET {self.url}?{param}={hit['payload']}",
+            "http_response": hit["evidence"][:500] if isinstance(hit["evidence"], str) else str(hit["evidence"])[:500],
             "reproduction": f"curl '{self.url}?{param}={hit['payload']}'"
         }
 
@@ -98,10 +108,15 @@ class LFIAgent(BaseAgent):
             "parameter": param,
             "payload": payload,
             "description": f"LFI detected via PHP wrapper. Source code can be read using base64 encoding filter.",
-            "severity": "CRITICAL",
+            "severity": normalize_severity("CRITICAL").value,
+            "cwe_id": get_cwe_for_vuln("LFI"),  # CWE-22
+            "cve_id": "N/A",  # LFI vulnerabilities are class-based, not specific CVEs
+            "remediation": get_remediation_for_vuln("LFI"),
             "validated": True,
             "evidence": f"PHP Wrapper matched signature after injecting {payload}",
             "status": self._determine_validation_status(response_text, payload),
+            "http_request": f"GET {self.url}?{param}={payload}",
+            "http_response": response_text[:500],
             "reproduction": f"curl '{self.url}?{param}={payload}' | base64 -d"
         }
 

@@ -12,6 +12,11 @@ from bugtrace.agents.base import BaseAgent
 from bugtrace.core.llm_client import llm_client
 from bugtrace.core.ui import dashboard
 from bugtrace.core.config import settings
+from bugtrace.reporting.standards import (
+    get_cwe_for_vuln,
+    get_remediation_for_vuln,
+    normalize_severity,
+)
 
 class JWTAgent(BaseAgent):
     """
@@ -436,11 +441,16 @@ class JWTAgent(BaseAgent):
                 "url": url,
                 "parameter": "alg",
                 "payload": f"alg:{alg}",
-                "severity": "CRITICAL",
+                "severity": normalize_severity("CRITICAL").value,
+                "cwe_id": get_cwe_for_vuln("JWT"),  # CWE-347
+                "cve_id": "N/A",  # Vulnerability class, not specific CVE
+                "remediation": get_remediation_for_vuln("JWT"),
                 "validated": True,
                 "status": "VALIDATED_CONFIRMED",
                 "description": f"JWT None Algorithm bypass vulnerability. The server accepts tokens with algorithm set to '{alg}', allowing signature verification to be bypassed. An attacker can forge arbitrary tokens without knowing the secret key.",
-                "reproduction": f"# Forge JWT with 'none' algorithm:\n# 1. Decode header, change 'alg' to '{alg}'\n# 2. Remove signature (keep trailing dot)\n# Forged token: {forged_token[:50]}..."
+                "reproduction": f"# Forge JWT with 'none' algorithm:\n# 1. Decode header, change 'alg' to '{alg}'\n# 2. Remove signature (keep trailing dot)\n# Forged token: {forged_token[:50]}...",
+                "http_request": f"GET {url} with forged token in Authorization header",
+                "http_response": "200 OK with elevated privileges"
             })
             return True
         return False
@@ -455,11 +465,16 @@ class JWTAgent(BaseAgent):
                 "url": url,
                 "parameter": "alg",
                 "payload": f"alg:{alg} (no dot)",
-                "severity": "CRITICAL",
+                "severity": normalize_severity("CRITICAL").value,
+                "cwe_id": get_cwe_for_vuln("JWT"),  # CWE-347
+                "cve_id": "N/A",  # Vulnerability class, not specific CVE
+                "remediation": get_remediation_for_vuln("JWT"),
                 "validated": True,
                 "status": "VALIDATED_CONFIRMED",
                 "description": f"JWT None Algorithm bypass vulnerability (no trailing dot variant). The server accepts tokens with algorithm '{alg}' without a trailing dot, allowing complete signature bypass.",
-                "reproduction": f"# Forge JWT with 'none' algorithm (no trailing dot):\n# Forged token: {forged_token_nodot[:50]}..."
+                "reproduction": f"# Forge JWT with 'none' algorithm (no trailing dot):\n# Forged token: {forged_token_nodot[:50]}...",
+                "http_request": f"GET {url} with forged token in Authorization header",
+                "http_response": "200 OK with elevated privileges"
             })
             return True
         return False
@@ -510,11 +525,16 @@ class JWTAgent(BaseAgent):
             "parameter": "header",
             "payload": secret,
             "evidence": f"Secret cracked: {secret}. Forged admin token created.",
-            "severity": "CRITICAL",
+            "severity": normalize_severity("CRITICAL").value,
+            "cwe_id": get_cwe_for_vuln("JWT"),  # CWE-347
+            "cve_id": "N/A",  # Vulnerability class, not specific CVE
+            "remediation": get_remediation_for_vuln("JWT"),
             "validated": True,
             "status": "VALIDATED_CONFIRMED",
             "description": f"Weak JWT secret discovered via dictionary attack. The HS256 signing secret is '{secret}', allowing attackers to forge arbitrary tokens including admin tokens.",
-            "reproduction": f"# Crack JWT secret and forge admin token:\nimport jwt\nforged = jwt.encode({{'admin': True, 'role': 'admin'}}, '{secret}', algorithm='HS256')\nprint(forged)"
+            "reproduction": f"# Crack JWT secret and forge admin token:\nimport jwt\nforged = jwt.encode({{'admin': True, 'role': 'admin'}}, '{secret}', algorithm='HS256')\nprint(forged)",
+            "http_request": f"GET {url} with forged token",
+            "http_response": "200 OK with admin privileges"
         })
 
         if await self._verify_token_works(forged_token, url, location):
@@ -570,11 +590,16 @@ class JWTAgent(BaseAgent):
                 "url": url,
                 "parameter": "kid",
                 "payload": "../../../../../../../dev/null",
-                "severity": "HIGH",
+                "severity": normalize_severity("HIGH").value,
+                "cwe_id": get_cwe_for_vuln("JWT"),  # CWE-347
+                "cve_id": "N/A",  # Vulnerability class, not specific CVE
+                "remediation": get_remediation_for_vuln("JWT"),
                 "validated": True,
                 "status": "VALIDATED_CONFIRMED",
                 "description": "JWT KID (Key ID) injection via directory traversal. The 'kid' header parameter is vulnerable to path traversal, allowing use of /dev/null as the signing key (empty content). This enables forging valid tokens.",
-                "reproduction": f"# Forge JWT with KID pointing to /dev/null:\n# 1. Set kid header to '../../../../../../../dev/null'\n# 2. Sign with empty key\n# Forged token: {forged_token[:60]}..."
+                "reproduction": f"# Forge JWT with KID pointing to /dev/null:\n# 1. Set kid header to '../../../../../../../dev/null'\n# 2. Sign with empty key\n# Forged token: {forged_token[:60]}...",
+                "http_request": f"GET {url} with forged token (kid: /dev/null)",
+                "http_response": "200 OK with token accepted"
             })
 
     async def _attack_key_confusion(self, token: str, url: str, location: str):
@@ -718,11 +743,16 @@ class JWTAgent(BaseAgent):
             "url": url,
             "parameter": "alg",
             "payload": "RS256->HS256 with Public Key",
-            "severity": "CRITICAL",
+            "severity": normalize_severity("CRITICAL").value,
+            "cwe_id": get_cwe_for_vuln("JWT"),  # CWE-347
+            "cve_id": "N/A",  # Vulnerability class, not specific CVE
+            "remediation": get_remediation_for_vuln("JWT"),
             "validated": True,
             "status": "VALIDATED_CONFIRMED",
             "description": f"JWT Algorithm Confusion vulnerability (RS256 to HS256). The server's public RSA key was used as an HMAC secret, allowing token forgery. Public key fetched from {jwks_url}.",
-            "reproduction": f"# Key Confusion Attack:\n# 1. Fetch public key from {jwks_url}\n# 2. Change alg from RS256 to HS256\n# 3. Sign with public key PEM as HMAC secret\n# Forged token: {forged_token[:60]}..."
+            "reproduction": f"# Key Confusion Attack:\n# 1. Fetch public key from {jwks_url}\n# 2. Change alg from RS256 to HS256\n# 3. Sign with public key PEM as HMAC secret\n# Forged token: {forged_token[:60]}...",
+            "http_request": f"GET {url} with RS256->HS256 confused token",
+            "http_response": "200 OK with elevated privileges"
         })
 
     async def _analyze_and_exploit(self, token: str, url: str, location: str):
