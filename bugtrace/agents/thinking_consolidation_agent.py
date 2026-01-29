@@ -25,6 +25,7 @@ from bugtrace.agents.base import BaseAgent
 from bugtrace.core.event_bus import event_bus, EventType
 from bugtrace.core.queue import queue_manager, SPECIALIST_QUEUES
 from bugtrace.core.config import settings
+from bugtrace.core.dedup_metrics import dedup_metrics, get_dedup_summary
 
 
 # Vulnerability type to specialist queue mapping
@@ -293,6 +294,8 @@ class ThinkingConsolidationAgent(BaseAgent):
     def _cleanup_event_subscriptions(self):
         """Unsubscribe from events on shutdown."""
         self.event_bus.unsubscribe(EventType.URL_ANALYZED.value, self._handle_url_analyzed)
+        # Log deduplication summary on shutdown
+        dedup_metrics.log_summary()
         logger.info(f"[{self.name}] Unsubscribed from events")
 
     async def _handle_url_analyzed(self, data: Dict[str, Any]) -> None:
@@ -547,38 +550,46 @@ class ThinkingConsolidationAgent(BaseAgent):
         Process a single finding through the full pipeline.
 
         Steps:
-        1. Check fp_confidence threshold
-        2. Check deduplication cache
-        3. Classify and prioritize
-        4. Distribute to specialist queue
-        5. Emit work_queued event
+        1. Record received (for metrics)
+        2. Check fp_confidence threshold
+        3. Check deduplication cache
+        4. Classify and prioritize
+        5. Distribute to specialist queue
+        6. Emit work_queued event
         """
-        # 1. FP confidence filter
+        # 1. Get specialist type for metrics tracking (before any filtering)
+        specialist = self._classify_finding(finding) or "unknown"
+        dedup_metrics.record_received(specialist)
+
+        # 2. FP confidence filter
         fp_confidence = finding.get("fp_confidence", 0.5)
         if fp_confidence < settings.THINKING_FP_THRESHOLD:
             logger.debug(f"[{self.name}] FP filtered: {finding.get('type')} "
                         f"(fp_confidence: {fp_confidence:.2f} < {settings.THINKING_FP_THRESHOLD})")
             self._stats["fp_filtered"] += 1
+            dedup_metrics.record_fp_filtered()
             return
 
-        # 2. Deduplication check
+        # 3. Deduplication check
         is_duplicate, key = await self._dedup_cache.check_and_add(finding, scan_context)
         if is_duplicate:
             self._stats["duplicates_filtered"] += 1
+            dedup_metrics.record_duplicate(specialist, key)
             return
 
-        # 3. Classify and prioritize
+        # 4. Classify and prioritize
         prioritized = await self._classify_and_prioritize(finding, scan_context)
         if not prioritized:
             self._stats.setdefault("unclassified", 0)
             self._stats["unclassified"] += 1
             return
 
-        # 4. Distribute to specialist queue
+        # 5. Distribute to specialist queue
         success = await self._distribute_to_queue(prioritized)
 
-        # 5. Emit work_queued event (only if successfully queued)
+        # 6. Emit work_queued event and record metrics (only if successfully queued)
         if success:
+            dedup_metrics.record_distributed(prioritized.specialist)
             await self._emit_work_queued_event(prioritized)
 
     async def run_loop(self):
@@ -627,16 +638,22 @@ class ThinkingConsolidationAgent(BaseAgent):
         for finding in batch:
             scan_context = finding.pop("_scan_context", self.scan_context)
 
+            # Record received for metrics (before filtering)
+            specialist = self._classify_finding(finding) or "unknown"
+            dedup_metrics.record_received(specialist)
+
             # FP filter
             fp_confidence = finding.get("fp_confidence", 0.5)
             if fp_confidence < settings.THINKING_FP_THRESHOLD:
                 self._stats["fp_filtered"] += 1
+                dedup_metrics.record_fp_filtered()
                 continue
 
             # Dedup check
-            is_duplicate, _ = await self._dedup_cache.check_and_add(finding, scan_context)
+            is_duplicate, key = await self._dedup_cache.check_and_add(finding, scan_context)
             if is_duplicate:
                 self._stats["duplicates_filtered"] += 1
+                dedup_metrics.record_duplicate(specialist, key)
                 continue
 
             # Classify and prioritize
@@ -654,6 +671,7 @@ class ThinkingConsolidationAgent(BaseAgent):
         for prioritized in prioritized_batch:
             success = await self._distribute_to_queue(prioritized)
             if success:
+                dedup_metrics.record_distributed(prioritized.specialist)
                 await self._emit_work_queued_event(prioritized)
 
         logger.info(f"[{self.name}] Batch complete: {len(prioritized_batch)} distributed")
@@ -728,6 +746,7 @@ class ThinkingConsolidationAgent(BaseAgent):
             "dedup_cache": self._dedup_cache.get_stats(),
             "mode": self._mode,
             "batch_buffer_size": len(self._batch_buffer) if self._mode == "batch" else 0,
+            "dedup_metrics": get_dedup_summary(),
         }
 
     def reset_stats(self) -> None:
