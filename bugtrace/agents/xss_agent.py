@@ -991,6 +991,200 @@ class XSSAgent(BaseAgent):
 
         return result
 
+    async def _test_single_param_from_queue(
+        self, url: str, param: str, finding: dict
+    ) -> Optional[XSSFinding]:
+        """
+        Test a single parameter from queue for XSS.
+
+        Uses existing validation pipeline but optimized for queue processing:
+        1. Check reflection context from finding
+        2. Select appropriate payloads for context
+        3. Test with HTTP-first validation (Phase 15)
+        4. Fall back to Playwright/CDP only if needed
+
+        Args:
+            url: Target URL
+            param: Parameter to test
+            finding: Finding data from queue
+
+        Returns:
+            XSSFinding if confirmed, None otherwise
+        """
+        try:
+            # Get context from finding if available
+            context = finding.get("context", "unknown")
+            suggested_payload = finding.get("payload")
+
+            # Initialize Interactsh if not already done
+            if not self.interactsh:
+                try:
+                    self.interactsh = InteractshClient()
+                    await self.interactsh.register()
+                except Exception as e:
+                    logger.warning(f"[{self.name}] Interactsh init failed: {e}")
+
+            interactsh_url = self.interactsh.get_url() if self.interactsh else ""
+
+            # Build payload list - prioritize suggested payload
+            payloads = []
+            if suggested_payload:
+                payloads.append(suggested_payload)
+
+            # Add context-specific payloads
+            context_payloads = self.get_payloads_for_context(context, interactsh_url)
+            payloads.extend(context_payloads[:5])  # Limit to avoid excessive testing
+
+            # Add golden payloads
+            golden = [p.replace("{{interactsh_url}}", interactsh_url) for p in self.GOLDEN_PAYLOADS[:3]]
+            payloads.extend(golden)
+
+            # Dedupe payloads
+            seen = set()
+            unique_payloads = []
+            for p in payloads:
+                if p not in seen:
+                    seen.add(p)
+                    unique_payloads.append(p)
+
+            # Test each payload
+            for payload in unique_payloads[:10]:  # Max 10 payloads per queue item
+                result = await self._test_payload_from_queue(url, param, payload, context)
+                if result:
+                    return result
+
+            return None
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Queue item test failed: {e}")
+            return None
+
+    async def _test_payload_from_queue(
+        self, url: str, param: str, payload: str, context: str
+    ) -> Optional[XSSFinding]:
+        """
+        Test a single payload against a parameter.
+
+        Uses HTTP-first validation from Phase 15 for efficiency.
+
+        Args:
+            url: Target URL
+            param: Parameter to test
+            payload: XSS payload to test
+            context: Reflection context
+
+        Returns:
+            XSSFinding if confirmed, None otherwise
+        """
+        try:
+            # Send payload
+            response_html = await self._send_payload(param, payload)
+
+            if not response_html:
+                return None
+
+            # HTTP-first validation (Phase 15)
+            evidence = {}
+            if self._can_confirm_from_http_response(payload, response_html, evidence):
+                return XSSFinding(
+                    url=url,
+                    parameter=param,
+                    payload=payload,
+                    context=context,
+                    validation_method="http_analysis",
+                    evidence={"http_confirmed": True, "reflection": payload in response_html},
+                    confidence=0.85,
+                    status="VALIDATED_CONFIRMED",
+                    validated=True
+                )
+
+            # Check if browser validation needed
+            if self._requires_browser_validation(payload, response_html):
+                # Attempt Playwright validation
+                try:
+                    browser_result = await self._validate_via_browser(url, param, payload)
+                    if browser_result:
+                        return XSSFinding(
+                            url=url,
+                            parameter=param,
+                            payload=payload,
+                            context=context,
+                            validation_method="browser",
+                            evidence=browser_result,
+                            confidence=0.95,
+                            status="VALIDATED_CONFIRMED",
+                            validated=True
+                        )
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Browser validation failed: {e}")
+
+            # Check Interactsh for OOB confirmation
+            if self.interactsh and "interactsh" in payload.lower():
+                await asyncio.sleep(2)  # Wait for callback
+                try:
+                    interactions = await self.interactsh.poll()
+                    if interactions:
+                        return XSSFinding(
+                            url=url,
+                            parameter=param,
+                            payload=payload,
+                            context=context,
+                            validation_method="interactsh",
+                            evidence={"oob_callback": True, "interactions": interactions},
+                            confidence=1.0,
+                            status="VALIDATED_CONFIRMED",
+                            validated=True
+                        )
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Interactsh poll failed: {e}")
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"[{self.name}] Payload test failed: {e}")
+            return None
+
+    async def _validate_via_browser(
+        self, url: str, param: str, payload: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Validate XSS using browser (Playwright).
+
+        Used for DOM-based XSS and event handlers that need JS execution.
+
+        Args:
+            url: Target URL
+            param: Parameter name
+            payload: XSS payload
+
+        Returns:
+            Evidence dict if confirmed, None otherwise
+        """
+        try:
+            # Build test URL with payload
+            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+            parsed = urlparse(url)
+            query_params = parse_qs(parsed.query, keep_blank_values=True)
+            query_params[param] = [payload]
+            new_query = urlencode(query_params, doseq=True)
+            test_url = urlunparse(parsed._replace(query=new_query))
+
+            # Use existing visual verifier
+            result = await self.verifier.verify(test_url, payload)
+            if result and result.get("confirmed"):
+                return result
+
+            # Also check for DOM marker
+            dom_result = await detect_dom_xss(test_url)
+            if dom_result and dom_result.get("confirmed"):
+                return dom_result
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"[{self.name}] Browser validation error: {e}")
+            return None
+
     async def _handle_queue_result(self, item: dict, result: Optional[XSSFinding]) -> None:
         """
         Handle completed queue item processing.
