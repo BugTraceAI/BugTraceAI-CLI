@@ -723,6 +723,9 @@ class ReportingAgent(BaseAgent):
         if f.get("specialist"):
             entry["specialist"] = f.get("specialist")
 
+        # Add validation method label for report display
+        entry["validation_method_label"] = self._extract_validation_method(f)
+
         return entry
 
     def _build_validation_section(self, f: Dict, status: str) -> Dict:
