@@ -14,9 +14,10 @@
 2. [Agent Architecture](#agent-architecture)
 3. [Hunter-Auditor Pattern](#hunter-auditor-pattern)
 4. [Integration Points](#integration-points)
-5. [Reporting Standards](#reporting-standards)
-6. [Step-by-Step: Creating a New Agent](#step-by-step-creating-a-new-agent)
-7. [Best Practices](#best-practices)
+5. [Queue-Based Agent Pattern](#queue-based-agent-pattern)
+6. [Reporting Standards](#reporting-standards)
+7. [Step-by-Step: Creating a New Agent](#step-by-step-creating-a-new-agent)
+8. [Best Practices](#best-practices)
 
 ---
 
@@ -712,6 +713,319 @@ def _extract_agent_from_response(self, response: str) -> str:
     ]
     ...
 ```
+
+---
+
+## Queue-Based Agent Pattern
+
+> **New in v2.3:** Specialist agents now receive work from queues for parallel processing.
+
+In v2.3, agents consume findings from specialist queues rather than receiving work via direct dispatch. The `ThinkingConsolidationAgent` classifies and prioritizes findings, then distributes them to per-specialist queues. Agents consume from their queue via a `WorkerPool` for parallel processing.
+
+For full queue infrastructure details, see [QUEUE_PATTERNS.md](./QUEUE_PATTERNS.md).
+
+### Queue Consumption Overview
+
+The v2.3 pipeline flow:
+
+```
+Discovery Phase          Evaluation Phase              Exploitation Phase
++---------------+       +------------------------+     +------------------+
+| SASTDASTAgent | --->  | ThinkingConsolidation  | --> | XSS Specialist   |
+| + Skeptical   |       | Agent                  |     | SQLi Specialist  |
++---------------+       | - Deduplication        |     | CSTI Specialist  |
+       |                | - Classification       |     | ... 8 more       |
+  url_analyzed          | - Prioritization       |     +------------------+
+    events              +------------------------+            ^
+                               |                              |
+                        specialist queues                     |
+                          (work_queued_*)                     |
+```
+
+**Key Concepts:**
+
+1. **Agents receive work from queues** - Not direct dispatch from orchestrator
+2. **ThinkingConsolidationAgent** distributes findings to specialist queues
+3. **WorkerPool** enables parallel processing of queue items
+4. **Events** signal finding status (vulnerability_detected)
+
+### WorkerPool Integration
+
+The `WorkerPool` class manages concurrent workers that consume from a specialist queue:
+
+```python
+from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
+from bugtrace.core.queue import queue_manager
+from bugtrace.core.config import settings
+
+class YourAgent(BaseAgent):
+    def __init__(self, url: str, ...):
+        super().__init__(
+            name="YourAgent",
+            role="Your Specialist",
+            agent_id="your_agent"
+        )
+        self.url = url
+        self._worker_pool: Optional[WorkerPool] = None
+
+    async def start_queue_consumer(self) -> None:
+        """Start consuming from the specialist queue."""
+        config = WorkerConfig(
+            specialist="your_specialist",  # Queue name
+            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,  # Default: 5
+            process_func=self._process_queue_item,
+            on_result=self._handle_result,  # Optional callback
+        )
+        self._worker_pool = WorkerPool(config)
+        await self._worker_pool.start()
+
+    async def stop_queue_consumer(self) -> None:
+        """Stop the worker pool gracefully."""
+        if self._worker_pool:
+            await self._worker_pool.drain()  # Wait for queue to empty
+            await self._worker_pool.stop()
+
+    async def _process_queue_item(self, item: dict) -> dict:
+        """Process a single queue item."""
+        finding = item.get("finding", {})
+        scan_context = item.get("scan_context", "")
+        priority = item.get("priority", 0)
+
+        # Your validation logic here
+        result = await self._test_finding(finding)
+        return result
+```
+
+**WorkerConfig Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `specialist` | (required) | Queue name (e.g., "xss", "sqli") |
+| `pool_size` | 5 | Number of concurrent workers |
+| `process_func` | (required) | Async function to process each item |
+| `on_result` | None | Optional callback(item, result) |
+| `shutdown_timeout` | 30s | Max wait for graceful shutdown |
+| `dequeue_timeout` | 5s | Timeout between dequeue attempts |
+
+### Event Emission Pattern
+
+After processing a queue item, emit a `vulnerability_detected` event:
+
+```python
+from bugtrace.core.event_bus import event_bus, EventType
+from bugtrace.core.validation_status import ValidationStatus
+
+async def _process_queue_item(self, item: dict) -> dict:
+    """Process queue item and emit event."""
+    finding = item.get("finding", {})
+    scan_context = item.get("scan_context", "")
+
+    # Validate the finding
+    result = await self._validate_finding(finding)
+
+    # Determine validation status
+    if result.get("confirmed"):
+        status = ValidationStatus.VALIDATED_CONFIRMED
+        validation_requires_cdp = False
+    else:
+        status = ValidationStatus.PENDING_VALIDATION
+        validation_requires_cdp = True
+
+    # Emit vulnerability_detected event
+    if self.event_bus:
+        await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+            "specialist": "your_agent",
+            "finding": finding,
+            "status": status.value,
+            "validation_requires_cdp": validation_requires_cdp,
+            "scan_context": scan_context,
+        })
+
+    return result
+```
+
+**Event Payload Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `specialist` | str | Agent identifier (e.g., "xss", "sqli") |
+| `finding` | dict | Original finding with validation results |
+| `status` | str | ValidationStatus value |
+| `validation_requires_cdp` | bool | True if CDP validation needed |
+| `scan_context` | str | Scan context identifier |
+
+### ValidationStatus Usage
+
+The `ValidationStatus` enum tracks finding validation state:
+
+```python
+from bugtrace.core.validation_status import (
+    ValidationStatus,
+    EDGE_CASE_PATTERNS,
+    requires_cdp_validation,
+    get_validation_status
+)
+
+# ValidationStatus values:
+# - VALIDATED_CONFIRMED: High confidence, skip CDP validation
+# - PENDING_VALIDATION: Needs CDP browser validation
+# - VALIDATION_ERROR: Validation process failed
+# - FINDING_VALIDATED: CDP confirmed as real vulnerability
+# - FINDING_REJECTED: CDP rejected as false positive
+```
+
+**When to use each status:**
+
+| Status | Use When |
+|--------|----------|
+| `VALIDATED_CONFIRMED` | HTTP evidence confirms (OOB callback, SQL error, file content) |
+| `PENDING_VALIDATION` | Needs browser context (DOM XSS, event handlers) |
+| `VALIDATION_ERROR` | Validation failed (timeout, network error) |
+
+**Edge case patterns that require CDP validation:**
+
+```python
+EDGE_CASE_PATTERNS = {
+    # DOM-based XSS - needs JavaScript execution
+    "dom_based_xss": [
+        "location.hash",      # Fragment-based XSS
+        "document.URL",       # Full URL access
+        "postMessage",        # Cross-origin messaging
+    ],
+
+    # Complex event handlers - need visual confirmation
+    "complex_event_handlers": [
+        "autofocus",          # Auto-triggers onfocus
+        "onfocus",            # Focus-based execution
+        "onanimationend",     # CSS animation triggers
+    ],
+
+    # Sink analysis - dangerous sinks need execution
+    "sink_analysis": [
+        "eval(",              # Direct code execution
+        "innerHTML",          # DOM injection
+        "document.write",     # Document rewriting
+        "setTimeout(",        # Delayed execution
+    ],
+}
+```
+
+**Helper function:**
+
+```python
+# Check if finding needs CDP validation
+if requires_cdp_validation(finding):
+    status = ValidationStatus.PENDING_VALIDATION
+    validation_requires_cdp = True
+else:
+    status = ValidationStatus.VALIDATED_CONFIRMED
+    validation_requires_cdp = False
+```
+
+### Complete Queue Consumer Example
+
+Minimal working example of a queue-consuming agent:
+
+```python
+from typing import Dict, Any, Optional
+from bugtrace.agents.base import BaseAgent
+from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
+from bugtrace.core.queue import queue_manager
+from bugtrace.core.event_bus import event_bus, EventType
+from bugtrace.core.validation_status import (
+    ValidationStatus,
+    requires_cdp_validation
+)
+from bugtrace.core.config import settings
+from bugtrace.utils.logger import get_logger
+
+logger = get_logger("agents.your_agent")
+
+
+class YourQueueAgent(BaseAgent):
+    """Queue-consuming specialist agent template."""
+
+    def __init__(self, url: str = None, event_bus: Any = None):
+        super().__init__(
+            name="YourQueueAgent",
+            role="Your Specialist",
+            event_bus=event_bus,
+            agent_id="your_queue_agent"
+        )
+        self.url = url
+        self._worker_pool: Optional[WorkerPool] = None
+
+    async def start_queue_consumer(self) -> None:
+        """Start consuming from the specialist queue."""
+        config = WorkerConfig(
+            specialist="your_specialist",
+            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,
+            process_func=self._process_queue_item,
+        )
+        self._worker_pool = WorkerPool(config)
+        await self._worker_pool.start()
+        logger.info(f"[{self.name}] Queue consumer started")
+
+    async def stop_queue_consumer(self) -> None:
+        """Stop the worker pool gracefully."""
+        if self._worker_pool:
+            await self._worker_pool.drain()
+            await self._worker_pool.stop()
+            logger.info(f"[{self.name}] Queue consumer stopped")
+
+    async def _process_queue_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Process a single queue item."""
+        finding = item.get("finding", {})
+        scan_context = item.get("scan_context", "")
+
+        logger.debug(f"Processing: {finding.get('url')} / {finding.get('parameter')}")
+
+        # Validate the finding
+        result = await self._validate(finding)
+
+        # Determine status based on evidence
+        if result.get("confirmed"):
+            status = ValidationStatus.VALIDATED_CONFIRMED
+            validation_requires_cdp = False
+        elif requires_cdp_validation(finding):
+            status = ValidationStatus.PENDING_VALIDATION
+            validation_requires_cdp = True
+        else:
+            status = ValidationStatus.PENDING_VALIDATION
+            validation_requires_cdp = True
+
+        # Emit event for downstream agents
+        if self.event_bus:
+            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "your_specialist",
+                "finding": {**finding, **result},
+                "status": status.value,
+                "validation_requires_cdp": validation_requires_cdp,
+                "scan_context": scan_context,
+            })
+
+        return result
+
+    async def _validate(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate the finding. Override with specialist logic."""
+        # Your validation implementation here
+        return {"confirmed": False}
+```
+
+**Key Methods:**
+
+| Method | Purpose |
+|--------|---------|
+| `start_queue_consumer()` | Initialize and start WorkerPool |
+| `stop_queue_consumer()` | Drain queue and stop workers |
+| `_process_queue_item()` | Process single item from queue |
+| `_validate()` | Specialist-specific validation logic |
+
+### Related Documentation
+
+- [QUEUE_PATTERNS.md](./QUEUE_PATTERNS.md) - Queue infrastructure details
+- [THINKING_AGENT.md](./THINKING_AGENT.md) - ThinkingConsolidationAgent algorithms
+- [Worker Pool Implementation](../../bugtrace/agents/worker_pool.py) - Source code
 
 ---
 
