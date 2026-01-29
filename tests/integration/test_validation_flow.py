@@ -817,3 +817,395 @@ class TestValidationCDPLoad:
         assert summary["cdp_load_percent"] == 100.0
         assert summary["target_met"] == False
         assert validation_metrics.get_reduction_percent() == 0.0
+
+    def test_per_specialist_breakdown(self):
+        """
+        Test per-specialist metrics breakdown in summary.
+        """
+        # Record findings for multiple specialists
+        validation_metrics.record_finding("xss", "VALIDATED_CONFIRMED")
+        validation_metrics.record_finding("xss", "VALIDATED_CONFIRMED")
+        validation_metrics.record_finding("xss", "PENDING_VALIDATION")
+        validation_metrics.record_finding("sqli", "VALIDATED_CONFIRMED")
+        validation_metrics.record_finding("sqli", "PENDING_VALIDATION")
+        validation_metrics.record_finding("lfi", "VALIDATED_CONFIRMED")
+
+        summary = validation_metrics.get_summary()
+
+        # Check per-specialist breakdown
+        assert summary["by_specialist"]["confirmed"]["xss"] == 2
+        assert summary["by_specialist"]["pending"]["xss"] == 1
+        assert summary["by_specialist"]["confirmed"]["sqli"] == 1
+        assert summary["by_specialist"]["pending"]["sqli"] == 1
+        assert summary["by_specialist"]["confirmed"]["lfi"] == 1
+
+    def test_reduction_summary_format(self):
+        """
+        Test get_reduction_summary() returns expected format.
+        """
+        # Record some findings
+        for _ in range(90):
+            validation_metrics.record_finding("xss", "VALIDATED_CONFIRMED")
+        for _ in range(10):
+            validation_metrics.record_finding("xss", "PENDING_VALIDATION")
+
+        summary = validation_metrics.get_reduction_summary()
+
+        # Verify all expected keys
+        assert "reduction_percent" in summary
+        assert "target_met" in summary
+        assert "target_percent" in summary
+        assert "total_findings" in summary
+        assert "skipped_cdp" in summary
+        assert "sent_to_cdp" in summary
+        assert "cdp_validated" in summary
+        assert "cdp_rejected" in summary
+        assert "cdp_load_percent" in summary
+        assert "per_specialist" in summary
+        assert "elapsed_seconds" in summary
+
+        # Verify values
+        assert summary["reduction_percent"] == 90.0
+        assert summary["target_met"] == False
+        assert summary["skipped_cdp"] == 90
+        assert summary["sent_to_cdp"] == 10
+
+
+# =============================================================================
+# TestValidationFlowMultiSpecialist - Multi-specialist scenarios
+# =============================================================================
+
+class TestValidationFlowMultiSpecialist:
+    """Test validation flow across all 11 specialist agents."""
+
+    SPECIALISTS = [
+        "xss", "sqli", "csti", "lfi", "idor", "rce",
+        "ssrf", "xxe", "jwt", "open_redirect", "prototype_pollution"
+    ]
+
+    @pytest.mark.asyncio
+    async def test_all_specialists_route_correctly(self, agentic_validator_instance, confirmed_finding_factory, pending_finding_factory):
+        """
+        All 11 specialist types should route correctly through validation.
+        """
+        av = agentic_validator_instance
+
+        # Send confirmed finding for each specialist
+        for specialist in self.SPECIALISTS:
+            finding = confirmed_finding_factory(specialist)
+            await av.handle_vulnerability_detected(finding)
+
+        # Verify all skipped (VALIDATED_CONFIRMED)
+        assert av._stats["skipped_confirmed"] == 11
+        assert av._stats["queued_for_cdp"] == 0
+
+        # Now send pending for each
+        for specialist in self.SPECIALISTS:
+            finding = pending_finding_factory(specialist)
+            await av.handle_vulnerability_detected(finding)
+
+        # Verify all queued
+        assert av._stats["queued_for_cdp"] == 11
+        assert av._stats["total_received"] == 22
+
+    def test_specialist_metrics_isolation(self):
+        """
+        Metrics should be tracked separately per specialist.
+        """
+        for specialist in self.SPECIALISTS:
+            validation_metrics.record_finding(specialist, "VALIDATED_CONFIRMED")
+
+        summary = validation_metrics.get_summary()
+
+        # Each specialist should have 1 confirmed
+        for specialist in self.SPECIALISTS:
+            assert summary["by_specialist"]["confirmed"].get(specialist, 0) == 1
+
+    def test_mixed_specialists_cdp_load(self):
+        """
+        Mixed specialists should calculate correct overall CDP load.
+        """
+        # Each specialist: 9 confirmed, 1 pending = 10% pending each
+        # Total: 11 * 10 = 110 findings, 11 pending = 10% CDP load
+        for specialist in self.SPECIALISTS:
+            for _ in range(9):
+                validation_metrics.record_finding(specialist, "VALIDATED_CONFIRMED")
+            validation_metrics.record_finding(specialist, "PENDING_VALIDATION")
+
+        summary = validation_metrics.get_summary()
+
+        assert summary["total_findings"] == 110
+        assert summary["validated_confirmed"] == 99
+        assert summary["pending_validation"] == 11
+        assert summary["cdp_load_percent"] == 10.0
+
+
+# =============================================================================
+# TestValidationFlowConcurrency - Concurrent event handling
+# =============================================================================
+
+class TestValidationFlowConcurrency:
+    """Test validation flow under concurrent conditions."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_events_processing(self, fresh_event_bus, confirmed_finding_factory, pending_finding_factory):
+        """
+        Multiple concurrent events should be handled correctly.
+        """
+        from bugtrace.agents.agentic_validator import AgenticValidator
+
+        av = AgenticValidator(event_bus=fresh_event_bus)
+        av._pending_queue = asyncio.Queue()
+        av._stats = {
+            "total_validated": 0,
+            "cache_hits": 0,
+            "cdp_confirmed": 0,
+            "vision_analyzed": 0,
+            "skipped_prevalidated": 0,
+            "avg_time_ms": 0,
+            "total_time_ms": 0,
+            "total_received": 0,
+            "skipped_confirmed": 0,
+            "queued_for_cdp": 0,
+            "cdp_rejected": 0,
+        }
+
+        # Create tasks for concurrent event handling
+        tasks = []
+        for i in range(50):
+            finding = confirmed_finding_factory("xss", url=f"http://test.com/c/{i}")
+            tasks.append(av.handle_vulnerability_detected(finding))
+        for i in range(50):
+            finding = pending_finding_factory("xss", url=f"http://test.com/p/{i}")
+            tasks.append(av.handle_vulnerability_detected(finding))
+
+        # Execute all concurrently
+        await asyncio.gather(*tasks)
+
+        # Verify correct counts
+        assert av._stats["total_received"] == 100
+        assert av._stats["skipped_confirmed"] == 50
+        assert av._stats["queued_for_cdp"] == 50
+
+    @pytest.mark.asyncio
+    async def test_concurrent_metrics_recording(self):
+        """
+        Concurrent metrics recording should maintain accuracy.
+        """
+        async def record_batch(specialist: str, count: int, status: str):
+            for i in range(count):
+                validation_metrics.record_finding(specialist, status)
+                await asyncio.sleep(0)  # Yield to other tasks
+
+        # Record concurrently
+        await asyncio.gather(
+            record_batch("xss", 100, "VALIDATED_CONFIRMED"),
+            record_batch("sqli", 100, "VALIDATED_CONFIRMED"),
+            record_batch("xss", 10, "PENDING_VALIDATION"),
+            record_batch("sqli", 10, "PENDING_VALIDATION"),
+        )
+
+        summary = validation_metrics.get_summary()
+
+        # Verify totals
+        assert summary["total_findings"] == 220
+        assert summary["validated_confirmed"] == 200
+        assert summary["pending_validation"] == 20
+
+        # Verify per-specialist
+        assert summary["by_specialist"]["confirmed"]["xss"] == 100
+        assert summary["by_specialist"]["confirmed"]["sqli"] == 100
+        assert summary["by_specialist"]["pending"]["xss"] == 10
+        assert summary["by_specialist"]["pending"]["sqli"] == 10
+
+
+# =============================================================================
+# TestValidationStatusTransitions - Status transition tests
+# =============================================================================
+
+class TestValidationStatusTransitions:
+    """Test validation status transitions and lifecycle."""
+
+    def test_status_enum_string_comparison(self):
+        """
+        ValidationStatus should compare equal to string values.
+        """
+        # str+Enum mixin allows direct comparison
+        assert ValidationStatus.VALIDATED_CONFIRMED == "VALIDATED_CONFIRMED"
+        assert ValidationStatus.PENDING_VALIDATION == "PENDING_VALIDATION"
+        assert ValidationStatus.FINDING_VALIDATED == "FINDING_VALIDATED"
+        assert ValidationStatus.FINDING_REJECTED == "FINDING_REJECTED"
+
+    def test_status_json_serialization(self):
+        """
+        ValidationStatus should serialize to JSON correctly.
+        """
+        import json
+
+        data = {
+            "status": ValidationStatus.VALIDATED_CONFIRMED,
+            "other": "value",
+        }
+
+        # Should serialize without error
+        json_str = json.dumps(data)
+        assert "VALIDATED_CONFIRMED" in json_str
+
+        # Should deserialize
+        loaded = json.loads(json_str)
+        assert loaded["status"] == "VALIDATED_CONFIRMED"
+
+    @pytest.mark.asyncio
+    async def test_cdp_result_updates_metrics(self):
+        """
+        CDP validation results should update metrics.
+        """
+        # Record initial findings
+        validation_metrics.record_finding("xss", "PENDING_VALIDATION")
+        validation_metrics.record_finding("sqli", "PENDING_VALIDATION")
+
+        # Record CDP results
+        validation_metrics.record_cdp_result(validated=True)  # Confirmed
+        validation_metrics.record_cdp_result(validated=False)  # Rejected
+
+        summary = validation_metrics.get_summary()
+
+        assert summary["cdp_validated"] == 1
+        assert summary["cdp_rejected"] == 1
+
+    def test_all_status_values_defined(self):
+        """
+        All expected validation status values should be defined.
+        """
+        expected_statuses = [
+            "VALIDATED_CONFIRMED",
+            "PENDING_VALIDATION",
+            "VALIDATION_ERROR",
+            "FINDING_VALIDATED",
+            "FINDING_REJECTED",
+        ]
+
+        for status in expected_statuses:
+            assert hasattr(ValidationStatus, status)
+            assert getattr(ValidationStatus, status).value == status
+
+
+# =============================================================================
+# TestValidationFlowReportingIntegration - Reporting integration
+# =============================================================================
+
+class TestValidationFlowReportingIntegration:
+    """Test validation flow integration with ReportingAgent."""
+
+    @pytest.mark.asyncio
+    async def test_reporting_deduplication(self, fresh_event_bus):
+        """
+        ReportingAgent should handle duplicate findings gracefully.
+
+        Note: Actual deduplication happens at report generation, not collection.
+        """
+        from bugtrace.agents.reporting import ReportingAgent
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reporting = ReportingAgent(
+                scan_id=1,
+                target_url="http://test.com",
+                output_dir=Path(tmpdir)
+            )
+            reporting._event_bus = fresh_event_bus
+
+            fresh_event_bus.subscribe(
+                EventType.VULNERABILITY_DETECTED.value,
+                reporting._handle_vulnerability_detected
+            )
+
+            # Send same finding twice
+            finding_data = {
+                "specialist": "xss",
+                "status": "VALIDATED_CONFIRMED",
+                "finding": {"url": "http://test.com/dup", "type": "XSS"},
+            }
+
+            await fresh_event_bus.emit(EventType.VULNERABILITY_DETECTED, finding_data)
+            await fresh_event_bus.emit(EventType.VULNERABILITY_DETECTED, finding_data)
+
+            await asyncio.sleep(0.05)
+
+            # Both should be collected (dedup is at report time)
+            collected = reporting.get_validated_findings()
+            assert len(collected) == 2
+
+    @pytest.mark.asyncio
+    async def test_reporting_clear_findings(self, fresh_event_bus):
+        """
+        ReportingAgent.clear_validated_findings() should work correctly.
+        """
+        from bugtrace.agents.reporting import ReportingAgent
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reporting = ReportingAgent(
+                scan_id=1,
+                target_url="http://test.com",
+                output_dir=Path(tmpdir)
+            )
+            reporting._event_bus = fresh_event_bus
+
+            fresh_event_bus.subscribe(
+                EventType.VULNERABILITY_DETECTED.value,
+                reporting._handle_vulnerability_detected
+            )
+
+            # Add some findings
+            await fresh_event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "xss",
+                "status": "VALIDATED_CONFIRMED",
+                "finding": {"url": "http://test.com/1"},
+            })
+
+            await asyncio.sleep(0.05)
+            assert len(reporting.get_validated_findings()) == 1
+
+            # Clear and verify
+            reporting.clear_validated_findings()
+            assert len(reporting.get_validated_findings()) == 0
+
+    @pytest.mark.asyncio
+    async def test_reporting_ignores_pending(self, fresh_event_bus):
+        """
+        ReportingAgent should ignore PENDING_VALIDATION in vulnerability_detected.
+
+        PENDING_VALIDATION findings go to AgenticValidator, not directly to reporting.
+        """
+        from bugtrace.agents.reporting import ReportingAgent
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reporting = ReportingAgent(
+                scan_id=1,
+                target_url="http://test.com",
+                output_dir=Path(tmpdir)
+            )
+            reporting._event_bus = fresh_event_bus
+
+            fresh_event_bus.subscribe(
+                EventType.VULNERABILITY_DETECTED.value,
+                reporting._handle_vulnerability_detected
+            )
+
+            # Send PENDING_VALIDATION
+            await fresh_event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "xss",
+                "status": "PENDING_VALIDATION",
+                "finding": {"url": "http://test.com/pending"},
+            })
+
+            await asyncio.sleep(0.05)
+
+            # Should NOT be collected
+            collected = reporting.get_validated_findings()
+            assert len(collected) == 0
