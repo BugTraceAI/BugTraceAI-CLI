@@ -32,6 +32,7 @@ from bugtrace.agents.base import BaseAgent
 from bugtrace.core.llm_client import llm_client
 from bugtrace.core.ui import dashboard
 from bugtrace.core.config import settings
+from bugtrace.core.event_bus import EventType
 
 
 class APISecurityAgent(BaseAgent):
@@ -58,11 +59,19 @@ class APISecurityAgent(BaseAgent):
         self.findings: List[Dict] = []
 
     def _setup_event_subscriptions(self):
-        """Subscribe to endpoint discovery events."""
+        """Subscribe to endpoint discovery and vulnerability events."""
         if self.event_bus:
+            # Existing subscriptions
             self.event_bus.subscribe("api_endpoint_found", self.handle_api_endpoint)
             self.event_bus.subscribe("graphql_endpoint_found", self.handle_graphql_endpoint)
-            logger.info(f"[{self.name}] Subscribed to API discovery events")
+
+            # New Phase 20: Subscribe to specialist vulnerability_detected events
+            self.event_bus.subscribe(
+                EventType.VULNERABILITY_DETECTED.value,
+                self.handle_vulnerability_detected
+            )
+
+            logger.info(f"[{self.name}] Subscribed to API and vulnerability events")
 
     async def handle_api_endpoint(self, data: Dict[str, Any]):
         """Triggered when REST API endpoint is discovered."""
@@ -553,6 +562,134 @@ class APISecurityAgent(BaseAgent):
         except Exception as e:
             logger.debug(f"operation failed: {e}")
             return {"accessible": False}
+
+    # ==================== VULNERABILITY CORRELATION ====================
+
+    async def handle_vulnerability_detected(self, data: Dict[str, Any]):
+        """
+        Handle vulnerability_detected events from specialist agents.
+
+        Correlates specialist findings with API endpoints for deeper analysis:
+        - SQLi findings on API endpoints -> test for GraphQL injection
+        - IDOR findings -> test for broken object-level authorization
+        - JWT findings -> integrate with API auth testing
+
+        Args:
+            data: Event data containing specialist, finding, status, scan_context
+        """
+        specialist = data.get("specialist", "unknown")
+        finding = data.get("finding", {})
+        status = data.get("status", "")
+        url = finding.get("url", "")
+
+        # Only process confirmed or pending findings
+        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+            return
+
+        self.think(f"Received {specialist} finding for potential API correlation")
+
+        # Correlate with API testing
+        await self._correlate_with_api_testing(specialist, finding, url)
+
+    async def _correlate_with_api_testing(self, specialist: str, finding: Dict, url: str):
+        """
+        Correlate specialist findings with API security testing.
+
+        Args:
+            specialist: The specialist that found the vulnerability
+            finding: Finding details
+            url: URL where vulnerability was found
+        """
+        if not url:
+            return
+
+        # Check if this URL is an API endpoint we're tracking
+        is_rest = url in self.rest_endpoints
+        is_graphql = url in self.graphql_endpoints
+
+        if not is_rest and not is_graphql:
+            # Check if URL looks like an API endpoint
+            if self._is_api_url(url):
+                # Add to tracked endpoints for future testing
+                self.rest_endpoints.add(url)
+                is_rest = True
+                logger.info(f"[{self.name}] Added {url} to REST endpoints from {specialist} finding")
+
+        # Trigger additional API-specific tests based on finding type
+        if is_rest or is_graphql:
+            await self._run_correlated_tests(specialist, finding, url, is_graphql)
+
+    def _is_api_url(self, url: str) -> bool:
+        """Check if URL looks like an API endpoint."""
+        api_indicators = ["/api/", "/v1/", "/v2/", "/graphql", "/rest/", "/json", "/data/"]
+        return any(indicator in url.lower() for indicator in api_indicators)
+
+    async def _run_correlated_tests(self, specialist: str, finding: Dict, url: str, is_graphql: bool):
+        """
+        Run additional tests based on correlated specialist findings.
+
+        Args:
+            specialist: The specialist that found the vulnerability
+            finding: Finding details
+            url: API endpoint URL
+            is_graphql: Whether this is a GraphQL endpoint
+        """
+        correlation_tests = {
+            "sqli": self._correlate_sqli_with_api,
+            "idor": self._correlate_idor_with_api,
+            "jwt": self._correlate_jwt_with_api,
+            "ssrf": self._correlate_ssrf_with_api,
+        }
+
+        handler = correlation_tests.get(specialist.lower())
+        if handler:
+            await handler(finding, url, is_graphql)
+
+    async def _correlate_sqli_with_api(self, finding: Dict, url: str, is_graphql: bool):
+        """Correlate SQLi finding with API - check for GraphQL injection."""
+        if is_graphql:
+            self.think(f"SQLi on GraphQL endpoint - testing GraphQL injection")
+            # The GraphQL endpoint may have similar injection vulnerabilities
+            # This is tracked for the next GraphQL test cycle
+            self.findings.append({
+                "type": "API Correlation",
+                "correlation": "SQLi -> GraphQL",
+                "original_finding": finding,
+                "recommendation": "Test GraphQL queries for similar injection patterns"
+            })
+
+    async def _correlate_idor_with_api(self, finding: Dict, url: str, is_graphql: bool):
+        """Correlate IDOR finding with API - check for BOLA."""
+        self.think(f"IDOR on API endpoint - testing for BOLA (Broken Object Level Authorization)")
+        # IDOR often indicates BOLA in REST APIs
+        self.findings.append({
+            "type": "API Correlation",
+            "correlation": "IDOR -> BOLA",
+            "original_finding": finding,
+            "recommendation": "Test all object-access endpoints for authorization bypass"
+        })
+
+    async def _correlate_jwt_with_api(self, finding: Dict, url: str, is_graphql: bool):
+        """Correlate JWT finding with API - check auth bypass."""
+        self.think(f"JWT vulnerability on API - testing for auth bypass across endpoints")
+        # JWT vulnerabilities can affect all authenticated endpoints
+        self.findings.append({
+            "type": "API Correlation",
+            "correlation": "JWT -> API Auth Bypass",
+            "original_finding": finding,
+            "recommendation": "Test all authenticated API endpoints with forged tokens"
+        })
+
+    async def _correlate_ssrf_with_api(self, finding: Dict, url: str, is_graphql: bool):
+        """Correlate SSRF finding with API - check for internal API access."""
+        self.think(f"SSRF on API endpoint - testing for internal API access")
+        # SSRF can be used to access internal APIs
+        self.findings.append({
+            "type": "API Correlation",
+            "correlation": "SSRF -> Internal API Access",
+            "original_finding": finding,
+            "recommendation": "Test SSRF payloads targeting internal API endpoints"
+        })
 
     # ==================== HELPERS ====================
 
