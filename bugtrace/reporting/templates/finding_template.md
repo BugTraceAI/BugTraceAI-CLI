@@ -7,6 +7,7 @@
 | **CVE** | {cve_reference} |
 | **Status** | {status_badge} |
 | **CVSS Score** | {cvss_score} |
+| **Validation Method** | {validation_method} |
 
 **URL:** `{url}`
 **Parameter:** `{parameter}`
