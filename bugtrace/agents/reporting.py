@@ -21,6 +21,8 @@ from bugtrace.core.database import get_db_manager
 from bugtrace.core.ui import dashboard
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.llm_client import llm_client
+from bugtrace.core.event_bus import EventType, event_bus
+from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.schemas.db_models import ScanTable
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
@@ -45,6 +47,59 @@ class ReportingAgent(BaseAgent):
         self.target_url = target_url
         self.output_dir = Path(output_dir)
         self.db = get_db_manager()
+
+        # Event-driven finding accumulation
+        self._validated_findings: List[Dict] = []
+        self._event_bus = event_bus
+        self._subscribed = False
+
+    def subscribe_to_events(self) -> None:
+        """
+        Subscribe to validation events from the pipeline.
+
+        Subscribes to:
+        - VULNERABILITY_DETECTED: Specialist self-validated findings (VALIDATED_CONFIRMED)
+        - FINDING_VALIDATED: AgenticValidator CDP-validated findings
+
+        Call this during scan startup to enable event-driven report generation.
+        """
+        if self._subscribed:
+            logger.warning(f"[{self.name}] Already subscribed to events")
+            return
+
+        self._event_bus.subscribe(
+            EventType.VULNERABILITY_DETECTED.value,
+            self._handle_vulnerability_detected
+        )
+        self._event_bus.subscribe(
+            EventType.FINDING_VALIDATED.value,
+            self._handle_finding_validated
+        )
+
+        self._subscribed = True
+        logger.info(f"[{self.name}] Subscribed to vulnerability_detected and finding_validated events")
+
+    def unsubscribe_from_events(self) -> None:
+        """
+        Unsubscribe from validation events.
+
+        Call this during scan cleanup to prevent memory leaks.
+        """
+        if not self._subscribed:
+            logger.debug(f"[{self.name}] Not subscribed, nothing to unsubscribe")
+            return
+
+        self._event_bus.unsubscribe(
+            EventType.VULNERABILITY_DETECTED.value,
+            self._handle_vulnerability_detected
+        )
+        self._event_bus.unsubscribe(
+            EventType.FINDING_VALIDATED.value,
+            self._handle_finding_validated
+        )
+
+        self._subscribed = False
+        logger.info(f"[{self.name}] Unsubscribed from validation events")
 
     async def run_loop(self):
         """Not used - call generate_all_deliverables() directly."""
