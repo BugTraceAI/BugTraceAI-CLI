@@ -117,7 +117,7 @@ class TeamOrchestrator:
         from bugtrace.agents.rce_agent import RCEAgent
         from bugtrace.agents.ssrf_agent import SSRFAgent
         from bugtrace.agents.xxe_agent import XXEAgent
-        from bugtrace.agents.open_redirect_agent import OpenRedirectAgent
+        from bugtrace.agents.openredirect_agent import OpenRedirectAgent
         from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
 
         # Initialize specialist agents WITHOUT url/param (they process from queue)
