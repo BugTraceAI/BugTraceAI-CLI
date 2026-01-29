@@ -95,7 +95,7 @@ class TeamOrchestrator:
 
         # Initialize ThinkingConsolidationAgent for V3 pipeline
         from bugtrace.agents.thinking_consolidation_agent import ThinkingConsolidationAgent
-        self.thinking_agent = ThinkingConsolidationAgent(event_bus=event_bus)
+        self.thinking_agent = ThinkingConsolidationAgent()
         logger.info("ThinkingConsolidationAgent initialized - V3 event-driven pipeline active")
 
         # Initialize specialist worker pools
@@ -120,30 +120,31 @@ class TeamOrchestrator:
         from bugtrace.agents.open_redirect_agent import OpenRedirectAgent
         from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
 
-        # Initialize specialist agents with event_bus
-        self.sqli_agent = SQLiAgent(event_bus=self.event_bus)
-        self.xss_agent = XSSAgent(event_bus=self.event_bus)
-        self.csti_agent = CSTIAgent(event_bus=self.event_bus)
-        self.lfi_agent = LFIAgent(event_bus=self.event_bus)
-        self.idor_agent = IDORAgent(event_bus=self.event_bus)
-        self.rce_agent = RCEAgent(event_bus=self.event_bus)
-        self.ssrf_agent = SSRFAgent(event_bus=self.event_bus)
-        self.xxe_agent = XXEAgent(event_bus=self.event_bus)
-        self.open_redirect_agent = OpenRedirectAgent(event_bus=self.event_bus)
-        self.prototype_pollution_agent = PrototypePollutionAgent(event_bus=self.event_bus)
+        # Initialize specialist agents WITHOUT url/param (they process from queue)
+        # Pass event_bus for event emission
+        self.sqli_worker_agent = SQLiAgent(event_bus=self.event_bus)
+        self.xss_worker_agent = XSSAgent(event_bus=self.event_bus)
+        self.csti_worker_agent = CSTIAgent(event_bus=self.event_bus)
+        self.lfi_worker_agent = LFIAgent(event_bus=self.event_bus)
+        self.idor_worker_agent = IDORAgent(event_bus=self.event_bus)
+        self.rce_worker_agent = RCEAgent(event_bus=self.event_bus)
+        self.ssrf_worker_agent = SSRFAgent(event_bus=self.event_bus)
+        self.xxe_worker_agent = XXEAgent(event_bus=self.event_bus)
+        self.open_redirect_worker_agent = OpenRedirectAgent(event_bus=self.event_bus)
+        self.prototype_pollution_worker_agent = PrototypePollutionAgent(event_bus=self.event_bus)
 
         # Start worker pools for each specialist
-        self.sqli_agent.start_queue_consumer()
-        self.xss_agent.start_queue_consumer()
-        self.csti_agent.start_queue_consumer()
-        self.lfi_agent.start_queue_consumer()
-        self.idor_agent.start_queue_consumer()
-        self.rce_agent.start_queue_consumer()
-        self.ssrf_agent.start_queue_consumer()
-        self.xxe_agent.start_queue_consumer()
+        self.sqli_worker_agent.start_queue_consumer()
+        self.xss_worker_agent.start_queue_consumer()
+        self.csti_worker_agent.start_queue_consumer()
+        self.lfi_worker_agent.start_queue_consumer()
+        self.idor_worker_agent.start_queue_consumer()
+        self.rce_worker_agent.start_queue_consumer()
+        self.ssrf_worker_agent.start_queue_consumer()
+        self.xxe_worker_agent.start_queue_consumer()
         self.jwt_agent.start_queue_consumer()  # JWT was already initialized
-        self.open_redirect_agent.start_queue_consumer()
-        self.prototype_pollution_agent.start_queue_consumer()
+        self.open_redirect_worker_agent.start_queue_consumer()
+        self.prototype_pollution_worker_agent.start_queue_consumer()
 
         logger.info("Started 11 specialist worker pools for V3 pipeline")
 
@@ -151,17 +152,17 @@ class TeamOrchestrator:
         """Shutdown specialist worker pools gracefully."""
         logger.info("Shutting down specialist worker pools...")
         shutdown_tasks = [
-            self.sqli_agent.stop_queue_consumer(),
-            self.xss_agent.stop_queue_consumer(),
-            self.csti_agent.stop_queue_consumer(),
-            self.lfi_agent.stop_queue_consumer(),
-            self.idor_agent.stop_queue_consumer(),
-            self.rce_agent.stop_queue_consumer(),
-            self.ssrf_agent.stop_queue_consumer(),
-            self.xxe_agent.stop_queue_consumer(),
+            self.sqli_worker_agent.stop_queue_consumer(),
+            self.xss_worker_agent.stop_queue_consumer(),
+            self.csti_worker_agent.stop_queue_consumer(),
+            self.lfi_worker_agent.stop_queue_consumer(),
+            self.idor_worker_agent.stop_queue_consumer(),
+            self.rce_worker_agent.stop_queue_consumer(),
+            self.ssrf_worker_agent.stop_queue_consumer(),
+            self.xxe_worker_agent.stop_queue_consumer(),
             self.jwt_agent.stop_queue_consumer(),
-            self.open_redirect_agent.stop_queue_consumer(),
-            self.prototype_pollution_agent.stop_queue_consumer(),
+            self.open_redirect_worker_agent.stop_queue_consumer(),
+            self.prototype_pollution_worker_agent.stop_queue_consumer(),
         ]
         await asyncio.gather(*shutdown_tasks, return_exceptions=True)
         logger.info("All specialist worker pools shutdown complete")
