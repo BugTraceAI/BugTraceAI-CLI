@@ -36,6 +36,7 @@ from bugtrace.core.config import settings
 from bugtrace.core.llm_client import llm_client
 from bugtrace.core.event_bus import EventType, event_bus as global_event_bus
 from bugtrace.core.validation_status import ValidationStatus
+from bugtrace.core.validation_metrics import validation_metrics
 # NOTE: ValidationFeedback imports removed - feedback loop eliminated for simplicity
 # AgenticValidator is now a linear CDP specialist (no loopback to specialist agents)
 
@@ -382,7 +383,7 @@ Respond in JSON format:
             logger.info(f"[{self.name}] Started queue processor")
 
     async def stop_queue_processor(self) -> None:
-        """Stop the background queue processor."""
+        """Stop the background queue processor and log CDP reduction summary."""
         if self._queue_processor_task and not self._queue_processor_task.done():
             self._cancellation_token["cancelled"] = True
             self._queue_processor_task.cancel()
@@ -391,6 +392,9 @@ Respond in JSON format:
             except asyncio.CancelledError:
                 pass
             logger.info(f"[{self.name}] Stopped queue processor")
+
+        # Log CDP reduction summary on scan completion
+        validation_metrics.log_reduction_summary()
 
     async def _process_pending_queue(self) -> None:
         """Process PENDING_VALIDATION findings from queue."""
