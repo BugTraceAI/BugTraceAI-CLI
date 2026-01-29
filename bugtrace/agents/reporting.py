@@ -1066,6 +1066,9 @@ class ReportingAgent(BaseAgent):
         reproduction_steps_list = self._generate_reproduction_steps(finding)
         reproduction_steps = "\n".join(reproduction_steps_list)
 
+        # Validation method label
+        validation_method = self._extract_validation_method(finding)
+
         # Fill template
         filled = template.format(
             index=index,
@@ -1076,6 +1079,7 @@ class ReportingAgent(BaseAgent):
             cve_reference=cve_reference,
             status_badge=status_badge,
             cvss_score=cvss_score_str,
+            validation_method=validation_method,
             url=url,
             parameter=parameter,
             payload=payload,
@@ -1101,6 +1105,7 @@ class ReportingAgent(BaseAgent):
         lines.append(f"|-------|-------|")
         lines.append(f"| **Severity** | {finding.get('severity', 'MEDIUM')} |")
         lines.append(f"| **Status** | ✅ CONFIRMED |")
+        lines.append(f"| **Validation Method** | {self._extract_validation_method(finding)} |")
         lines.append(f"| **URL** | `{finding.get('url', '')}` |")
         lines.append(f"| **Parameter** | `{finding.get('parameter', '')}` |")
         if finding.get("db_type"):
