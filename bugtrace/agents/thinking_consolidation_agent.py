@@ -422,15 +422,119 @@ class ThinkingConsolidationAgent(BaseAgent):
 
         return prioritized
 
+    async def _distribute_to_queue(self, prioritized: PrioritizedFinding) -> bool:
+        """
+        Distribute a prioritized finding to the appropriate specialist queue.
+
+        Handles backpressure by retrying with exponential backoff.
+
+        Args:
+            prioritized: PrioritizedFinding with specialist and priority
+
+        Returns:
+            True if successfully queued, False if queue full after retries
+        """
+        specialist = prioritized.specialist
+        queue = queue_manager.get_queue(specialist)
+
+        # Prepare queue payload
+        payload = prioritized.queue_payload
+
+        # Try to enqueue with backpressure handling
+        for attempt in range(settings.THINKING_BACKPRESSURE_RETRIES):
+            success = await queue.enqueue(payload, prioritized.scan_context)
+
+            if success:
+                self._stats["distributed"] += 1
+                self._stats["by_specialist"][specialist] = \
+                    self._stats["by_specialist"].get(specialist, 0) + 1
+
+                logger.debug(
+                    f"[{self.name}] Queued: {prioritized.finding.get('type')} -> "
+                    f"{specialist} (priority: {prioritized.priority:.1f})"
+                )
+                return True
+
+            # Backpressure - wait and retry
+            delay = settings.THINKING_BACKPRESSURE_DELAY * (2 ** attempt)
+            logger.warning(
+                f"[{self.name}] Queue {specialist} full, retry {attempt + 1}/"
+                f"{settings.THINKING_BACKPRESSURE_RETRIES} in {delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+
+        # Failed after all retries
+        self._stats.setdefault("backpressure_drops", 0)
+        self._stats["backpressure_drops"] += 1
+        logger.error(
+            f"[{self.name}] Dropped finding: {prioritized.finding.get('type')} -> "
+            f"{specialist} (queue full after {settings.THINKING_BACKPRESSURE_RETRIES} retries)"
+        )
+        return False
+
+    async def _emit_work_queued_event(self, prioritized: PrioritizedFinding) -> None:
+        """
+        Emit work_queued_{specialist} event for downstream coordination.
+
+        Event types are from EventType enum:
+        - WORK_QUEUED_XSS, WORK_QUEUED_SQLI, etc.
+
+        Args:
+            prioritized: The distributed finding
+        """
+        if not settings.THINKING_EMIT_EVENTS:
+            return
+
+        # Map specialist to EventType
+        specialist_to_event = {
+            "xss": EventType.WORK_QUEUED_XSS,
+            "sqli": EventType.WORK_QUEUED_SQLI,
+            "csti": EventType.WORK_QUEUED_CSTI,
+            "lfi": EventType.WORK_QUEUED_LFI,
+            "idor": EventType.WORK_QUEUED_IDOR,
+            "rce": EventType.WORK_QUEUED_RCE,
+            "ssrf": EventType.WORK_QUEUED_SSRF,
+            "xxe": EventType.WORK_QUEUED_XXE,
+            "jwt": EventType.WORK_QUEUED_JWT,
+            "openredirect": EventType.WORK_QUEUED_OPENREDIRECT,
+            "prototype_pollution": EventType.WORK_QUEUED_PROTOTYPE_POLLUTION,
+        }
+
+        event_type = specialist_to_event.get(prioritized.specialist)
+        if not event_type:
+            logger.warning(f"[{self.name}] No event type for specialist: {prioritized.specialist}")
+            return
+
+        event_data = {
+            "specialist": prioritized.specialist,
+            "finding": {
+                "type": prioritized.finding.get("type"),
+                "parameter": prioritized.finding.get("parameter"),
+                "url": prioritized.finding.get("url"),
+                "severity": prioritized.finding.get("severity"),
+                "fp_confidence": prioritized.finding.get("fp_confidence"),
+            },
+            "priority": prioritized.priority,
+            "scan_context": prioritized.scan_context,
+            "timestamp": time.time(),
+        }
+
+        try:
+            await self.event_bus.emit(event_type, event_data)
+            logger.debug(f"[{self.name}] Emitted {event_type.value}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to emit {event_type.value}: {e}")
+
     async def _process_finding(self, finding: Dict[str, Any], scan_context: str) -> None:
         """
-        Process a single finding through deduplication and classification.
+        Process a single finding through the full pipeline.
 
         Steps:
         1. Check fp_confidence threshold
         2. Check deduplication cache
         3. Classify and prioritize
-        4. (Plan 03) Distribute to specialist queue
+        4. Distribute to specialist queue
+        5. Emit work_queued event
         """
         # 1. FP confidence filter
         fp_confidence = finding.get("fp_confidence", 0.5)
@@ -453,12 +557,12 @@ class ThinkingConsolidationAgent(BaseAgent):
             self._stats["unclassified"] += 1
             return
 
-        # 4. (Plan 03) Distribute to queue
-        # For now, track what would be distributed
-        specialist = prioritized.specialist
-        self._stats["by_specialist"][specialist] = self._stats["by_specialist"].get(specialist, 0) + 1
+        # 4. Distribute to specialist queue
+        success = await self._distribute_to_queue(prioritized)
 
-        logger.debug(f"[{self.name}] Ready for distribution: {key} -> {specialist} (p={prioritized.priority})")
+        # 5. Emit work_queued event (only if successfully queued)
+        if success:
+            await self._emit_work_queued_event(prioritized)
 
     async def run_loop(self):
         """Main agent loop - manages batch processing if in batch mode."""
