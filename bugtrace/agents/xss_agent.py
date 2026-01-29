@@ -2661,6 +2661,32 @@ Return JSON:
 
         return None
 
+    def _can_confirm_from_http_response(self, payload: str, response_html: str, evidence: Dict) -> bool:
+        """
+        Attempt to confirm XSS from HTTP response analysis (before browser).
+
+        HIGH confidence confirmation when payload lands in executable context:
+        - script_block: Direct execution in <script> tags
+        - event_handler: Execution via event attributes
+        - javascript_uri: Execution via javascript: URIs
+        - template_expression: Execution via framework templates
+
+        Returns True if XSS is confirmed, False if browser validation needed.
+        """
+        context = self._detect_execution_context(payload, response_html)
+
+        if context in ["script_block", "event_handler", "javascript_uri", "template_expression"]:
+            evidence["http_confirmed"] = True
+            evidence["execution_context"] = context
+            evidence["validation_method"] = "http_response_analysis"
+            dashboard.log(
+                f"[{self.name}] HTTP Confirmed: Payload in {context}",
+                "SUCCESS"
+            )
+            return True
+
+        return False
+
     def _fragment_build_url(self, payload: str) -> str:
         """Build fragment URL with payload in hash (bypasses WAF)."""
         from urllib.parse import urlparse
