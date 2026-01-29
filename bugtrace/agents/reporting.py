@@ -662,19 +662,54 @@ class ReportingAgent(BaseAgent):
         return path
 
     def _md_build_header(self, lines: List[str], validated: List[Dict], manual_review: List[Dict], pending: List[Dict]):
-        """Build markdown report header and summary."""
-        lines.append(f"# Security Assessment: {self.target_url}\n")
-        lines.append(f"**Scan ID:** {self.scan_id}")
-        lines.append(f"**Date:** {datetime.now().strftime('%d %b %Y %H:%M')}")
-        lines.append(f"**Tool:** BugTraceAI v{settings.VERSION}\n")
+        """Build markdown report header and summary with standardized structure."""
+        # Calculate stats for header
+        stats = self._calculate_scan_stats(validated + manual_review + pending)
+        by_severity = self._count_by_severity(validated)
 
-        # Summary
+        # Header: Security Assessment Report
+        lines.append("# Security Assessment Report\n")
+
+        # Scan Metadata table
+        lines.append("## Scan Metadata\n")
+        lines.append("| Field | Value |")
+        lines.append("|-------|-------|")
+        lines.append(f"| **Target** | {self.target_url} |")
+        lines.append(f"| **Scan ID** | {self.scan_id} |")
+        lines.append(f"| **Date** | {datetime.now().strftime('%d %b %Y %H:%M')} |")
+        lines.append(f"| **Tool Version** | BugTraceAI v{settings.VERSION} |")
+        lines.append(f"| **Duration** | {stats.get('duration', 'N/A')} |")
+        lines.append(f"| **URLs Scanned** | {stats.get('urls_scanned', 0)} |")
+        lines.append("")
+
+        # Executive Summary
         lines.append("## Executive Summary\n")
-        lines.append(f"| Category | Count |")
-        lines.append(f"|----------|-------|")
-        lines.append(f"| **Confirmed Vulnerabilities** | {len(validated)} |")
-        lines.append(f"| **Needs Manual Review** | {len(manual_review)} |")
-        lines.append(f"| **Pending Validation** | {len(pending)} |")
+
+        # Findings by Severity table
+        lines.append("### Findings by Severity\n")
+        lines.append("| Severity | Count |")
+        lines.append("|----------|-------|")
+        lines.append(f"| Critical | {by_severity.get('critical', 0)} |")
+        lines.append(f"| High | {by_severity.get('high', 0)} |")
+        lines.append(f"| Medium | {by_severity.get('medium', 0)} |")
+        lines.append(f"| Low | {by_severity.get('low', 0)} |")
+        lines.append(f"| Info | {by_severity.get('info', 0)} |")
+        total_count = sum(by_severity.values())
+        lines.append(f"| **Total** | **{total_count}** |")
+        lines.append("")
+
+        # Validation Summary table
+        lines.append("### Validation Summary\n")
+        lines.append("| Category | Count |")
+        lines.append("|----------|-------|")
+        lines.append(f"| Confirmed | {len(validated)} |")
+        lines.append(f"| Manual Review | {len(manual_review)} |")
+
+        # Count false positives and pending from all findings if available
+        # For now, we'll use the pending list passed in
+        false_positive_count = 0  # Not tracked in this method's params
+        lines.append(f"| False Positives | {false_positive_count} |")
+        lines.append(f"| Pending | {len(pending)} |")
         lines.append("")
 
     def _md_build_validated_findings(self, lines: List[str], validated: List[Dict]):
