@@ -117,8 +117,12 @@ class Settings(BaseSettings):
     PIPELINE_AUTO_TRANSITION: bool = True  # Automatic phase transitions
 
     # --- Performance Metrics Configuration (Phase 24: v2.3) ---
+    PERF_CDP_LOG_ENABLED: bool = True  # Log CDP reduction summary after each scan
+    PERF_CDP_LOG_INTERVAL: int = 50  # Log interim CDP metrics every N findings (0 to disable)
     PERF_DEDUP_LOG_ENABLED: bool = True  # Log deduplication metrics during and after scans
     PERF_DEDUP_LOG_INTERVAL: int = 25  # Log dedup stats every N duplicates (0 to disable)
+    PERF_PARALLEL_LOG_ENABLED: bool = True  # Log parallelization metrics during and after scans
+    PERF_PARALLEL_LOG_INTERVAL: int = 10  # Log parallelization stats every N worker operations (0 to disable)
 
     def get_threshold_for_type(self, vuln_type: str) -> int:
         """Get the skeptical threshold for a vulnerability type."""
