@@ -187,8 +187,8 @@ class DBType(Enum):
 class SQLMapConfig:
     """Advanced SQLMap configuration for intelligent scanning."""
     # Basic
-    level: int = 2  # 1-5, higher = more payloads
-    risk: int = 2   # 1-3, higher = more risky payloads
+    level: int = 5  # 1-5, higher = more payloads (increased from 2 for better coverage)
+    risk: int = 3   # 1-3, higher = more risky payloads (increased from 2 for comprehensive testing)
     # IMPROVED (2026-01-23): No Time-Based by default to reduce false positives
     # Time-based (T) causes many FPs due to network latency
     technique: str = "BEUS"  # B=Boolean, E=Error, U=Union, S=Stacked (NO T=Time)
