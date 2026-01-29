@@ -7,6 +7,11 @@ from bugtrace.core.ui import dashboard
 from bugtrace.core.job_manager import JobStatus
 from bugtrace.utils.logger import get_logger
 from bugtrace.tools.external import external_tools
+from bugtrace.reporting.standards import (
+    get_cwe_for_vuln,
+    get_remediation_for_vuln,
+    normalize_severity,
+)
 
 logger = get_logger("agents.idor")
 
@@ -57,11 +62,16 @@ class IDORAgent(BaseAgent):
             "parameter": param,
             "payload": hit["id"],
             "description": f"IDOR vulnerability detected on ID {hit['id']}. Differed from baseline ID {original_value}. Status: {hit['status_code']}. Contains sensitive data: {hit.get('contains_sensitive')}",
-            "severity": hit["severity"],
+            "severity": hit["severity"].upper() if isinstance(hit["severity"], str) else hit["severity"],
             "validated": hit["severity"] == "CRITICAL",
             "evidence": f"Status {hit['status_code']}. Diff Type: {hit['diff_type']}. Sensitive: {hit.get('contains_sensitive')}",
             "status": self._determine_validation_status("differential", confidence_level),
-            "reproduction": f"# Compare responses:\ncurl '{self.url}?{param}={original_value}'\ncurl '{self.url}?{param}={hit['id']}'"
+            "reproduction": f"# Compare responses:\ncurl '{self.url}?{param}={original_value}'\ncurl '{self.url}?{param}={hit['id']}'",
+            "cwe_id": get_cwe_for_vuln("IDOR"),
+            "remediation": get_remediation_for_vuln("IDOR"),
+            "cve_id": "N/A",
+            "http_request": f"GET {self.url}?{param}={hit['id']}",
+            "http_response": f"Status: {hit['status_code']}, Diff: {hit['diff_type']}, Sensitive data: {hit.get('contains_sensitive', False)}",
         }
 
     async def run_loop(self) -> Dict:
