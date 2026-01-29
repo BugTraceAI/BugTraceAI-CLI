@@ -132,6 +132,26 @@ class FindingRecord:
     processed: bool = False
 
 
+@dataclass
+class PrioritizedFinding:
+    """Finding with classification and priority for queue distribution."""
+    finding: Dict[str, Any]
+    specialist: str  # Queue name (e.g., "xss", "sqli")
+    priority: float  # 0-100, higher = more urgent
+    scan_context: str
+    classified_at: float = field(default_factory=time.monotonic)
+
+    @property
+    def queue_payload(self) -> Dict[str, Any]:
+        """Prepare payload for specialist queue."""
+        return {
+            "finding": self.finding,
+            "priority": self.priority,
+            "scan_context": self.scan_context,
+            "classified_at": self.classified_at,
+        }
+
+
 class DeduplicationCache:
     """
     LRU cache for finding deduplication.
@@ -297,14 +317,120 @@ class ThinkingConsolidationAgent(BaseAgent):
         for finding in findings:
             await self._process_finding(finding, scan_context)
 
+    def _classify_finding(self, finding: Dict[str, Any]) -> Optional[str]:
+        """
+        Classify finding to determine target specialist queue.
+
+        Args:
+            finding: Finding dict with 'type' field
+
+        Returns:
+            Specialist queue name (e.g., "xss") or None if unclassifiable
+        """
+        vuln_type = finding.get("type", "").lower().strip()
+
+        # Direct match
+        if vuln_type in VULN_TYPE_TO_SPECIALIST:
+            return VULN_TYPE_TO_SPECIALIST[vuln_type]
+
+        # Partial match (for compound types like "Reflected XSS in parameter")
+        for pattern, specialist in VULN_TYPE_TO_SPECIALIST.items():
+            if pattern in vuln_type:
+                return specialist
+
+        # Unknown type
+        logger.warning(f"[{self.name}] Unknown vulnerability type: {vuln_type}")
+        return None
+
+    def _calculate_priority(self, finding: Dict[str, Any]) -> float:
+        """
+        Calculate exploitation probability priority score.
+
+        Priority Formula:
+        priority = (severity_base * 0.4) + (fp_confidence * 100 * 0.35) + (skeptical_score * 10 * 0.25)
+
+        Components:
+        - Severity base (40%): Critical=100, High=75, Medium=50, Low=25
+        - FP confidence (35%): 0.0-1.0 scaled to 0-100
+        - Skeptical score (25%): 0-10 scaled to 0-100
+
+        Returns:
+            Priority score 0-100 (higher = more likely to be exploitable)
+        """
+        # Get severity base score
+        severity = finding.get("severity", "medium").lower()
+        severity_base = SEVERITY_PRIORITY.get(severity, 50)
+
+        # Get FP confidence (0.0-1.0)
+        fp_confidence = finding.get("fp_confidence", 0.5)
+
+        # Get skeptical score (0-10)
+        skeptical_score = finding.get("skeptical_score", 5)
+
+        # Calculate weighted priority
+        priority = (
+            (severity_base * 0.40) +           # Severity: 40% weight
+            (fp_confidence * 100 * 0.35) +     # FP confidence: 35% weight
+            (skeptical_score * 10 * 0.25)      # Skeptical score: 25% weight
+        )
+
+        # Boost for validated findings
+        if finding.get("validated", False):
+            priority = min(100, priority * 1.2)
+
+        # Boost for high vote count (multiple approaches agreed)
+        votes = finding.get("votes", 1)
+        if votes >= 4:
+            priority = min(100, priority * 1.1)
+
+        return round(priority, 2)
+
+    async def _classify_and_prioritize(
+        self, finding: Dict[str, Any], scan_context: str
+    ) -> Optional[PrioritizedFinding]:
+        """
+        Classify finding and calculate priority for queue distribution.
+
+        Args:
+            finding: Finding dict from url_analyzed event
+            scan_context: Scan context for tracking
+
+        Returns:
+            PrioritizedFinding ready for queue, or None if unclassifiable
+        """
+        # Classify to get specialist
+        specialist = self._classify_finding(finding)
+        if not specialist:
+            logger.debug(f"[{self.name}] Unclassifiable: {finding.get('type')}")
+            return None
+
+        # Calculate priority
+        priority = self._calculate_priority(finding)
+
+        # Create prioritized finding
+        prioritized = PrioritizedFinding(
+            finding=finding,
+            specialist=specialist,
+            priority=priority,
+            scan_context=scan_context
+        )
+
+        logger.debug(
+            f"[{self.name}] Classified: {finding.get('type')} -> {specialist} "
+            f"(priority: {priority:.1f})"
+        )
+
+        return prioritized
+
     async def _process_finding(self, finding: Dict[str, Any], scan_context: str) -> None:
         """
-        Process a single finding through deduplication.
+        Process a single finding through deduplication and classification.
 
         Steps:
         1. Check fp_confidence threshold
         2. Check deduplication cache
-        3. Forward to classification/prioritization (Plan 02)
+        3. Classify and prioritize
+        4. (Plan 03) Distribute to specialist queue
         """
         # 1. FP confidence filter
         fp_confidence = finding.get("fp_confidence", 0.5)
@@ -320,12 +446,19 @@ class ThinkingConsolidationAgent(BaseAgent):
             self._stats["duplicates_filtered"] += 1
             return
 
-        # 3. Forward for classification (implemented in Plan 02)
-        # For now, just log that we would process it
-        logger.debug(f"[{self.name}] New finding: {key} (fp: {fp_confidence:.2f})")
+        # 3. Classify and prioritize
+        prioritized = await self._classify_and_prioritize(finding, scan_context)
+        if not prioritized:
+            self._stats.setdefault("unclassified", 0)
+            self._stats["unclassified"] += 1
+            return
 
-        # Placeholder for Plan 02 - will call classify/prioritize
-        # await self._classify_and_prioritize(finding, scan_context)
+        # 4. (Plan 03) Distribute to queue
+        # For now, track what would be distributed
+        specialist = prioritized.specialist
+        self._stats["by_specialist"][specialist] = self._stats["by_specialist"].get(specialist, 0) + 1
+
+        logger.debug(f"[{self.name}] Ready for distribution: {key} -> {specialist} (p={prioritized.priority})")
 
     async def run_loop(self):
         """Main agent loop - manages batch processing if in batch mode."""
@@ -390,4 +523,4 @@ class ThinkingConsolidationAgent(BaseAgent):
 
 
 # Module exports
-__all__ = ["ThinkingConsolidationAgent", "DeduplicationCache", "FindingRecord"]
+__all__ = ["ThinkingConsolidationAgent", "DeduplicationCache", "FindingRecord", "PrioritizedFinding"]
