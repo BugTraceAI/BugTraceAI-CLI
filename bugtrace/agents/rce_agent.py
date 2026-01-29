@@ -6,6 +6,11 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from bugtrace.agents.base import BaseAgent
 from bugtrace.core.ui import dashboard
+from bugtrace.reporting.standards import (
+    get_cwe_for_vuln,
+    get_remediation_for_vuln,
+    normalize_severity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +39,7 @@ class RCEAgent(BaseAgent):
     def _create_time_based_finding(self, param: str, payload: str, elapsed: float) -> Dict:
         """Create finding for time-based RCE."""
         return {
-            "type": "Command Injection (Time-based)",
+            "type": "RCE",
             "url": self.url,
             "parameter": param,
             "payload": payload,
@@ -43,13 +48,18 @@ class RCEAgent(BaseAgent):
             "status": "VALIDATED_CONFIRMED",
             "evidence": f"Delay of {elapsed:.2f}s detected with payload: {payload}",
             "description": f"Time-based Command Injection confirmed. Parameter '{param}' executes OS commands. Payload caused {elapsed:.2f}s delay (expected 5s+).",
-            "reproduction": f"# Time-based RCE test:\ntime curl '{self._inject_payload(self.url, param, payload)}'"
+            "reproduction": f"# Time-based RCE test:\ntime curl '{self._inject_payload(self.url, param, payload)}'",
+            "cwe_id": get_cwe_for_vuln("RCE"),
+            "remediation": get_remediation_for_vuln("RCE"),
+            "cve_id": "N/A",
+            "http_request": f"GET {self._inject_payload(self.url, param, payload)}",
+            "http_response": f"Time delay: {elapsed:.2f}s (indicates command execution)",
         }
 
     def _create_eval_finding(self, param: str, payload: str, target: str) -> Dict:
         """Create finding for eval-based RCE."""
         return {
-            "type": "Remote Code Execution (Eval)",
+            "type": "RCE",
             "url": self.url,
             "parameter": param,
             "payload": payload,
@@ -58,7 +68,12 @@ class RCEAgent(BaseAgent):
             "status": "VALIDATED_CONFIRMED",
             "evidence": f"Mathematical expression '1+1' evaluated to '2' in response.",
             "description": f"Remote Code Execution via eval() confirmed. Parameter '{param}' evaluates arbitrary code. Expression '1+1' returned '2'.",
-            "reproduction": f"curl '{target}' | grep -i 'result'"
+            "reproduction": f"curl '{target}' | grep -i 'result'",
+            "cwe_id": get_cwe_for_vuln("RCE"),
+            "remediation": get_remediation_for_vuln("RCE"),
+            "cve_id": "N/A",
+            "http_request": f"GET {target}",
+            "http_response": "Result: 2 (indicates code evaluation)",
         }
 
     async def run_loop(self) -> Dict:

@@ -3,6 +3,11 @@ from typing import Dict, List, Optional
 import aiohttp
 from bugtrace.agents.base import BaseAgent
 from bugtrace.core.ui import dashboard
+from bugtrace.reporting.standards import (
+    get_cwe_for_vuln,
+    get_remediation_for_vuln,
+    normalize_severity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +94,7 @@ class XXEAgent(BaseAgent):
         severity = "HIGH"
         if "passwd" in payload or "XInclude" in payload:
             severity = "CRITICAL"
-            
+
         return {
             "type": "XXE",
             "url": self.url,
@@ -99,7 +104,12 @@ class XXEAgent(BaseAgent):
             "validated": True,
             "status": self._determine_validation_status(payload),
             "successful_payloads": successful_payloads or [payload],
-            "reproduction": f"curl -X POST '{self.url}' -H 'Content-Type: application/xml' -d '{payload[:150]}...'"
+            "reproduction": f"curl -X POST '{self.url}' -H 'Content-Type: application/xml' -d '{payload[:150]}...'",
+            "cwe_id": get_cwe_for_vuln("XXE"),
+            "remediation": get_remediation_for_vuln("XXE"),
+            "cve_id": "N/A",
+            "http_request": f"POST {self.url}\nContent-Type: application/xml\n\n{payload[:200]}",
+            "http_response": "Local file content or entity reference detected in response",
         }
 
     async def _test_xml(self, session, xml_body) -> bool:
