@@ -124,7 +124,7 @@ class ReportService:
         # Update stats
         context.stats.vulns_found = len([
             f for f in context.findings
-            if f.severity not in [Severity.INFO, Severity.SAFE]
+            if f.severity != Severity.INFO
         ])
         context.stats.validated_findings = len([f for f in context.findings if f.validated])
 

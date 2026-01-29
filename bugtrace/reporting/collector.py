@@ -47,8 +47,7 @@ class DataCollector:
             "HIGH": Severity.HIGH,
             "MEDIUM": Severity.MEDIUM,
             "LOW": Severity.LOW,
-            "INFO": Severity.INFO,
-            "SAFE": Severity.SAFE
+            "INFO": Severity.INFO
         }
 
         # Default to INFO if unknown

@@ -4,12 +4,11 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 
 class Severity(str, Enum):
-    CRITICAL = "Critical"
-    HIGH = "High"
-    MEDIUM = "Medium"
-    LOW = "Low"
-    INFO = "Information"
-    SAFE = "Safe"
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
 
 class Confidence(str, Enum):
     CERTAIN = "Certain"
@@ -75,5 +74,5 @@ class ReportContext(BaseModel):
 
     def add_finding(self, finding: Finding):
         self.findings.append(finding)
-        if finding.type == FindingType.VULNERABILITY and finding.severity not in [Severity.INFO, Severity.SAFE]:
+        if finding.type == FindingType.VULNERABILITY and finding.severity != Severity.INFO:
             self.stats.vulns_found += 1
