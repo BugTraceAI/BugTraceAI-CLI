@@ -35,6 +35,14 @@ from bugtrace.tools.headless import detect_dom_xss
 # Import framework's WAF intelligence (Q-Learning based)
 from bugtrace.tools.waf import waf_fingerprinter, strategy_router, encoding_techniques
 
+# Import reporting standards for consistent output
+from bugtrace.reporting.standards import (
+    get_cwe_for_vuln,
+    get_remediation_for_vuln,
+    normalize_severity,
+    get_default_severity,
+)
+
 logger = get_logger("agents.xss_v4")
 
 
@@ -3552,9 +3560,15 @@ Return JSON:
             "screenshot_path": finding.screenshot_path, # Fixed key for WB mapping
             "validated": finding.validated,  # Use authority flag directly
             "status": finding.status,
-            "severity": "High",
+            "severity": normalize_severity("HIGH").value,  # Standardized uppercase severity
+            "cwe_id": get_cwe_for_vuln("XSS"),  # CWE-79
+            "cve_id": "N/A",  # XSS vulnerabilities are class-based, not specific CVEs
+            "remediation": get_remediation_for_vuln("XSS"),
             "description": f"Reflected XSS confirmed in parameter '{finding.parameter}'. Context: {finding.reflection_context}. Payload executed successfully via {finding.validation_method}.",
             "reproduction": reproduction,
+            # HTTP evidence fields
+            "http_request": finding.evidence.get("http_request", f"GET {test_url if 'test_url' in locals() else finding.url}"),
+            "http_response": finding.evidence.get("http_response", finding.evidence.get("page_html", "")[:500] if finding.evidence.get("page_html") else ""),
             # NEW FIELDS
             "xss_type": finding.xss_type,
             "injection_context_type": finding.injection_context_type,

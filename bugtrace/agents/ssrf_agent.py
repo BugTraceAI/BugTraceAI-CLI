@@ -8,6 +8,11 @@ from bugtrace.core.job_manager import JobStatus
 from bugtrace.core.ui import dashboard
 from bugtrace.utils.logger import get_logger
 from bugtrace.tools.external import external_tools
+from bugtrace.reporting.standards import (
+    get_cwe_for_vuln,
+    get_remediation_for_vuln,
+    normalize_severity,
+)
 
 logger = get_logger("agents.ssrf")
 
@@ -40,12 +45,18 @@ class SSRFAgent(BaseAgent):
             for hit in go_result["hits"]:
                 dashboard.log(f"[{self.name}] 🚨 SSRF HIT: {hit['payload']} ({hit['severity']})", "CRITICAL")
                 findings.append({
+                    "type": "SSRF",
                     "param": param,
                     "payload": hit["payload"],
-                    "severity": hit["severity"],
+                    "severity": hit["severity"].upper(),
                     "reason": hit["reason"],
                     "status": "VALIDATED_CONFIRMED",
-                    "validated": True
+                    "validated": True,
+                    "cwe_id": get_cwe_for_vuln("SSRF"),
+                    "remediation": get_remediation_for_vuln("SSRF"),
+                    "cve_id": "N/A",
+                    "http_request": f"GET {self.url}?{param}={hit['payload']}",
+                    "http_response": hit.get("response", "Callback or internal response detected"),
                 })
         return findings
 
@@ -70,12 +81,18 @@ class SSRFAgent(BaseAgent):
             res = await self._test_payload(param, payload)
             if res and self._determine_validation_status(res):
                 findings.append({
+                    "type": "SSRF",
                     "param": param,
                     "payload": payload,
                     "severity": "HIGH",
                     "reason": "Confirmed via LLM-designed payload",
                     "status": "VALIDATED_CONFIRMED",
-                    "validated": True
+                    "validated": True,
+                    "cwe_id": get_cwe_for_vuln("SSRF"),
+                    "remediation": get_remediation_for_vuln("SSRF"),
+                    "cve_id": "N/A",
+                    "http_request": f"GET {self.url}?{param}={payload}",
+                    "http_response": res.get("text", "")[:200],
                 })
                 break
         return findings
@@ -208,7 +225,12 @@ class SSRFAgent(BaseAgent):
             "description": f"Confirmed SSRF in '{res['param']}'. Response contains internal data or indicators.",
             "validated": True,
             "status": "VALIDATED_CONFIRMED",
-            "reproduction": f"curl '{self.url}' --data-urlencode '{res['param']}={res['payload']}'"
+            "reproduction": f"curl '{self.url}' --data-urlencode '{res['param']}={res['payload']}'",
+            "cwe_id": get_cwe_for_vuln("SSRF"),
+            "remediation": get_remediation_for_vuln("SSRF"),
+            "cve_id": "N/A",
+            "http_request": f"GET {self.url}?{res['param']}={res['payload']}",
+            "http_response": res.get("text", res.get("reason", "Internal data or callback detected")),
         }
         # In a real integration, we'd emit an event or call state_manager directly
         logger.info(f"🔥🔥 SSRF CONFIRMED: {res['payload']} on {res['param']}")
