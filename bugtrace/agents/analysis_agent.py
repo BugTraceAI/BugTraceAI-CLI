@@ -36,7 +36,7 @@ class DASTySASTAgent(BaseAgent):
         return await self.run()
 
     async def run(self) -> Dict:
-        """Performs 5-approach analysis on the URL (DAST+SAST)."""
+        """Performs 6-approach analysis on the URL (DAST+SAST) with event emission."""
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] Running DAST+SAST Analysis on {self.url[:50]}...", "INFO")
 
@@ -48,6 +48,8 @@ class DASTySASTAgent(BaseAgent):
             valid_analyses = await self._run_execute_analyses(context)
             if not valid_analyses:
                 dashboard.log(f"[{self.name}] All analysis approaches failed.", "ERROR")
+                # Emit event even on failure (empty findings)
+                await self._emit_url_analyzed([])
                 return {"error": "Analysis failed", "vulnerabilities": []}
 
             # 3. Consolidate & Review
@@ -57,11 +59,13 @@ class DASTySASTAgent(BaseAgent):
             # 4. Save Results
             await self._run_save_results(vulnerabilities)
 
+            # 5. Emit url_analyzed event (Phase 17: DISC-04)
+            await self._emit_url_analyzed(vulnerabilities)
+
             return {
                 "url": self.url,
                 "vulnerabilities": vulnerabilities,
                 "report_file": str(self.report_dir / f"vulnerabilities_{self._get_safe_name()}.md"),
-                # Phase 17: Add FP stats
                 "fp_stats": {
                     "total_findings": len(vulnerabilities),
                     "high_confidence": len([v for v in vulnerabilities if v.get('fp_confidence', 0) >= 0.7]),
@@ -72,6 +76,11 @@ class DASTySASTAgent(BaseAgent):
 
         except Exception as e:
             logger.error(f"DASTySASTAgent failed: {e}", exc_info=True)
+            # Emit event even on exception (empty findings)
+            try:
+                await self._emit_url_analyzed([])
+            except Exception:
+                pass  # Best effort
             return {"error": str(e), "vulnerabilities": []}
 
     async def _run_prepare_context(self) -> Dict:
