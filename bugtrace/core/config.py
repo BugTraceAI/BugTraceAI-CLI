@@ -86,6 +86,13 @@ class Settings(BaseSettings):
     FP_VOTES_WEIGHT: float = 0.3  # Weight of votes in fp_confidence calc
     FP_EVIDENCE_WEIGHT: float = 0.3  # Weight of evidence quality in fp_confidence calc
 
+    # --- ThinkingConsolidationAgent settings (Phase 18: v2.3) ---
+    THINKING_MODE: str = "streaming"  # "streaming" | "batch"
+    THINKING_BATCH_SIZE: int = 50  # Max findings per batch in batch mode
+    THINKING_BATCH_TIMEOUT: float = 5.0  # Seconds to wait before processing incomplete batch
+    THINKING_DEDUP_WINDOW: int = 1000  # Max dedup keys to track (LRU eviction)
+    THINKING_FP_THRESHOLD: float = 0.5  # Min fp_confidence to forward to specialists
+
     def get_threshold_for_type(self, vuln_type: str) -> int:
         """Get the skeptical threshold for a vulnerability type."""
         vuln_upper = vuln_type.upper()
@@ -170,6 +177,14 @@ class Settings(BaseSettings):
         """Validate FP confidence threshold is between 0 and 1."""
         if not 0.0 <= v <= 1.0:
             raise ValueError("FP_CONFIDENCE_THRESHOLD must be between 0.0 and 1.0")
+        return v
+
+    @field_validator('THINKING_MODE')
+    @classmethod
+    def validate_thinking_mode(cls, v):
+        """Validate thinking mode is valid."""
+        if v not in ("streaming", "batch"):
+            raise ValueError("THINKING_MODE must be 'streaming' or 'batch'")
         return v
 
     # --- OpenRouter Configuration ---
