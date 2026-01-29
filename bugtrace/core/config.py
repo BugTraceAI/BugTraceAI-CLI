@@ -109,6 +109,13 @@ class Settings(BaseSettings):
     CDP_LOAD_TARGET: float = 0.01  # Target <1% findings go to CDP validation
     VALIDATION_LOG_INTERVAL: int = 100  # Log metrics every N findings
 
+    # --- Pipeline Orchestration Configuration (Phase 23: v2.3) ---
+    PIPELINE_PHASE_TIMEOUT: int = 600  # 10 min max per phase
+    PIPELINE_DRAIN_TIMEOUT: int = 30  # 30s to drain queues on shutdown
+    PIPELINE_PAUSE_CHECK_INTERVAL: float = 0.5  # Pause check frequency
+    PIPELINE_DISCOVERY_COMPLETION_DELAY: float = 2.0  # Wait for late findings
+    PIPELINE_AUTO_TRANSITION: bool = True  # Automatic phase transitions
+
     def get_threshold_for_type(self, vuln_type: str) -> int:
         """Get the skeptical threshold for a vulnerability type."""
         vuln_upper = vuln_type.upper()
@@ -201,6 +208,22 @@ class Settings(BaseSettings):
         """Validate thinking mode is valid."""
         if v not in ("streaming", "batch"):
             raise ValueError("THINKING_MODE must be 'streaming' or 'batch'")
+        return v
+
+    @field_validator('PIPELINE_PHASE_TIMEOUT', 'PIPELINE_DRAIN_TIMEOUT')
+    @classmethod
+    def validate_pipeline_timeouts(cls, v, info):
+        """Validate pipeline timeout values are positive."""
+        if v <= 0:
+            raise ValueError(f"{info.field_name} must be positive (got {v})")
+        return v
+
+    @field_validator('PIPELINE_PAUSE_CHECK_INTERVAL', 'PIPELINE_DISCOVERY_COMPLETION_DELAY')
+    @classmethod
+    def validate_pipeline_intervals(cls, v, info):
+        """Validate pipeline interval values are positive."""
+        if v <= 0:
+            raise ValueError(f"{info.field_name} must be positive (got {v})")
         return v
 
     # --- OpenRouter Configuration ---
