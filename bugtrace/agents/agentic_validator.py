@@ -34,6 +34,8 @@ from bugtrace.tools.visual.verifier import XSSVerifier, VerificationResult
 from bugtrace.core.ui import dashboard
 from bugtrace.core.config import settings
 from bugtrace.core.llm_client import llm_client
+from bugtrace.core.event_bus import EventType, event_bus as global_event_bus
+from bugtrace.core.validation_status import ValidationStatus
 # NOTE: ValidationFeedback imports removed - feedback loop eliminated for simplicity
 # AgenticValidator is now a linear CDP specialist (no loopback to specialist agents)
 
@@ -160,7 +162,7 @@ class AgenticValidator(BaseAgent):
         super().__init__("AgenticValidator", "AI Vision Validator", event_bus, agent_id="agentic_validator")
         self.max_retries = 3
         self.validation_prompts = self._load_prompts()
-        
+
         # Cancellation token for graceful shutdown (injected from orchestrator)
         self._cancellation_token = cancellation_token or {"cancelled": False}
 
@@ -178,12 +180,30 @@ class AgenticValidator(BaseAgent):
             "vision_analyzed": 0,
             "skipped_prevalidated": 0,
             "avg_time_ms": 0,
-            "total_time_ms": 0
+            "total_time_ms": 0,
+            # Phase 21: CDP load tracking
+            "total_received": 0,       # All vulnerability_detected events
+            "skipped_confirmed": 0,    # VALIDATED_CONFIRMED (skipped)
+            "queued_for_cdp": 0,       # PENDING_VALIDATION (processed)
+            "cdp_rejected": 0,         # CDP rejected as FP
         }
 
         # NOTE: Feedback loop removed - AgenticValidator is now a linear CDP specialist
         # No loopback to XSSAgent/CSTIAgent - validation is single-attempt
         self.llm_client = llm_client
+
+        # Phase 21: Subscribe to specialist vulnerability_detected events
+        self._event_bus = event_bus or global_event_bus
+        if self._event_bus:
+            self._event_bus.subscribe(
+                EventType.VULNERABILITY_DETECTED.value,
+                self.handle_vulnerability_detected
+            )
+            logger.info(f"[{self.name}] Subscribed to vulnerability_detected events")
+
+        # Validation queue for PENDING_VALIDATION findings
+        self._pending_queue: asyncio.Queue = asyncio.Queue()
+        self._queue_processor_task: Optional[asyncio.Task] = None
         
     def _load_prompts(self) -> Dict[str, str]:
         """Load specialized prompts for different vulnerability types."""
@@ -318,7 +338,126 @@ Respond in JSON format:
     async def run_loop(self):
         """Typically triggered by orchestrator, not continuous."""
         pass
-    
+
+    # =========================================================================
+    # Phase 21: Event-Driven Validation (PENDING_VALIDATION filtering)
+    # =========================================================================
+
+    async def handle_vulnerability_detected(self, data: Dict[str, Any]) -> None:
+        """
+        Handle vulnerability_detected events from specialist agents.
+
+        Only queue findings with PENDING_VALIDATION status for CDP validation.
+        VALIDATED_CONFIRMED findings are passed through without CDP.
+
+        Args:
+            data: Event payload with specialist, finding, status, scan_context
+        """
+        status = data.get("status", "")
+        specialist = data.get("specialist", "unknown")
+        finding = data.get("finding", {})
+
+        self._stats["total_received"] = self._stats.get("total_received", 0) + 1
+
+        # Filter: Only process PENDING_VALIDATION
+        if status != ValidationStatus.PENDING_VALIDATION.value:
+            self._stats["skipped_confirmed"] = self._stats.get("skipped_confirmed", 0) + 1
+            logger.debug(f"[{self.name}] Skipping {specialist} finding (status={status})")
+            return
+
+        # Queue for CDP validation
+        self._stats["queued_for_cdp"] = self._stats.get("queued_for_cdp", 0) + 1
+        logger.info(f"[{self.name}] Queuing {specialist} finding for CDP validation")
+
+        await self._pending_queue.put({
+            "specialist": specialist,
+            "finding": finding,
+            "scan_context": data.get("scan_context", ""),
+        })
+
+    async def start_queue_processor(self) -> None:
+        """Start the background queue processor for CDP validation."""
+        if self._queue_processor_task is None or self._queue_processor_task.done():
+            self._queue_processor_task = asyncio.create_task(self._process_pending_queue())
+            logger.info(f"[{self.name}] Started queue processor")
+
+    async def stop_queue_processor(self) -> None:
+        """Stop the background queue processor."""
+        if self._queue_processor_task and not self._queue_processor_task.done():
+            self._cancellation_token["cancelled"] = True
+            self._queue_processor_task.cancel()
+            try:
+                await self._queue_processor_task
+            except asyncio.CancelledError:
+                pass
+            logger.info(f"[{self.name}] Stopped queue processor")
+
+    async def _process_pending_queue(self) -> None:
+        """Process PENDING_VALIDATION findings from queue."""
+        while True:
+            try:
+                item = await asyncio.wait_for(self._pending_queue.get(), timeout=30.0)
+                await self._validate_and_emit(item)
+                self._pending_queue.task_done()
+            except asyncio.TimeoutError:
+                # Check if we should shut down
+                if self._cancellation_token.get("cancelled", False):
+                    break
+            except asyncio.CancelledError:
+                logger.info(f"[{self.name}] Queue processor cancelled")
+                break
+            except Exception as e:
+                logger.error(f"[{self.name}] Queue processing error: {e}")
+
+    async def _validate_and_emit(self, item: Dict[str, Any]) -> None:
+        """
+        Validate a finding via CDP and emit result event.
+
+        Emits:
+        - EventType.FINDING_VALIDATED if CDP confirms
+        - EventType.FINDING_REJECTED if CDP rejects as FP
+        """
+        specialist = item.get("specialist", "unknown")
+        finding = item.get("finding", {})
+        scan_context = item.get("scan_context", "")
+
+        # Build finding dict for validation
+        finding_for_validation = {
+            "url": finding.get("url", ""),
+            "payload": finding.get("payload", ""),
+            "parameter": finding.get("parameter", ""),
+            "type": finding.get("type", specialist.upper()),
+            "evidence": finding.get("evidence", {}),
+        }
+
+        # Perform CDP validation
+        result = await self.validate_finding_agentically(finding_for_validation)
+
+        # Determine event type based on result
+        if result.get("validated", False):
+            event_type = EventType.FINDING_VALIDATED
+            status = "VALIDATED"
+            self._stats["cdp_confirmed"] += 1
+        else:
+            event_type = EventType.FINDING_REJECTED
+            status = "REJECTED_FP"
+            self._stats["cdp_rejected"] = self._stats.get("cdp_rejected", 0) + 1
+
+        # Emit result event
+        if self._event_bus:
+            await self._event_bus.emit(event_type, {
+                "specialist": specialist,
+                "finding": finding,
+                "validation_result": {
+                    "status": status,
+                    "reasoning": result.get("reasoning", ""),
+                    "screenshot_path": result.get("screenshot_path"),
+                    "confidence": result.get("confidence", 0.0),
+                },
+                "scan_context": scan_context,
+            })
+            logger.info(f"[{self.name}] Emitted {event_type.value} for {specialist}")
+
     async def validate_with_vision(
         self, 
         finding: Dict[str, Any],
@@ -532,10 +671,17 @@ Respond in JSON format:
         self._stats["avg_time_ms"] = self._stats["total_time_ms"] / self._stats["total_validated"]
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get validation statistics for reporting."""
+        """Get validation statistics including CDP load percentage."""
+        total = self._stats.get("total_received", 0)
+        cdp_processed = self._stats.get("queued_for_cdp", 0)
+
+        cdp_load = (cdp_processed / total * 100) if total > 0 else 0.0
+
         return {
             **self._stats,
-            "cache_size": len(self._cache)
+            "cache_size": len(self._cache),
+            "cdp_load_percent": round(cdp_load, 2),
+            "cdp_target_met": cdp_load <= 1.0,  # Target: <1%
         }
 
     async def _execute_payload_optimized(
