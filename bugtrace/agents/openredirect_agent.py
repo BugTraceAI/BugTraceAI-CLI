@@ -273,7 +273,55 @@ class OpenRedirectAgent(BaseAgent):
         - Append payload to path
         - Or inject in path segment
         """
-        # Placeholder - will be implemented in Task 2
+        parsed = urlparse(self.url)
+        path = parsed.path
+
+        # Try appending payload to path
+        for tier in ["basic"]:  # Path redirects usually work with basic payloads
+            payloads = get_payloads_for_tier(tier, DEFAULT_ATTACKER_DOMAIN)
+
+            for payload in payloads:
+                # Try payload as path segment
+                test_paths = [
+                    f"{path.rstrip('/')}/{payload}",
+                    f"{path}?url={payload}",  # Some path handlers accept query
+                ]
+
+                for test_path in test_paths:
+                    test_url = urlunparse(parsed._replace(path=test_path, query=''))
+
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(
+                                test_url,
+                                allow_redirects=False,
+                                timeout=aiohttp.ClientTimeout(total=5)
+                            ) as response:
+                                if response.status not in REDIRECT_STATUS_CODES:
+                                    continue
+
+                                location = response.headers.get('Location', '')
+                                if self._is_external_redirect(location, payload):
+                                    return {
+                                        "exploitable": True,
+                                        "type": "OPEN_REDIRECT",
+                                        "param": None,
+                                        "path": test_path,
+                                        "payload": payload,
+                                        "tier": tier,
+                                        "technique": "path_based",
+                                        "status_code": response.status,
+                                        "location": location,
+                                        "test_url": test_url,
+                                        "method": "PATH_REDIRECT",
+                                        "severity": "MEDIUM",
+                                        "http_request": f"GET {test_url}",
+                                        "http_response": f"HTTP/{response.version.major}.{response.version.minor} {response.status}\nLocation: {location}",
+                                    }
+
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        logger.debug(f"Path test failed for {test_url}: {e}")
+
         return None
 
     async def _test_content_vector(self, vector: Dict) -> Optional[Dict]:
@@ -282,7 +330,55 @@ class OpenRedirectAgent(BaseAgent):
 
         These are more informational - we check if user input flows to redirect.
         """
-        # Placeholder - will be implemented in Task 2
+        redirect_url = vector.get("redirect_url", "")
+
+        # Check if the redirect URL appears to be user-controllable
+        # (contains param markers or dynamic content)
+        if not redirect_url:
+            return None
+
+        # If redirect URL is already external, it's a finding
+        parsed = urlparse(redirect_url)
+        original_host = urlparse(self.url).netloc.lower()
+        redirect_host = parsed.netloc.lower()
+
+        if redirect_host and redirect_host != original_host:
+            return {
+                "exploitable": True,
+                "type": "OPEN_REDIRECT",
+                "param": None,
+                "payload": redirect_url,
+                "tier": "content",
+                "technique": vector.get("pattern_name", "javascript_redirect"),
+                "status_code": None,
+                "location": redirect_url,
+                "test_url": self.url,
+                "method": vector["type"],
+                "severity": "MEDIUM",
+                "http_request": f"GET {self.url}",
+                "http_response": f"JavaScript/Meta redirect to: {redirect_url}",
+            }
+
+        # Check if redirect URL contains variable markers (suggests user control)
+        dynamic_markers = ["getParam", "URLSearchParams", "location.search", "document.URL"]
+        for marker in dynamic_markers:
+            if marker in str(vector.get("source", "")):
+                return {
+                    "exploitable": True,
+                    "type": "OPEN_REDIRECT",
+                    "param": None,
+                    "payload": "User-controlled JavaScript redirect",
+                    "tier": "content",
+                    "technique": "dynamic_javascript",
+                    "status_code": None,
+                    "location": redirect_url,
+                    "test_url": self.url,
+                    "method": "JAVASCRIPT_DYNAMIC",
+                    "severity": "MEDIUM",
+                    "http_request": f"GET {self.url}",
+                    "http_response": f"Dynamic JS redirect pattern detected",
+                }
+
         return None
 
     def _analyze_http_redirect(self, vector: Dict) -> Optional[Dict]:
@@ -291,7 +387,38 @@ class OpenRedirectAgent(BaseAgent):
 
         If the page already redirects externally, check if it's controllable.
         """
-        # Placeholder - will be implemented in Task 2
+        location = vector.get("location", "")
+        status_code = vector.get("status_code")
+
+        # Check if redirect is to external domain
+        original_host = urlparse(self.url).netloc.lower()
+        redirect_parsed = urlparse(location)
+        redirect_host = redirect_parsed.netloc.lower()
+
+        if redirect_host and redirect_host != original_host:
+            # Check if any query param value appears in the redirect
+            parsed = urlparse(self.url)
+            params = parse_qs(parsed.query)
+
+            for param, values in params.items():
+                for value in values:
+                    if value and value in location:
+                        return {
+                            "exploitable": True,
+                            "type": "OPEN_REDIRECT",
+                            "param": param,
+                            "payload": value,
+                            "tier": "existing",
+                            "technique": "reflected_redirect",
+                            "status_code": status_code,
+                            "location": location,
+                            "test_url": self.url,
+                            "method": "HTTP_HEADER_REFLECTED",
+                            "severity": "MEDIUM",
+                            "http_request": f"GET {self.url}",
+                            "http_response": f"HTTP/1.1 {status_code}\nLocation: {location}",
+                        }
+
         return None
 
     async def _create_finding(self, result: Dict):
