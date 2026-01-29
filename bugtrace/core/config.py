@@ -96,6 +96,14 @@ class Settings(BaseSettings):
     THINKING_BACKPRESSURE_DELAY: float = 0.5  # Seconds between retries
     THINKING_EMIT_EVENTS: bool = True  # Emit work_queued events
 
+    # --- Worker Pool Configuration (Phase 19: v2.3) ---
+    WORKER_POOL_DEFAULT_SIZE: int = 5  # Default workers per specialist
+    WORKER_POOL_XSS_SIZE: int = 8  # XSS-specific (high volume)
+    WORKER_POOL_SQLI_SIZE: int = 5  # SQLi-specific
+    WORKER_POOL_SHUTDOWN_TIMEOUT: float = 30.0  # Max seconds to drain on shutdown
+    WORKER_POOL_DEQUEUE_TIMEOUT: float = 5.0  # Seconds to wait for queue item
+    WORKER_POOL_EMIT_EVENTS: bool = True  # Emit vulnerability_detected events
+
     def get_threshold_for_type(self, vuln_type: str) -> int:
         """Get the skeptical threshold for a vulnerability type."""
         vuln_upper = vuln_type.upper()
