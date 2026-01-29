@@ -24,8 +24,9 @@ class DASTySASTAgent(BaseAgent):
         self.report_dir = report_dir
         self.state_manager = state_manager
         
-        # 5 different analysis approaches for maximum coverage
-        self.approaches = ["pentester", "bug_bounty", "code_auditor", "red_team", "researcher"]
+        # 6 different analysis approaches for maximum coverage
+        # 5 core LLM approaches + 1 skeptical approach for early FP elimination
+        self.approaches = ["pentester", "bug_bounty", "code_auditor", "red_team", "researcher", "skeptical_agent"]
         self.model = getattr(settings, "ANALYSIS_PENTESTER_MODEL", None) or settings.DEFAULT_MODEL
         
     async def run_loop(self):
@@ -105,9 +106,11 @@ class DASTySASTAgent(BaseAgent):
 
     async def _run_execute_analyses(self, context: Dict) -> List[Dict]:
         """Execute parallel analyses with all approaches."""
+        # Run 5 core approaches in parallel first
+        core_approaches = [a for a in self.approaches if a != "skeptical_agent"]
         tasks = [
             self._analyze_with_approach(context, approach)
-            for approach in self.approaches
+            for approach in core_approaches
         ]
 
         # Add Header Injection Check
@@ -115,7 +118,15 @@ class DASTySASTAgent(BaseAgent):
         tasks.append(self._check_header_injection(header_detector))
 
         analyses = await asyncio.gather(*tasks, return_exceptions=True)
-        return [a for a in analyses if isinstance(a, dict) and not a.get("error")]
+        valid_analyses = [a for a in analyses if isinstance(a, dict) and not a.get("error")]
+
+        # Run skeptical_agent AFTER to review findings from core approaches
+        if "skeptical_agent" in self.approaches:
+            skeptical_result = await self._run_skeptical_approach(context, valid_analyses)
+            if skeptical_result and not skeptical_result.get("error"):
+                valid_analyses.append(skeptical_result)
+
+        return valid_analyses
 
     async def _run_save_results(self, vulnerabilities: List[Dict]):
         """Save vulnerabilities to state manager and markdown report."""
@@ -355,11 +366,150 @@ Return ONLY valid XML tags. Do not add markdown code blocks.
 
     def _get_system_prompt(self, approach: str) -> str:
         """Get system prompt from external config."""
+        if approach == "skeptical_agent":
+            return self._get_skeptical_system_prompt()
+
         personas = self.agent_config.get("personas", {})
         if approach in personas:
             return personas[approach].strip()
-            
+
         return self.system_prompt or "You are an expert security analyst."
+
+    def _get_skeptical_system_prompt(self) -> str:
+        """
+        Get system prompt for skeptical_agent approach.
+
+        The skeptical agent's job is to:
+        1. Challenge findings from other approaches
+        2. Identify common false positive patterns
+        3. Assign FP likelihood scores
+        """
+        return """You are a SKEPTICAL security auditor. Your job is to CHALLENGE vulnerability findings and identify FALSE POSITIVES.
+
+SKEPTICAL MINDSET:
+- Parameter names alone (id, user, file) are NOT evidence of vulnerability
+- Generic patterns without concrete evidence are likely false positives
+- Error messages must be SPECIFIC SQL/command errors, not generic 500s
+- XSS requires UNESCAPED reflection in dangerous contexts, not just reflection
+- WAF-blocked requests indicate the app HAS protections
+
+FALSE POSITIVE INDICATORS:
+- "Could be vulnerable" or "potentially" without concrete evidence
+- Vulnerability based on parameter NAME only (id -> SQLi assumption)
+- No specific payload that would trigger the issue
+- Technology stack inference without actual testing
+- Assumptions based on common patterns
+
+LIKELY TRUE POSITIVE INDICATORS:
+- Specific error messages (SQL syntax errors, stack traces)
+- Unescaped user input in script/event handler contexts
+- Demonstrated behavioral differences (time-based, boolean-based)
+- OOB callbacks received
+- Specific version with known CVE
+
+For EACH potential vulnerability, assign a SKEPTICAL_SCORE:
+- 0-3: LIKELY FALSE POSITIVE - Reject, based on weak evidence
+- 4-5: UNCERTAIN - Could be either, needs specialist validation
+- 6-7: PLAUSIBLE - Some evidence, worth specialist investigation
+- 8-10: LIKELY TRUE POSITIVE - Strong evidence, high priority
+
+REMEMBER: Being skeptical SAVES TIME. False positives waste specialist agent resources."""
+
+    async def _run_skeptical_approach(self, context: Dict, prior_analyses: List[Dict]) -> Dict:
+        """
+        Run skeptical_agent approach to review findings from core approaches.
+
+        The skeptical agent sees ALL prior findings and challenges them,
+        assigning skeptical_scores to help filter false positives early.
+        """
+        # Consolidate prior findings for skeptical review
+        prior_findings = []
+        for analysis in prior_analyses:
+            for vuln in analysis.get("vulnerabilities", []):
+                prior_findings.append(vuln)
+
+        if not prior_findings:
+            return {"vulnerabilities": []}
+
+        # Build skeptical review prompt
+        system_prompt = self._get_skeptical_system_prompt()
+        user_prompt = self._build_skeptical_prompt(context, prior_findings)
+
+        try:
+            response = await llm_client.generate(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                model_override=settings.SKEPTICAL_MODEL,  # Use fast model for efficiency
+                module_name="DASTySASTAgent_Skeptical",
+                max_tokens=4000
+            )
+
+            if not response:
+                return {"error": "Empty response from skeptical agent"}
+
+            return self._parse_skeptical_response(response, prior_findings)
+
+        except Exception as e:
+            logger.error(f"Skeptical approach failed: {e}", exc_info=True)
+            return {"error": str(e)}
+
+    def _build_skeptical_prompt(self, context: Dict, prior_findings: List[Dict]) -> str:
+        """Build prompt for skeptical review of prior findings."""
+        findings_summary = []
+        for i, f in enumerate(prior_findings):
+            findings_summary.append(
+                f"{i+1}. {f.get('type', 'Unknown')} on '{f.get('parameter', 'unknown')}' "
+                f"(confidence: {f.get('confidence_score', 5)}/10)\n"
+                f"   Reasoning: {f.get('reasoning', 'No reasoning')[:200]}"
+            )
+
+        return f"""Review these vulnerability findings and identify FALSE POSITIVES:
+
+=== TARGET ===
+URL: {self.url}
+
+=== FINDINGS TO REVIEW ({len(prior_findings)} total) ===
+{chr(10).join(findings_summary)}
+
+=== YOUR TASK ===
+For EACH finding, assign a SKEPTICAL_SCORE (0-10):
+- 0-3: LIKELY FALSE POSITIVE (reject)
+- 4-5: UNCERTAIN (needs validation)
+- 6-7: PLAUSIBLE (investigate)
+- 8-10: LIKELY TRUE POSITIVE (high priority)
+
+Return XML:
+<skeptical_review>
+  <finding>
+    <index>1</index>
+    <type>XSS</type>
+    <skeptical_score>3</skeptical_score>
+    <fp_reason>Based on parameter name only, no evidence of reflection</fp_reason>
+  </finding>
+</skeptical_review>
+
+Be RUTHLESS. False positives waste resources."""
+
+    def _parse_skeptical_response(self, response: str, prior_findings: List[Dict]) -> Dict:
+        """Parse skeptical review response and tag findings with skeptical scores."""
+        parser = XmlParser()
+        finding_blocks = parser.extract_list(response, "finding")
+
+        scored_findings = []
+
+        for block in finding_blocks:
+            try:
+                idx = int(parser.extract_tag(block, "index")) - 1
+                if 0 <= idx < len(prior_findings):
+                    finding = prior_findings[idx].copy()
+                    finding["skeptical_score"] = int(parser.extract_tag(block, "skeptical_score") or "5")
+                    finding["fp_reason"] = parser.extract_tag(block, "fp_reason") or ""
+                    scored_findings.append(finding)
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Failed to parse skeptical finding: {e}")
+
+        logger.info(f"[{self.name}] Skeptical review: {len(scored_findings)} findings scored")
+        return {"vulnerabilities": scored_findings, "approach": "skeptical_agent"}
 
     def _consolidate(self, analyses: List[Dict]) -> List[Dict]:
         """Consolidate findings from different approaches using simple voting/merging."""
