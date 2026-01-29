@@ -36,6 +36,7 @@ from bugtrace.utils.token_scanner import find_jwts
 from bugtrace.agents.asset_discovery_agent import AssetDiscoveryAgent
 from bugtrace.agents.api_security_agent import APISecurityAgent
 from bugtrace.agents.chain_discovery_agent import ChainDiscoveryAgent
+from bugtrace.agents.openredirect_agent import OpenRedirectAgent
 
 # Event Bus integration
 from bugtrace.core.event_bus import event_bus
@@ -1246,6 +1247,12 @@ class TeamOrchestrator:
             idor_agent = IDORAgent(url, params=idor_params, report_dir=url_dir)
             tasks.append(run_agent_with_semaphore(self.url_semaphore, idor_agent, process_result))
 
+        if "OPENREDIRECT_AGENT" in specialist_dispatches:
+            from bugtrace.agents.openredirect_agent import OpenRedirectAgent
+            p_list = list(params_map.get("OPENREDIRECT_AGENT", [])) or None
+            openredirect_agent = OpenRedirectAgent(url, p_list, url_dir)
+            tasks.append(run_agent_with_semaphore(self.url_semaphore, openredirect_agent, process_result))
+
         return tasks
 
     async def _execute_agents(self, agent_tasks: list, dashboard) -> bool:
@@ -1497,6 +1504,8 @@ class TeamOrchestrator:
         if "RCE" in v_type or "COMMAND" in v_type or "REMOTE CODE" in v_type: return "RCE_AGENT"
         if "UPLOAD" in v_type or "FILES" in v_type: return "FILE_UPLOAD_AGENT"
         if "JWT" in v_type or "TOKEN" in v_type: return "JWT_AGENT"
+        if "REDIRECT" in v_type or "OPEN REDIRECT" in v_type or "URL REDIRECT" in v_type: return "OPENREDIRECT_AGENT"
+        if "IDOR" in v_type or "INSECURE DIRECT" in v_type: return "IDOR_AGENT"
 
         return None
 
@@ -1518,6 +1527,10 @@ class TeamOrchestrator:
         - HEADER_INJECTION (CRLF, Response Splitting)
         - FILE_UPLOAD_AGENT (Unrestricted file upload, RCE via shell)
         - IDOR_AGENT (Insecure Direct Object Reference, Parameter Tampering)
+        - SSRF_AGENT (Server-Side Request Forgery, internal network access)
+        - LFI_AGENT (Local File Inclusion, path traversal)
+        - RCE_AGENT (Remote Code Execution, command injection)
+        - OPENREDIRECT_AGENT (Open Redirect, URL redirection to untrusted site)
         - IGNORE (If low confidence or not relevant)
 
         Return ONLY the Agent Name using XML format:
@@ -1533,7 +1546,11 @@ class TeamOrchestrator:
 
         if chosen_agent:
             chosen_agent = chosen_agent.strip().replace("`", "").upper()
-            valid_agents = ["XSS_AGENT", "SQL_AGENT", "XXE_AGENT", "SSRF_AGENT", "LFI_AGENT", "RCE_AGENT", "PROTO_AGENT", "HEADER_INJECTION", "IDOR_AGENT", "JWT_AGENT", "FILE_UPLOAD_AGENT", "IGNORE"]
+            valid_agents = [
+                "XSS_AGENT", "SQL_AGENT", "XXE_AGENT", "SSRF_AGENT", "LFI_AGENT",
+                "RCE_AGENT", "PROTO_AGENT", "HEADER_INJECTION", "IDOR_AGENT",
+                "JWT_AGENT", "FILE_UPLOAD_AGENT", "OPENREDIRECT_AGENT", "IGNORE"
+            ]
 
             for valid in valid_agents:
                 if valid in chosen_agent:
