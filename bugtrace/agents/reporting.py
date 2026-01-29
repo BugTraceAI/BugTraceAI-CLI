@@ -101,6 +101,86 @@ class ReportingAgent(BaseAgent):
         self._subscribed = False
         logger.info(f"[{self.name}] Unsubscribed from validation events")
 
+    async def _handle_vulnerability_detected(self, data: Dict[str, Any]) -> None:
+        """
+        Handle vulnerability_detected events from specialist agents.
+
+        Only processes findings with VALIDATED_CONFIRMED status (specialist self-validated).
+        These are high-confidence findings that don't require CDP validation.
+
+        Args:
+            data: Event payload containing:
+                - status: ValidationStatus string
+                - finding: Finding dictionary
+                - specialist: Specialist agent name
+                - scan_context: Scan context identifier
+                - validation_requires_cdp: Whether CDP validation was needed
+        """
+        status = data.get("status", "")
+
+        # Only collect VALIDATED_CONFIRMED findings (skip PENDING_VALIDATION)
+        if status != ValidationStatus.VALIDATED_CONFIRMED.value:
+            return
+
+        finding = data.get("finding", {}).copy()
+        specialist = data.get("specialist", "unknown")
+
+        # Enrich finding with event metadata
+        finding["scan_context"] = data.get("scan_context", "")
+        finding["specialist"] = specialist
+        finding["validation_requires_cdp"] = data.get("validation_requires_cdp", False)
+        finding["status"] = status
+        finding["event_source"] = "vulnerability_detected"
+
+        self._validated_findings.append(finding)
+        logger.info(f"[{self.name}] Collected VALIDATED_CONFIRMED finding from {specialist}")
+
+    async def _handle_finding_validated(self, data: Dict[str, Any]) -> None:
+        """
+        Handle finding_validated events from AgenticValidator.
+
+        These are findings that required CDP validation and were confirmed.
+
+        Args:
+            data: Event payload containing:
+                - finding: Original finding dictionary
+                - validation_result: CDP validation result with reasoning/confidence
+                - scan_context: Scan context identifier
+        """
+        finding = data.get("finding", {}).copy()
+        validation_result = data.get("validation_result", {})
+        specialist = finding.get("specialist", data.get("specialist", "unknown"))
+
+        # Mark as CDP-validated
+        finding["status"] = "VALIDATED"
+        finding["cdp_validated"] = True
+        finding["cdp_reasoning"] = validation_result.get("reasoning", "")
+        finding["cdp_confidence"] = validation_result.get("confidence", 0.0)
+        finding["scan_context"] = data.get("scan_context", "")
+        finding["event_source"] = "finding_validated"
+
+        self._validated_findings.append(finding)
+        logger.info(f"[{self.name}] Collected CDP-VALIDATED finding from {specialist}")
+
+    def get_validated_findings(self) -> List[Dict]:
+        """
+        Get a copy of all accumulated validated findings.
+
+        Returns:
+            List of validated finding dictionaries (copy to prevent mutation)
+        """
+        return self._validated_findings.copy()
+
+    def clear_validated_findings(self) -> None:
+        """
+        Clear all accumulated validated findings.
+
+        Useful for testing or multi-scan scenarios where the same
+        ReportingAgent instance is reused.
+        """
+        self._validated_findings.clear()
+        logger.debug(f"[{self.name}] Cleared validated findings")
+
     async def run_loop(self):
         """Not used - call generate_all_deliverables() directly."""
         pass
