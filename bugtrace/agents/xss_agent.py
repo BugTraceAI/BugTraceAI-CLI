@@ -2633,7 +2633,34 @@ Return JSON:
                 return True
 
         return False
-    
+
+    def _detect_execution_context(self, payload: str, response_html: str) -> Optional[str]:
+        """
+        Detect the execution context where payload landed.
+
+        Returns context type for high-confidence execution, or None.
+        Priority order: script_block > event_handler > javascript_uri > template_expression
+        """
+        escaped = re.escape(payload)
+
+        # 1. Script block - highest priority (direct execution in <script> tags)
+        if re.search(rf'<script[^>]*>.*?{escaped}.*?</script>', response_html, re.DOTALL | re.IGNORECASE):
+            return "script_block"
+
+        # 2. Event handler attributes (onclick, onerror, onload, etc.)
+        if re.search(rf'on\w+\s*=\s*["\'][^"\']*{escaped}', response_html, re.IGNORECASE):
+            return "event_handler"
+
+        # 3. javascript: URI scheme (href, src, action attributes)
+        if re.search(rf'(href|src|action)\s*=\s*["\']?javascript:[^"\']*{escaped}', response_html, re.IGNORECASE):
+            return "javascript_uri"
+
+        # 4. Template expressions (Angular/Vue/etc.)
+        if re.search(rf'\{{\{{[^}}]*{escaped}[^}}]*\}}\}}', response_html) or re.search(rf'\$\{{[^}}]*{escaped}[^}}]*\}}', response_html):
+            return "template_expression"
+
+        return None
+
     def _fragment_build_url(self, payload: str) -> str:
         """Build fragment URL with payload in hash (bypasses WAF)."""
         from urllib.parse import urlparse
