@@ -81,6 +81,10 @@ openapi_tags = [
         "name": "health",
         "description": "Server health and readiness monitoring",
     },
+    {
+        "name": "metrics",
+        "description": "Real-time performance metrics - queue depths, CDP reduction, parallelization",
+    },
 ]
 
 # Create FastAPI app
@@ -309,10 +313,12 @@ async def readiness_check() -> Dict[str, Any]:
 from bugtrace.api.routes.scans import router as scans_router
 from bugtrace.api.routes.reports import router as reports_router
 from bugtrace.api.routes.config import router as config_router
+from bugtrace.api.routes.metrics import router as metrics_router
 
 app.include_router(scans_router, prefix="/api", tags=["scans"])
 app.include_router(reports_router, prefix="/api", tags=["reports"])
 app.include_router(config_router, prefix="/api", tags=["config"])
+app.include_router(metrics_router, prefix="/api", tags=["metrics"])
 
 
 # WebSocket endpoint for real-time scan event streaming
