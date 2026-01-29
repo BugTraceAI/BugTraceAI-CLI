@@ -15,6 +15,7 @@ from bugtrace.reporting.standards import (
     get_remediation_for_vuln,
     normalize_severity,
 )
+from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 
 logger = get_logger("agents.idor")
 
@@ -280,9 +281,26 @@ class IDORAgent(BaseAgent):
         Handle completed queue item processing.
 
         Emits vulnerability_detected event on confirmed findings.
+        Uses centralized validation status to determine if CDP validation is needed.
         """
         if result is None:
             return
+
+        # Use centralized validation status for proper tagging
+        # IDOR with differential analysis may need human verification
+        finding_data = {
+            "context": "idor_differential",
+            "payload": result.get("payload", ""),
+            "validation_method": "idor_fuzzer",
+            "evidence": {"diff_type": result.get("evidence", "")},
+        }
+        needs_cdp = requires_cdp_validation(finding_data)
+
+        # IDOR-specific edge case: Response differs but no clear user data markers
+        status = result.get("status", "PENDING_VALIDATION")
+        if status == "PENDING_VALIDATION":
+            # IDOR findings without clear PII/user data markers need validation
+            needs_cdp = True
 
         # Emit vulnerability_detected event
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
@@ -294,7 +312,8 @@ class IDORAgent(BaseAgent):
                     "parameter": result.get("parameter"),
                     "payload": result.get("payload"),
                 },
-                "status": result.get("status", "PENDING_VALIDATION"),
+                "status": status,
+                "validation_requires_cdp": needs_cdp,
                 "scan_context": self._scan_context,
             })
 

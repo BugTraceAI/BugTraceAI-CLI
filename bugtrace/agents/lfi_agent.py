@@ -14,6 +14,7 @@ from bugtrace.reporting.standards import (
     get_remediation_for_vuln,
     normalize_severity,
 )
+from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 
 logger = logging.getLogger(__name__)
 
@@ -339,9 +340,26 @@ class LFIAgent(BaseAgent):
         Handle completed queue item processing.
 
         Emits vulnerability_detected event on confirmed findings.
+        Uses centralized validation status to determine if CDP validation is needed.
         """
         if result is None:
             return
+
+        # Use centralized validation status for proper tagging
+        # PHP wrapper results may need additional verification if source code not confirmed
+        finding_data = {
+            "context": result.get("type", "LFI"),
+            "payload": result.get("payload", ""),
+            "validation_method": "lfi_fuzzer",
+            "evidence": {"response": result.get("evidence", "")},
+        }
+        needs_cdp = requires_cdp_validation(finding_data)
+
+        # LFI-specific edge case: PHP wrapper returned data but can't confirm source code
+        payload = result.get("payload", "")
+        status = result.get("status", "VALIDATED_CONFIRMED")
+        if "php://filter" in payload and status == "PENDING_VALIDATION":
+            needs_cdp = True
 
         # Emit vulnerability_detected event
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
@@ -353,7 +371,8 @@ class LFIAgent(BaseAgent):
                     "parameter": result.get("parameter"),
                     "payload": result.get("payload"),
                 },
-                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "status": status,
+                "validation_requires_cdp": needs_cdp,
                 "scan_context": self._scan_context,
             })
 

@@ -15,6 +15,7 @@ from bugtrace.reporting.standards import (
     get_remediation_for_vuln,
     normalize_severity,
 )
+from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 
 logger = logging.getLogger(__name__)
 
@@ -222,9 +223,33 @@ class RCEAgent(BaseAgent):
             return None
 
     async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
-        """Handle completed queue item processing."""
+        """
+        Handle completed queue item processing.
+
+        Emits vulnerability_detected event on confirmed findings.
+        Uses centralized validation status to determine if CDP validation is needed.
+        """
         if result is None:
             return
+
+        # Use centralized validation status for proper tagging
+        finding_data = {
+            "context": "rce_command",
+            "payload": result.get("payload", ""),
+            "validation_method": "rce_fuzzer",
+            "evidence": {"technique": result.get("evidence", "")},
+        }
+        needs_cdp = requires_cdp_validation(finding_data)
+
+        # RCE-specific edge case: Time-based blind RCE without command output
+        status = result.get("status", "VALIDATED_CONFIRMED")
+        evidence_str = result.get("evidence", "")
+        if "time" in str(evidence_str).lower() and "delay" in str(evidence_str).lower():
+            # Time-based detection without output confirmation may need validation
+            if "command_output" not in str(evidence_str):
+                needs_cdp = True
+                if status == "VALIDATED_CONFIRMED":
+                    status = ValidationStatus.PENDING_VALIDATION.value
 
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
@@ -235,7 +260,8 @@ class RCEAgent(BaseAgent):
                     "parameter": result.get("parameter"),
                     "payload": result.get("payload"),
                 },
-                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "status": status,
+                "validation_requires_cdp": needs_cdp,
                 "scan_context": self._scan_context,
             })
 

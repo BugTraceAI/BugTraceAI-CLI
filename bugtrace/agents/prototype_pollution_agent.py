@@ -13,6 +13,7 @@ from bugtrace.core.ui import dashboard
 from bugtrace.core.queue import queue_manager
 from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
+from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.utils.logger import get_logger
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
@@ -704,6 +705,18 @@ class PrototypePollutionAgent(BaseAgent):
         if result is None:
             return
 
+        # Build evidence from result for validation status determination
+        evidence = {
+            "pollution_verified": result.get("pollution_confirmed", False),
+            "rce_confirmed": result.get("rce_confirmed", False),
+            "gadget_chain_confirmed": result.get("gadget_found", False),
+            "pollution_attempt": result.get("exploitable", False),
+            "vulnerable_pattern": result.get("tier") in ("pollution_detection", "encoding_bypass"),
+        }
+
+        # Determine validation status
+        status = self._get_validation_status(evidence)
+
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
                 "specialist": "prototype_pollution",
@@ -714,11 +727,12 @@ class PrototypePollutionAgent(BaseAgent):
                     "payload": result.get("payload"),
                     "rce_escalation": result.get("rce_confirmed", False),
                 },
-                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "status": status,
+                "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
                 "scan_context": self._scan_context,
             })
 
-        logger.info(f"[{self.name}] Confirmed Prototype Pollution: {result.get('url', result.get('test_url'))} (RCE: {result.get('rce_confirmed', False)})")
+        logger.info(f"[{self.name}] Confirmed Prototype Pollution: {result.get('url', result.get('test_url'))} (RCE: {result.get('rce_confirmed', False)}) [status={status}]")
 
     async def _on_work_queued(self, data: dict) -> None:
         """Handle work_queued_prototype_pollution notification (logging only)."""
@@ -749,3 +763,40 @@ class PrototypePollutionAgent(BaseAgent):
             "queue_mode": True,
             "worker_stats": self._worker_pool.get_stats(),
         }
+
+    def _get_validation_status(self, evidence: Dict) -> str:
+        """
+        Determine tiered validation status for Prototype Pollution finding.
+
+        TIER 1 (VALIDATED_CONFIRMED): Definitive proof
+            - Object.prototype polluted and verified (marker appears in response)
+            - RCE escalation confirmed (command output or timing attack)
+            - Gadget chain exploitation successful
+
+        TIER 2 (PENDING_VALIDATION): Needs verification
+            - Pollution attempt detected but not verified
+            - Pattern suggests vulnerability but unconfirmed
+            - No marker reflection in response
+        """
+        # TIER 1: Pollution verified (marker in response)
+        if evidence.get("pollution_verified"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: RCE confirmed (highest severity)
+        if evidence.get("rce_confirmed"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: Gadget chain exploitation
+        if evidence.get("gadget_chain_confirmed"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 2: Pollution attempt without verification
+        if evidence.get("pollution_attempt") and not evidence.get("pollution_verified"):
+            return ValidationStatus.PENDING_VALIDATION.value
+
+        # TIER 2: Vulnerable pattern detected but unconfirmed
+        if evidence.get("vulnerable_pattern"):
+            return ValidationStatus.PENDING_VALIDATION.value
+
+        # Default: Confirmed if exploitation was successful
+        return ValidationStatus.VALIDATED_CONFIRMED.value

@@ -15,6 +15,7 @@ from bugtrace.core.ui import dashboard
 from bugtrace.core.queue import queue_manager
 from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
+from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -891,6 +892,9 @@ class JWTAgent(BaseAgent):
         if result is None:
             return
 
+        # Determine validation status from finding
+        status = self._get_validation_status(result)
+
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
                 "specialist": "jwt",
@@ -900,11 +904,12 @@ class JWTAgent(BaseAgent):
                     "vulnerability": result.get("vulnerability_type", result.get("type")),
                     "severity": result.get("severity"),
                 },
-                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "status": status,
+                "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
                 "scan_context": self._scan_context,
             })
 
-        logger.info(f"[{self.name}] Confirmed JWT vulnerability: {result.get('vulnerability_type', result.get('type', 'unknown'))}")
+        logger.info(f"[{self.name}] Confirmed JWT vulnerability: {result.get('vulnerability_type', result.get('type', 'unknown'))} [status={status}]")
 
     async def _on_work_queued(self, data: dict) -> None:
         """Handle work_queued_jwt notification (logging only)."""
@@ -935,6 +940,57 @@ class JWTAgent(BaseAgent):
             "queue_mode": True,
             "worker_stats": self._worker_pool.get_stats(),
         }
+
+    def _get_validation_status(self, finding: Dict) -> str:
+        """
+        Determine tiered validation status for JWT finding.
+
+        TIER 1 (VALIDATED_CONFIRMED): Definitive proof
+            - alg=none bypass works (token accepted without signature)
+            - Key confusion exploit succeeds (valid forged signature)
+            - Weak secret cracked and admin token accepted
+            - KID injection successful
+
+        TIER 2 (PENDING_VALIDATION): Needs verification
+            - Algorithm confusion detected but not confirmed
+            - Signature not verified by server (ambiguous behavior)
+            - JWT structure vulnerable but exploit not confirmed
+
+        Most JWT findings are business logic - if the forged token is accepted
+        with elevated privileges, it's VALIDATED_CONFIRMED.
+        """
+        vuln_type = finding.get("type", "").lower()
+
+        # TIER 1: None algorithm bypass confirmed
+        if "none" in vuln_type and finding.get("validated"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: Key confusion attack confirmed
+        if "confusion" in vuln_type and finding.get("validated"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: Weak secret cracked
+        if "weak" in vuln_type or "secret" in vuln_type:
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: KID injection successful
+        if "kid" in vuln_type and finding.get("validated"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: Generic validated finding
+        if finding.get("validated") and finding.get("status") == "VALIDATED_CONFIRMED":
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 2: Algorithm confusion detected but not exploited
+        if "confusion" in vuln_type or "algorithm" in vuln_type:
+            return ValidationStatus.PENDING_VALIDATION.value
+
+        # TIER 2: JWT vulnerability detected but needs confirmation
+        if not finding.get("validated"):
+            return ValidationStatus.PENDING_VALIDATION.value
+
+        # Default: Specialist trust
+        return ValidationStatus.VALIDATED_CONFIRMED.value
 
 
 async def run_jwt_analysis(token: str, url: str) -> Dict:

@@ -12,6 +12,7 @@ from bugtrace.core.ui import dashboard
 from bugtrace.core.queue import queue_manager
 from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
+from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.utils.logger import get_logger
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
@@ -719,6 +720,20 @@ class OpenRedirectAgent(BaseAgent):
         if result is None:
             return
 
+        # Build evidence from result for validation status determination
+        method = result.get("method", "")
+        evidence = {
+            "location_header_redirect": method in ("HTTP_HEADER", "HTTP_HEADER_REFLECTED", "PATH_REDIRECT"),
+            "meta_refresh_redirect": method == "META_REFRESH",
+            "js_redirect": method in ("JAVASCRIPT", "JAVASCRIPT_DYNAMIC"),
+            "dynamic_redirect": method == "JAVASCRIPT_DYNAMIC",
+            "status_code": result.get("status_code"),
+            "external_redirect": result.get("exploitable", False),
+        }
+
+        # Determine validation status
+        status = self._get_validation_status(evidence)
+
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
                 "specialist": "openredirect",
@@ -728,11 +743,12 @@ class OpenRedirectAgent(BaseAgent):
                     "parameter": result.get("param") or result.get("parameter"),
                     "payload": result.get("payload"),
                 },
-                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "status": status,
+                "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
                 "scan_context": self._scan_context,
             })
 
-        logger.info(f"[{self.name}] Confirmed Open Redirect: {result.get('url', result.get('test_url'))}")
+        logger.info(f"[{self.name}] Confirmed Open Redirect: {result.get('url', result.get('test_url'))} [status={status}]")
 
     async def _on_work_queued(self, data: dict) -> None:
         """Handle work_queued_openredirect notification (logging only)."""
@@ -763,3 +779,40 @@ class OpenRedirectAgent(BaseAgent):
             "queue_mode": True,
             "worker_stats": self._worker_pool.get_stats(),
         }
+
+    def _get_validation_status(self, evidence: Dict) -> str:
+        """
+        Determine tiered validation status for OpenRedirect finding.
+
+        TIER 1 (VALIDATED_CONFIRMED): Definitive proof
+            - Location header redirect to external domain confirmed
+            - Meta refresh redirect to external domain confirmed
+            - HTTP redirect response (3xx) with external Location
+
+        TIER 2 (PENDING_VALIDATION): Needs verification
+            - JavaScript-based redirect (needs browser execution to confirm)
+            - Dynamic redirect patterns (user-controllable but unconfirmed)
+        """
+        # TIER 1: HTTP Location header redirect confirmed
+        if evidence.get("location_header_redirect"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: Meta refresh redirect confirmed
+        if evidence.get("meta_refresh_redirect"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: HTTP redirect status code with external location
+        if evidence.get("status_code") in (301, 302, 303, 307, 308):
+            if evidence.get("external_redirect"):
+                return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 2: JavaScript-based redirect (needs browser confirmation)
+        if evidence.get("js_redirect"):
+            return ValidationStatus.PENDING_VALIDATION.value
+
+        # TIER 2: Dynamic redirect pattern detected
+        if evidence.get("dynamic_redirect"):
+            return ValidationStatus.PENDING_VALIDATION.value
+
+        # Default: HTTP-validated redirect is confirmed
+        return ValidationStatus.VALIDATED_CONFIRMED.value
