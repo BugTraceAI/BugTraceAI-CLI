@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.config import settings
 from bugtrace.core.queue import SpecialistQueue, queue_manager
+from bugtrace.core.parallelization_metrics import parallelization_metrics, get_parallelization_summary
 
 logger = get_logger("worker_pool")
 
@@ -137,6 +138,9 @@ class Worker:
                     # Timeout - check _running and retry
                     continue
 
+                # Record worker start for parallelization metrics
+                parallelization_metrics.record_worker_start(self.specialist, self.worker_id)
+
                 start = time.monotonic()
                 try:
                     # Process the item
@@ -156,6 +160,8 @@ class Worker:
                 finally:
                     latency = time.monotonic() - start
                     self._update_latency(latency)
+                    # Record worker stop for parallelization metrics
+                    parallelization_metrics.record_worker_stop(self.specialist, self.worker_id)
 
             except asyncio.CancelledError:
                 logger.debug(f"Worker {self.worker_id} cancelled")
@@ -328,6 +334,9 @@ class WorkerPool:
 
         uptime = time.monotonic() - self._started_at if self._started_at else 0.0
 
+        # Get parallelization data for this specialist
+        parallelization_data = get_parallelization_summary().get("by_specialist", {}).get(self.config.specialist, {})
+
         return {
             "specialist": self.config.specialist,
             "running": self._running,
@@ -338,6 +347,7 @@ class WorkerPool:
             "avg_latency_ms": round(avg_latency * 1000, 2),
             "uptime_seconds": round(uptime, 2),
             "queue_depth": self._queue.depth(),
+            "parallelization": parallelization_data,
             "workers": worker_stats,
         }
 
