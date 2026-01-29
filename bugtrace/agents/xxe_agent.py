@@ -1,7 +1,11 @@
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import aiohttp
 from bugtrace.agents.base import BaseAgent
+from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
+from bugtrace.core.queue import queue_manager
+from bugtrace.core.event_bus import EventType
+from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
@@ -16,15 +20,21 @@ class XXEAgent(BaseAgent):
     Specialist Agent for XML External Entity (XXE).
     Target: Endpoints consuming XML.
     """
-    
-    def __init__(self, url: str):
+
+    def __init__(self, url: str, event_bus: Any = None):
         super().__init__(
             name="XXEAgent",
             role="XXE Specialist",
+            event_bus=event_bus,
             agent_id="xxe_agent"
         )
         self.url = url
         self.MAX_BYPASS_ATTEMPTS = 5
+
+        # Queue consumption mode (Phase 20)
+        self._queue_mode = False
+        self._worker_pool: Optional[WorkerPool] = None
+        self._scan_context: str = ""
 
     def _determine_validation_status(self, payload: str, evidence: str = "success") -> str:
         """
@@ -167,7 +177,121 @@ class XXEAgent(BaseAgent):
             system_prompt=system_prompt,
             module_name="XXE_AGENT"
         )
-        
+
         from bugtrace.utils.parsers import XmlParser
         tags = ["payload", "vulnerable", "context", "confidence"]
         return XmlParser.extract_tags(response, tags)
+
+    # =========================================================================
+    # QUEUE CONSUMPTION MODE (Phase 20)
+    # =========================================================================
+
+    async def start_queue_consumer(self, scan_context: str) -> None:
+        """
+        Start XXEAgent in queue consumer mode.
+
+        Spawns a worker pool that consumes from the xxe queue and
+        processes findings in parallel.
+        """
+        self._queue_mode = True
+        self._scan_context = scan_context
+
+        config = WorkerConfig(
+            specialist="xxe",
+            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,
+            process_func=self._process_queue_item,
+            on_result=self._handle_queue_result,
+            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
+        )
+
+        self._worker_pool = WorkerPool(config)
+
+        if self.event_bus:
+            self.event_bus.subscribe(
+                EventType.WORK_QUEUED_XXE.value,
+                self._on_work_queued
+            )
+
+        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
+        await self._worker_pool.start()
+
+    async def _process_queue_item(self, item: dict) -> Optional[Dict]:
+        """Process a single item from the xxe queue."""
+        finding = item.get("finding", {})
+        url = finding.get("url")
+
+        if not url:
+            logger.warning(f"[{self.name}] Invalid queue item: missing url")
+            return None
+
+        self.url = url
+        return await self._test_single_url_from_queue(url, finding)
+
+    async def _test_single_url_from_queue(self, url: str, finding: dict) -> Optional[Dict]:
+        """Test a single URL from queue for XXE."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Test with heuristic payloads
+                successful_payloads, best_payload = await self._test_heuristic_payloads(session)
+
+                if successful_payloads:
+                    return self._create_finding(best_payload, successful_payloads)
+
+                # Try LLM bypass if heuristics failed
+                bypass_payloads, bypass_best = await self._try_llm_bypass(session, "")
+                if bypass_payloads:
+                    return self._create_finding(bypass_best, bypass_payloads)
+
+                return None
+        except Exception as e:
+            logger.error(f"[{self.name}] Queue item test failed: {e}")
+            return None
+
+    async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
+        """Handle completed queue item processing."""
+        if result is None:
+            return
+
+        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "xxe",
+                "finding": {
+                    "type": "XXE",
+                    "url": result.get("url"),
+                    "payload": result.get("payload"),
+                },
+                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "scan_context": self._scan_context,
+            })
+
+        logger.info(f"[{self.name}] Confirmed XXE: {result.get('url')}")
+
+    async def _on_work_queued(self, data: dict) -> None:
+        """Handle work_queued_xxe notification (logging only)."""
+        logger.debug(f"[{self.name}] Work queued: {data.get('finding', {}).get('url', 'unknown')}")
+
+    async def stop_queue_consumer(self) -> None:
+        """Stop queue consumer mode gracefully."""
+        if self._worker_pool:
+            await self._worker_pool.stop()
+            self._worker_pool = None
+
+        if self.event_bus:
+            self.event_bus.unsubscribe(
+                EventType.WORK_QUEUED_XXE.value,
+                self._on_work_queued
+            )
+
+        self._queue_mode = False
+        logger.info(f"[{self.name}] Queue consumer stopped")
+
+    def get_queue_stats(self) -> dict:
+        """Get queue consumer statistics."""
+        if not self._worker_pool:
+            return {"mode": "direct", "queue_mode": False}
+
+        return {
+            "mode": "queue",
+            "queue_mode": True,
+            "worker_stats": self._worker_pool.get_stats(),
+        }
