@@ -25,6 +25,130 @@ class QueueItem:
     enqueued_at: float = field(default_factory=time.monotonic)
 
 
+@dataclass
+class QueueStats:
+    """
+    Statistics for a specialist queue.
+
+    Tracks:
+    - Depth: Current queue size
+    - Throughput: Items processed per second
+    - Latency: Time from enqueue to dequeue
+
+    All timing uses monotonic clock for accuracy.
+    """
+    # Counters
+    total_enqueued: int = 0
+    total_dequeued: int = 0
+    total_rejected: int = 0  # Rejected due to backpressure
+
+    # Timing windows (for throughput calculation)
+    _enqueue_times: List[float] = field(default_factory=list)
+    _dequeue_times: List[float] = field(default_factory=list)
+    _latencies: List[float] = field(default_factory=list)
+
+    # Window size for rolling calculations
+    _window_seconds: float = 60.0
+    _max_samples: int = 1000
+
+    def record_enqueue(self) -> None:
+        """Record an enqueue event."""
+        self.total_enqueued += 1
+        now = time.monotonic()
+        self._enqueue_times.append(now)
+        self._prune_old_samples()
+
+    def record_dequeue(self, enqueued_at: float) -> None:
+        """Record a dequeue event with latency."""
+        self.total_dequeued += 1
+        now = time.monotonic()
+        self._dequeue_times.append(now)
+
+        # Calculate latency
+        latency = now - enqueued_at
+        self._latencies.append(latency)
+        self._prune_old_samples()
+
+    def record_rejected(self) -> None:
+        """Record a rejected enqueue (backpressure)."""
+        self.total_rejected += 1
+
+    def _prune_old_samples(self) -> None:
+        """Remove samples older than window."""
+        now = time.monotonic()
+        cutoff = now - self._window_seconds
+
+        # Prune old timestamps
+        self._enqueue_times = [t for t in self._enqueue_times if t > cutoff][-self._max_samples:]
+        self._dequeue_times = [t for t in self._dequeue_times if t > cutoff][-self._max_samples:]
+        self._latencies = self._latencies[-self._max_samples:]
+
+    @property
+    def enqueue_throughput(self) -> float:
+        """Items enqueued per second (rolling window)."""
+        if not self._enqueue_times:
+            return 0.0
+        window = time.monotonic() - self._enqueue_times[0]
+        if window <= 0:
+            return 0.0
+        return len(self._enqueue_times) / window
+
+    @property
+    def dequeue_throughput(self) -> float:
+        """Items dequeued per second (rolling window)."""
+        if not self._dequeue_times:
+            return 0.0
+        window = time.monotonic() - self._dequeue_times[0]
+        if window <= 0:
+            return 0.0
+        return len(self._dequeue_times) / window
+
+    @property
+    def avg_latency(self) -> float:
+        """Average latency in seconds."""
+        if not self._latencies:
+            return 0.0
+        return sum(self._latencies) / len(self._latencies)
+
+    @property
+    def p95_latency(self) -> float:
+        """95th percentile latency in seconds."""
+        if not self._latencies:
+            return 0.0
+        sorted_latencies = sorted(self._latencies)
+        idx = int(len(sorted_latencies) * 0.95)
+        return sorted_latencies[min(idx, len(sorted_latencies) - 1)]
+
+    @property
+    def max_latency(self) -> float:
+        """Maximum latency in seconds."""
+        if not self._latencies:
+            return 0.0
+        return max(self._latencies)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Export stats as dictionary."""
+        return {
+            "total_enqueued": self.total_enqueued,
+            "total_dequeued": self.total_dequeued,
+            "total_rejected": self.total_rejected,
+            "enqueue_throughput": round(self.enqueue_throughput, 2),
+            "dequeue_throughput": round(self.dequeue_throughput, 2),
+            "avg_latency_ms": round(self.avg_latency * 1000, 2),
+            "p95_latency_ms": round(self.p95_latency * 1000, 2),
+            "max_latency_ms": round(self.max_latency * 1000, 2),
+        }
+
+    def reset(self) -> None:
+        """Reset all statistics."""
+        self.total_enqueued = 0
+        self.total_dequeued = 0
+        self.total_rejected = 0
+        self._enqueue_times.clear()
+        self._dequeue_times.clear()
+        self._latencies.clear()
+
+
 class SpecialistQueue:
     """
     Async queue for specialist agents with backpressure and rate limiting.
@@ -47,6 +171,9 @@ class SpecialistQueue:
         self._tokens = self.rate_limit if self.rate_limit > 0 else float('inf')
         self._last_replenish = time.monotonic()
 
+        # Statistics tracking
+        self._stats = QueueStats()
+
         logger.info(f"Queue '{name}' created: max_depth={self.max_depth}, rate_limit={self.rate_limit}/s")
 
     async def enqueue(self, item: dict, scan_context: str) -> bool:
@@ -62,6 +189,7 @@ class SpecialistQueue:
         """
         # Check backpressure first
         if self.is_full():
+            self._stats.record_rejected()
             logger.warning(f"Queue '{self.name}' is full ({self.depth()}/{self.max_depth}), backpressure triggered")
             return False
 
@@ -76,6 +204,7 @@ class SpecialistQueue:
             enqueued_at=time.monotonic()
         )
         await self._queue.put(queue_item)
+        self._stats.record_enqueue()
         logger.debug(f"Queue '{self.name}' enqueued item (depth: {self.depth()})")
         return True
 
