@@ -3,8 +3,11 @@ from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import aiohttp
 from bugtrace.agents.base import BaseAgent
+from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
 from bugtrace.core.ui import dashboard
 from bugtrace.core.job_manager import JobStatus
+from bugtrace.core.event_bus import EventType
+from bugtrace.core.config import settings
 from bugtrace.utils.logger import get_logger
 from bugtrace.tools.external import external_tools
 from bugtrace.reporting.standards import (
@@ -21,19 +24,25 @@ class IDORAgent(BaseAgent):
     Target: Numeric ID parameters.
     Strategy: Test ID-1, ID+1 and compare with baseline.
     """
-    
-    def __init__(self, url: str, params: List[Dict] = None, report_dir: Path = None):
+
+    def __init__(self, url: str, params: List[Dict] = None, report_dir: Path = None, event_bus=None):
         super().__init__(
             name="IDORAgent",
             role="IDOR Specialist",
+            event_bus=event_bus,
             agent_id="idor_agent"
         )
         self.url = url
         self.params = params or []
         self.report_dir = report_dir or Path("./reports")
-        
+
         # Deduplication
         self._tested_params = set()
+
+        # Queue consumption mode (Phase 20)
+        self._queue_mode = False
+        self._worker_pool: Optional[WorkerPool] = None
+        self._scan_context: str = ""
         
     def _determine_validation_status(self, evidence_type: str, confidence: str) -> str:
         """
@@ -160,3 +169,144 @@ class IDORAgent(BaseAgent):
         except Exception as e:
             logger.debug(f"_fetch_with_cookie failed: {e}")
             return None
+
+    # =========================================================================
+    # Queue Consumption Mode (Phase 20)
+    # =========================================================================
+
+    async def start_queue_consumer(self, scan_context: str) -> None:
+        """
+        Start IDORAgent in queue consumer mode.
+
+        Spawns a worker pool that consumes from the idor queue and
+        processes findings in parallel.
+
+        Args:
+            scan_context: Scan identifier for event correlation
+        """
+        self._queue_mode = True
+        self._scan_context = scan_context
+
+        # Configure worker pool
+        config = WorkerConfig(
+            specialist="idor",
+            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,
+            process_func=self._process_queue_item,
+            on_result=self._handle_queue_result,
+            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
+        )
+
+        self._worker_pool = WorkerPool(config)
+
+        # Subscribe to work_queued_idor events (optional notification)
+        if self.event_bus:
+            self.event_bus.subscribe(
+                EventType.WORK_QUEUED_IDOR.value,
+                self._on_work_queued
+            )
+
+        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
+        await self._worker_pool.start()
+
+    async def stop_queue_consumer(self) -> None:
+        """Stop queue consumer mode gracefully."""
+        if self._worker_pool:
+            await self._worker_pool.stop()
+            self._worker_pool = None
+
+        if self.event_bus:
+            self.event_bus.unsubscribe(
+                EventType.WORK_QUEUED_IDOR.value,
+                self._on_work_queued
+            )
+
+        self._queue_mode = False
+        logger.info(f"[{self.name}] Queue consumer stopped")
+
+    async def _on_work_queued(self, data: dict) -> None:
+        """Handle work_queued_idor notification (logging only)."""
+        logger.debug(f"[{self.name}] Work queued: {data.get('finding', {}).get('url', 'unknown')}")
+
+    async def _process_queue_item(self, item: dict) -> Optional[Dict]:
+        """
+        Process a single item from the idor queue.
+
+        Item structure (from ThinkingConsolidationAgent):
+        {
+            "finding": {
+                "type": "IDOR",
+                "url": "...",
+                "parameter": "...",
+                "original_value": "...",  # Current ID value
+            },
+            "priority": 85.5,
+            "scan_context": "scan_123",
+            "classified_at": 1234567890.0
+        }
+        """
+        finding = item.get("finding", {})
+        url = finding.get("url")
+        param = finding.get("parameter")
+        original_value = finding.get("original_value", "")
+
+        if not url or not param:
+            logger.warning(f"[{self.name}] Invalid queue item: missing url or parameter")
+            return None
+
+        # Configure self for this specific test
+        self.url = url
+
+        # Run validation using existing IDOR testing logic
+        return await self._test_single_param_from_queue(url, param, original_value, finding)
+
+    async def _test_single_param_from_queue(
+        self, url: str, param: str, original_value: str, finding: dict
+    ) -> Optional[Dict]:
+        """
+        Test a single parameter from queue for IDOR.
+
+        Uses existing validation pipeline optimized for queue processing.
+        """
+        try:
+            # Use existing IDOR testing logic via _test_idor_param
+            item = {"parameter": param, "original_value": original_value}
+            return await self._test_idor_param(item)
+        except Exception as e:
+            logger.error(f"[{self.name}] Queue item test failed: {e}")
+            return None
+
+    async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
+        """
+        Handle completed queue item processing.
+
+        Emits vulnerability_detected event on confirmed findings.
+        """
+        if result is None:
+            return
+
+        # Emit vulnerability_detected event
+        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "idor",
+                "finding": {
+                    "type": "IDOR",
+                    "url": result.get("url"),
+                    "parameter": result.get("parameter"),
+                    "payload": result.get("payload"),
+                },
+                "status": result.get("status", "PENDING_VALIDATION"),
+                "scan_context": self._scan_context,
+            })
+
+        logger.info(f"[{self.name}] Confirmed IDOR: {result.get('url')}?{result.get('parameter')}")
+
+    def get_queue_stats(self) -> dict:
+        """Get queue consumer statistics."""
+        if not self._worker_pool:
+            return {"mode": "direct", "queue_mode": False}
+
+        return {
+            "mode": "queue",
+            "queue_mode": True,
+            "worker_stats": self._worker_pool.get_stats(),
+        }
