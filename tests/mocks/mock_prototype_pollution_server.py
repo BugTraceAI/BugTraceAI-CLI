@@ -141,6 +141,7 @@ async def safe_immutable_endpoint(request: web.Request) -> web.Response:
     """
     Safe endpoint: Uses Object.create(null) pattern.
     SAFE: No prototype chain, pollution impossible.
+    Filters exact and encoding bypass variants of __proto__/constructor.
     """
     try:
         body = await request.json()
@@ -149,9 +150,12 @@ async def safe_immutable_endpoint(request: web.Request) -> web.Response:
         # In real code: Object.create(null)
         safe_config = {}
         for key, value in body.items():
-            # Filter dangerous keys
-            if key not in ("__proto__", "constructor", "prototype"):
-                safe_config[key] = value
+            # Filter dangerous keys (exact match and encoding variants)
+            key_lower = key.lower().replace("_", "")
+            if any(dangerous in key_lower for dangerous in ["proto", "constructor", "prototype"]):
+                # Skip dangerous keys (log but don't error - immutable pattern just ignores)
+                continue
+            safe_config[key] = value
 
         return web.json_response({
             "status": "safe",
@@ -166,16 +170,19 @@ async def safe_frozen_endpoint(request: web.Request) -> web.Response:
     """
     Safe endpoint: Simulates Object.freeze pattern.
     SAFE: Prototype frozen, modification rejected.
+    Rejects exact and encoding bypass variants of __proto__/constructor.
     """
     try:
         body = await request.json()
 
-        # Check for pollution attempts
-        if "__proto__" in body or "constructor" in body:
-            return web.json_response({
-                "status": "rejected",
-                "error": "Prototype modification not allowed",
-            }, status=400)
+        # Check for pollution attempts (exact and encoding variants)
+        for key in body.keys():
+            key_lower = key.lower().replace("_", "")
+            if any(dangerous in key_lower for dangerous in ["proto", "constructor", "prototype"]):
+                return web.json_response({
+                    "status": "rejected",
+                    "error": "Prototype modification not allowed",
+                }, status=400)
 
         return web.json_response({
             "status": "safe",
