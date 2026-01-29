@@ -10,6 +10,7 @@ from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
 from bugtrace.core.job_manager import JobStatus
 from bugtrace.core.ui import dashboard
+from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 from bugtrace.utils.logger import get_logger
 from bugtrace.tools.external import external_tools
 from bugtrace.reporting.standards import (
@@ -171,25 +172,57 @@ class SSRFAgent(BaseAgent):
     def _determine_validation_status(self, res: Dict) -> bool:
         """Determines if the response indicates a successful SSRF."""
         text = res.get("text", "").lower()
-        
-        # 🟢 CLASSIC Indicators
+
+        # CLASSIC Indicators
         indicators = [
-            "root:x:", 
+            "root:x:",
             "connected to internal",
             "aws metadata",
             "metadata-flavor",
             "computeMetadata/v1"
         ]
-        
+
         for indicator in indicators:
             if indicator in text:
                 return True
-        
-        # 🟡 TIMING Indicators (Potential)
+
+        # TIMING Indicators (Potential)
         if res.get("elapsed", 0) > 3:
             return True
-            
+
         return False
+
+    def _get_validation_status(self, evidence: Dict) -> str:
+        """
+        Determine tiered validation status for SSRF finding.
+
+        TIER 1 (VALIDATED_CONFIRMED): Definitive proof
+            - Interactsh OOB callback received
+            - Internal IP response (cloud metadata, internal services)
+            - Cloud metadata content (AWS, GCP, Azure)
+
+        TIER 2 (PENDING_VALIDATION): Needs verification
+            - DNS rebinding (timing-based)
+            - Blind SSRF without OOB confirmation
+        """
+        # TIER 1: Definitive proof - OOB callback
+        if evidence.get("interactsh_hit"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: Internal IP response detected
+        if evidence.get("internal_ip_response"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: Cloud metadata content retrieved
+        if evidence.get("cloud_metadata"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: File content retrieved (SSRF to file://)
+        if evidence.get("file_content"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 2: Needs verification (blind SSRF, timing-based)
+        return ValidationStatus.PENDING_VALIDATION.value
 
     async def _llm_get_strategy(self, param: str) -> Dict:
         """Asks LLM for best SSRF payloads based on context."""
@@ -314,6 +347,20 @@ class SSRFAgent(BaseAgent):
         if result is None:
             return
 
+        # Build evidence from result for validation status determination
+        evidence = {
+            "interactsh_hit": result.get("interactsh_hit", False),
+            "internal_ip_response": "internal" in result.get("reason", "").lower(),
+            "cloud_metadata": any(
+                ind in result.get("reason", "").lower()
+                for ind in ["metadata", "cloud", "aws", "gcp"]
+            ),
+            "file_content": "file" in result.get("payload", "").lower(),
+        }
+
+        # Determine validation status
+        status = self._get_validation_status(evidence)
+
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
                 "specialist": "ssrf",
@@ -323,11 +370,12 @@ class SSRFAgent(BaseAgent):
                     "parameter": result.get("param"),
                     "payload": result.get("payload"),
                 },
-                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "status": status,
+                "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
                 "scan_context": self._scan_context,
             })
 
-        logger.info(f"[{self.name}] Confirmed SSRF: {self.url}?{result.get('param')}")
+        logger.info(f"[{self.name}] Confirmed SSRF: {self.url}?{result.get('param')} [status={status}]")
 
     async def _on_work_queued(self, data: dict) -> None:
         """Handle work_queued_ssrf notification (logging only)."""

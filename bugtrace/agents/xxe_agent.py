@@ -7,6 +7,7 @@ from bugtrace.core.queue import queue_manager
 from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
+from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -38,15 +39,70 @@ class XXEAgent(BaseAgent):
 
     def _determine_validation_status(self, payload: str, evidence: str = "success") -> str:
         """
-        Determine tiered validation status.
+        Determine tiered validation status for XXE finding.
+
+        TIER 1 (VALIDATED_CONFIRMED): Definitive proof
+            - File content exfiltrated (/etc/passwd)
+            - OOB callback received (Interactsh hit)
+            - DTD loaded with external entity
+
+        TIER 2 (PENDING_VALIDATION): Needs verification
+            - Error-based XXE (shows path but not content)
+            - Blind XXE without OOB confirmation
         """
-        # OOB (XXE OOB Triggered) or File Disclosure (etc/passwd)
-        if "passwd" in payload or "Triggered" in evidence:
-             logger.info(f"[{self.name}] High confidence. Marking as VALIDATED_CONFIRMED")
-             return "VALIDATED_CONFIRMED"
-             
-        logger.info(f"[{self.name}] XXE anomaly detected. Marking as VALIDATED_CONFIRMED (Specialist Trust).")
-        return "VALIDATED_CONFIRMED"
+        # TIER 1: File disclosure confirmed
+        if "passwd" in payload or "root:x:" in evidence:
+            logger.info(f"[{self.name}] File disclosure confirmed - VALIDATED_CONFIRMED")
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: OOB callback triggered
+        if "Triggered" in evidence or "oob" in evidence.lower():
+            logger.info(f"[{self.name}] OOB callback confirmed - VALIDATED_CONFIRMED")
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: DTD loaded successfully
+        if "dtd" in payload.lower() and "loaded" in evidence.lower():
+            logger.info(f"[{self.name}] DTD loaded confirmed - VALIDATED_CONFIRMED")
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: Entity confirmed in response
+        if "BUGTRACE_XXE_CONFIRMED" in evidence:
+            logger.info(f"[{self.name}] Entity confirmation - VALIDATED_CONFIRMED")
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 2: Error-based XXE (shows path but not file content)
+        if "failed to load" in evidence.lower() or "no such file" in evidence.lower():
+            logger.info(f"[{self.name}] Error-based XXE - PENDING_VALIDATION")
+            return ValidationStatus.PENDING_VALIDATION.value
+
+        # Default: High-confidence specialist trust
+        logger.info(f"[{self.name}] XXE anomaly detected - VALIDATED_CONFIRMED (Specialist Trust)")
+        return ValidationStatus.VALIDATED_CONFIRMED.value
+
+    def _get_validation_status_from_evidence(self, evidence: Dict) -> str:
+        """
+        Determine validation status from evidence dictionary.
+
+        Used by queue consumer for standardized event emission.
+        """
+        # TIER 1: File content exfiltrated
+        if evidence.get("file_content"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: OOB hit confirmed
+        if evidence.get("oob_hit") or evidence.get("interactsh_hit"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 1: DTD loaded successfully
+        if evidence.get("dtd_loaded"):
+            return ValidationStatus.VALIDATED_CONFIRMED.value
+
+        # TIER 2: Error-based (needs verification)
+        if evidence.get("error_based"):
+            return ValidationStatus.PENDING_VALIDATION.value
+
+        # Default: High-confidence
+        return ValidationStatus.VALIDATED_CONFIRMED.value
         
     def _get_initial_xxe_payloads(self) -> list:
         """Get baseline XXE payloads for testing."""
@@ -252,6 +308,19 @@ class XXEAgent(BaseAgent):
         if result is None:
             return
 
+        # Build evidence from result for validation status determination
+        payload = result.get("payload", "")
+        http_response = result.get("http_response", "")
+        evidence = {
+            "file_content": "root:x:" in http_response or "passwd" in payload,
+            "oob_hit": "oob" in http_response.lower() or "triggered" in http_response.lower(),
+            "dtd_loaded": "dtd" in payload.lower(),
+            "error_based": "failed to load" in http_response.lower() or "no such file" in http_response.lower(),
+        }
+
+        # Determine validation status
+        status = self._get_validation_status_from_evidence(evidence)
+
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
                 "specialist": "xxe",
@@ -260,11 +329,12 @@ class XXEAgent(BaseAgent):
                     "url": result.get("url"),
                     "payload": result.get("payload"),
                 },
-                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "status": status,
+                "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
                 "scan_context": self._scan_context,
             })
 
-        logger.info(f"[{self.name}] Confirmed XXE: {result.get('url')}")
+        logger.info(f"[{self.name}] Confirmed XXE: {result.get('url')} [status={status}]")
 
     async def _on_work_queued(self, data: dict) -> None:
         """Handle work_queued_xxe notification (logging only)."""
