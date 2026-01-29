@@ -77,19 +77,219 @@ class OpenRedirectAgent(BaseAgent):
 
     async def _hunter_phase(self) -> List[Dict]:
         """
-        Hunter Phase: Discover redirect vectors.
+        Hunter Phase: Discover all potential redirect vectors.
+
+        Scans for:
+        - Query parameters matching known redirect names
+        - URL paths that suggest redirect functionality
+        - JavaScript redirect patterns in response
+        - Meta refresh tags
+        - HTTP header-based redirects
 
         Returns:
-            List of potential redirect vectors with their parameters and contexts.
+            List of vectors with type, parameter/path, and source
         """
-        # TODO: Implement in subsequent plan
-        # Will detect:
-        # 1. URL parameters (url, redirect, next, return, etc.)
-        # 2. Path-based redirects (/redirect/*, /goto/*)
-        # 3. JavaScript redirect patterns (window.location, location.href)
-        # 4. Meta refresh tags
-        logger.info(f"[{self.name}] Hunter phase placeholder - to be implemented")
-        return []
+        dashboard.log(f"[{self.name}] Hunter: Scanning for redirect vectors", "INFO")
+        vectors = []
+
+        # 1. Check existing query parameters
+        param_vectors = self._discover_param_vectors()
+        vectors.extend(param_vectors)
+
+        # 2. Check URL path patterns
+        path_vectors = self._discover_path_vectors()
+        vectors.extend(path_vectors)
+
+        # 3. Fetch page and analyze content
+        try:
+            content_vectors = await self._discover_content_vectors()
+            vectors.extend(content_vectors)
+        except Exception as e:
+            logger.warning(f"[{self.name}] Content analysis failed: {e}")
+
+        dashboard.log(f"[{self.name}] Hunter found {len(vectors)} potential vectors", "INFO")
+        return vectors
+
+    def _discover_param_vectors(self) -> List[Dict]:
+        """Discover redirect vectors in query parameters."""
+        vectors = []
+        parsed = urlparse(self.url)
+        existing_params = parse_qs(parsed.query)
+
+        # Check if any existing params match redirect parameter names
+        for param in existing_params.keys():
+            param_lower = param.lower()
+
+            # Check against known redirect parameter list
+            for redirect_param in REDIRECT_PARAMS:
+                if param_lower == redirect_param.lower():
+                    vectors.append({
+                        "type": "QUERY_PARAM",
+                        "param": param,
+                        "value": existing_params[param][0] if existing_params[param] else "",
+                        "source": "URL_EXISTING",
+                        "confidence": "HIGH"
+                    })
+                    break
+
+            # Heuristic: check if param name contains redirect-related keywords
+            if not any(v["param"] == param for v in vectors):
+                keywords = ["redirect", "url", "next", "return", "goto", "dest", "redir", "callback", "continue"]
+                for keyword in keywords:
+                    if keyword in param_lower:
+                        vectors.append({
+                            "type": "QUERY_PARAM",
+                            "param": param,
+                            "value": existing_params[param][0] if existing_params[param] else "",
+                            "source": "URL_HEURISTIC",
+                            "confidence": "MEDIUM"
+                        })
+                        break
+
+        # Also check params provided to agent
+        if self.params:
+            for param in self.params:
+                if not any(v["param"] == param for v in vectors):
+                    vectors.append({
+                        "type": "QUERY_PARAM",
+                        "param": param,
+                        "value": "",
+                        "source": "AGENT_INPUT",
+                        "confidence": "HIGH"
+                    })
+
+        return vectors
+
+    def _discover_path_vectors(self) -> List[Dict]:
+        """Discover redirect vectors in URL paths."""
+        vectors = []
+        parsed = urlparse(self.url)
+        path = parsed.path.lower()
+
+        for pattern in PATH_PATTERNS:
+            if pattern.rstrip("?/") in path:
+                vectors.append({
+                    "type": "PATH",
+                    "param": None,
+                    "path": parsed.path,
+                    "pattern_matched": pattern,
+                    "source": "URL_PATH",
+                    "confidence": "MEDIUM"
+                })
+                break  # One match is enough
+
+        return vectors
+
+    async def _discover_content_vectors(self) -> List[Dict]:
+        """
+        Discover redirect vectors in page content.
+
+        Fetches the page and analyzes:
+        - JavaScript redirect patterns (window.location, location.href, etc.)
+        - Meta refresh tags
+        - Server redirect response (Location header)
+        """
+        vectors = []
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    self.url,
+                    allow_redirects=False,  # Don't follow - inspect redirect headers
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    # Check for HTTP redirect
+                    if response.status in REDIRECT_STATUS_CODES:
+                        location = response.headers.get('Location', '')
+                        if location:
+                            vectors.append({
+                                "type": "HTTP_REDIRECT",
+                                "param": None,
+                                "location": location,
+                                "status_code": response.status,
+                                "source": "HTTP_RESPONSE",
+                                "confidence": "HIGH"
+                            })
+
+                    # Read content for JS analysis
+                    content = await response.text()
+
+                    # Check JavaScript patterns
+                    js_vectors = self._analyze_javascript_redirects(content)
+                    vectors.extend(js_vectors)
+
+                    # Check meta refresh
+                    meta_vectors = self._analyze_meta_refresh(content)
+                    vectors.extend(meta_vectors)
+
+        except aiohttp.ClientError as e:
+            logger.warning(f"[{self.name}] HTTP request failed: {e}")
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.name}] Request timeout for {self.url}")
+
+        return vectors
+
+    def _analyze_javascript_redirects(self, html_content: str) -> List[Dict]:
+        """Analyze HTML for JavaScript-based redirect patterns."""
+        vectors = []
+
+        for pattern_info in JS_REDIRECT_PATTERNS:
+            pattern = pattern_info["pattern"]
+            name = pattern_info["name"]
+
+            matches = re.findall(pattern, html_content, re.IGNORECASE)
+            for match in matches:
+                # match could be the captured group or full match
+                redirect_url = match if isinstance(match, str) else match[0] if match else None
+
+                if redirect_url:
+                    vectors.append({
+                        "type": "JAVASCRIPT",
+                        "param": None,
+                        "redirect_url": redirect_url,
+                        "pattern_name": name,
+                        "source": "JS_ANALYSIS",
+                        "confidence": "MEDIUM"
+                    })
+
+        return vectors
+
+    def _analyze_meta_refresh(self, html_content: str) -> List[Dict]:
+        """Analyze HTML for meta refresh redirect tags."""
+        vectors = []
+
+        # Method 1: Regex for meta refresh
+        matches = re.findall(META_REFRESH_PATTERN, html_content, re.IGNORECASE)
+        for url in matches:
+            vectors.append({
+                "type": "META_REFRESH",
+                "param": None,
+                "redirect_url": url,
+                "source": "META_TAG",
+                "confidence": "HIGH"
+            })
+
+        # Method 2: BeautifulSoup for more robust parsing
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            meta_tags = soup.find_all('meta', attrs={'http-equiv': re.compile(r'refresh', re.I)})
+
+            for meta in meta_tags:
+                content = meta.get('content', '')
+                # Parse content: "0;url=https://..." or "5; URL=https://..."
+                url_match = re.search(r'url\s*=\s*([^\s"\']+)', content, re.IGNORECASE)
+                if url_match and not any(v.get("redirect_url") == url_match.group(1) for v in vectors):
+                    vectors.append({
+                        "type": "META_REFRESH",
+                        "param": None,
+                        "redirect_url": url_match.group(1),
+                        "source": "META_TAG_BS4",
+                        "confidence": "HIGH"
+                    })
+        except Exception as e:
+            logger.debug(f"BeautifulSoup meta parsing failed: {e}")
+
+        return vectors
 
     async def _auditor_phase(self, vectors: List[Dict]) -> List[Dict]:
         """
