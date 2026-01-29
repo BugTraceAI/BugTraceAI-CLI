@@ -224,6 +224,7 @@ class SpecialistQueue:
             else:
                 queue_item = await self._queue.get()
 
+            self._stats.record_dequeue(queue_item.enqueued_at)
             logger.debug(f"Queue '{self.name}' dequeued item (depth: {self.depth()})")
             return queue_item.payload
         except asyncio.TimeoutError:
@@ -237,6 +238,21 @@ class SpecialistQueue:
     def is_full(self) -> bool:
         """Check if queue is at max capacity (backpressure)."""
         return self.depth() >= self.max_depth
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get queue statistics."""
+        stats = self._stats.to_dict()
+        stats["name"] = self.name
+        stats["current_depth"] = self.depth()
+        stats["max_depth"] = self.max_depth
+        stats["rate_limit"] = self.rate_limit
+        stats["is_full"] = self.is_full()
+        return stats
+
+    def reset_stats(self) -> None:
+        """Reset queue statistics."""
+        self._stats.reset()
+        logger.debug(f"Queue '{self.name}' stats reset")
 
     async def _wait_for_token(self) -> None:
         """
@@ -285,6 +301,28 @@ class QueueManager:
         self._queues.clear()
         logger.info("QueueManager reset")
 
+    def get_aggregate_stats(self) -> Dict[str, Any]:
+        """Get aggregate statistics across all queues."""
+        total_enqueued = 0
+        total_dequeued = 0
+        total_rejected = 0
+        total_depth = 0
+
+        for queue in self._queues.values():
+            stats = queue.get_stats()
+            total_enqueued += stats["total_enqueued"]
+            total_dequeued += stats["total_dequeued"]
+            total_rejected += stats["total_rejected"]
+            total_depth += stats["current_depth"]
+
+        return {
+            "total_queues": len(self._queues),
+            "total_enqueued": total_enqueued,
+            "total_dequeued": total_dequeued,
+            "total_rejected": total_rejected,
+            "total_depth": total_depth
+        }
+
 
 # Pre-defined specialist names
 SPECIALIST_QUEUES = [
@@ -299,4 +337,4 @@ queue_manager = QueueManager()
 
 
 # Module exports
-__all__ = ["SpecialistQueue", "QueueManager", "queue_manager", "SPECIALIST_QUEUES"]
+__all__ = ["SpecialistQueue", "QueueManager", "queue_manager", "SPECIALIST_QUEUES", "QueueStats", "QueueItem"]
