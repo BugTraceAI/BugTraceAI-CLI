@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     
     # Model for skeptical analysis in DASTySAST agent
     SKEPTICAL_MODEL: str = "google/gemini-3-flash-preview"
-    
+
     # Skeptical Review Thresholds (0-10 scale)
     # CRITICAL vulns have LOWER thresholds to avoid missing them
     SKEPTICAL_THRESHOLDS: dict = {
@@ -79,6 +79,12 @@ class Settings(BaseSettings):
         "IDOR": 6,     # Lower risk
         "DEFAULT": 5   # Fallback
     }
+
+    # --- False Positive Filtering (Phase 17: v2.3) ---
+    FP_CONFIDENCE_THRESHOLD: float = 0.5  # Minimum fp_confidence to pass filtering (0.0-1.0)
+    FP_SKEPTICAL_WEIGHT: float = 0.4  # Weight of skeptical_score in fp_confidence calc
+    FP_VOTES_WEIGHT: float = 0.3  # Weight of votes in fp_confidence calc
+    FP_EVIDENCE_WEIGHT: float = 0.3  # Weight of evidence quality in fp_confidence calc
 
     def get_threshold_for_type(self, vuln_type: str) -> int:
         """Get the skeptical threshold for a vulnerability type."""
@@ -156,6 +162,14 @@ class Settings(BaseSettings):
         valid_modes = ['memory', 'redis']
         if v not in valid_modes:
             raise ValueError(f"QUEUE_PERSISTENCE_MODE must be one of: {valid_modes}")
+        return v
+
+    @field_validator('FP_CONFIDENCE_THRESHOLD')
+    @classmethod
+    def validate_fp_threshold(cls, v):
+        """Validate FP confidence threshold is between 0 and 1."""
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("FP_CONFIDENCE_THRESHOLD must be between 0.0 and 1.0")
         return v
 
     # --- OpenRouter Configuration ---
