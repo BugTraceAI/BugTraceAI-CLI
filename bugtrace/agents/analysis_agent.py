@@ -58,7 +58,14 @@ class DASTySASTAgent(BaseAgent):
             return {
                 "url": self.url,
                 "vulnerabilities": vulnerabilities,
-                "report_file": str(self.report_dir / f"vulnerabilities_{self._get_safe_name()}.md")
+                "report_file": str(self.report_dir / f"vulnerabilities_{self._get_safe_name()}.md"),
+                # Phase 17: Add FP stats
+                "fp_stats": {
+                    "total_findings": len(vulnerabilities),
+                    "high_confidence": len([v for v in vulnerabilities if v.get('fp_confidence', 0) >= 0.7]),
+                    "medium_confidence": len([v for v in vulnerabilities if 0.5 <= v.get('fp_confidence', 0) < 0.7]),
+                    "low_confidence": len([v for v in vulnerabilities if v.get('fp_confidence', 0) < 0.5])
+                }
             }
 
         except Exception as e:
@@ -142,7 +149,7 @@ class DASTySASTAgent(BaseAgent):
         dashboard.log(f"[{self.name}] Found {len(vulnerabilities)} potential vulnerabilities.", "SUCCESS")
 
     def _save_single_vulnerability(self, v: Dict):
-        """Save a single vulnerability to state manager."""
+        """Save a single vulnerability to state manager with fp_confidence."""
         # Normalize field names
         v_name = v.get("vulnerability_name") or v.get("name") or v.get("vulnerability") or "Vulnerability"
         v_desc = v.get("description") or v.get("reasoning") or v.get("details") or "No description provided."
@@ -163,7 +170,11 @@ class DASTySASTAgent(BaseAgent):
             payload=v.get("payload") or v.get("logic") or v.get("exploitation_strategy"),
             evidence=v.get("evidence") or v.get("reasoning"),
             screenshot_path=v.get("screenshot_path"),
-            validated=v.get("validated", False)
+            validated=v.get("validated", False),
+            # Phase 17: Add FP confidence fields
+            fp_confidence=v.get("fp_confidence", 0.5),
+            skeptical_score=v.get("skeptical_score", 5),
+            fp_reason=v.get("fp_reason", "")
         )
 
     def _normalize_vulnerability_name(self, v_name: str, v_desc: str, v: Dict) -> str:
@@ -867,16 +878,34 @@ Return XML:
             logger.warning(f"[{self.name}] Failed to parse finding: {e}")
 
     def _save_markdown_report(self, path: Path, vulnerabilities: List[Dict]):
-        """Saves a human-readable markdown report of potential vulnerabilities."""
+        """Saves markdown report with FP confidence scores."""
         content = f"# Potential Vulnerabilities for {self.url}\n\n"
+
         if not vulnerabilities:
             content += "No vulnerabilities detected by DAST+SAST analysis.\n"
         else:
+            content += "| Type | Parameter | FP Confidence | Skeptical Score | Votes |\n"
+            content += "|------|-----------|---------------|-----------------|-------|\n"
+
+            for v in sorted(vulnerabilities, key=lambda x: x.get('fp_confidence', 0), reverse=True):
+                fp_conf = v.get('fp_confidence', 0.5)
+                fp_indicator = '++' if fp_conf >= 0.7 else '+' if fp_conf >= 0.5 else '-'
+
+                content += f"| {v.get('type', 'Unknown')} | {v.get('parameter', 'N/A')} | "
+                content += f"{fp_conf:.2f} {fp_indicator} | {v.get('skeptical_score', 5)}/10 | "
+                content += f"{v.get('votes', 1)}/5 |\n"
+
+            content += "\n## Details\n\n"
+
             for v in vulnerabilities:
-                content += f"## {v.get('type')} (Confidence: {v.get('confidence')})\n"
-                content += f"- **Parameter**: {v.get('parameter')}\n"
-                content += f"- **Reasoning**: {v.get('reasoning')}\n"
-                content += f"- **Votes**: {v.get('votes', 1)}/5 approaches\n\n"
-        
+                content += f"### {v.get('type')} on `{v.get('parameter')}`\n\n"
+                content += f"- **FP Confidence**: {v.get('fp_confidence', 0.5):.2f}\n"
+                content += f"- **Skeptical Score**: {v.get('skeptical_score', 5)}/10\n"
+                content += f"- **Votes**: {v.get('votes', 1)}/5 approaches\n"
+                content += f"- **Reasoning**: {v.get('reasoning', 'N/A')}\n"
+                if v.get('fp_reason'):
+                    content += f"- **FP Analysis**: {v.get('fp_reason')}\n"
+                content += "\n"
+
         with open(path, "w") as f:
             f.write(content)
