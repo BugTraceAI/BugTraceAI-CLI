@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 from loguru import logger
 
 from bugtrace.agents.base import BaseAgent
+from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
+from bugtrace.core.queue import queue_manager
+from bugtrace.core.event_bus import EventType
 from bugtrace.tools.external import external_tools
 from bugtrace.core.ui import dashboard
 from bugtrace.core.config import settings
@@ -294,6 +297,11 @@ class SQLiAgent(BaseAgent):
             "filters_detected": 0,
             "prepared_statement_exits": 0,
         }
+
+        # Queue consumption mode (Phase 19)
+        self._queue_mode = False  # True when consuming from queue
+        self._worker_pool: Optional[WorkerPool] = None
+        self._scan_context: str = ""
 
     def _finding_to_dict(self, finding: SQLiFinding) -> Dict:
         """Convert SQLiFinding object to dictionary for report."""
@@ -1865,3 +1873,183 @@ Write the exploitation explanation section for the report."""
             "second_order": "Second-Order",
         }
         return names.get(technique, "Unknown")
+
+    # =========================================================================
+    # QUEUE CONSUMPTION MODE (PHASE 19)
+    # =========================================================================
+
+    async def start_queue_consumer(self, scan_context: str) -> None:
+        """
+        Start SQLiAgent in queue consumer mode.
+
+        Spawns a worker pool that consumes from the sqli queue and
+        processes findings in parallel.
+        """
+        self._queue_mode = True
+        self._scan_context = scan_context
+
+        # Configure worker pool
+        config = WorkerConfig(
+            specialist="sqli",
+            pool_size=settings.WORKER_POOL_SQLI_SIZE,
+            process_func=self._process_queue_item,
+            on_result=self._handle_queue_result,
+            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
+        )
+
+        self._worker_pool = WorkerPool(config)
+
+        # Subscribe to work_queued_sqli events (optional notification)
+        self.event_bus.subscribe(
+            EventType.WORK_QUEUED_SQLI.value,
+            self._on_work_queued
+        )
+
+        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
+        await self._worker_pool.start()
+
+    async def _process_queue_item(self, item: dict) -> Optional[SQLiFinding]:
+        """
+        Process a single item from the sqli queue.
+
+        Item structure (from ThinkingConsolidationAgent):
+        {
+            "finding": {
+                "type": "SQL Injection",
+                "url": "...",
+                "parameter": "...",
+                "technique": "...",  # Optional: error_based, time_based, etc.
+            },
+            "priority": 85.5,
+            "scan_context": "scan_123",
+            "classified_at": 1234567890.0
+        }
+        """
+        finding = item.get("finding", {})
+        url = finding.get("url")
+        param = finding.get("parameter")
+
+        if not url or not param:
+            logger.warning(f"[{self.name}] Invalid queue item: missing url or parameter")
+            return None
+
+        # Configure self for this specific test
+        self.url = url
+        self.param = param
+
+        # Run validation using existing SQLi testing logic
+        result = await self._test_single_param_from_queue(url, param, finding)
+
+        return result
+
+    async def _test_single_param_from_queue(
+        self, url: str, param: str, finding: dict
+    ) -> Optional[SQLiFinding]:
+        """
+        Test a single parameter from queue for SQL injection.
+
+        Uses existing validation pipeline optimized for queue processing.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Initialize baseline if needed
+                if self._baseline_response_time == 0:
+                    await self._initialize_baseline(session)
+
+                # Check for prepared statements (early exit)
+                if await self._detect_prepared_statements(session, param):
+                    return None
+
+                # Detect filtered characters
+                await self._detect_filtered_chars(session, param)
+
+                # Test with techniques based on priority
+                suggested_technique = finding.get("technique", "").lower()
+
+                # Error-based first (most reliable)
+                result = await self._test_error_based(session, param)
+                if result:
+                    return await self._finalize_finding(result, "error_based")
+
+                # Boolean-based
+                result = await self._test_boolean_based(session, param)
+                if result:
+                    return await self._finalize_finding(result, "boolean_based")
+
+                # Time-based only if suggested (slow, prone to FP)
+                if "time" in suggested_technique:
+                    result = await self._test_time_based(session, param)
+                    if result:
+                        return await self._finalize_finding(result, "time_based")
+
+                # OOB SQLi if Interactsh available
+                if self._interactsh:
+                    result = await self._test_oob_sqli(session, param)
+                    if result:
+                        return result
+
+                return None
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Queue item test failed: {e}")
+            return None
+
+    async def _handle_queue_result(self, item: dict, result: Optional[SQLiFinding]) -> None:
+        """
+        Handle completed queue item processing.
+
+        Emits vulnerability_detected event on confirmed findings.
+        """
+        if result is None:
+            return
+
+        # Convert to dict if needed
+        finding_dict = self._finding_to_dict(result)
+
+        # Emit vulnerability_detected event
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "sqli",
+                "finding": {
+                    "type": "SQLI",
+                    "url": result.url,
+                    "parameter": result.parameter,
+                    "payload": result.working_payload,
+                    "technique": result.injection_type,
+                    "dbms": result.dbms_detected,
+                },
+                "status": result.status,
+                "scan_context": self._scan_context,
+            })
+
+        logger.info(f"[{self.name}] Confirmed SQLi: {result.url}?{result.parameter} ({result.injection_type})")
+
+    async def _on_work_queued(self, data: dict) -> None:
+        """Handle work_queued_sqli notification (logging only)."""
+        logger.debug(f"[{self.name}] Work queued: {data.get('finding', {}).get('url', 'unknown')}")
+
+    async def stop_queue_consumer(self) -> None:
+        """Stop queue consumer mode gracefully."""
+        if self._worker_pool:
+            await self._worker_pool.stop()
+            self._worker_pool = None
+
+        self.event_bus.unsubscribe(
+            EventType.WORK_QUEUED_SQLI.value,
+            self._on_work_queued
+        )
+
+        self._queue_mode = False
+        logger.info(f"[{self.name}] Queue consumer stopped")
+
+    def get_queue_stats(self) -> dict:
+        """Get queue consumer statistics."""
+        if not self._worker_pool:
+            return {"mode": "direct", "queue_mode": False, "stats": self._stats}
+
+        return {
+            "mode": "queue",
+            "queue_mode": True,
+            "worker_stats": self._worker_pool.get_stats(),
+            "agent_stats": self._stats,
+        }
