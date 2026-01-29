@@ -1,10 +1,13 @@
 import logging
 import aiohttp
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from bugtrace.agents.base import BaseAgent
+from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
 from bugtrace.core.ui import dashboard
+from bugtrace.core.event_bus import EventType
+from bugtrace.core.config import settings
 from bugtrace.tools.external import external_tools
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
@@ -18,19 +21,25 @@ class LFIAgent(BaseAgent):
     """
     Specialist Agent for Local File Inclusion (LFI) and Path Traversal.
     """
-    
-    def __init__(self, url: str, params: List[str] = None, report_dir: Path = None):
+
+    def __init__(self, url: str, params: List[str] = None, report_dir: Path = None, event_bus=None):
         super().__init__(
             name="LFIAgent",
             role="LFI Specialist",
+            event_bus=event_bus,
             agent_id="lfi_agent"
         )
         self.url = url
         self.params = params or []
         self.report_dir = report_dir or Path("./reports")
-        
+
         # Deduplication
         self._tested_params = set()
+
+        # Queue consumption mode (Phase 20)
+        self._queue_mode = False
+        self._worker_pool: Optional[WorkerPool] = None
+        self._scan_context: str = ""
         
     def _determine_validation_status(self, response_text: str, payload: str) -> str:
         """
@@ -210,3 +219,153 @@ class LFIAgent(BaseAgent):
         q[param] = [payload]
         new_query = urlencode(q, doseq=True)
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+    # =========================================================================
+    # Queue Consumption Mode (Phase 20)
+    # =========================================================================
+
+    async def start_queue_consumer(self, scan_context: str) -> None:
+        """
+        Start LFIAgent in queue consumer mode.
+
+        Spawns a worker pool that consumes from the lfi queue and
+        processes findings in parallel.
+
+        Args:
+            scan_context: Scan identifier for event correlation
+        """
+        self._queue_mode = True
+        self._scan_context = scan_context
+
+        # Configure worker pool
+        config = WorkerConfig(
+            specialist="lfi",
+            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,
+            process_func=self._process_queue_item,
+            on_result=self._handle_queue_result,
+            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
+        )
+
+        self._worker_pool = WorkerPool(config)
+
+        # Subscribe to work_queued_lfi events (optional notification)
+        if self.event_bus:
+            self.event_bus.subscribe(
+                EventType.WORK_QUEUED_LFI.value,
+                self._on_work_queued
+            )
+
+        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
+        await self._worker_pool.start()
+
+    async def stop_queue_consumer(self) -> None:
+        """Stop queue consumer mode gracefully."""
+        if self._worker_pool:
+            await self._worker_pool.stop()
+            self._worker_pool = None
+
+        if self.event_bus:
+            self.event_bus.unsubscribe(
+                EventType.WORK_QUEUED_LFI.value,
+                self._on_work_queued
+            )
+
+        self._queue_mode = False
+        logger.info(f"[{self.name}] Queue consumer stopped")
+
+    async def _on_work_queued(self, data: dict) -> None:
+        """Handle work_queued_lfi notification (logging only)."""
+        logger.debug(f"[{self.name}] Work queued: {data.get('finding', {}).get('url', 'unknown')}")
+
+    async def _process_queue_item(self, item: dict) -> Optional[Dict]:
+        """
+        Process a single item from the lfi queue.
+
+        Item structure (from ThinkingConsolidationAgent):
+        {
+            "finding": {
+                "type": "LFI",
+                "url": "...",
+                "parameter": "...",
+            },
+            "priority": 85.5,
+            "scan_context": "scan_123",
+            "classified_at": 1234567890.0
+        }
+        """
+        finding = item.get("finding", {})
+        url = finding.get("url")
+        param = finding.get("parameter")
+
+        if not url or not param:
+            logger.warning(f"[{self.name}] Invalid queue item: missing url or parameter")
+            return None
+
+        # Configure self for this specific test
+        self.url = url
+
+        # Run validation using existing LFI testing logic
+        return await self._test_single_param_from_queue(url, param, finding)
+
+    async def _test_single_param_from_queue(
+        self, url: str, param: str, finding: dict
+    ) -> Optional[Dict]:
+        """
+        Test a single parameter from queue for LFI.
+
+        Uses existing validation pipeline optimized for queue processing.
+        """
+        try:
+            # High-Performance Go Fuzzer first
+            go_result = await external_tools.run_go_lfi_fuzzer(url, param)
+            if go_result and go_result.get("hits"):
+                hit = go_result["hits"][0]
+                return self._create_lfi_finding_from_hit(hit, param)
+
+            # Fallback to PHP wrappers
+            async with aiohttp.ClientSession() as session:
+                wrapper_finding = await self._test_php_wrappers(session, param)
+                if wrapper_finding:
+                    return wrapper_finding
+
+            return None
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Queue item test failed: {e}")
+            return None
+
+    async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
+        """
+        Handle completed queue item processing.
+
+        Emits vulnerability_detected event on confirmed findings.
+        """
+        if result is None:
+            return
+
+        # Emit vulnerability_detected event
+        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "lfi",
+                "finding": {
+                    "type": "LFI",
+                    "url": result.get("url"),
+                    "parameter": result.get("parameter"),
+                    "payload": result.get("payload"),
+                },
+                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "scan_context": self._scan_context,
+            })
+
+        logger.info(f"[{self.name}] Confirmed LFI: {result.get('url')}?{result.get('parameter')}")
+
+    def get_queue_stats(self) -> dict:
+        """Get queue consumer statistics."""
+        if not self._worker_pool:
+            return {"mode": "direct", "queue_mode": False}
+
+        return {
+            "mode": "queue",
+            "queue_mode": True,
+            "worker_stats": self._worker_pool.get_stats(),
+        }
