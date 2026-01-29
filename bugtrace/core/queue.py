@@ -301,27 +301,65 @@ class QueueManager:
         self._queues.clear()
         logger.info("QueueManager reset")
 
-    def get_aggregate_stats(self) -> Dict[str, Any]:
-        """Get aggregate statistics across all queues."""
-        total_enqueued = 0
-        total_dequeued = 0
-        total_rejected = 0
-        total_depth = 0
+    def get_all_stats(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get statistics for all queues.
 
-        for queue in self._queues.values():
-            stats = queue.get_stats()
-            total_enqueued += stats["total_enqueued"]
-            total_dequeued += stats["total_dequeued"]
-            total_rejected += stats["total_rejected"]
-            total_depth += stats["current_depth"]
+        Returns:
+            Dict mapping queue name to stats dict
+        """
+        return {name: queue.get_stats() for name, queue in self._queues.items()}
+
+    def get_aggregate_stats(self) -> Dict[str, Any]:
+        """
+        Get aggregate statistics across all queues.
+
+        Returns:
+            Dict with totals and averages across all queues
+        """
+        all_stats = self.get_all_stats()
+
+        if not all_stats:
+            return {
+                "total_queues": 0,
+                "total_enqueued": 0,
+                "total_dequeued": 0,
+                "total_rejected": 0,
+                "total_depth": 0,
+                "avg_enqueue_throughput": 0.0,
+                "avg_dequeue_throughput": 0.0,
+                "avg_latency_ms": 0.0,
+                "max_latency_ms": 0.0,
+            }
+
+        total_enqueued = sum(s["total_enqueued"] for s in all_stats.values())
+        total_dequeued = sum(s["total_dequeued"] for s in all_stats.values())
+        total_rejected = sum(s["total_rejected"] for s in all_stats.values())
+        total_depth = sum(s["current_depth"] for s in all_stats.values())
+
+        enqueue_throughputs = [s["enqueue_throughput"] for s in all_stats.values() if s["enqueue_throughput"] > 0]
+        dequeue_throughputs = [s["dequeue_throughput"] for s in all_stats.values() if s["dequeue_throughput"] > 0]
+        latencies = [s["avg_latency_ms"] for s in all_stats.values() if s["avg_latency_ms"] > 0]
+        max_latencies = [s["max_latency_ms"] for s in all_stats.values()]
 
         return {
-            "total_queues": len(self._queues),
+            "total_queues": len(all_stats),
             "total_enqueued": total_enqueued,
             "total_dequeued": total_dequeued,
             "total_rejected": total_rejected,
-            "total_depth": total_depth
+            "total_depth": total_depth,
+            "avg_enqueue_throughput": round(sum(enqueue_throughputs) / len(enqueue_throughputs), 2) if enqueue_throughputs else 0.0,
+            "avg_dequeue_throughput": round(sum(dequeue_throughputs) / len(dequeue_throughputs), 2) if dequeue_throughputs else 0.0,
+            "avg_latency_ms": round(sum(latencies) / len(latencies), 2) if latencies else 0.0,
+            "max_latency_ms": round(max(max_latencies), 2) if max_latencies else 0.0,
+            "queues_with_backpressure": sum(1 for s in all_stats.values() if s["is_full"]),
         }
+
+    def reset_all_stats(self) -> None:
+        """Reset statistics for all queues."""
+        for queue in self._queues.values():
+            queue.reset_stats()
+        logger.info("All queue stats reset")
 
 
 # Pre-defined specialist names
