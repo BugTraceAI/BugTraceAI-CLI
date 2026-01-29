@@ -37,6 +37,7 @@ from bugtrace.agents.asset_discovery_agent import AssetDiscoveryAgent
 from bugtrace.agents.api_security_agent import APISecurityAgent
 from bugtrace.agents.chain_discovery_agent import ChainDiscoveryAgent
 from bugtrace.agents.openredirect_agent import OpenRedirectAgent
+from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
 
 # Event Bus integration
 from bugtrace.core.event_bus import event_bus
@@ -1253,6 +1254,12 @@ class TeamOrchestrator:
             openredirect_agent = OpenRedirectAgent(url, p_list, url_dir)
             tasks.append(run_agent_with_semaphore(self.url_semaphore, openredirect_agent, process_result))
 
+        if "PROTOTYPE_POLLUTION_AGENT" in specialist_dispatches:
+            from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
+            p_list = list(params_map.get("PROTOTYPE_POLLUTION_AGENT", [])) or None
+            pp_agent = PrototypePollutionAgent(url, p_list, url_dir)
+            tasks.append(run_agent_with_semaphore(self.url_semaphore, pp_agent, process_result))
+
         return tasks
 
     async def _execute_agents(self, agent_tasks: list, dashboard) -> bool:
@@ -1505,6 +1512,7 @@ class TeamOrchestrator:
         if "UPLOAD" in v_type or "FILES" in v_type: return "FILE_UPLOAD_AGENT"
         if "JWT" in v_type or "TOKEN" in v_type: return "JWT_AGENT"
         if "REDIRECT" in v_type or "OPEN REDIRECT" in v_type or "URL REDIRECT" in v_type: return "OPENREDIRECT_AGENT"
+        if "PROTOTYPE" in v_type or "POLLUTION" in v_type or "PROTO POLLUTION" in v_type or "__PROTO__" in v_type: return "PROTOTYPE_POLLUTION_AGENT"
         if "IDOR" in v_type or "INSECURE DIRECT" in v_type: return "IDOR_AGENT"
 
         return None
@@ -1531,6 +1539,7 @@ class TeamOrchestrator:
         - LFI_AGENT (Local File Inclusion, path traversal)
         - RCE_AGENT (Remote Code Execution, command injection)
         - OPENREDIRECT_AGENT (Open Redirect, URL redirection to untrusted site)
+        - PROTOTYPE_POLLUTION_AGENT (Prototype Pollution, __proto__ injection, object manipulation)
         - IGNORE (If low confidence or not relevant)
 
         Return ONLY the Agent Name using XML format:
@@ -1549,7 +1558,8 @@ class TeamOrchestrator:
             valid_agents = [
                 "XSS_AGENT", "SQL_AGENT", "XXE_AGENT", "SSRF_AGENT", "LFI_AGENT",
                 "RCE_AGENT", "PROTO_AGENT", "HEADER_INJECTION", "IDOR_AGENT",
-                "JWT_AGENT", "FILE_UPLOAD_AGENT", "OPENREDIRECT_AGENT", "IGNORE"
+                "JWT_AGENT", "FILE_UPLOAD_AGENT", "OPENREDIRECT_AGENT",
+                "PROTOTYPE_POLLUTION_AGENT", "IGNORE"
             ]
 
             for valid in valid_agents:
