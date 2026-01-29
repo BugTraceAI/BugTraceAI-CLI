@@ -42,6 +42,11 @@ from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
 # Event Bus integration
 from bugtrace.core.event_bus import event_bus
 
+# Pipeline orchestration (v2.3)
+from bugtrace.core.pipeline import (
+    PipelineOrchestrator, PipelineLifecycle, PipelinePhase, PipelineState
+)
+
 async def run_agent_with_semaphore(semaphore: asyncio.Semaphore, agent, process_result_fn):
     """
     Execute an agent with semaphore-controlled concurrency.
@@ -86,7 +91,12 @@ class TeamOrchestrator:
 
         self.event_bus = event_bus
         logger.info("Event Bus integrated into TeamOrchestrator")
-        logger.info("✨ Phase 1 Agents loaded: AssetDiscovery, APISecurity, ChainDiscovery")
+        logger.info("Phase 1 Agents loaded: AssetDiscovery, APISecurity, ChainDiscovery")
+
+        # Pipeline orchestration (v2.3)
+        self._pipeline: Optional[PipelineOrchestrator] = None
+        self._lifecycle: Optional[PipelineLifecycle] = None
+        logger.info("Pipeline orchestration infrastructure initialized")
 
     def _init_vertical_mode(self, use_vertical_agents: bool):
         """Initialize vertical agent architecture settings."""
@@ -127,8 +137,38 @@ class TeamOrchestrator:
                 self.url_queue = state.get("url_queue", [])
                 logger.info(f"Resumed scan: {len(self.processed_urls)} URLs already processed, {len(self.url_queue)} pending.")
 
+    def _init_pipeline(self):
+        """Initialize 5-phase pipeline orchestration."""
+        self._pipeline = PipelineOrchestrator(
+            scan_id=str(self.scan_id),
+            event_bus=self.event_bus
+        )
+        self._lifecycle = PipelineLifecycle(
+            state=self._pipeline.state,
+            event_bus=self.event_bus
+        )
+        logger.info(f"[TeamOrchestrator] Pipeline initialized for scan {self.scan_id}")
+
     def set_auth(self, creds: str):
         self.auth_creds = creds
+
+    async def pause_pipeline(self, reason: str = "User requested") -> bool:
+        """Pause pipeline at next phase boundary."""
+        if self._lifecycle:
+            return await self._lifecycle.pause_at_boundary(reason)
+        return False
+
+    async def resume_pipeline(self) -> bool:
+        """Resume paused pipeline."""
+        if self._lifecycle:
+            return await self._lifecycle.resume()
+        return False
+
+    def get_pipeline_state(self) -> Optional[Dict]:
+        """Get current pipeline state."""
+        if self._pipeline:
+            return self._pipeline.get_state()
+        return None
 
     async def start(self):
         """Starts the Multi-Agent Team."""
@@ -1368,30 +1408,72 @@ class TeamOrchestrator:
         logger.info("Entering V2 Sequential Pipeline")
         start_time = datetime.now()
 
+        # Initialize and start pipeline
+        self._init_pipeline()
+        await self._pipeline.start()
+
         # Setup
         scan_dir, recon_dir, analysis_dir, captures_dir = self._setup_scan_directory(start_time)
-        dashboard.log(f"📂 Scan directory created: {scan_dir.name}", "INFO")
+        dashboard.log(f"Scan directory created: {scan_dir.name}", "INFO")
+
+        # Check pause point before Phase 1
+        if await self._lifecycle.check_pause_point():
+            logger.info("[TeamOrchestrator] Paused at phase boundary")
+            return
 
         # Phase 1: Reconnaissance
         await self._phase_1_reconnaissance(dashboard, recon_dir)
+        await self._lifecycle.signal_phase_complete(
+            PipelinePhase.DISCOVERY,
+            {'urls_found': len(self.urls_to_scan)}
+        )
 
         if self._check_stop_requested(dashboard):
+            return
+
+        # Check pause point before Phase 2
+        if await self._lifecycle.check_pause_point():
+            logger.info("[TeamOrchestrator] Paused at phase boundary")
             return
 
         # Phase 2: URL-by-URL Analysis
         await self._phase_2_analysis(dashboard, analysis_dir)
+        await self._lifecycle.signal_phase_complete(
+            PipelinePhase.EXPLOITATION,
+            {'urls_processed': len(self.urls_to_scan)}
+        )
 
         if self._check_stop_requested(dashboard):
             return
 
+        # Check pause point before Phase 3
+        if await self._lifecycle.check_pause_point():
+            logger.info("[TeamOrchestrator] Paused at phase boundary")
+            return
+
         # Phase 3: Global Review
+        all_findings_for_review = self.state_manager.get_findings()
         await self._phase_3_global_review(dashboard, scan_dir)
+        await self._lifecycle.signal_phase_complete(
+            PipelinePhase.VALIDATION,
+            {'findings_reviewed': len(all_findings_for_review)}
+        )
 
         if self._check_stop_requested(dashboard):
+            return
+
+        # Check pause point before Phase 4
+        if await self._lifecycle.check_pause_point():
+            logger.info("[TeamOrchestrator] Paused at phase boundary")
             return
 
         # Phase 4: Reporting
         await self._phase_4_reporting(dashboard, scan_dir)
+        await self._lifecycle.signal_phase_complete(
+            PipelinePhase.REPORTING,
+            {'report_generated': True}
+        )
+        await self._pipeline.stop()
 
         logger.info("=== V2 SEQUENTIAL PIPELINE COMPLETE ===")
 
