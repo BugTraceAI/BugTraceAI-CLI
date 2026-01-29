@@ -223,7 +223,7 @@ class ReportingAgent(BaseAgent):
         (self.output_dir / "captures").mkdir(exist_ok=True)
 
     async def _collect_all_findings(self) -> tuple[List[Dict], Dict]:
-        """Collect all findings from DB and Nuclei."""
+        """Collect all findings from DB, Nuclei, and event bus."""
         all_findings = self._get_findings_from_db()
         logger.info(f"[{self.name}] Retrieved {len(all_findings)} findings from DB")
 
@@ -232,7 +232,87 @@ class ReportingAgent(BaseAgent):
             all_findings.extend(nuclei_findings)
             logger.info(f"[{self.name}] Added {len(nuclei_findings)} Nuclei findings")
 
+        # Merge event-sourced findings
+        all_findings = self._merge_event_findings(all_findings)
+
         return all_findings, tech_stack
+
+    def _merge_event_findings(self, db_findings: List[Dict]) -> List[Dict]:
+        """
+        Merge event-sourced validated findings with database findings.
+
+        Deduplicates based on (url, parameter, payload) to prevent duplicates.
+        Event findings are marked with source='event_bus'.
+
+        Args:
+            db_findings: Findings from database and Nuclei
+
+        Returns:
+            Merged list with event findings appended (no duplicates)
+        """
+        event_findings = self.get_validated_findings()
+        if not event_findings:
+            return db_findings
+
+        # Build deduplication key function
+        def dedup_key(f: Dict) -> tuple:
+            return (f.get("url"), f.get("parameter"), f.get("payload"))
+
+        # Create seen keys set from DB findings
+        seen_keys = set(dedup_key(f) for f in db_findings)
+
+        # Mark DB findings with source
+        for f in db_findings:
+            if "source" not in f:
+                f["source"] = "database"
+
+        # Merge non-duplicate event findings
+        merged = list(db_findings)
+        added_count = 0
+
+        for event_finding in event_findings:
+            key = dedup_key(event_finding)
+            if key not in seen_keys:
+                # Convert to DB-compatible format
+                formatted = self._event_finding_to_db_format(event_finding)
+                merged.append(formatted)
+                seen_keys.add(key)
+                added_count += 1
+
+        logger.info(f"[{self.name}] Merged {added_count} event findings with {len(db_findings)} DB findings")
+        return merged
+
+    def _event_finding_to_db_format(self, event_finding: Dict) -> Dict:
+        """
+        Convert event finding structure to DB-compatible structure.
+
+        Args:
+            event_finding: Finding from event bus accumulator
+
+        Returns:
+            Dictionary with DB-compatible field names
+        """
+        evidence = event_finding.get("evidence", {})
+
+        return {
+            "id": None,  # Event findings don't have DB IDs
+            "type": event_finding.get("type") or event_finding.get("vuln_type", "Unknown"),
+            "severity": event_finding.get("severity", "HIGH"),
+            "url": event_finding.get("url", ""),
+            "parameter": event_finding.get("parameter", ""),
+            "payload": event_finding.get("payload", ""),
+            "description": event_finding.get("description") or evidence.get("description", ""),
+            "status": event_finding.get("status", "VALIDATED_CONFIRMED"),
+            "validator_notes": event_finding.get("cdp_reasoning") or event_finding.get("reasoning", ""),
+            "screenshot_path": event_finding.get("screenshot_path"),
+            "validation_method": event_finding.get("validation_method", "event_bus"),
+            "source": "event_bus",
+            # Preserve event-specific metadata
+            "specialist": event_finding.get("specialist"),
+            "scan_context": event_finding.get("scan_context"),
+            "cdp_validated": event_finding.get("cdp_validated", False),
+            "cdp_confidence": event_finding.get("cdp_confidence"),
+        }
 
     def _categorize_findings(self, all_findings: List[Dict]) -> Dict[str, List[Dict]]:
         """Categorize findings by validation status."""
@@ -1292,16 +1372,79 @@ class ReportingAgent(BaseAgent):
         else:
             return "# No reproduction command available"
 
-    def _get_validation_method(self, finding: Dict) -> str:
-        """Get validation method based on finding type."""
-        vuln_type = finding.get("type", "").upper()
-        
-        if vuln_type in ["SQLI", "SQLi"]:
-            return "SQLMap Automated Validation"
-        elif vuln_type in ["XSS", "CSTI", "SSTI"]:
+    def _extract_validation_method(self, finding: Dict) -> str:
+        """
+        Extract and normalize validation method from findings.
+
+        Maps various validation method indicators to standardized labels:
+        - OOB (Interactsh): Out-of-band validation via Interactsh callbacks
+        - HTTP Response Analysis: Server response analysis without browser
+        - Playwright Browser: Full browser automation validation
+        - CDP + Vision AI: Chrome DevTools Protocol with visual AI
+        - SQLMap Automated: SQLMap tool validation
+        - Template Engine: CSTI/SSTI template injection validation
+        - Fuzzer Validation: Go fuzzer or similar tool validation
+
+        Args:
+            finding: Finding dictionary with validation data
+
+        Returns:
+            Standardized validation method label
+        """
+        # Extract raw method from multiple possible locations
+        raw_method = finding.get("validation_method")
+        if not raw_method:
+            evidence = finding.get("evidence")
+            if isinstance(evidence, dict):
+                raw_method = evidence.get("validation_method")
+        if not raw_method:
+            raw_method = ""
+        raw_method = str(raw_method).lower()
+
+        # OOB-based validation (Interactsh callbacks)
+        if "interactsh" in raw_method or "oob" in raw_method:
+            return "OOB (Interactsh)"
+
+        # HTTP response analysis (no browser needed)
+        if "http" in raw_method or raw_method == "http_response_analysis":
+            return "HTTP Response Analysis"
+
+        # Playwright browser validation
+        if "playwright" in raw_method or "browser" in raw_method:
+            return "Playwright Browser"
+
+        # CDP validation (Chrome DevTools Protocol)
+        if finding.get("cdp_validated") or "cdp" in raw_method or "vision" in raw_method:
             return "CDP + Vision AI"
-        else:
-            return finding.get("validation_method", "Automated Validation")
+
+        # SQLMap validation
+        if "sqlmap" in raw_method:
+            return "SQLMap Automated"
+
+        # Template-specific (CSTI)
+        template_engines = ["jinja", "twig", "freemarker", "velocity", "mako", "smarty"]
+        if raw_method and any(engine in raw_method for engine in template_engines):
+            return f"Template Engine ({raw_method.title()})"
+
+        # Fuzzer-based
+        if "fuzzer" in raw_method:
+            return "Fuzzer Validation"
+
+        # Fallback based on vuln type
+        vuln_type = (finding.get("type") or "").upper()
+        if vuln_type in ["SQLI", "SQL"]:
+            return "SQLMap/Error Detection"
+        if vuln_type == "XSS":
+            return "HTTP/Playwright"
+
+        return raw_method.title() if raw_method else "Automated Check"
+
+    def _get_validation_method(self, finding: Dict) -> str:
+        """
+        Get validation method based on finding.
+        Delegates to _extract_validation_method for consistent extraction.
+        """
+        return self._extract_validation_method(finding)
     
     def _get_validation_notes(self, finding: Dict) -> str:
         """Generate detailed validation notes based on finding type."""
