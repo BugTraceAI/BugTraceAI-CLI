@@ -120,31 +120,33 @@ class TeamOrchestrator:
         from bugtrace.agents.openredirect_agent import OpenRedirectAgent
         from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
 
-        # Initialize specialist agents WITHOUT url/param (they process from queue)
-        # Pass event_bus for event emission
-        self.sqli_worker_agent = SQLiAgent(event_bus=self.event_bus)
-        self.xss_worker_agent = XSSAgent(event_bus=self.event_bus)
-        self.csti_worker_agent = CSTIAgent(event_bus=self.event_bus)
-        self.lfi_worker_agent = LFIAgent(event_bus=self.event_bus)
-        self.idor_worker_agent = IDORAgent(event_bus=self.event_bus)
-        self.rce_worker_agent = RCEAgent(event_bus=self.event_bus)
-        self.ssrf_worker_agent = SSRFAgent(event_bus=self.event_bus)
-        self.xxe_worker_agent = XXEAgent(event_bus=self.event_bus)
-        self.open_redirect_worker_agent = OpenRedirectAgent(event_bus=self.event_bus)
-        self.prototype_pollution_worker_agent = PrototypePollutionAgent(event_bus=self.event_bus)
+        # Initialize specialist agents with minimal parameters
+        # url parameter required but will be overridden by queue work items
+        self.sqli_worker_agent = SQLiAgent(url="", event_bus=self.event_bus)
+        self.xss_worker_agent = XSSAgent(url="", event_bus=self.event_bus)
+        self.csti_worker_agent = CSTIAgent(url="", event_bus=self.event_bus)
+        self.lfi_worker_agent = LFIAgent(url="", event_bus=self.event_bus)
+        self.idor_worker_agent = IDORAgent(url="", event_bus=self.event_bus)
+        self.rce_worker_agent = RCEAgent(url="", event_bus=self.event_bus)
+        self.ssrf_worker_agent = SSRFAgent(url="", event_bus=self.event_bus)
+        self.xxe_worker_agent = XXEAgent(url="", event_bus=self.event_bus)
+        self.open_redirect_worker_agent = OpenRedirectAgent(url="", event_bus=self.event_bus)
+        self.prototype_pollution_worker_agent = PrototypePollutionAgent(url="", event_bus=self.event_bus)
 
         # Start worker pools for each specialist
-        self.sqli_worker_agent.start_queue_consumer()
-        self.xss_worker_agent.start_queue_consumer()
-        self.csti_worker_agent.start_queue_consumer()
-        self.lfi_worker_agent.start_queue_consumer()
-        self.idor_worker_agent.start_queue_consumer()
-        self.rce_worker_agent.start_queue_consumer()
-        self.ssrf_worker_agent.start_queue_consumer()
-        self.xxe_worker_agent.start_queue_consumer()
-        self.jwt_agent.start_queue_consumer()  # JWT was already initialized
-        self.open_redirect_worker_agent.start_queue_consumer()
-        self.prototype_pollution_worker_agent.start_queue_consumer()
+        # scan_context will be passed in actual scan, use global for now
+        scan_ctx = "scan_global"
+        self.sqli_worker_agent.start_queue_consumer(scan_ctx)
+        self.xss_worker_agent.start_queue_consumer(scan_ctx)
+        self.csti_worker_agent.start_queue_consumer(scan_ctx)
+        self.lfi_worker_agent.start_queue_consumer(scan_ctx)
+        self.idor_worker_agent.start_queue_consumer(scan_ctx)
+        self.rce_worker_agent.start_queue_consumer(scan_ctx)
+        self.ssrf_worker_agent.start_queue_consumer(scan_ctx)
+        self.xxe_worker_agent.start_queue_consumer(scan_ctx)
+        self.jwt_agent.start_queue_consumer(scan_ctx)  # JWT was already initialized
+        self.open_redirect_worker_agent.start_queue_consumer(scan_ctx)
+        self.prototype_pollution_worker_agent.start_queue_consumer(scan_ctx)
 
         logger.info("Started 11 specialist worker pools for V3 pipeline")
 
