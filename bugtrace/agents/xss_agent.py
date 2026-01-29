@@ -32,6 +32,11 @@ from bugtrace.memory.payload_learner import PayloadLearner
 from bugtrace.tools.external import external_tools
 from bugtrace.tools.headless import detect_dom_xss
 
+# Import worker pool for queue consumption (Phase 19)
+from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
+from bugtrace.core.queue import queue_manager
+from bugtrace.core.event_bus import EventType
+
 # Import framework's WAF intelligence (Q-Learning based)
 from bugtrace.tools.waf import waf_fingerprinter, strategy_router, encoding_techniques
 
@@ -193,6 +198,11 @@ class XSSAgent(BaseAgent):
 
         # Victory Hierarchy: Track if we achieved maximum impact
         self._max_impact_achieved = False
+
+        # Queue consumption mode (Phase 19)
+        self._queue_mode = False  # True when consuming from queue
+        self._worker_pool: Optional[WorkerPool] = None
+        self._scan_context: str = ""
 
     def _get_snippet(self, text: str, target: str, max_len: int = 200) -> str:
         """Extract snippet around the target string."""
@@ -889,6 +899,140 @@ class XSSAgent(BaseAgent):
                     dashboard.log(f"[{self.name}] 🎯 Header XSS found!", "SUCCESS")
             except Exception as e:
                 logger.debug(f"Header injection testing failed: {e}")
+
+    # =========================================================================
+    # Queue Consumption Mode (Phase 19)
+    # =========================================================================
+
+    async def start_queue_consumer(self, scan_context: str) -> None:
+        """
+        Start XSSAgent in queue consumer mode.
+
+        Spawns a worker pool that consumes from the xss queue and
+        processes findings in parallel.
+
+        Args:
+            scan_context: Scan identifier for event correlation
+        """
+        self._queue_mode = True
+        self._scan_context = scan_context
+
+        # Configure worker pool
+        config = WorkerConfig(
+            specialist="xss",
+            pool_size=settings.WORKER_POOL_XSS_SIZE,
+            process_func=self._process_queue_item,
+            on_result=self._handle_queue_result,
+            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
+        )
+
+        self._worker_pool = WorkerPool(config)
+
+        # Subscribe to work_queued_xss events (optional notification)
+        self.event_bus.subscribe(
+            EventType.WORK_QUEUED_XSS.value,
+            self._on_work_queued
+        )
+
+        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
+        await self._worker_pool.start()
+
+    async def stop_queue_consumer(self) -> None:
+        """Stop queue consumer mode gracefully."""
+        if self._worker_pool:
+            await self._worker_pool.stop()
+            self._worker_pool = None
+
+        self.event_bus.unsubscribe(
+            EventType.WORK_QUEUED_XSS.value,
+            self._on_work_queued
+        )
+
+        self._queue_mode = False
+        logger.info(f"[{self.name}] Queue consumer stopped")
+
+    async def _on_work_queued(self, data: dict) -> None:
+        """Handle work_queued_xss notification (logging only)."""
+        logger.debug(f"[{self.name}] Work queued: {data.get('finding', {}).get('url', 'unknown')}")
+
+    async def _process_queue_item(self, item: dict) -> Optional[XSSFinding]:
+        """
+        Process a single item from the xss queue.
+
+        Item structure (from ThinkingConsolidationAgent):
+        {
+            "finding": {
+                "type": "XSS",
+                "url": "...",
+                "parameter": "...",
+                "payload": "...",  # Optional suggested payload
+                "context": "...",  # Reflection context
+            },
+            "priority": 85.5,
+            "scan_context": "scan_123",
+            "classified_at": 1234567890.0
+        }
+        """
+        finding = item.get("finding", {})
+        url = finding.get("url")
+        param = finding.get("parameter")
+
+        if not url or not param:
+            logger.warning(f"[{self.name}] Invalid queue item: missing url or parameter")
+            return None
+
+        # Use existing XSS testing logic
+        # Configure self for this specific test
+        self.url = url
+        self.params = [param]
+
+        # Run validation (reuse existing _test_parameter or similar)
+        result = await self._test_single_param_from_queue(url, param, finding)
+
+        return result
+
+    async def _handle_queue_result(self, item: dict, result: Optional[XSSFinding]) -> None:
+        """
+        Handle completed queue item processing.
+
+        Emits vulnerability_detected event on confirmed findings.
+        """
+        if result is None:
+            return
+
+        # Add to findings list
+        self.findings.append(result)
+
+        # Emit vulnerability_detected event
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "xss",
+                "finding": {
+                    "type": "XSS",
+                    "url": result.url,
+                    "parameter": result.parameter,
+                    "payload": result.payload,
+                    "context": result.context,
+                    "confidence": result.confidence,
+                    "validation_method": result.validation_method,
+                },
+                "status": result.status,
+                "scan_context": self._scan_context,
+            })
+
+        logger.info(f"[{self.name}] Confirmed XSS: {result.url}?{result.parameter}")
+
+    def get_queue_stats(self) -> dict:
+        """Get queue consumer statistics."""
+        if not self._worker_pool:
+            return {"mode": "direct", "queue_mode": False}
+
+        return {
+            "mode": "queue",
+            "queue_mode": True,
+            "worker_stats": self._worker_pool.get_stats(),
+            "findings_confirmed": len(self.findings),
+        }
 
     async def run_loop(self) -> Dict:
         """Main entry point for XSS scanning."""
