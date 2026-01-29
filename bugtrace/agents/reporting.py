@@ -315,10 +315,24 @@ class ReportingAgent(BaseAgent):
         }
 
     def _categorize_findings(self, all_findings: List[Dict]) -> Dict[str, List[Dict]]:
-        """Categorize findings by validation status."""
+        """
+        Categorize findings by validation status.
+
+        Handles both:
+        - VALIDATED_CONFIRMED: Specialist self-validated (no CDP needed)
+        - VALIDATED: CDP-validated findings from AgenticValidator
+        """
+        # Define validated status values (both specialist and CDP confirmed)
+        validated_statuses = {
+            "VALIDATED_CONFIRMED",  # Specialist self-validated
+            "VALIDATED",  # CDP validated (from finding_validated events)
+            ValidationStatus.VALIDATED_CONFIRMED.value,
+            ValidationStatus.FINDING_VALIDATED.value if hasattr(ValidationStatus, 'FINDING_VALIDATED') else "FINDING_VALIDATED",
+        }
+
         return {
             "raw": [f for f in all_findings],
-            "validated": [f for f in all_findings if f.get("status") == "VALIDATED_CONFIRMED"],
+            "validated": [f for f in all_findings if f.get("status") in validated_statuses],
             "manual_review": [f for f in all_findings if f.get("status") == "MANUAL_REVIEW_RECOMMENDED"],
             "false_positives": [f for f in all_findings if f.get("status") == "VALIDATED_FALSE_POSITIVE"],
             "pending": [f for f in all_findings if f.get("status") == "PENDING_VALIDATION"]
@@ -659,6 +673,10 @@ class ReportingAgent(BaseAgent):
 
     def _build_finding_entry(self, f: Dict, finding_id: str, status: str, confidence: str) -> Dict:
         """Build a single finding entry with all required fields."""
+        # Determine source (event_bus or database)
+        source = f.get("source", "database")
+        validation_source = "event_bus" if source == "event_bus" else "database"
+
         entry = {
             "id": finding_id,
             "type": f.get("type", "Unknown"),
@@ -677,7 +695,10 @@ class ReportingAgent(BaseAgent):
             "cvss_vector": f.get("cvss_vector"),
             "cvss_rationale": f.get("cvss_rationale"),
             "cve": f.get("cve"),
-            "markdown_block": self._generate_finding_markdown(f, int(finding_id.split("-")[1]))
+            "markdown_block": self._generate_finding_markdown(f, int(finding_id.split("-")[1])),
+            # Source tracking for report viewers
+            "source": source,
+            "validation_source": validation_source,
         }
 
         # Add SQLi-specific fields
@@ -693,6 +714,14 @@ class ReportingAgent(BaseAgent):
         # Add screenshot path if available
         if f.get("screenshot_path"):
             entry["screenshot_path"] = f"captures/{Path(f.get('screenshot_path', '')).name}"
+
+        # Add CDP validation metadata if present (from event_bus findings)
+        if f.get("cdp_validated"):
+            entry["cdp_validated"] = f.get("cdp_validated")
+        if f.get("cdp_confidence"):
+            entry["cdp_confidence"] = f.get("cdp_confidence")
+        if f.get("specialist"):
+            entry["specialist"] = f.get("specialist")
 
         return entry
 
@@ -837,13 +866,22 @@ class ReportingAgent(BaseAgent):
         manual_review: List[Dict],
         by_severity: Dict
     ) -> Dict:
-        """Build engagement summary section."""
+        """Build engagement summary section with source tracking."""
+        # Count findings by source
+        event_sourced = sum(1 for f in all_findings if f.get("source") == "event_bus")
+        db_sourced = sum(1 for f in all_findings if f.get("source") in ("database", None))
+        nuclei_sourced = sum(1 for f in all_findings if f.get("source") == "nuclei")
+
         return {
             "total_findings": len(all_findings),
             "validated": len(validated),
             "false_positives": len(false_positives),
             "manual_review": len(manual_review),
-            "by_severity": by_severity
+            "by_severity": by_severity,
+            # Source breakdown for report insights
+            "event_sourced": event_sourced,
+            "db_sourced": db_sourced,
+            "nuclei_sourced": nuclei_sourced,
         }
 
     def _count_by_severity(self, validated: List[Dict]) -> Dict[str, int]:
