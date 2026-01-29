@@ -5,8 +5,10 @@ from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from bugtrace.agents.base import BaseAgent
+from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
 from bugtrace.core.ui import dashboard
 from bugtrace.core.job_manager import JobStatus
+from bugtrace.core.event_bus import EventType
 from bugtrace.utils.logger import get_logger
 from bugtrace.utils.parsers import XmlParser
 from bugtrace.core.llm_client import llm_client
@@ -309,10 +311,11 @@ class CSTIAgent(BaseAgent):
     - Blind SSTI Detection via Interactsh (OOB)
     """
     
-    def __init__(self, url: str, params: List[Dict] = None, report_dir: Path = None):
+    def __init__(self, url: str, params: List[Dict] = None, report_dir: Path = None, event_bus=None):
         super().__init__(
             name="CSTIAgent",
             role="Template Injection Specialist",
+            event_bus=event_bus,
             agent_id="csti_agent"
         )
         self.url = url
@@ -323,6 +326,11 @@ class CSTIAgent(BaseAgent):
         self.interactsh = None
         self.interactsh_url = None
         self._max_impact_achieved = False
+
+        # Queue consumption mode (Phase 20)
+        self._queue_mode = False
+        self._worker_pool: Optional[WorkerPool] = None
+        self._scan_context: str = ""
 
     async def _detect_waf_async(self) -> Tuple[str, float]:
         """Detect WAF using framework's intelligent fingerprinter."""
@@ -1340,3 +1348,191 @@ Response format (XML):
                 logger.info(f"[CSTIAgent] Generated universal variant: {variant[:80]}...")
                 return variant
         return None
+
+    # =========================================================================
+    # Queue Consumption Mode (Phase 20)
+    # =========================================================================
+
+    async def start_queue_consumer(self, scan_context: str) -> None:
+        """
+        Start CSTIAgent in queue consumer mode.
+
+        Spawns a worker pool that consumes from the csti queue and
+        processes findings in parallel.
+
+        Args:
+            scan_context: Scan identifier for event correlation
+        """
+        self._queue_mode = True
+        self._scan_context = scan_context
+
+        # Configure worker pool
+        config = WorkerConfig(
+            specialist="csti",
+            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,
+            process_func=self._process_queue_item,
+            on_result=self._handle_queue_result,
+            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
+        )
+
+        self._worker_pool = WorkerPool(config)
+
+        # Subscribe to work_queued_csti events (optional notification)
+        if self.event_bus:
+            self.event_bus.subscribe(
+                EventType.WORK_QUEUED_CSTI.value,
+                self._on_work_queued
+            )
+
+        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
+        await self._worker_pool.start()
+
+    async def stop_queue_consumer(self) -> None:
+        """Stop queue consumer mode gracefully."""
+        if self._worker_pool:
+            await self._worker_pool.stop()
+            self._worker_pool = None
+
+        if self.event_bus:
+            self.event_bus.unsubscribe(
+                EventType.WORK_QUEUED_CSTI.value,
+                self._on_work_queued
+            )
+
+        self._queue_mode = False
+        logger.info(f"[{self.name}] Queue consumer stopped")
+
+    async def _on_work_queued(self, data: dict) -> None:
+        """Handle work_queued_csti notification (logging only)."""
+        logger.debug(f"[{self.name}] Work queued: {data.get('finding', {}).get('url', 'unknown')}")
+
+    async def _process_queue_item(self, item: dict) -> Optional[CSTIFinding]:
+        """
+        Process a single item from the csti queue.
+
+        Item structure (from ThinkingConsolidationAgent):
+        {
+            "finding": {
+                "type": "CSTI",
+                "url": "...",
+                "parameter": "...",
+                "template_engine": "...",  # Optional: detected engine
+            },
+            "priority": 85.5,
+            "scan_context": "scan_123",
+            "classified_at": 1234567890.0
+        }
+        """
+        finding = item.get("finding", {})
+        url = finding.get("url")
+        param = finding.get("parameter")
+
+        if not url or not param:
+            logger.warning(f"[{self.name}] Invalid queue item: missing url or parameter")
+            return None
+
+        # Configure self for this specific test
+        self.url = url
+
+        # Run validation using existing CSTI testing logic
+        return await self._test_single_param_from_queue(url, param, finding)
+
+    async def _test_single_param_from_queue(
+        self, url: str, param: str, finding: dict
+    ) -> Optional[CSTIFinding]:
+        """
+        Test a single parameter from queue for CSTI.
+
+        Uses existing validation pipeline optimized for queue processing.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Fetch page for template engine detection
+                html = await self._fetch_page(session)
+
+                # Detect template engine
+                engines = TemplateEngineFingerprinter.fingerprint(html)
+
+                # Use suggested engine from finding if available
+                suggested_engine = finding.get("template_engine")
+                if suggested_engine and suggested_engine != "unknown":
+                    engines = [suggested_engine] + [e for e in engines if e != suggested_engine]
+
+                # Test with targeted payloads first
+                if engines and engines[0] != "unknown":
+                    result = await self._targeted_probe(session, param, engines)
+                    if result:
+                        return self._dict_to_finding(result)
+
+                # Universal probe
+                result = await self._universal_probe(session, param)
+                if result:
+                    return self._dict_to_finding(result)
+
+                # OOB probe if Interactsh available
+                if not self.interactsh:
+                    await self._setup_interactsh()
+                if self.interactsh_url:
+                    result = await self._oob_probe(session, param, engines)
+                    if result:
+                        return self._dict_to_finding(result)
+
+                return None
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Queue item test failed: {e}")
+            return None
+
+    def _dict_to_finding(self, result: Dict) -> Optional[CSTIFinding]:
+        """Convert finding dict back to CSTIFinding object."""
+        if not result:
+            return None
+
+        return CSTIFinding(
+            url=result.get("url", self.url),
+            parameter=result.get("parameter", ""),
+            payload=result.get("payload", ""),
+            template_engine=result.get("template_engine", "unknown"),
+            engine_type=result.get("csti_metadata", {}).get("type", "unknown"),
+            status=result.get("status", "VALIDATED_CONFIRMED"),
+            validated=result.get("validated", True),
+            description=result.get("description", ""),
+            evidence=result.get("evidence", {}),
+        )
+
+    async def _handle_queue_result(self, item: dict, result: Optional[CSTIFinding]) -> None:
+        """
+        Handle completed queue item processing.
+
+        Emits vulnerability_detected event on confirmed findings.
+        """
+        if result is None:
+            return
+
+        # Emit vulnerability_detected event
+        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "csti",
+                "finding": {
+                    "type": "CSTI",
+                    "url": result.url,
+                    "parameter": result.parameter,
+                    "payload": result.payload,
+                    "template_engine": result.template_engine,
+                },
+                "status": result.status,
+                "scan_context": self._scan_context,
+            })
+
+        logger.info(f"[{self.name}] Confirmed CSTI: {result.url}?{result.parameter} ({result.template_engine})")
+
+    def get_queue_stats(self) -> dict:
+        """Get queue consumer statistics."""
+        if not self._worker_pool:
+            return {"mode": "direct", "queue_mode": False}
+
+        return {
+            "mode": "queue",
+            "queue_mode": True,
+            "worker_stats": self._worker_pool.get_stats(),
+        }
