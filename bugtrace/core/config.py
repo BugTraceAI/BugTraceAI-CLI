@@ -149,6 +149,15 @@ class Settings(BaseSettings):
                 raise ValueError(f"Invalid model in list: {model} (expected: provider/model)")
         return v
 
+    @field_validator('QUEUE_PERSISTENCE_MODE')
+    @classmethod
+    def validate_queue_mode(cls, v):
+        """Validate queue persistence mode."""
+        valid_modes = ['memory', 'redis']
+        if v not in valid_modes:
+            raise ValueError(f"QUEUE_PERSISTENCE_MODE must be one of: {valid_modes}")
+        return v
+
     # --- OpenRouter Configuration ---
     OPENROUTER_ONLINE: bool = True  # Enable internet access for models
     
@@ -189,6 +198,12 @@ class Settings(BaseSettings):
     CDP_ENABLED: bool = True  # Enable CDP as primary verification method
     CDP_PORT: int = 9222  # Chrome remote debugging port
     CDP_TIMEOUT: float = 5.0  # Time to wait for XSS execution (seconds)
+
+    # --- Queue Configuration (Phase 16: v2.3) ---
+    QUEUE_PERSISTENCE_MODE: str = "memory"  # "memory" or "redis"
+    QUEUE_DEFAULT_MAX_DEPTH: int = 1000  # Max items per queue
+    QUEUE_DEFAULT_RATE_LIMIT: float = 100.0  # Max items/second (0 = unlimited)
+    QUEUE_REDIS_URL: str = "redis://localhost:6379/0"  # For future Redis mode
 
     # --- SSL/TLS Configuration (TASK-66) ---
     # Enable SSL certificate verification by default for security
