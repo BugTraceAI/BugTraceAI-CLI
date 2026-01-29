@@ -127,6 +127,39 @@ def summary(
         console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1)
 
+@app.command(name="agents")
+def agents():
+    """List all available security testing agents."""
+    from rich.table import Table
+
+    table = Table(title="BugTraceAI Security Agents", show_header=True)
+    table.add_column("Agent", style="cyan")
+    table.add_column("Target", style="green")
+    table.add_column("CWE", style="yellow")
+    table.add_column("Description")
+
+    # Core agents
+    table.add_row("XSSAgent", "Cross-Site Scripting", "CWE-79", "Detects reflected, stored, and DOM-based XSS")
+    table.add_row("SQLMapAgent", "SQL Injection", "CWE-89", "Detects SQL injection via SQLMap integration")
+    table.add_row("JWTAgent", "JWT Vulnerabilities", "CWE-347", "Analyzes JWT tokens for weaknesses")
+    table.add_row("LFIAgent", "Local File Inclusion", "CWE-98", "Detects path traversal and LFI")
+    table.add_row("SSRFAgent", "Server-Side Request Forgery", "CWE-918", "Detects SSRF via URL parameters")
+    table.add_row("IDORAgent", "Insecure Direct Object Reference", "CWE-639", "Detects authorization bypass")
+    table.add_row("XXEAgent", "XML External Entity", "CWE-611", "Detects XXE in XML parsers")
+    table.add_row("RCEAgent", "Remote Code Execution", "CWE-94", "Detects command injection")
+
+    # New v2.2 agents
+    table.add_row("OpenRedirectAgent", "Open Redirect", "CWE-601", "Detects URL redirection vulnerabilities")
+    table.add_row("PrototypePollutionAgent", "Prototype Pollution", "CWE-1321", "Detects JS prototype pollution with RCE escalation")
+
+    # Support agents
+    table.add_row("CSTIAgent", "Client-Side Template Injection", "CWE-94", "Detects template injection")
+    table.add_row("APISecurityAgent", "API Security", "Multiple", "API endpoint security analysis")
+    table.add_row("ChainDiscoveryAgent", "Vulnerability Chaining", "Multiple", "Discovers attack chains")
+
+    console.print(table)
+    console.print("\n[dim]Run with: bugtrace scan <url> or bugtrace full <url>[/dim]")
+
 def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
     """Internal helper to run the pipeline phases."""
     if safe_mode is not None:
