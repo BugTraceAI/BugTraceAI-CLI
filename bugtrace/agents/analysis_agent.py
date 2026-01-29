@@ -671,7 +671,7 @@ Be RUTHLESS. False positives waste resources."""
                         # Average confidence
                         merged[key]["confidence_score"] = int((merged[key]["confidence_score"] + conf) / 2)
 
-        # Second pass: merge skeptical scores into findings
+        # Second pass: merge skeptical scores and calculate fp_confidence
         for key, vuln in merged.items():
             if key in skeptical_data:
                 vuln["skeptical_score"] = skeptical_data[key]["skeptical_score"]
@@ -680,6 +680,9 @@ Be RUTHLESS. False positives waste resources."""
                 # No skeptical review for this finding - default to uncertain
                 vuln["skeptical_score"] = 5
                 vuln["fp_reason"] = "Not reviewed by skeptical agent"
+
+            # Calculate FP confidence (Phase 17 enhancement)
+            vuln['fp_confidence'] = self._calculate_fp_confidence(vuln)
 
         # Apply consensus filter - require at least 4 votes to reduce false positives
         min_votes = getattr(settings, "ANALYSIS_CONSENSUS_VOTES", 4)
@@ -697,24 +700,28 @@ Be RUTHLESS. False positives waste resources."""
         Use a skeptical LLM (Claude Haiku) to review findings and filter false positives.
         This is the final gate before findings reach specialist agents.
 
-        Now enhanced with skeptical_agent approach scores from consolidation phase.
-        Findings with skeptical_score <= 3 are pre-filtered before this review.
+        Phase 17: Now uses fp_confidence for smart pre-filtering.
+        Findings with low fp_confidence AND low skeptical_score are rejected early.
         """
-        # 1. Pre-filter based on skeptical_agent scores (Phase 17 enhancement)
+        # 1. Pre-filter based on fp_confidence threshold (Phase 17 enhancement)
+        threshold = getattr(settings, 'FP_CONFIDENCE_THRESHOLD', 0.5)
+
         pre_filtered = []
         rejected_count = 0
         for v in vulnerabilities:
-            skeptical_score = v.get("skeptical_score", 5)
-            if skeptical_score <= 3:
-                # Likely FP from skeptical_agent - reject early
+            fp_conf = v.get('fp_confidence', 0.5)
+            skeptical_score = v.get('skeptical_score', 5)
+
+            # Reject if BOTH skeptical_score is low AND fp_confidence is below threshold
+            if skeptical_score <= 3 and fp_conf < threshold:
                 logger.info(f"[{self.name}] Pre-filtered FP: {v.get('type')} on '{v.get('parameter')}' "
-                           f"(skeptical_score: {skeptical_score}, reason: {v.get('fp_reason', 'N/A')[:50]})")
+                           f"(fp_confidence: {fp_conf:.2f}, skeptical: {skeptical_score})")
                 rejected_count += 1
             else:
                 pre_filtered.append(v)
 
         if rejected_count > 0:
-            logger.info(f"[{self.name}] Skeptical pre-filter: {rejected_count} FPs removed, {len(pre_filtered)} remaining")
+            logger.info(f"[{self.name}] FP pre-filter: {rejected_count} removed (threshold: {threshold}), {len(pre_filtered)} remaining")
 
         if not pre_filtered:
             return []
