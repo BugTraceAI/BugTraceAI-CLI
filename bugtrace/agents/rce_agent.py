@@ -1,10 +1,14 @@
 import logging
 import aiohttp
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from bugtrace.agents.base import BaseAgent
+from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
+from bugtrace.core.queue import queue_manager
+from bugtrace.core.event_bus import EventType
+from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
@@ -18,16 +22,22 @@ class RCEAgent(BaseAgent):
     """
     Specialist Agent for Remote Code Execution (RCE) and Command Injection.
     """
-    
-    def __init__(self, url: str, params: List[str] = None, report_dir: Path = None):
+
+    def __init__(self, url: str, params: List[str] = None, report_dir: Path = None, event_bus: Any = None):
         super().__init__(
             name="RCEAgent",
             role="RCE Specialist",
+            event_bus=event_bus,
             agent_id="rce_agent"
         )
         self.url = url
         self.params = params or []
         self.report_dir = report_dir or Path("./reports")
+
+        # Queue consumption mode (Phase 20)
+        self._queue_mode = False
+        self._worker_pool: Optional[WorkerPool] = None
+        self._scan_context: str = ""
         
     def _get_time_payloads(self) -> list:
         """Get time-based RCE payloads."""
@@ -154,3 +164,109 @@ class RCEAgent(BaseAgent):
         q[param] = [payload]
         new_query = urlencode(q, doseq=True)
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+    # =========================================================================
+    # QUEUE CONSUMPTION MODE (Phase 20)
+    # =========================================================================
+
+    async def start_queue_consumer(self, scan_context: str) -> None:
+        """
+        Start RCEAgent in queue consumer mode.
+
+        Spawns a worker pool that consumes from the rce queue and
+        processes findings in parallel.
+        """
+        self._queue_mode = True
+        self._scan_context = scan_context
+
+        config = WorkerConfig(
+            specialist="rce",
+            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,
+            process_func=self._process_queue_item,
+            on_result=self._handle_queue_result,
+            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
+        )
+
+        self._worker_pool = WorkerPool(config)
+
+        if self.event_bus:
+            self.event_bus.subscribe(
+                EventType.WORK_QUEUED_RCE.value,
+                self._on_work_queued
+            )
+
+        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
+        await self._worker_pool.start()
+
+    async def _process_queue_item(self, item: dict) -> Optional[Dict]:
+        """Process a single item from the rce queue."""
+        finding = item.get("finding", {})
+        url = finding.get("url")
+        param = finding.get("parameter")
+
+        if not url or not param:
+            logger.warning(f"[{self.name}] Invalid queue item: missing url or parameter")
+            return None
+
+        self.url = url
+        return await self._test_single_param_from_queue(url, param, finding)
+
+    async def _test_single_param_from_queue(self, url: str, param: str, finding: dict) -> Optional[Dict]:
+        """Test a single parameter from queue for RCE."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                time_payloads = self._get_time_payloads()
+                return await self._test_parameter(session, param, time_payloads)
+        except Exception as e:
+            logger.error(f"[{self.name}] Queue item test failed: {e}")
+            return None
+
+    async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
+        """Handle completed queue item processing."""
+        if result is None:
+            return
+
+        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                "specialist": "rce",
+                "finding": {
+                    "type": "RCE",
+                    "url": result.get("url"),
+                    "parameter": result.get("parameter"),
+                    "payload": result.get("payload"),
+                },
+                "status": result.get("status", "VALIDATED_CONFIRMED"),
+                "scan_context": self._scan_context,
+            })
+
+        logger.info(f"[{self.name}] Confirmed RCE: {result.get('url')}?{result.get('parameter')}")
+
+    async def _on_work_queued(self, data: dict) -> None:
+        """Handle work_queued_rce notification (logging only)."""
+        logger.debug(f"[{self.name}] Work queued: {data.get('finding', {}).get('url', 'unknown')}")
+
+    async def stop_queue_consumer(self) -> None:
+        """Stop queue consumer mode gracefully."""
+        if self._worker_pool:
+            await self._worker_pool.stop()
+            self._worker_pool = None
+
+        if self.event_bus:
+            self.event_bus.unsubscribe(
+                EventType.WORK_QUEUED_RCE.value,
+                self._on_work_queued
+            )
+
+        self._queue_mode = False
+        logger.info(f"[{self.name}] Queue consumer stopped")
+
+    def get_queue_stats(self) -> dict:
+        """Get queue consumer statistics."""
+        if not self._worker_pool:
+            return {"mode": "direct", "queue_mode": False}
+
+        return {
+            "mode": "queue",
+            "queue_mode": True,
+            "worker_stats": self._worker_pool.get_stats(),
+        }
