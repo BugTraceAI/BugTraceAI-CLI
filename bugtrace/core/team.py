@@ -93,10 +93,78 @@ class TeamOrchestrator:
         logger.info("Event Bus integrated into TeamOrchestrator")
         logger.info("Phase 1 Agents loaded: AssetDiscovery, APISecurity, ChainDiscovery")
 
+        # Initialize ThinkingConsolidationAgent for V3 pipeline
+        from bugtrace.agents.thinking_consolidation_agent import ThinkingConsolidationAgent
+        self.thinking_agent = ThinkingConsolidationAgent(event_bus=event_bus)
+        logger.info("ThinkingConsolidationAgent initialized - V3 event-driven pipeline active")
+
+        # Initialize specialist worker pools
+        self._init_specialist_workers()
+        logger.info("Specialist worker pools initialized")
+
         # Pipeline orchestration (v2.3)
         self._pipeline: Optional[PipelineOrchestrator] = None
         self._lifecycle: Optional[PipelineLifecycle] = None
         logger.info("Pipeline orchestration infrastructure initialized")
+
+    def _init_specialist_workers(self):
+        """Initialize specialist worker pools for V3 pipeline."""
+        from bugtrace.agents.sqli_agent import SQLiAgent
+        from bugtrace.agents.xss_agent import XSSAgent
+        from bugtrace.agents.csti_agent import CSTIAgent
+        from bugtrace.agents.lfi_agent import LFIAgent
+        from bugtrace.agents.idor_agent import IDORAgent
+        from bugtrace.agents.rce_agent import RCEAgent
+        from bugtrace.agents.ssrf_agent import SSRFAgent
+        from bugtrace.agents.xxe_agent import XXEAgent
+        from bugtrace.agents.open_redirect_agent import OpenRedirectAgent
+        from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
+
+        # Initialize specialist agents with event_bus
+        self.sqli_agent = SQLiAgent(event_bus=self.event_bus)
+        self.xss_agent = XSSAgent(event_bus=self.event_bus)
+        self.csti_agent = CSTIAgent(event_bus=self.event_bus)
+        self.lfi_agent = LFIAgent(event_bus=self.event_bus)
+        self.idor_agent = IDORAgent(event_bus=self.event_bus)
+        self.rce_agent = RCEAgent(event_bus=self.event_bus)
+        self.ssrf_agent = SSRFAgent(event_bus=self.event_bus)
+        self.xxe_agent = XXEAgent(event_bus=self.event_bus)
+        self.open_redirect_agent = OpenRedirectAgent(event_bus=self.event_bus)
+        self.prototype_pollution_agent = PrototypePollutionAgent(event_bus=self.event_bus)
+
+        # Start worker pools for each specialist
+        self.sqli_agent.start_queue_consumer()
+        self.xss_agent.start_queue_consumer()
+        self.csti_agent.start_queue_consumer()
+        self.lfi_agent.start_queue_consumer()
+        self.idor_agent.start_queue_consumer()
+        self.rce_agent.start_queue_consumer()
+        self.ssrf_agent.start_queue_consumer()
+        self.xxe_agent.start_queue_consumer()
+        self.jwt_agent.start_queue_consumer()  # JWT was already initialized
+        self.open_redirect_agent.start_queue_consumer()
+        self.prototype_pollution_agent.start_queue_consumer()
+
+        logger.info("Started 11 specialist worker pools for V3 pipeline")
+
+    async def _shutdown_specialist_workers(self):
+        """Shutdown specialist worker pools gracefully."""
+        logger.info("Shutting down specialist worker pools...")
+        shutdown_tasks = [
+            self.sqli_agent.stop_queue_consumer(),
+            self.xss_agent.stop_queue_consumer(),
+            self.csti_agent.stop_queue_consumer(),
+            self.lfi_agent.stop_queue_consumer(),
+            self.idor_agent.stop_queue_consumer(),
+            self.rce_agent.stop_queue_consumer(),
+            self.ssrf_agent.stop_queue_consumer(),
+            self.xxe_agent.stop_queue_consumer(),
+            self.jwt_agent.stop_queue_consumer(),
+            self.open_redirect_agent.stop_queue_consumer(),
+            self.prototype_pollution_agent.stop_queue_consumer(),
+        ]
+        await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+        logger.info("All specialist worker pools shutdown complete")
 
     def _init_vertical_mode(self, use_vertical_agents: bool):
         """Initialize vertical agent architecture settings."""
@@ -1474,6 +1542,9 @@ class TeamOrchestrator:
             {'report_generated': True}
         )
         await self._pipeline.stop()
+
+        # Shutdown specialist worker pools
+        await self._shutdown_specialist_workers()
 
         logger.info("=== V2 SEQUENTIAL PIPELINE COMPLETE ===")
 
