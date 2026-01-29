@@ -107,6 +107,26 @@ def mcp():
     from bugtrace.mcp.server import run_mcp_server
     run_mcp_server()
 
+@app.command(name="summary")
+def summary(
+    target: Optional[str] = typer.Argument(None, help="Target URL (uses latest scan for this target)"),
+    scan_id: Optional[int] = typer.Option(None, "--scan-id", "-s", help="Specific scan ID"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+):
+    """Show aggregated findings summary by severity for a scan."""
+    from bugtrace.core.summary import generate_scan_summary, format_summary_table, format_summary_json
+
+    try:
+        scan_summary = generate_scan_summary(scan_id=scan_id, target_url=target)
+
+        if json_output:
+            console.print(format_summary_json(scan_summary))
+        else:
+            console.print(format_summary_table(scan_summary))
+    except ValueError as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        raise typer.Exit(code=1)
+
 def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
     """Internal helper to run the pipeline phases."""
     if safe_mode is not None:
