@@ -98,16 +98,15 @@ class TeamOrchestrator:
         self.thinking_agent = ThinkingConsolidationAgent()
         logger.info("ThinkingConsolidationAgent initialized - V3 event-driven pipeline active")
 
-        # Initialize specialist worker pools
-        self._init_specialist_workers()
-        logger.info("Specialist worker pools initialized")
+        # Specialist worker pools will be initialized async in _run_hunter_core
+        self._specialist_workers_started = False
 
         # Pipeline orchestration (v2.3)
         self._pipeline: Optional[PipelineOrchestrator] = None
         self._lifecycle: Optional[PipelineLifecycle] = None
         logger.info("Pipeline orchestration infrastructure initialized")
 
-    def _init_specialist_workers(self):
+    async def _init_specialist_workers(self):
         """Initialize specialist worker pools for V3 pipeline."""
         from bugtrace.agents.sqli_agent import SQLiAgent
         from bugtrace.agents.xss_agent import XSSAgent
@@ -136,17 +135,19 @@ class TeamOrchestrator:
         # Start worker pools for each specialist
         # scan_context will be passed in actual scan, use global for now
         scan_ctx = "scan_global"
-        self.sqli_worker_agent.start_queue_consumer(scan_ctx)
-        self.xss_worker_agent.start_queue_consumer(scan_ctx)
-        self.csti_worker_agent.start_queue_consumer(scan_ctx)
-        self.lfi_worker_agent.start_queue_consumer(scan_ctx)
-        self.idor_worker_agent.start_queue_consumer(scan_ctx)
-        self.rce_worker_agent.start_queue_consumer(scan_ctx)
-        self.ssrf_worker_agent.start_queue_consumer(scan_ctx)
-        self.xxe_worker_agent.start_queue_consumer(scan_ctx)
-        self.jwt_agent.start_queue_consumer(scan_ctx)  # JWT was already initialized
-        self.open_redirect_worker_agent.start_queue_consumer(scan_ctx)
-        self.prototype_pollution_worker_agent.start_queue_consumer(scan_ctx)
+        await asyncio.gather(
+            self.sqli_worker_agent.start_queue_consumer(scan_ctx),
+            self.xss_worker_agent.start_queue_consumer(scan_ctx),
+            self.csti_worker_agent.start_queue_consumer(scan_ctx),
+            self.lfi_worker_agent.start_queue_consumer(scan_ctx),
+            self.idor_worker_agent.start_queue_consumer(scan_ctx),
+            self.rce_worker_agent.start_queue_consumer(scan_ctx),
+            self.ssrf_worker_agent.start_queue_consumer(scan_ctx),
+            self.xxe_worker_agent.start_queue_consumer(scan_ctx),
+            self.jwt_agent.start_queue_consumer(scan_ctx),
+            self.open_redirect_worker_agent.start_queue_consumer(scan_ctx),
+            self.prototype_pollution_worker_agent.start_queue_consumer(scan_ctx),
+        )
 
         logger.info("Started 11 specialist worker pools for V3 pipeline")
 
@@ -317,6 +318,12 @@ class TeamOrchestrator:
 
         if not self.resume:
             self.state_manager.clear()
+
+        # Start specialist worker pools (async initialization)
+        if not self._specialist_workers_started:
+            await self._init_specialist_workers()
+            self._specialist_workers_started = True
+            logger.info("Specialist worker pools initialized")
 
         # Authentication phase
         await self._handle_authentication()
