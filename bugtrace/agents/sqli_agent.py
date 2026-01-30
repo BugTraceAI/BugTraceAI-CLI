@@ -2022,7 +2022,7 @@ Write the exploitation explanation section for the report."""
             cookies = []
             try:
                 from bugtrace.tools.visual.browser import browser_manager
-                session_data = await browser_manager.export_session_context()
+                session_data = await browser_manager.get_session_data()
                 cookies = session_data.get("cookies", [])
             except Exception:
                 pass

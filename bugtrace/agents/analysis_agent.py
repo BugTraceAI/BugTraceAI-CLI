@@ -432,7 +432,7 @@ class DASTySASTAgent(BaseAgent):
         try:
             # Get cookies from browser session
             from bugtrace.tools.visual.browser import browser_manager
-            session_data = await browser_manager.export_session_context()
+            session_data = await browser_manager.get_session_data()
             cookies = session_data.get("cookies", [])
 
             if not cookies:
