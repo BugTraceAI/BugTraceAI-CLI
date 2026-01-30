@@ -664,21 +664,86 @@ class EnhancedSQLMapRunner:
         cmd.extend(["--data", validated_post_data])
 
     def _add_cookies(self, cmd: List[str]):
-        """Add cookies to command (TASK-32)."""
+        """Add cookies to command (TASK-32).
+
+        IMPROVED (2026-01-30): Enable cookie injection testing, not just authentication.
+        SQLMap at level >= 2 tests cookies, but we need proper configuration.
+        """
         if not self.cookies:
             return
 
         try:
             validated_cookies = []
+            base64_cookies = []
+            cookie_names = []
+
             for c in self.cookies:
                 name = c.get('name', '')
                 value = c.get('value', '')
                 validated_value = validate_cookie_value(name, value)
                 validated_cookies.append(f"{name}={validated_value}")
+                cookie_names.append(name)
+
+                # IMPROVED: Detect Base64-encoded cookies for special handling
+                if self._is_likely_base64(validated_value):
+                    base64_cookies.append(name)
+                    logger.info(f"Detected Base64-encoded cookie: {name}")
+
             cookie_str = "; ".join(validated_cookies)
             cmd.append(f"--cookie={cookie_str}")
+
+            # IMPROVED: Enable cookie injection testing explicitly
+            # With --level 5, SQLMap tests cookies, but we ensure proper delimiter
+            cmd.append("--cookie-del=;")
+
+            # CRITICAL: Tell SQLMap to test ALL cookies explicitly
+            # This forces SQLMap to treat cookies as injection points
+            if cookie_names:
+                cmd.extend(["-p", ",".join(cookie_names)])
+                logger.info(f"Explicitly testing cookie parameters: {cookie_names}")
+
+            # IMPROVED: For Base64 cookies, add special handling
+            # SQLMap's --base64 option decodes before testing, re-encodes after
+            for b64_cookie in base64_cookies:
+                cmd.append(f"--base64={b64_cookie}")
+                logger.info(f"Enabled Base64 decoding for cookie: {b64_cookie}")
+
         except ValueError as e:
             logger.warning(f"Invalid cookie skipped: {e}")
+
+    def _is_likely_base64(self, value: str) -> bool:
+        """Check if a value looks like Base64 encoding.
+
+        ADDED (2026-01-30): Detect Base64-encoded values for proper SQLi testing.
+        """
+        import base64
+
+        if not value or len(value) < 4:
+            return False
+
+        # Base64 typically has these characteristics:
+        # - Length is multiple of 4 (or close with padding)
+        # - Contains only A-Z, a-z, 0-9, +, /, =
+        # - May end with = or == for padding
+
+        base64_pattern = re.compile(r'^[A-Za-z0-9+/]+=*$')
+        if not base64_pattern.match(value):
+            return False
+
+        # Try to decode it - if it works, likely Base64
+        try:
+            # Add padding if needed
+            padded = value + '=' * (4 - len(value) % 4) if len(value) % 4 else value
+            decoded = base64.b64decode(padded, validate=True)
+            # Check if decoded value looks like text (not binary garbage)
+            try:
+                decoded.decode('utf-8')
+                return True
+            except UnicodeDecodeError:
+                # Could still be valid Base64 of binary data
+                return len(value) >= 8  # Longer encoded values more likely to be Base64
+        except Exception:
+            return False
 
     def _add_headers(self, cmd: List[str]):
         """Add custom headers to command (TASK-33)."""
@@ -1036,22 +1101,39 @@ class SQLMapAgent(BaseAgent):
                 dashboard.log(f"[{self.name}] ✅ Quick probe found SQLi!", "SUCCESS")
 
     def _get_parameters_to_test(self) -> List[str]:
-        """Get list of parameters to test."""
-        params_to_test = self.params
+        """Get list of parameters to test.
+
+        IMPROVED (2026-01-30): Also include cookie names as testable parameters.
+        Cookies are often overlooked injection points (e.g., TrackingId at ginandjuice.shop).
+        """
+        params_to_test = list(self.params) if self.params else []
+
+        # Add URL query parameters
         if not params_to_test:
             parsed = urlparse(self.url)
             query_params = parse_qs(parsed.query)
             params_to_test = list(query_params.keys())
 
+        # Add POST parameters
         if self.post_data:
             post_params = self._extract_post_params(self.post_data)
             params_to_test.extend(post_params)
+
+        # IMPROVED: Add cookie names as testable parameters
+        # At --level 5, SQLMap tests cookies, but we explicitly include them
+        if self.cookies:
+            for cookie in self.cookies:
+                cookie_name = cookie.get('name', '')
+                if cookie_name and cookie_name not in params_to_test:
+                    params_to_test.append(cookie_name)
+                    logger.info(f"Added cookie '{cookie_name}' to injection test list")
 
         params_to_test = list(set(params_to_test))
 
         if not params_to_test:
             params_to_test = ["id"]
 
+        logger.info(f"Parameters to test: {params_to_test}")
         return params_to_test
 
     async def _run_phase2_parameter_testing(self, params_to_test: List[str]) -> List[Dict]:
@@ -1572,13 +1654,33 @@ class SQLMapAgent(BaseAgent):
         return None
 
     def _default_error_patterns(self) -> List[str]:
-        """Default SQL error patterns."""
+        """Default SQL error patterns.
+
+        IMPROVED (2026-01-30): Added PostgreSQL-specific patterns for ginandjuice.shop.
+        """
         return [
+            # Generic SQL errors
             r"SQL syntax", r"SQL Error", r"mysql_", r"mysqli_",
             r"Warning:.*\bSQL\b", r"Unclosed quotation mark",
             r"quoted string not properly terminated",
-            r"PostgreSQL.*ERROR", r"ODBC SQL Server Driver",
-            r"sqlite3\.OperationalError", r"ORA-\d{5}",
+            # PostgreSQL-specific (ADDED 2026-01-30)
+            r"PostgreSQL.*ERROR",
+            r"pg_query\(\)",
+            r"pg_exec\(\)",
+            r"PG::SyntaxError",
+            r"ERROR:\s+syntax error",
+            r"unterminated quoted string",
+            r"invalid input syntax",
+            r"column.*does not exist",
+            # MS SQL Server
+            r"ODBC SQL Server Driver",
+            r"Incorrect syntax near",
+            # SQLite
+            r"sqlite3\.OperationalError",
+            # Oracle
+            r"ORA-\d{5}",
+            r"PLS-\d{5}",
+            # Other databases
             r"DB2 SQL error", r"Dynamic SQL Error"
         ]
 
