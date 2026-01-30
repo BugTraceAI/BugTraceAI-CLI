@@ -366,7 +366,7 @@ class QueueManager:
 SPECIALIST_QUEUES = [
     "xss", "sqli", "csti", "lfi", "idor", "rce",
     "ssrf", "xxe", "jwt", "openredirect", "prototype_pollution",
-    "file_upload", "chain_discovery", "api_security"
+    "file_upload", "chain_discovery", "api_security", "header_injection"
 ]
 
 

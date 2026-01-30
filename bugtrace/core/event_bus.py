@@ -73,6 +73,7 @@ class EventType(str, Enum):
     WORK_QUEUED_JWT = "work_queued_jwt"
     WORK_QUEUED_OPENREDIRECT = "work_queued_openredirect"
     WORK_QUEUED_PROTOTYPE_POLLUTION = "work_queued_prototype_pollution"
+    WORK_QUEUED_HEADER_INJECTION = "work_queued_header_injection"
 
     # Exploitation
     VULNERABILITY_DETECTED = "vulnerability_detected"

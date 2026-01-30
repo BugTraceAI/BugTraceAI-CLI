@@ -105,8 +105,13 @@ VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
     "prototype_pollution": "prototype_pollution",
     "__proto__ pollution": "prototype_pollution",
 
-    # Header injection (maps to XSS specialist as similar validation)
-    "header injection": "xss",
+    # Header injection / CRLF (has dedicated specialist now)
+    "header injection": "header_injection",
+    "crlf": "header_injection",
+    "crlf injection": "header_injection",
+    "http response header injection": "header_injection",
+    "response splitting": "header_injection",
+    "http header injection": "header_injection",
     "crlf injection": "xss",
     "http response splitting": "xss",
 }
@@ -518,6 +523,7 @@ class ThinkingConsolidationAgent(BaseAgent):
             "jwt": EventType.WORK_QUEUED_JWT,
             "openredirect": EventType.WORK_QUEUED_OPENREDIRECT,
             "prototype_pollution": EventType.WORK_QUEUED_PROTOTYPE_POLLUTION,
+            "header_injection": EventType.WORK_QUEUED_HEADER_INJECTION,
         }
 
         event_type = specialist_to_event.get(prioritized.specialist)
