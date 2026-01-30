@@ -1635,14 +1635,15 @@ class TeamOrchestrator:
         return vulnerabilities_by_url
 
     async def _phase_2_analysis(self, dashboard, analysis_dir):
-        """Execute Phase 2: URL-by-URL Analysis."""
+        """Execute Phase 2: Batch DAST Discovery + Specialist Exploitation."""
         dashboard.set_phase("PHASE_2_ANALYSIS")
 
-        for i, url in enumerate(self.urls_to_scan):
-            await self._process_url(url, i, len(self.urls_to_scan), analysis_dir, dashboard)
-            if dashboard.stop_requested or self._stop_event.is_set():
-                dashboard.log("🛑 Stop requested. Finishing current URL and exiting...", "WARN")
-                break
+        # Phase 2A: Batch DAST Discovery
+        self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir)
+
+        # Phase 2B: Specialist exploitation happens via queue consumption
+        # ThinkingConsolidationAgent receives url_analyzed events and distributes to specialists
+        dashboard.log(f"Batch DAST emitted {sum(len(v) for v in self.vulnerabilities_by_url.values())} findings to queues", "INFO")
 
         await self._checkpoint("Analysis & Exploitation (DAST + Specialists)")
 
