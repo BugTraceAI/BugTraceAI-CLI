@@ -298,6 +298,8 @@ HIGH_PRIORITY_PARAMS = [
     "input", "value", "data", "query", "q", "search",
     # File/Path
     "file", "path", "include", "partial",
+    # ADDED (2026-01-30): Common vulnerable params from real-world findings
+    "category", "filter", "sort", "lang", "locale", "theme",
 ]
 
 class CSTIAgent(BaseAgent):
