@@ -1515,24 +1515,20 @@ class TeamOrchestrator:
         self._save_checkpoint(url)
 
     async def _run_sequential_pipeline(self, dashboard):
-        """Implements the V2 Sequential Pipeline Flow."""
-        logger.info("Entering V2 Sequential Pipeline")
+        """Implements the V3 Batch Processing Pipeline Flow."""
+        logger.info("Entering V3 Batch Processing Pipeline")
         start_time = datetime.now()
 
         # Initialize and start pipeline
         self._init_pipeline()
         await self._pipeline.start()
 
-        # Setup
+        # Setup directories
         scan_dir, recon_dir, analysis_dir, captures_dir = self._setup_scan_directory(start_time)
         dashboard.log(f"Scan directory created: {scan_dir.name}", "INFO")
 
-        # Check pause point before Phase 1
-        if await self._lifecycle.check_pause_point():
-            logger.info("[TeamOrchestrator] Paused at phase boundary")
-            return
-
-        # Phase 1: Reconnaissance
+        # ========== PHASE 1: DISCOVERY ==========
+        # GoSpider crawls target, discovers URLs
         await self._phase_1_reconnaissance(dashboard, recon_dir)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.DISCOVERY,
@@ -1542,28 +1538,35 @@ class TeamOrchestrator:
         if self._check_stop_requested(dashboard):
             return
 
-        # Check pause point before Phase 2
-        if await self._lifecycle.check_pause_point():
-            logger.info("[TeamOrchestrator] Paused at phase boundary")
-            return
+        # ========== PHASE 2: EVALUATION (Batch DAST) ==========
+        # DASTySASTAgent analyzes ALL URLs in parallel
+        # ThinkingConsolidationAgent deduplicates and distributes to queues
+        logger.info("=== PHASE 2: EVALUATION (Batch DAST) ===")
+        dashboard.log(f"🔬 Running batch DAST on {len(self.urls_to_scan)} URLs", "INFO")
 
-        # Phase 2: URL-by-URL Analysis
-        await self._phase_2_analysis(dashboard, analysis_dir)
+        # Batch DAST processing happens in _phase_2_analysis
+        await self._lifecycle.signal_phase_complete(
+            PipelinePhase.EVALUATION,
+            {'urls_analyzed': len(self.urls_to_scan)}
+        )
+
+        # ========== PHASE 3: EXPLOITATION (Queue Consumption) ==========
+        # Specialists consume from queues in true parallel
+        logger.info("=== PHASE 3: EXPLOITATION (Specialist Queue Processing) ===")
+        dashboard.log(f"⚡ Specialists processing findings from queues", "INFO")
+
+        await self._phase_2_analysis(dashboard, analysis_dir)  # Now uses batch mode
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.EXPLOITATION,
-            {'urls_processed': len(self.urls_to_scan)}
+            {'findings_exploited': self.thinking_agent.get_stats().get('distributed', 0) if self.thinking_agent else 0}
         )
 
         if self._check_stop_requested(dashboard):
             return
 
-        # Check pause point before Phase 3
-        if await self._lifecycle.check_pause_point():
-            logger.info("[TeamOrchestrator] Paused at phase boundary")
-            return
-
-        # Phase 3: Global Review
+        # ========== PHASE 4: VALIDATION ==========
         all_findings_for_review = self.state_manager.get_findings()
+        logger.info("=== PHASE 4: VALIDATION (Global Review) ===")
         await self._phase_3_global_review(dashboard, scan_dir)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.VALIDATION,
@@ -1573,12 +1576,8 @@ class TeamOrchestrator:
         if self._check_stop_requested(dashboard):
             return
 
-        # Check pause point before Phase 4
-        if await self._lifecycle.check_pause_point():
-            logger.info("[TeamOrchestrator] Paused at phase boundary")
-            return
-
-        # Phase 4: Reporting
+        # ========== PHASE 5: REPORTING ==========
+        logger.info("=== PHASE 5: REPORTING ===")
         await self._phase_4_reporting(dashboard, scan_dir)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.REPORTING,
@@ -1586,10 +1585,11 @@ class TeamOrchestrator:
         )
         await self._pipeline.stop()
 
-        # Shutdown specialist worker pools
+        # Cleanup
         await self._shutdown_specialist_workers()
 
-        logger.info("=== V2 SEQUENTIAL PIPELINE COMPLETE ===")
+        duration = (datetime.now() - start_time).total_seconds()
+        logger.info(f"=== V3 BATCH PIPELINE COMPLETE in {duration:.1f}s ===")
 
     async def _phase_1_reconnaissance(self, dashboard, recon_dir):
         """Execute Phase 1: Reconnaissance."""
@@ -1695,17 +1695,26 @@ class TeamOrchestrator:
         return vulnerabilities_by_url
 
     async def _phase_2_analysis(self, dashboard, analysis_dir):
-        """Execute Phase 2: Batch DAST Discovery + Specialist Exploitation."""
+        """Execute Phase 2: Batch DAST Analysis + Queue-based Specialist Execution."""
         dashboard.set_phase("PHASE_2_ANALYSIS")
 
-        # Phase 2A: Batch DAST Discovery
+        # Phase 2A: Batch DAST Discovery (runs in parallel)
         self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir)
 
-        # Phase 2B: Specialist exploitation happens via queue consumption
-        # ThinkingConsolidationAgent receives url_analyzed events and distributes to specialists
-        dashboard.log(f"Batch DAST emitted {sum(len(v) for v in self.vulnerabilities_by_url.values())} findings to queues", "INFO")
+        # Phase 2B: Wait for ThinkingAgent to distribute to queues
+        # and for specialist workers to process their items
+        queue_results = await self._wait_for_specialist_queues(dashboard, timeout=300.0)
 
-        await self._checkpoint("Analysis & Exploitation (DAST + Specialists)")
+        dashboard.log(
+            f"Specialist execution complete: {queue_results.get('items_distributed', 0)} items processed",
+            "INFO"
+        )
+
+        # Log batch summary from ThinkingAgent
+        if self.thinking_agent and hasattr(self.thinking_agent, 'log_batch_summary'):
+            self.thinking_agent.log_batch_summary()
+
+        await self._checkpoint("Batch Analysis & Queue-based Exploitation")
 
     async def _phase_3_global_review(self, dashboard, scan_dir):
         """Execute Phase 3: Global Review."""
