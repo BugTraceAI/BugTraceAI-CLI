@@ -568,13 +568,22 @@ class ThinkingConsolidationAgent(BaseAgent):
         dedup_metrics.record_received(specialist)
 
         # 2. FP confidence filter
+        # SQLi findings bypass this filter - SQLMap is the authoritative judge, not LLM confidence
+        # This ensures all potential SQLi reaches the SQLiAgent for proper testing
         fp_confidence = finding.get("fp_confidence", 0.5)
-        if fp_confidence < settings.THINKING_FP_THRESHOLD:
+        is_sqli = specialist == "sqli"
+        is_probe_validated = finding.get("probe_validated", False)
+
+        if not is_sqli and not is_probe_validated and fp_confidence < settings.THINKING_FP_THRESHOLD:
             logger.debug(f"[{self.name}] FP filtered: {finding.get('type')} "
                         f"(fp_confidence: {fp_confidence:.2f} < {settings.THINKING_FP_THRESHOLD})")
             self._stats["fp_filtered"] += 1
             dedup_metrics.record_fp_filtered()
             return
+
+        if is_sqli and fp_confidence < settings.THINKING_FP_THRESHOLD:
+            logger.info(f"[{self.name}] SQLi bypass: {finding.get('type')} forwarded to SQLMap for validation "
+                       f"(fp_confidence: {fp_confidence:.2f} < threshold, but SQLMap decides)")
 
         # 3. Deduplication check
         is_duplicate, key = await self._dedup_cache.check_and_add(finding, scan_context)

@@ -407,6 +407,74 @@ class DASTySASTAgent(BaseAgent):
                                 })
                                 break
 
+                        # Detection Method 3: Time-based Blind SQLi
+                        # Only if error-based didn't find anything
+                        if not any(f.get("parameter") == param_name for f in findings):
+                            import time
+                            # Test with SLEEP payload (MySQL/MariaDB style, works on many DBs)
+                            sleep_payloads = [
+                                ("' AND SLEEP(3)--", "mysql"),
+                                ("' WAITFOR DELAY '0:0:3'--", "mssql"),
+                                ("'; SELECT pg_sleep(3);--", "postgresql"),
+                            ]
+
+                            for sleep_payload, db_type in sleep_payloads:
+                                test_params_sleep = {k: v[0] if v else "" for k, v in params.items()}
+                                original_value = test_params_sleep.get(param_name, "")
+                                test_params_sleep[param_name] = f"{original_value}{sleep_payload}"
+
+                                url_sleep = urlunparse((
+                                    parsed.scheme, parsed.netloc, parsed.path,
+                                    parsed.params, urlencode(test_params_sleep), parsed.fragment
+                                ))
+
+                                try:
+                                    start_time = time.time()
+                                    async with session.get(url_sleep, ssl=False, timeout=aiohttp.ClientTimeout(total=8)) as resp_sleep:
+                                        await resp_sleep.text()
+                                    elapsed = time.time() - start_time
+
+                                    # If response took > 2.5 seconds, likely blind SQLi
+                                    if elapsed >= 2.5:
+                                        logger.info(f"[SQLi Probe] Time-based blind SQLi in {param_name}: {elapsed:.2f}s delay ({db_type})")
+                                        findings.append({
+                                            "type": "SQLi",
+                                            "vulnerability": f"SQL Injection (Time-based Blind - {db_type})",
+                                            "parameter": param_name,
+                                            "payload": sleep_payload,
+                                            "confidence": 0.85,
+                                            "severity": "Critical",
+                                            "probe_validated": True,
+                                            "fp_confidence": 0.8,
+                                            "skeptical_score": 8,
+                                            "votes": 5,
+                                            "evidence": f"Response delayed by {elapsed:.2f}s with SLEEP payload (expected 3s)",
+                                            "description": f"Time-based blind SQL injection detected in parameter '{param_name}'. The server response was delayed when SLEEP was injected, indicating the SQL was executed.",
+                                            "reproduction": f"time curl '{url_sleep}' # Should take ~3 seconds"
+                                        })
+                                        break  # Found blind SQLi, don't test other DB types
+                                except asyncio.TimeoutError:
+                                    # Timeout could also indicate SQLi (server waiting)
+                                    logger.info(f"[SQLi Probe] Possible time-based blind SQLi (timeout) in {param_name} ({db_type})")
+                                    findings.append({
+                                        "type": "SQLi",
+                                        "vulnerability": f"SQL Injection (Time-based Blind - {db_type})",
+                                        "parameter": param_name,
+                                        "payload": sleep_payload,
+                                        "confidence": 0.7,
+                                        "severity": "Critical",
+                                        "probe_validated": True,
+                                        "fp_confidence": 0.7,
+                                        "skeptical_score": 7,
+                                        "votes": 5,
+                                        "evidence": "Request timed out with SLEEP payload (>8s)",
+                                        "description": f"Possible time-based blind SQL injection in '{param_name}'. Request timed out when SLEEP payload was injected.",
+                                        "reproduction": f"time curl --max-time 10 '{url_sleep}'"
+                                    })
+                                    break
+                                except Exception:
+                                    continue  # Try next payload
+
                     except Exception as e:
                         logger.debug(f"[SQLi Probe] Network error testing {param_name}: {e}")
                         continue
@@ -532,6 +600,73 @@ class DASTySASTAgent(BaseAgent):
                         except Exception as e:
                             logger.debug(f"[Cookie SQLi Probe] Error testing {cookie_name}: {e}")
                             continue
+
+                    # Time-based Blind SQLi Detection for Cookies
+                    # Only if error-based didn't find anything for this cookie
+                    if not any(f.get("parameter") == f"Cookie: {cookie_name}" for f in findings):
+                        import time as time_module
+
+                        sleep_payloads = [
+                            ("' AND SLEEP(3)--", "mysql"),
+                            ("' WAITFOR DELAY '0:0:3'--", "mssql"),
+                            ("'; SELECT pg_sleep(3);--", "postgresql"),
+                            ("' AND (SELECT * FROM (SELECT(SLEEP(3)))a)--", "mysql_subquery"),
+                        ]
+
+                        for sleep_payload, db_type in sleep_payloads:
+                            try:
+                                # Build cookie with sleep payload
+                                other_cookies = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
+                                cookie_with_sleep = f"{cookie_value}{sleep_payload}"
+                                cookies_sleep = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={cookie_with_sleep}"])
+                                headers_sleep = {"Cookie": cookies_sleep}
+
+                                start_time = time_module.time()
+                                async with session.get(base_url, headers=headers_sleep, ssl=False, timeout=aiohttp.ClientTimeout(total=8)) as resp_sleep:
+                                    await resp_sleep.text()
+                                elapsed = time_module.time() - start_time
+
+                                if elapsed >= 2.5:
+                                    logger.info(f"[Cookie SQLi Probe] Time-based blind SQLi in cookie {cookie_name}: {elapsed:.2f}s delay ({db_type})")
+                                    findings.append({
+                                        "type": "SQLi",
+                                        "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type})",
+                                        "parameter": f"Cookie: {cookie_name}",
+                                        "payload": sleep_payload,
+                                        "confidence": 0.85,
+                                        "severity": "Critical",
+                                        "probe_validated": True,
+                                        "fp_confidence": 0.8,
+                                        "skeptical_score": 8,
+                                        "votes": 5,
+                                        "evidence": f"Response delayed {elapsed:.2f}s with SLEEP payload (expected ~3s)",
+                                        "description": f"Time-based blind SQL injection detected in cookie '{cookie_name}'. The {db_type} SLEEP payload caused a {elapsed:.2f}s delay.",
+                                        "reproduction": f"curl -b '{cookie_name}={cookie_with_sleep}' '{base_url}' # Should take ~3s"
+                                    })
+                                    break  # Found SQLi via time-based, move to next cookie
+
+                            except asyncio.TimeoutError:
+                                # Timeout could indicate SLEEP worked (server hung)
+                                logger.info(f"[Cookie SQLi Probe] Timeout (possible blind SQLi) in cookie {cookie_name} with {db_type}")
+                                findings.append({
+                                    "type": "SQLi",
+                                    "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type}, Timeout)",
+                                    "parameter": f"Cookie: {cookie_name}",
+                                    "payload": sleep_payload,
+                                    "confidence": 0.75,
+                                    "severity": "Critical",
+                                    "probe_validated": True,
+                                    "fp_confidence": 0.7,
+                                    "skeptical_score": 7,
+                                    "votes": 5,
+                                    "evidence": f"Request timed out with SLEEP payload (likely hung on database)",
+                                    "description": f"Possible time-based blind SQL injection in cookie '{cookie_name}'. Request timed out with {db_type} SLEEP payload.",
+                                    "reproduction": f"curl -b '{cookie_name}={cookie_value}{sleep_payload}' '{base_url}' # Should timeout"
+                                })
+                                break
+                            except Exception as e:
+                                logger.debug(f"[Cookie SQLi Probe] Time-based test error for {cookie_name}: {e}")
+                                continue
 
             return {"vulnerabilities": findings}
 
