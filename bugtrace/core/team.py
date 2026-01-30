@@ -1601,6 +1601,66 @@ class TeamOrchestrator:
         self.tech_profile = {"frameworks": [], "server": "unknown"}
         self.urls_to_scan = await self._run_reconnaissance(dashboard, recon_dir)
 
+    async def _wait_for_specialist_queues(self, dashboard, timeout: float = 300.0) -> Dict[str, Any]:
+        """
+        Wait for specialist queues to drain after batch DAST.
+
+        Args:
+            dashboard: UI dashboard for status updates
+            timeout: Maximum seconds to wait for queues to drain
+
+        Returns:
+            Dict of specialist -> items_processed counts
+        """
+        from bugtrace.core.queue import queue_manager
+        import time
+
+        start_time = time.monotonic()
+        check_interval = 2.0  # Check every 2 seconds
+        last_log_time = start_time
+
+        dashboard.log("Waiting for specialist queues to drain...", "INFO")
+
+        while (time.monotonic() - start_time) < timeout:
+            # Get queue depths
+            queue_stats = {}
+            total_pending = 0
+
+            for specialist in ["xss", "sqli", "csti", "lfi", "idor", "rce", "ssrf", "xxe", "jwt", "openredirect", "prototype_pollution"]:
+                try:
+                    queue = queue_manager.get_queue(specialist)
+                    depth = queue.depth() if hasattr(queue, 'depth') else 0
+                    queue_stats[specialist] = depth
+                    total_pending += depth
+                except Exception:
+                    queue_stats[specialist] = 0
+
+            # Log progress every 10 seconds
+            if (time.monotonic() - last_log_time) >= 10.0:
+                dashboard.log(f"Queue status: {total_pending} items pending", "INFO")
+                last_log_time = time.monotonic()
+
+            if total_pending == 0:
+                dashboard.log("All specialist queues drained", "SUCCESS")
+                break
+
+            await asyncio.sleep(check_interval)
+
+        elapsed = time.monotonic() - start_time
+
+        if total_pending > 0:
+            dashboard.log(f"Queue drain timeout after {elapsed:.1f}s, {total_pending} items remaining", "WARN")
+
+        # Collect ThinkingAgent stats
+        stats = self.thinking_agent.get_stats() if self.thinking_agent else {}
+
+        return {
+            "elapsed_seconds": elapsed,
+            "items_distributed": stats.get("distributed", 0),
+            "by_specialist": stats.get("by_specialist", {}),
+            "pending_at_timeout": total_pending
+        }
+
     async def _phase_2_batch_dast(self, dashboard, analysis_dir) -> Dict[str, list]:
         """Run DAST analysis on ALL URLs in parallel batch."""
         dashboard.log(f"Running batch DAST on {len(self.urls_to_scan)} URLs...", "INFO")
