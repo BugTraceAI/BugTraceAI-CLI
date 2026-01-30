@@ -206,7 +206,9 @@ class DASTySASTAgent(BaseAgent):
             # Phase 17: Add FP confidence fields
             fp_confidence=v.get("fp_confidence", 0.5),
             skeptical_score=v.get("skeptical_score", 5),
-            fp_reason=v.get("fp_reason", "")
+            fp_reason=v.get("fp_reason", ""),
+            # Phase 27: Add reproduction command for probe validation
+            reproduction_command=v.get("reproduction", "")
         )
 
     def _normalize_vulnerability_name(self, v_name: str, v_desc: str, v: Dict) -> str:
@@ -381,7 +383,7 @@ class DASTySASTAgent(BaseAgent):
                                 "votes": 5,  # Boost votes for probe findings (counts as expert validation)
                                 "evidence": f"Status code differential: single quote (') returns {status_single}, escaped quote ('') returns {status_double}",
                                 "description": f"Error-based SQL injection detected in parameter '{param_name}'. Single quote causes server error (500) while escaped quote works normally, indicating SQL query breakage.",
-                                "reproduction": f"curl -s -o /dev/null -w '%{{http_code}}' '{url_single}' # Returns {status_single}"
+                                "reproduction": f"[PROBE-VALIDATED] curl -s -o /dev/null -w '%{{http_code}}' '{url_single}' # Returns {status_single}"
                             })
                             continue  # Found SQLi, next param
 
@@ -403,7 +405,7 @@ class DASTySASTAgent(BaseAgent):
                                     "votes": 5,  # Boost votes for probe findings (counts as expert validation)
                                     "evidence": f"SQL error detected: '{error_pattern}' in response",
                                     "description": f"Error-based SQL injection detected in parameter '{param_name}'. Database error message exposed in response.",
-                                    "reproduction": f"curl '{url_single}' | grep -i 'error\\|sql'"
+                                    "reproduction": f"[PROBE-VALIDATED] curl '{url_single}' | grep -i 'error\\|sql'"
                                 })
                                 break
 
@@ -450,7 +452,7 @@ class DASTySASTAgent(BaseAgent):
                                             "votes": 5,
                                             "evidence": f"Response delayed by {elapsed:.2f}s with SLEEP payload (expected 3s)",
                                             "description": f"Time-based blind SQL injection detected in parameter '{param_name}'. The server response was delayed when SLEEP was injected, indicating the SQL was executed.",
-                                            "reproduction": f"time curl '{url_sleep}' # Should take ~3 seconds"
+                                            "reproduction": f"[PROBE-VALIDATED] time curl '{url_sleep}' # Should take ~3 seconds"
                                         })
                                         break  # Found blind SQLi, don't test other DB types
                                 except asyncio.TimeoutError:
@@ -469,7 +471,7 @@ class DASTySASTAgent(BaseAgent):
                                         "votes": 5,
                                         "evidence": "Request timed out with SLEEP payload (>8s)",
                                         "description": f"Possible time-based blind SQL injection in '{param_name}'. Request timed out when SLEEP payload was injected.",
-                                        "reproduction": f"time curl --max-time 10 '{url_sleep}'"
+                                        "reproduction": f"[PROBE-VALIDATED] time curl --max-time 10 '{url_sleep}'"
                                     })
                                     break
                                 except Exception:
@@ -489,12 +491,14 @@ class DASTySASTAgent(BaseAgent):
         """
         Active SQLi probe for cookies: Test each cookie value for SQL injection.
         Handles Base64-encoded values (like TrackingId with JSON inside).
+        Also tests synthetic cookies for common vulnerable patterns.
         """
         import aiohttp
         import base64
         import json
         from urllib.parse import urlparse
 
+        logger.info(f"[Cookie SQLi Probe] Starting cookie probe for {self.url[:50]}...")
         findings = []
 
         try:
@@ -502,177 +506,273 @@ class DASTySASTAgent(BaseAgent):
             from bugtrace.tools.visual.browser import browser_manager
             session_data = await browser_manager.get_session_data()
             cookies = session_data.get("cookies", [])
+            logger.debug(f"[Cookie SQLi Probe] Got {len(cookies)} cookies from browser session")
+
+            # Add synthetic cookies for common vulnerable patterns
+            # These are tested even if not present in the session
+            synthetic_cookies = await self._generate_synthetic_cookies()
+
+            # Merge: real cookies + synthetic (avoid duplicates)
+            existing_names = {c.get("name", "").lower() for c in cookies}
+            for sc in synthetic_cookies:
+                if sc.get("name", "").lower() not in existing_names:
+                    cookies.append(sc)
+
+            logger.debug(f"[Cookie SQLi Probe] Testing {len(cookies)} cookies ({len(synthetic_cookies)} synthetic)")
 
             if not cookies:
                 return {"vulnerabilities": []}
 
             parsed = urlparse(self.url)
-            base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            # Test cookies against multiple paths since cookies are domain-wide
+            # and may only be processed by certain endpoints
+            test_paths = [
+                parsed.path,  # Current path
+                "/",          # Root
+                "/catalog",   # Common product page
+                "/api",       # API endpoint
+            ]
+            # Remove duplicates and empty paths
+            test_paths = list(dict.fromkeys([p for p in test_paths if p]))
+            base_scheme_host = f"{parsed.scheme}://{parsed.netloc}"
+
+            logger.debug(f"[Cookie SQLi Probe] Will test against {len(test_paths)} paths: {test_paths}")
 
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-                for cookie in cookies:
-                    cookie_name = cookie.get("name", "")
-                    cookie_value = cookie.get("value", "")
+                # Test each cookie against each path (cookies are domain-wide)
+                for test_path in test_paths:
+                    test_url = f"{base_scheme_host}{test_path}"
 
-                    if not cookie_name or not cookie_value:
-                        continue
+                    for cookie in cookies:
+                        cookie_name = cookie.get("name", "")
+                        cookie_value = cookie.get("value", "")
 
-                    # Skip session/auth cookies (don't want to break session)
-                    if cookie_name.lower() in ["session", "sessionid", "phpsessid", "jsessionid"]:
-                        continue
-
-                    # Prepare test values
-                    test_values = []
-
-                    # Test 1: Direct injection
-                    test_values.append(("direct", f"{cookie_value}'", f"{cookie_value}''"))
-
-                    # Test 2: Try Base64 decode and inject inside
-                    try:
-                        # Pad Base64 if needed
-                        padded = cookie_value + "=" * (4 - len(cookie_value) % 4) if len(cookie_value) % 4 else cookie_value
-                        decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
-
-                        # Check if it's JSON
-                        if decoded.strip().startswith('{'):
-                            try:
-                                json_data = json.loads(decoded)
-                                # Inject in each JSON field
-                                for key in json_data:
-                                    if isinstance(json_data[key], str):
-                                        # Create modified JSON with injection
-                                        json_single = json_data.copy()
-                                        json_single[key] = "'"
-                                        json_double = json_data.copy()
-                                        json_double[key] = "''"
-
-                                        val_single = base64.b64encode(json.dumps(json_single).encode()).decode()
-                                        val_double = base64.b64encode(json.dumps(json_double).encode()).decode()
-                                        test_values.append((f"base64_json_{key}", val_single, val_double))
-                            except json.JSONDecodeError:
-                                pass
-                        else:
-                            # Plain Base64, inject in decoded value
-                            val_single = base64.b64encode(f"{decoded}'".encode()).decode()
-                            val_double = base64.b64encode(f"{decoded}''".encode()).decode()
-                            test_values.append(("base64_plain", val_single, val_double))
-                    except Exception:
-                        pass  # Not Base64, skip
-
-                    # Run tests
-                    for test_type, val_single, val_double in test_values:
-                        try:
-                            # Build cookie strings
-                            other_cookies = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
-
-                            cookies_single = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={val_single}"])
-                            cookies_double = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={val_double}"])
-
-                            headers_single = {"Cookie": cookies_single}
-                            headers_double = {"Cookie": cookies_double}
-
-                            async with session.get(base_url, headers=headers_single, ssl=False) as resp_single:
-                                status_single = resp_single.status
-
-                            async with session.get(base_url, headers=headers_double, ssl=False) as resp_double:
-                                status_double = resp_double.status
-
-                            # Detection: Status code differential
-                            if status_single >= 500 and status_double < 400:
-                                logger.info(f"[Cookie SQLi Probe] Status differential in cookie {cookie_name} ({test_type}): '={status_single}, ''={status_double}")
-                                findings.append({
-                                    "type": "SQLi",
-                                    "vulnerability": "SQL Injection in Cookie (Error-based)",
-                                    "parameter": f"Cookie: {cookie_name}",
-                                    "payload": "'" if "base64" not in test_type else f"Base64-encoded ' in {test_type}",
-                                    "confidence": 0.9,
-                                    "severity": "Critical",
-                                    "probe_validated": True,  # Active test confirmed - don't override scores
-                                    "fp_confidence": 0.85,
-                                    "skeptical_score": 8,
-                                    "votes": 5,  # Boost votes for probe findings (counts as expert validation)
-                                    "evidence": f"Status code differential: single quote returns {status_single}, escaped quote returns {status_double}",
-                                    "description": f"Error-based SQL injection detected in cookie '{cookie_name}' ({test_type}). Single quote causes server error while escaped quote works normally.",
-                                    "reproduction": f"curl -b '{cookie_name}={val_single}' '{base_url}' # Returns {status_single}"
-                                })
-                                break  # Found SQLi in this cookie, move on
-
-                        except Exception as e:
-                            logger.debug(f"[Cookie SQLi Probe] Error testing {cookie_name}: {e}")
+                        if not cookie_name or not cookie_value:
                             continue
 
-                    # Time-based Blind SQLi Detection for Cookies
-                    # Only if error-based didn't find anything for this cookie
-                    if not any(f.get("parameter") == f"Cookie: {cookie_name}" for f in findings):
-                        import time as time_module
+                        # Skip session/auth cookies (don't want to break session)
+                        if cookie_name.lower() in ["session", "sessionid", "phpsessid", "jsessionid"]:
+                            continue
 
-                        sleep_payloads = [
-                            ("' AND SLEEP(3)--", "mysql"),
-                            ("' WAITFOR DELAY '0:0:3'--", "mssql"),
-                            ("'; SELECT pg_sleep(3);--", "postgresql"),
-                            ("' AND (SELECT * FROM (SELECT(SLEEP(3)))a)--", "mysql_subquery"),
-                        ]
+                        # Skip if already found SQLi for this cookie (from previous path)
+                        if any(f.get("parameter") == f"Cookie: {cookie_name}" for f in findings):
+                            continue
 
-                        for sleep_payload, db_type in sleep_payloads:
+                        # Prepare test values
+                        test_values = []
+
+                        # Test 1: Direct injection
+                        test_values.append(("direct", f"{cookie_value}'", f"{cookie_value}''"))
+
+                        # Test 2: Try Base64 decode and inject inside
+                        try:
+                            # Pad Base64 if needed
+                            padded = cookie_value + "=" * (4 - len(cookie_value) % 4) if len(cookie_value) % 4 else cookie_value
+                            decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+
+                            # Check if it's JSON
+                            if decoded.strip().startswith('{'):
+                                try:
+                                    json_data = json.loads(decoded)
+                                    # Inject in each JSON field
+                                    for key in json_data:
+                                        if isinstance(json_data[key], str):
+                                            # Create modified JSON with injection
+                                            json_single = json_data.copy()
+                                            json_single[key] = "'"
+                                            json_double = json_data.copy()
+                                            json_double[key] = "''"
+
+                                            val_single = base64.b64encode(json.dumps(json_single).encode()).decode()
+                                            val_double = base64.b64encode(json.dumps(json_double).encode()).decode()
+                                            test_values.append((f"base64_json_{key}", val_single, val_double))
+                                except json.JSONDecodeError:
+                                    pass
+                            else:
+                                # Plain Base64, inject in decoded value
+                                val_single = base64.b64encode(f"{decoded}'".encode()).decode()
+                                val_double = base64.b64encode(f"{decoded}''".encode()).decode()
+                                test_values.append(("base64_plain", val_single, val_double))
+                        except Exception:
+                            pass  # Not Base64, skip
+
+                        # Run tests
+                        for test_type, val_single, val_double in test_values:
                             try:
-                                # Build cookie with sleep payload
+                                # Build cookie strings
                                 other_cookies = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
-                                cookie_with_sleep = f"{cookie_value}{sleep_payload}"
-                                cookies_sleep = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={cookie_with_sleep}"])
-                                headers_sleep = {"Cookie": cookies_sleep}
 
-                                start_time = time_module.time()
-                                async with session.get(base_url, headers=headers_sleep, ssl=False, timeout=aiohttp.ClientTimeout(total=8)) as resp_sleep:
-                                    await resp_sleep.text()
-                                elapsed = time_module.time() - start_time
+                                cookies_single = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={val_single}"])
+                                cookies_double = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={val_double}"])
 
-                                if elapsed >= 2.5:
-                                    logger.info(f"[Cookie SQLi Probe] Time-based blind SQLi in cookie {cookie_name}: {elapsed:.2f}s delay ({db_type})")
+                                headers_single = {"Cookie": cookies_single}
+                                headers_double = {"Cookie": cookies_double}
+
+                                async with session.get(test_url, headers=headers_single, ssl=False) as resp_single:
+                                    status_single = resp_single.status
+
+                                async with session.get(test_url, headers=headers_double, ssl=False) as resp_double:
+                                    status_double = resp_double.status
+
+                                logger.debug(f"[Cookie SQLi Probe] {cookie_name} @ {test_path} ({test_type}): '={status_single}, ''={status_double}")
+
+                                # Detection: Status code differential
+                                if status_single >= 500 and status_double < 400:
+                                    logger.info(f"[Cookie SQLi Probe] DETECTED SQLi in cookie {cookie_name} @ {test_path} ({test_type}): {status_single} vs {status_double}")
                                     findings.append({
                                         "type": "SQLi",
-                                        "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type})",
+                                        "vulnerability": "SQL Injection in Cookie (Error-based)",
                                         "parameter": f"Cookie: {cookie_name}",
-                                        "payload": sleep_payload,
-                                        "confidence": 0.85,
+                                        "payload": "'" if "base64" not in test_type else f"Base64-encoded ' in {test_type}",
+                                        "confidence": 0.9,
                                         "severity": "Critical",
-                                        "probe_validated": True,
-                                        "fp_confidence": 0.8,
+                                        "probe_validated": True,  # Active test confirmed - don't override scores
+                                        "fp_confidence": 0.85,
                                         "skeptical_score": 8,
-                                        "votes": 5,
-                                        "evidence": f"Response delayed {elapsed:.2f}s with SLEEP payload (expected ~3s)",
-                                        "description": f"Time-based blind SQL injection detected in cookie '{cookie_name}'. The {db_type} SLEEP payload caused a {elapsed:.2f}s delay.",
-                                        "reproduction": f"curl -b '{cookie_name}={cookie_with_sleep}' '{base_url}' # Should take ~3s"
+                                        "votes": 5,  # Boost votes for probe findings (counts as expert validation)
+                                        "evidence": f"Status code differential: single quote returns {status_single}, escaped quote returns {status_double}",
+                                        "description": f"Error-based SQL injection detected in cookie '{cookie_name}' at {test_url} ({test_type}). Single quote causes server error while escaped quote works normally.",
+                                        "reproduction": f"[PROBE-VALIDATED] curl -b '{cookie_name}={val_single}' '{test_url}' # Returns {status_single}"
                                     })
-                                    break  # Found SQLi via time-based, move to next cookie
+                                    break  # Found SQLi in this cookie, move on
 
-                            except asyncio.TimeoutError:
-                                # Timeout could indicate SLEEP worked (server hung)
-                                logger.info(f"[Cookie SQLi Probe] Timeout (possible blind SQLi) in cookie {cookie_name} with {db_type}")
-                                findings.append({
-                                    "type": "SQLi",
-                                    "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type}, Timeout)",
-                                    "parameter": f"Cookie: {cookie_name}",
-                                    "payload": sleep_payload,
-                                    "confidence": 0.75,
-                                    "severity": "Critical",
-                                    "probe_validated": True,
-                                    "fp_confidence": 0.7,
-                                    "skeptical_score": 7,
-                                    "votes": 5,
-                                    "evidence": f"Request timed out with SLEEP payload (likely hung on database)",
-                                    "description": f"Possible time-based blind SQL injection in cookie '{cookie_name}'. Request timed out with {db_type} SLEEP payload.",
-                                    "reproduction": f"curl -b '{cookie_name}={cookie_value}{sleep_payload}' '{base_url}' # Should timeout"
-                                })
-                                break
                             except Exception as e:
-                                logger.debug(f"[Cookie SQLi Probe] Time-based test error for {cookie_name}: {e}")
+                                logger.debug(f"[Cookie SQLi Probe] Error testing {cookie_name}: {e}")
                                 continue
 
+                        # Time-based Blind SQLi Detection for Cookies
+                        # Only if error-based didn't find anything for this cookie
+                        if not any(f.get("parameter") == f"Cookie: {cookie_name}" for f in findings):
+                            import time as time_module
+
+                            sleep_payloads = [
+                                ("' AND SLEEP(3)--", "mysql"),
+                                ("' WAITFOR DELAY '0:0:3'--", "mssql"),
+                                ("'; SELECT pg_sleep(3);--", "postgresql"),
+                                ("' AND (SELECT * FROM (SELECT(SLEEP(3)))a)--", "mysql_subquery"),
+                            ]
+
+                            for sleep_payload, db_type in sleep_payloads:
+                                try:
+                                    # Build cookie with sleep payload
+                                    other_cookies = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
+                                    cookie_with_sleep = f"{cookie_value}{sleep_payload}"
+                                    cookies_sleep = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={cookie_with_sleep}"])
+                                    headers_sleep = {"Cookie": cookies_sleep}
+
+                                    start_time = time_module.time()
+                                    async with session.get(test_url, headers=headers_sleep, ssl=False, timeout=aiohttp.ClientTimeout(total=8)) as resp_sleep:
+                                        await resp_sleep.text()
+                                    elapsed = time_module.time() - start_time
+
+                                    if elapsed >= 2.5:
+                                        logger.info(f"[Cookie SQLi Probe] Time-based blind SQLi in cookie {cookie_name} @ {test_path}: {elapsed:.2f}s delay ({db_type})")
+                                        findings.append({
+                                            "type": "SQLi",
+                                            "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type})",
+                                            "parameter": f"Cookie: {cookie_name}",
+                                            "payload": sleep_payload,
+                                            "confidence": 0.85,
+                                            "severity": "Critical",
+                                            "probe_validated": True,
+                                            "fp_confidence": 0.8,
+                                            "skeptical_score": 8,
+                                            "votes": 5,
+                                            "evidence": f"Response delayed {elapsed:.2f}s with SLEEP payload (expected ~3s)",
+                                            "description": f"Time-based blind SQL injection detected in cookie '{cookie_name}' at {test_url}. The {db_type} SLEEP payload caused a {elapsed:.2f}s delay.",
+                                            "reproduction": f"[PROBE-VALIDATED] curl -b '{cookie_name}={cookie_with_sleep}' '{test_url}' # Should take ~3s"
+                                        })
+                                        break  # Found SQLi via time-based, move to next cookie
+
+                                except asyncio.TimeoutError:
+                                    # Timeout could indicate SLEEP worked (server hung)
+                                    logger.info(f"[Cookie SQLi Probe] Timeout (possible blind SQLi) in cookie {cookie_name} @ {test_path} with {db_type}")
+                                    findings.append({
+                                        "type": "SQLi",
+                                        "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type}, Timeout)",
+                                        "parameter": f"Cookie: {cookie_name}",
+                                        "payload": sleep_payload,
+                                        "confidence": 0.75,
+                                        "severity": "Critical",
+                                        "probe_validated": True,
+                                        "fp_confidence": 0.7,
+                                        "skeptical_score": 7,
+                                        "votes": 5,
+                                        "evidence": f"Request timed out with SLEEP payload (likely hung on database)",
+                                        "description": f"Possible time-based blind SQL injection in cookie '{cookie_name}' at {test_url}. Request timed out with {db_type} SLEEP payload.",
+                                        "reproduction": f"[PROBE-VALIDATED] curl -b '{cookie_name}={cookie_value}{sleep_payload}' '{test_url}' # Should timeout"
+                                    })
+                                    break
+                                except Exception as e:
+                                    logger.debug(f"[Cookie SQLi Probe] Time-based test error for {cookie_name}: {e}")
+                                    continue
+
+            logger.info(f"[Cookie SQLi Probe] Completed: {len(findings)} findings")
             return {"vulnerabilities": findings}
 
         except Exception as e:
             logger.error(f"Cookie SQLi probe check failed: {e}", exc_info=True)
             return {"vulnerabilities": []}
+
+    async def _generate_synthetic_cookies(self) -> list:
+        """
+        Generate synthetic cookies for common vulnerable patterns.
+        These are tested even if they don't exist in the browser session.
+
+        Patterns tested:
+        1. TrackingId with Base64-encoded JSON (like PortSwigger labs)
+        2. Common tracking/analytics cookies
+        3. User preference cookies with serialized data
+        """
+        import base64
+        import json
+        import random
+        import string
+
+        synthetic = []
+
+        # Generate a random value for the cookie
+        random_value = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+
+        # Pattern 1: TrackingId with JSON inside Base64 (PortSwigger pattern)
+        # Format: {"type":"class","value":"<random>"}
+        tracking_json = {"type": "class", "value": random_value}
+        tracking_b64 = base64.b64encode(json.dumps(tracking_json).encode()).decode()
+        synthetic.append({
+            "name": "TrackingId",
+            "value": tracking_b64,
+            "_synthetic": True,
+            "_pattern": "base64_json"
+        })
+
+        # Pattern 2: Simple tracking cookie (plain value)
+        synthetic.append({
+            "name": "tracking",
+            "value": random_value,
+            "_synthetic": True,
+            "_pattern": "plain"
+        })
+
+        # Pattern 3: User ID cookie (numeric, common SQLi target)
+        synthetic.append({
+            "name": "userId",
+            "value": str(random.randint(1000, 9999)),
+            "_synthetic": True,
+            "_pattern": "numeric"
+        })
+
+        # Pattern 4: Preference cookie with Base64 data
+        pref_json = {"theme": "dark", "lang": "en", "user": random_value}
+        pref_b64 = base64.b64encode(json.dumps(pref_json).encode()).decode()
+        synthetic.append({
+            "name": "preferences",
+            "value": pref_b64,
+            "_synthetic": True,
+            "_pattern": "base64_json"
+        })
+
+        logger.info(f"[Cookie SQLi Probe] Generated {len(synthetic)} synthetic cookies for testing")
+        return synthetic
 
     async def _analyze_with_approach(self, context: Dict, approach: str) -> Dict:
         """Analyze with a specific persona."""
@@ -1137,13 +1237,25 @@ Be RUTHLESS. False positives waste resources."""
 
         Phase 17: Now uses fp_confidence for smart pre-filtering.
         Findings with low fp_confidence AND low skeptical_score are rejected early.
+
+        Phase 27: Probe-validated findings bypass LLM review (active testing > LLM analysis).
         """
+        # 0. Separate probe-validated findings (they bypass LLM review)
+        probe_validated = []
+        llm_findings = []
+        for v in vulnerabilities:
+            if v.get("probe_validated"):
+                probe_validated.append(v)
+                logger.info(f"[{self.name}] Probe-validated finding bypasses skeptical review: {v.get('type')} on {v.get('parameter')}")
+            else:
+                llm_findings.append(v)
+
         # 1. Pre-filter based on fp_confidence threshold (Phase 17 enhancement)
         threshold = getattr(settings, 'FP_CONFIDENCE_THRESHOLD', 0.5)
 
         pre_filtered = []
         rejected_count = 0
-        for v in vulnerabilities:
+        for v in llm_findings:
             fp_conf = v.get('fp_confidence', 0.5)
             skeptical_score = v.get('skeptical_score', 5)
 
@@ -1159,12 +1271,13 @@ Be RUTHLESS. False positives waste resources."""
             logger.info(f"[{self.name}] FP pre-filter: {rejected_count} removed (threshold: {threshold}), {len(pre_filtered)} remaining")
 
         if not pre_filtered:
-            return []
+            # Still return probe-validated findings
+            return probe_validated
 
         # 2. Deduplicate
         vulnerabilities = self._review_deduplicate(pre_filtered)
         if not vulnerabilities:
-            return []
+            return probe_validated
 
         # 3. Build prompt
         prompt = self._review_build_prompt(vulnerabilities)
@@ -1181,14 +1294,15 @@ Be RUTHLESS. False positives waste resources."""
 
             if not response:
                 logger.warning(f"[{self.name}] Skeptical review empty - keeping all")
-                return vulnerabilities
+                return probe_validated + vulnerabilities
 
-            # 4. Parse and approve
-            return self._review_parse_approval(response, vulnerabilities)
+            # 4. Parse and approve, then add probe-validated
+            llm_approved = self._review_parse_approval(response, vulnerabilities)
+            return probe_validated + llm_approved
 
         except Exception as e:
             logger.error(f"[{self.name}] Skeptical review failed: {e}", exc_info=True)
-            return vulnerabilities
+            return probe_validated + vulnerabilities
 
     def _review_deduplicate(self, vulnerabilities: List[Dict]) -> List[Dict]:
         """Deduplicate vulnerabilities by type+parameter, keeping highest confidence."""

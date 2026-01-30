@@ -119,13 +119,17 @@ class ValidationEngine:
         return str(vuln_type_raw or "").upper()
 
     def _classify_sqli_finding(self, finding, specialist_authority: List, unvalidated_sqli: List):
-        """Classify SQLi finding based on SQLMap evidence."""
-        has_sqlmap_evidence = (
-            finding.reproduction_command and
-            "sqlmap" in str(finding.reproduction_command).lower()
+        """Classify SQLi finding based on SQLMap evidence or probe validation."""
+        reproduction = str(finding.reproduction_command or "").lower()
+        # Accept SQLMap validated OR probe-validated findings
+        has_validation_evidence = (
+            "sqlmap" in reproduction or
+            "[probe-validated]" in reproduction
         )
-        if has_sqlmap_evidence:
+        if has_validation_evidence:
             specialist_authority.append(finding)
+            if "[probe-validated]" in reproduction:
+                dashboard.log(f"✅ SQLi on Cookie: {finding.vuln_parameter or 'N/A'} - probe-validated (active HTTP testing)", "SUCCESS")
         else:
             unvalidated_sqli.append(finding)
 
