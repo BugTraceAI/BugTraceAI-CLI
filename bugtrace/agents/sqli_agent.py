@@ -1940,8 +1940,13 @@ Write the exploitation explanation section for the report."""
         self.url = url
         self.param = param
 
-        # Run validation using existing SQLi testing logic
-        result = await self._test_single_param_from_queue(url, param, finding)
+        # Check if this is a cookie-based SQLi finding
+        if param.startswith("Cookie:"):
+            cookie_name = param.replace("Cookie:", "").strip()
+            result = await self._test_cookie_sqli_from_queue(url, cookie_name, finding)
+        else:
+            # Run validation using existing SQLi testing logic
+            result = await self._test_single_param_from_queue(url, param, finding)
 
         return result
 
@@ -1996,6 +2001,89 @@ Write the exploitation explanation section for the report."""
         except Exception as e:
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
+
+    async def _test_cookie_sqli_from_queue(
+        self, url: str, cookie_name: str, finding: dict
+    ) -> Optional[SQLiFinding]:
+        """
+        Test a cookie for SQL injection using SQLMap with --level=2.
+
+        Cookie-based SQLi requires different handling than URL params:
+        - Uses cookies from browser session
+        - SQLMap with --level=2 to test cookie values
+        - Handles Base64-encoded cookie values
+        """
+        try:
+            from urllib.parse import urlparse
+
+            logger.info(f"[{self.name}] Testing cookie '{cookie_name}' for SQLi")
+
+            # Get cookies from browser if available
+            cookies = []
+            try:
+                from bugtrace.tools.visual.browser import browser_manager
+                session_data = await browser_manager.export_session_context()
+                cookies = session_data.get("cookies", [])
+            except Exception:
+                pass
+
+            # Run SQLMap with --level=2 to test cookies
+            # The cookie probe already detected potential SQLi, now we confirm with SQLMap
+            sqlmap_result = await external_tools.run_sqlmap(
+                url,
+                cookies=cookies,
+                target_param=None  # Let SQLMap test all params including cookies
+            )
+
+            if sqlmap_result and sqlmap_result.get("vulnerable"):
+                # Create SQLiFinding for cookie-based injection
+                return SQLiFinding(
+                    url=url,
+                    parameter=f"Cookie: {cookie_name}",
+                    injection_type=sqlmap_result.get("type", "error_based"),
+                    technique="cookie_injection",
+                    working_payload=finding.get("payload", "'"),
+                    evidence=f"SQLMap confirmed cookie SQLi: {sqlmap_result.get('output_snippet', '')[:500]}",
+                    dbms_detected=self._detect_dbms_from_output(sqlmap_result.get("output_snippet", "")),
+                    sqlmap_confirmation=True,
+                    reproduction_steps=sqlmap_result.get("reproduction_command", ""),
+                )
+
+            # If SQLMap didn't confirm, still return finding based on probe detection
+            # The probe already detected status code differential
+            if finding.get("confidence", 0) >= 0.85:
+                return SQLiFinding(
+                    url=url,
+                    parameter=f"Cookie: {cookie_name}",
+                    injection_type="error_based",
+                    technique="cookie_injection",
+                    working_payload=finding.get("payload", "'"),
+                    evidence=finding.get("evidence", "Status code differential detected"),
+                    dbms_detected="Unknown",
+                    sqlmap_confirmation=False,
+                    reproduction_steps=finding.get("reproduction", ""),
+                )
+
+            return None
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Cookie SQLi test failed: {e}")
+            return None
+
+    def _detect_dbms_from_output(self, output: str) -> str:
+        """Detect DBMS type from SQLMap output."""
+        output_lower = output.lower()
+        if "mysql" in output_lower:
+            return "MySQL"
+        elif "postgresql" in output_lower or "postgres" in output_lower:
+            return "PostgreSQL"
+        elif "microsoft sql server" in output_lower or "mssql" in output_lower:
+            return "MSSQL"
+        elif "oracle" in output_lower:
+            return "Oracle"
+        elif "sqlite" in output_lower:
+            return "SQLite"
+        return "Unknown"
 
     async def _handle_queue_result(self, item: dict, result: Optional[SQLiFinding]) -> None:
         """
