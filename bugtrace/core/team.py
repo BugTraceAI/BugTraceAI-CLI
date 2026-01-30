@@ -53,6 +53,9 @@ from bugtrace.core.phase_semaphores import (
     get_exploitation_semaphore, get_analysis_semaphore, get_validation_semaphore
 )
 
+# Batch metrics (v3.1)
+from bugtrace.core.batch_metrics import batch_metrics, reset_batch_metrics
+
 async def run_agent_with_semaphore(semaphore: asyncio.Semaphore, agent, process_result_fn):
     """
     Execute an agent with semaphore-controlled concurrency.
@@ -1519,6 +1522,10 @@ class TeamOrchestrator:
         logger.info("Entering V3 Batch Processing Pipeline")
         start_time = datetime.now()
 
+        # Initialize batch metrics
+        reset_batch_metrics()
+        batch_metrics.start_scan()
+
         # Initialize and start pipeline
         self._init_pipeline()
         await self._pipeline.start()
@@ -1588,8 +1595,14 @@ class TeamOrchestrator:
         # Cleanup
         await self._shutdown_specialist_workers()
 
+        # End metrics and log performance summary
+        all_findings = self.state_manager.get_findings()
+        batch_metrics.end_scan(findings_exploited=len(all_findings))
+        batch_metrics.log_summary()
+
         duration = (datetime.now() - start_time).total_seconds()
         logger.info(f"=== V3 BATCH PIPELINE COMPLETE in {duration:.1f}s ===")
+        logger.info(f"V3 Batch Pipeline: {batch_metrics.time_saved_percent:.1f}% faster than sequential")
 
     async def _phase_1_reconnaissance(self, dashboard, recon_dir):
         """Execute Phase 1: Reconnaissance."""
@@ -1665,6 +1678,9 @@ class TeamOrchestrator:
         """Run DAST analysis on ALL URLs in parallel batch."""
         dashboard.log(f"Running batch DAST on {len(self.urls_to_scan)} URLs...", "INFO")
 
+        # Start DAST metrics
+        batch_metrics.start_dast()
+
         # Use analysis semaphore for DAST concurrency
         analysis_semaphore = get_analysis_semaphore()
 
@@ -1692,6 +1708,12 @@ class TeamOrchestrator:
         total_vulns = sum(len(v) for v in vulnerabilities_by_url.values())
         dashboard.log(f"Batch DAST complete: {total_vulns} findings from {len(vulnerabilities_by_url)} URLs", "INFO")
 
+        # End DAST metrics
+        batch_metrics.end_dast(
+            urls_analyzed=len(vulnerabilities_by_url),
+            findings_count=total_vulns
+        )
+
         return vulnerabilities_by_url
 
     async def _phase_2_analysis(self, dashboard, analysis_dir):
@@ -1703,7 +1725,12 @@ class TeamOrchestrator:
 
         # Phase 2B: Wait for ThinkingAgent to distribute to queues
         # and for specialist workers to process their items
+        batch_metrics.start_queue_drain()
         queue_results = await self._wait_for_specialist_queues(dashboard, timeout=300.0)
+        batch_metrics.end_queue_drain(
+            findings_distributed=queue_results.get('items_distributed', 0),
+            by_specialist=queue_results.get('by_specialist', {})
+        )
 
         dashboard.log(
             f"Specialist execution complete: {queue_results.get('items_distributed', 0)} items processed",
