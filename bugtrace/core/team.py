@@ -160,6 +160,16 @@ class TeamOrchestrator:
     async def _shutdown_specialist_workers(self):
         """Shutdown specialist worker pools gracefully."""
         logger.info("Shutting down specialist worker pools...")
+
+        # Stop ThinkingConsolidationAgent first
+        if hasattr(self.thinking_agent, 'stop'):
+            try:
+                await self.thinking_agent.stop()
+                logger.info("ThinkingConsolidationAgent stopped")
+            except Exception as e:
+                logger.error(f"Failed to stop ThinkingAgent: {e}")
+
+        # Stop specialist workers
         shutdown_tasks = [
             self.sqli_worker_agent.stop_queue_consumer(),
             self.xss_worker_agent.stop_queue_consumer(),
@@ -217,6 +227,7 @@ class TeamOrchestrator:
         # Initialize state
         self.processed_urls = set()
         self.url_queue = []
+        self.vulnerabilities_by_url: Dict[str, list] = {}
 
         # Load active state if resuming
         if self.resume:
@@ -341,6 +352,11 @@ class TeamOrchestrator:
             await self._init_specialist_workers()
             self._specialist_workers_started = True
             logger.info("Specialist worker pools initialized")
+
+        # Start ThinkingConsolidationAgent for batch processing
+        if hasattr(self.thinking_agent, 'start'):
+            asyncio.create_task(self.thinking_agent.start())
+            logger.info("ThinkingConsolidationAgent started for batch processing")
 
         # Authentication phase
         await self._handle_authentication()
@@ -1584,6 +1600,39 @@ class TeamOrchestrator:
 
         self.tech_profile = {"frameworks": [], "server": "unknown"}
         self.urls_to_scan = await self._run_reconnaissance(dashboard, recon_dir)
+
+    async def _phase_2_batch_dast(self, dashboard, analysis_dir) -> Dict[str, list]:
+        """Run DAST analysis on ALL URLs in parallel batch."""
+        dashboard.log(f"Running batch DAST on {len(self.urls_to_scan)} URLs...", "INFO")
+
+        # Use analysis semaphore for DAST concurrency
+        analysis_semaphore = get_analysis_semaphore()
+
+        async def analyze_url(url: str) -> tuple:
+            async with analysis_semaphore:
+                url_dir = self._create_url_directory(url, analysis_dir)
+                dast = DASTySASTAgent(url, self.tech_profile, url_dir, state_manager=self.state_manager)
+                result = await dast.run()
+                return (url, result.get("vulnerabilities", []))
+
+        # Run ALL URLs in parallel
+        tasks = [analyze_url(url) for url in self.urls_to_scan]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Aggregate results
+        vulnerabilities_by_url = {}
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"DAST batch error: {result}")
+                continue
+            url, vulns = result
+            vulnerabilities_by_url[url] = vulns
+            self.processed_urls.add(url)
+
+        total_vulns = sum(len(v) for v in vulnerabilities_by_url.values())
+        dashboard.log(f"Batch DAST complete: {total_vulns} findings from {len(vulnerabilities_by_url)} URLs", "INFO")
+
+        return vulnerabilities_by_url
 
     async def _phase_2_analysis(self, dashboard, analysis_dir):
         """Execute Phase 2: URL-by-URL Analysis."""
