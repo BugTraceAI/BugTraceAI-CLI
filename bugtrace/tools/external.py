@@ -476,7 +476,18 @@ class ExternalToolManager:
         dashboard.log(f"[External] Launching GoSpider (depth={depth}) against {url}", "INFO")
         dashboard.update_task("gospider", name="GoSpider", status=f"Crawling: {url}")
 
-        cmd = ["-s", url, "-d", str(depth), "-c", "10"]
+        # IMPROVED 2026-01-30: Use GoSpider's full power
+        # -a: Query Wayback Machine, CommonCrawl, VirusTotal, AlienVault for historical URLs
+        # --sitemap: Parse sitemap.xml for additional URLs
+        # --robots: Parse robots.txt (enabled by default)
+        # --js: Extract links from JavaScript (enabled by default)
+        cmd = [
+            "-s", url,
+            "-d", str(depth),
+            "-c", "10",
+            "-a",           # OTHER SOURCES: Wayback, CommonCrawl, VirusTotal, AlienVault
+            "--sitemap",    # Parse sitemap.xml
+        ]
 
         if cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
