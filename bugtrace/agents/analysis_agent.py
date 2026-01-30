@@ -375,9 +375,10 @@ class DASTySASTAgent(BaseAgent):
                                 "payload": "'",
                                 "confidence": 0.9,
                                 "severity": "Critical",
-                                "validated": False,
+                                "probe_validated": True,  # Active test confirmed - don't override scores
                                 "fp_confidence": 0.85,
                                 "skeptical_score": 8,
+                                "votes": 5,  # Boost votes for probe findings (counts as expert validation)
                                 "evidence": f"Status code differential: single quote (') returns {status_single}, escaped quote ('') returns {status_double}",
                                 "description": f"Error-based SQL injection detected in parameter '{param_name}'. Single quote causes server error (500) while escaped quote works normally, indicating SQL query breakage.",
                                 "reproduction": f"curl -s -o /dev/null -w '%{{http_code}}' '{url_single}' # Returns {status_single}"
@@ -396,9 +397,10 @@ class DASTySASTAgent(BaseAgent):
                                     "payload": "'",
                                     "confidence": 0.95,
                                     "severity": "Critical",
-                                    "validated": False,
+                                    "probe_validated": True,  # Active test confirmed - don't override scores
                                     "fp_confidence": 0.9,
                                     "skeptical_score": 9,
+                                    "votes": 5,  # Boost votes for probe findings (counts as expert validation)
                                     "evidence": f"SQL error detected: '{error_pattern}' in response",
                                     "description": f"Error-based SQL injection detected in parameter '{param_name}'. Database error message exposed in response.",
                                     "reproduction": f"curl '{url_single}' | grep -i 'error\\|sql'"
@@ -517,9 +519,10 @@ class DASTySASTAgent(BaseAgent):
                                     "payload": "'" if "base64" not in test_type else f"Base64-encoded ' in {test_type}",
                                     "confidence": 0.9,
                                     "severity": "Critical",
-                                    "validated": False,
+                                    "probe_validated": True,  # Active test confirmed - don't override scores
                                     "fp_confidence": 0.85,
                                     "skeptical_score": 8,
+                                    "votes": 5,  # Boost votes for probe findings (counts as expert validation)
                                     "evidence": f"Status code differential: single quote returns {status_single}, escaped quote returns {status_double}",
                                     "description": f"Error-based SQL injection detected in cookie '{cookie_name}' ({test_type}). Single quote causes server error while escaped quote works normally.",
                                     "reproduction": f"curl -b '{cookie_name}={val_single}' '{base_url}' # Returns {status_single}"
@@ -947,25 +950,39 @@ Be RUTHLESS. False positives waste resources."""
                     # Standard consolidation for core approaches
                     if key not in merged:
                         merged[key] = vuln.copy()
-                        merged[key]["votes"] = 1
+                        merged[key]["votes"] = vuln.get("votes", 1)  # Preserve probe's boost
                         merged[key]["confidence_score"] = conf
                     else:
-                        merged[key]["votes"] += 1
-                        # Average confidence
-                        merged[key]["confidence_score"] = int((merged[key]["confidence_score"] + conf) / 2)
+                        # If existing is probe_validated, don't overwrite - just add votes
+                        if merged[key].get("probe_validated"):
+                            merged[key]["votes"] += 1
+                            # Keep probe's scores, just add LLM's vote as confirmation
+                        elif vuln.get("probe_validated"):
+                            # New finding is probe-validated, replace existing LLM finding
+                            old_votes = merged[key].get("votes", 1)
+                            merged[key] = vuln.copy()
+                            merged[key]["votes"] = vuln.get("votes", 1) + old_votes
+                        else:
+                            # Both are LLM findings - merge normally
+                            merged[key]["votes"] += 1
+                            merged[key]["confidence_score"] = int((merged[key]["confidence_score"] + conf) / 2)
 
         # Second pass: merge skeptical scores and calculate fp_confidence
         for key, vuln in merged.items():
-            if key in skeptical_data:
+            # Probe-validated findings keep their original scores (active testing > LLM analysis)
+            if vuln.get("probe_validated"):
+                vuln["fp_reason"] = "Validated by active probe testing"
+                # Don't override skeptical_score or fp_confidence - probe's scores are authoritative
+            elif key in skeptical_data:
                 vuln["skeptical_score"] = skeptical_data[key]["skeptical_score"]
                 vuln["fp_reason"] = skeptical_data[key]["fp_reason"]
+                # Calculate FP confidence (Phase 17 enhancement)
+                vuln['fp_confidence'] = self._calculate_fp_confidence(vuln)
             else:
                 # No skeptical review for this finding - default to uncertain
                 vuln["skeptical_score"] = 5
                 vuln["fp_reason"] = "Not reviewed by skeptical agent"
-
-            # Calculate FP confidence (Phase 17 enhancement)
-            vuln['fp_confidence'] = self._calculate_fp_confidence(vuln)
+                vuln['fp_confidence'] = self._calculate_fp_confidence(vuln)
 
         # Apply consensus filter - require at least 4 votes to reduce false positives
         min_votes = getattr(settings, "ANALYSIS_CONSENSUS_VOTES", 4)
