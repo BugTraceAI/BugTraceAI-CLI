@@ -124,6 +124,12 @@ class Settings(BaseSettings):
     PERF_PARALLEL_LOG_ENABLED: bool = True  # Log parallelization metrics during and after scans
     PERF_PARALLEL_LOG_INTERVAL: int = 10  # Log parallelization stats every N worker operations (0 to disable)
 
+    # --- Pipeline V3 Batch Processing Configuration (Phase 31: v2.5) ---
+    BATCH_PROCESSING_ENABLED: bool = True  # Enable batch DAST mode
+    BATCH_DAST_CONCURRENCY: int = 5  # Max concurrent DAST agents
+    BATCH_QUEUE_DRAIN_TIMEOUT: float = 300.0  # Seconds to wait for queues
+    BATCH_QUEUE_CHECK_INTERVAL: float = 2.0  # Seconds between queue depth checks
+
     def get_threshold_for_type(self, vuln_type: str) -> int:
         """Get the skeptical threshold for a vulnerability type."""
         vuln_upper = vuln_type.upper()
