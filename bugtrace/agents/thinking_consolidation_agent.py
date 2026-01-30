@@ -321,7 +321,7 @@ class ThinkingConsolidationAgent(BaseAgent):
         scan_context = data.get("scan_context", self.scan_context)
         findings = data.get("findings", [])
 
-        logger.info(f"[{self.name}] Received url_analyzed: {len(findings)} findings for {url[:50]}")
+        logger.info(f"[{self.name}] Processing batch: {len(findings)} findings from {url[:50]}")
 
         self._stats["total_received"] += len(findings)
 
@@ -744,6 +744,19 @@ class ThinkingConsolidationAgent(BaseAgent):
         # If switching from batch to streaming, flush buffer
         if old_mode == "batch" and mode == "streaming" and self._batch_buffer:
             asyncio.create_task(self.flush_batch())
+
+    def log_batch_summary(self):
+        """Log summary of batch processing."""
+        stats = self.get_stats()
+        logger.info(
+            f"[{self.name}] Batch Summary: "
+            f"received={stats['total_received']}, "
+            f"deduplicated={stats['duplicates_filtered']}, "
+            f"fp_filtered={stats['fp_filtered']}, "
+            f"distributed={stats['distributed']}"
+        )
+        for specialist, count in stats.get('by_specialist', {}).items():
+            logger.info(f"[{self.name}]   {specialist}: {count} findings queued")
 
     def get_stats(self) -> Dict[str, Any]:
         """Get processing statistics."""
