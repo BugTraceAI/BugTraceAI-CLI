@@ -3,8 +3,8 @@ import asyncio
 import json
 import re
 import os
-from typing import List, Dict, Optional, Any
-from urllib.parse import urlparse
+from typing import List, Dict, Optional, Any, Tuple
+from urllib.parse import urlparse, urljoin
 from bugtrace.utils.logger import get_logger
 logger = get_logger("tools.external")
 from bugtrace.core.config import settings
@@ -407,13 +407,33 @@ class ExternalToolManager:
             }
         return None
 
-    def _parse_gospider_urls(self, output: str, target_domain: str) -> List[str]:
-        """Parse URLs from GoSpider output, filtering to target domain."""
+    def _parse_gospider_urls(self, output: str, target_domain: str) -> Tuple[List[str], List[str]]:
+        """
+        Parse URLs from GoSpider output, filtering to target domain.
+
+        Returns:
+            Tuple of (all_urls, form_urls) - form_urls need parameter extraction
+        """
         urls = []
+        form_urls = []
+
         for line in output.splitlines():
+            line = line.strip()
+
+            # Detect line type BEFORE stripping brackets
+            is_form = line.startswith("[form]")
+
+            # Extract URL from line
             parts = line.replace("[", "").replace("]", "").split(" - ")
-            urls.extend(self._extract_urls_from_parts(parts, target_domain))
-        return list(set(urls))
+            extracted = self._extract_urls_from_parts(parts, target_domain)
+
+            urls.extend(extracted)
+
+            # Track form URLs separately for parameter extraction
+            if is_form:
+                form_urls.extend(extracted)
+
+        return list(set(urls)), list(set(form_urls))
 
     def _extract_urls_from_parts(self, parts: list, target_domain: str) -> list:
         """Extract in-scope URLs from line parts."""
@@ -467,10 +487,152 @@ class ExternalToolManager:
         target_domain = urlparse(url).hostname.lower()
         logger.info(f"GoSpider raw output (first 10 lines):\n{chr(10).join(output.splitlines()[:10])}")
 
-        unique_urls = self._parse_gospider_urls(output, target_domain)
-        logger.info(f"GoSpider found {len(unique_urls)} in-scope URLs out of {len(output.splitlines())} total lines.")
-        dashboard.log(f"[External] GoSpider discovered {len(unique_urls)} in-scope endpoints.", "INFO")
+        # Parse URLs AND identify forms (IMPROVED 2026-01-30)
+        unique_urls, form_urls = self._parse_gospider_urls(output, target_domain)
+        logger.info(f"GoSpider found {len(unique_urls)} in-scope URLs, {len(form_urls)} forms.")
+
+        # Extract parameters from forms (CRITICAL for CSTI, SQLi detection)
+        if form_urls:
+            logger.info(f"[GoSpider] Extracting parameters from {len(form_urls)} forms...")
+            param_urls = await self._extract_form_params(form_urls, cookies)
+            if param_urls:
+                logger.info(f"[GoSpider] Extracted {len(param_urls)} parameterized URLs from forms")
+                unique_urls = list(set(unique_urls + param_urls))
+
+        dashboard.log(f"[External] GoSpider discovered {len(unique_urls)} endpoints (including form params).", "INFO")
         return unique_urls
+
+    async def _extract_form_params(self, form_urls: List[str], cookies: List[Dict] = None) -> List[str]:
+        """
+        Fetch form URLs and extract input names to build parameterized URLs.
+
+        This is CRITICAL for discovering vulnerabilities like:
+        - /blog?search=X (CSTI)
+        - /catalog?category=X (SQLi, CSTI)
+        - /login?username=X (SQLi)
+
+        Extracts from:
+        1. HTML forms (<input name="...">)
+        2. Inline JavaScript (URLs with query params in JS objects/strings)
+
+        Args:
+            form_urls: List of URLs where GoSpider detected forms
+            cookies: Optional session cookies
+
+        Returns:
+            List of URLs with discovered parameters (e.g., /blog?search=FUZZ)
+        """
+        import aiohttp
+        from bs4 import BeautifulSoup
+
+        param_urls = []
+        headers = {"User-Agent": settings.USER_AGENT}
+
+        # Build cookie header if provided
+        cookie_header = None
+        if cookies:
+            cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+
+        timeout = aiohttp.ClientTimeout(total=10)
+
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            for form_url in form_urls:
+                try:
+                    req_headers = headers.copy()
+                    if cookie_header:
+                        req_headers["Cookie"] = cookie_header
+
+                    async with session.get(form_url, headers=req_headers, ssl=False) as resp:
+                        if resp.status != 200:
+                            continue
+
+                        html = await resp.text()
+                        soup = BeautifulSoup(html, 'html.parser')
+                        base_domain = urlparse(form_url).hostname
+
+                        # 1. Extract from HTML forms
+                        for form in soup.find_all('form'):
+                            action = form.get('action', '')
+                            method = form.get('method', 'GET').upper()
+
+                            # Build form action URL
+                            if action:
+                                action_url = urljoin(form_url, action)
+                            else:
+                                action_url = form_url
+
+                            # Ensure action URL is in scope
+                            action_domain = urlparse(action_url).hostname
+                            if action_domain and action_domain != base_domain:
+                                continue
+
+                            # Extract all input elements
+                            inputs = form.find_all(['input', 'textarea', 'select'])
+                            for inp in inputs:
+                                name = inp.get('name')
+                                inp_type = inp.get('type', 'text').lower()
+
+                                # Skip hidden tokens, CSRF, submit buttons
+                                if not name:
+                                    continue
+                                if inp_type in ('hidden', 'submit', 'button', 'image', 'reset'):
+                                    continue
+                                if name.lower() in ('csrf', 'token', '_token', 'csrfmiddlewaretoken'):
+                                    continue
+
+                                # Build URL with parameter
+                                separator = "&" if "?" in action_url else "?"
+                                param_url = f"{action_url}{separator}{name}=FUZZ"
+                                param_urls.append(param_url)
+                                logger.debug(f"[GoSpider] Found form param: {name} at {action_url}")
+
+                        # 2. Extract URLs with params from inline JavaScript
+                        # This catches dynamic navigation like: {"/catalog?category=Gin"}
+                        js_param_urls = self._extract_js_urls(html, form_url, base_domain)
+                        param_urls.extend(js_param_urls)
+
+                except Exception as e:
+                    logger.debug(f"[GoSpider] Failed to extract form params from {form_url}: {e}")
+
+        return list(set(param_urls))
+
+    def _extract_js_urls(self, html: str, base_url: str, base_domain: str) -> List[str]:
+        """
+        Extract URLs with query parameters from inline JavaScript.
+
+        Catches patterns like:
+        - "/catalog?category=Accessories"
+        - '/blog?search=' + query
+        - href="/page?param=value"
+
+        Args:
+            html: Page HTML content
+            base_url: Base URL for resolving relative paths
+            base_domain: Domain for scope checking
+
+        Returns:
+            List of discovered parameterized URLs
+        """
+        urls = []
+
+        # Pattern to find URLs with query params in JS strings
+        # Matches: "/path?param=value" or '/path?param=value'
+        js_url_pattern = re.compile(r'["\'](/[^"\']*\?[^"\']+)["\']')
+
+        for match in js_url_pattern.finditer(html):
+            relative_url = match.group(1)
+            try:
+                full_url = urljoin(base_url, relative_url)
+                url_domain = urlparse(full_url).hostname
+
+                # Check scope
+                if url_domain == base_domain:
+                    urls.append(full_url)
+                    logger.debug(f"[GoSpider] Found JS URL with params: {full_url}")
+            except Exception:
+                pass
+
+        return urls
 
     def _build_fuzz_url(self, url: str, param: str) -> str:
         """Build URL with FUZZ marker replacing parameter value."""
