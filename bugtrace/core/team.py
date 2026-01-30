@@ -47,6 +47,12 @@ from bugtrace.core.pipeline import (
     PipelineOrchestrator, PipelineLifecycle, PipelinePhase, PipelineState
 )
 
+# Phase-specific semaphores (v2.4)
+from bugtrace.core.phase_semaphores import (
+    phase_semaphores, ScanPhase,
+    get_exploitation_semaphore, get_analysis_semaphore, get_validation_semaphore
+)
+
 async def run_agent_with_semaphore(semaphore: asyncio.Semaphore, agent, process_result_fn):
     """
     Execute an agent with semaphore-controlled concurrency.
@@ -173,9 +179,20 @@ class TeamOrchestrator:
     def _init_vertical_mode(self, use_vertical_agents: bool):
         """Initialize vertical agent architecture settings."""
         self.use_vertical_agents = use_vertical_agents
-        self.url_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_URL_AGENTS)
+
+        # Initialize phase-specific semaphores (v2.4)
+        phase_semaphores.initialize()
+
+        # Keep url_semaphore for backward compatibility (maps to EXPLOITATION phase)
+        self.url_semaphore = get_exploitation_semaphore()
+
         if use_vertical_agents:
-            logger.info(f"Sequential Pipeline (V2) ENABLED (max {settings.MAX_CONCURRENT_URL_AGENTS} concurrent URLs)")
+            logger.info(
+                f"Sequential Pipeline (V2) ENABLED "
+                f"(Analysis={settings.MAX_CONCURRENT_ANALYSIS}, "
+                f"Specialists={settings.MAX_CONCURRENT_SPECIALISTS}, "
+                f"Validation={settings.MAX_CONCURRENT_VALIDATION})"
+            )
 
     def _init_database(self, resume: bool):
         """Initialize database and resumption logic."""

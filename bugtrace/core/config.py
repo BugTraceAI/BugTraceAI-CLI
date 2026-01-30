@@ -334,6 +334,20 @@ class Settings(BaseSettings):
         if "MAX_CONCURRENT_URL_AGENTS" in config["SCAN"]:
             self.MAX_CONCURRENT_URL_AGENTS = config["SCAN"].getint("MAX_CONCURRENT_URL_AGENTS")
 
+    def _load_parallelization_config(self, config):
+        """Load PARALLELIZATION section config for granular per-phase concurrency."""
+        if "PARALLELIZATION" not in config:
+            return
+        section = config["PARALLELIZATION"]
+        if "MAX_CONCURRENT_DISCOVERY" in section:
+            self.MAX_CONCURRENT_DISCOVERY = section.getint("MAX_CONCURRENT_DISCOVERY")
+        if "MAX_CONCURRENT_ANALYSIS" in section:
+            self.MAX_CONCURRENT_ANALYSIS = section.getint("MAX_CONCURRENT_ANALYSIS")
+        if "MAX_CONCURRENT_SPECIALISTS" in section:
+            self.MAX_CONCURRENT_SPECIALISTS = section.getint("MAX_CONCURRENT_SPECIALISTS")
+        if "MAX_CONCURRENT_VALIDATION" in section:
+            self.MAX_CONCURRENT_VALIDATION = section.getint("MAX_CONCURRENT_VALIDATION")
+
     def _load_llm_models_config(self, config):
         """Load LLM_MODELS section config."""
         if "LLM_MODELS" not in config:
@@ -430,6 +444,7 @@ class Settings(BaseSettings):
         config.read(conf_path)
         self._load_crawler_config(config)
         self._load_scan_config(config)
+        self._load_parallelization_config(config)
         self._load_llm_models_config(config)
         self._load_conductor_and_scanning_config(config)
         self._load_analysis_and_misc_config(config)
@@ -457,6 +472,16 @@ class Settings(BaseSettings):
             errors.append("MAX_CONCURRENT_REQUESTS must be >= 1")
         if self.MAX_CONCURRENT_URL_AGENTS < 1:
             errors.append("MAX_CONCURRENT_URL_AGENTS must be >= 1")
+
+        # Granular phase concurrency validators
+        if self.MAX_CONCURRENT_DISCOVERY < 1:
+            errors.append("MAX_CONCURRENT_DISCOVERY must be >= 1")
+        if self.MAX_CONCURRENT_ANALYSIS < 1:
+            errors.append("MAX_CONCURRENT_ANALYSIS must be >= 1")
+        if self.MAX_CONCURRENT_SPECIALISTS < 1:
+            errors.append("MAX_CONCURRENT_SPECIALISTS must be >= 1")
+        if self.MAX_CONCURRENT_VALIDATION < 1:
+            errors.append("MAX_CONCURRENT_VALIDATION must be >= 1")
 
         # Check confidence thresholds (0.0 - 1.0)
         if not 0.0 <= self.CONDUCTOR_MIN_CONFIDENCE <= 1.0:
@@ -634,8 +659,14 @@ class Settings(BaseSettings):
     # --- Scan Configuration (Mapped from [SCAN] in conf) ---
     MAX_DEPTH: int = 2
     MAX_URLS: int = 20
-    MAX_CONCURRENT_URL_AGENTS: int = 10  # Parallel URLMasterAgents
-    
+    MAX_CONCURRENT_URL_AGENTS: int = 10  # Parallel URLMasterAgents (legacy, alias for SPECIALISTS)
+
+    # --- Granular Phase Concurrency (Phase 31: v2.4) ---
+    MAX_CONCURRENT_DISCOVERY: int = 1      # GoSpider (single-threaded by design)
+    MAX_CONCURRENT_ANALYSIS: int = 5       # DAST/SAST per URL
+    MAX_CONCURRENT_SPECIALISTS: int = 10   # SQLi, XSS, CSTI paralelos
+    MAX_CONCURRENT_VALIDATION: int = 5     # CDP browser validation sessions
+
     # --- Visual / Browser ---
     HEADLESS_BROWSER: bool = True
     

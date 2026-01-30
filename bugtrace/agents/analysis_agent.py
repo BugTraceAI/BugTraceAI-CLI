@@ -40,7 +40,18 @@ class DASTySASTAgent(BaseAgent):
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] Running DAST+SAST Analysis on {self.url[:50]}...", "INFO")
 
+        # Use phase-specific analysis semaphore for tracking (v2.4)
         try:
+            from bugtrace.core.phase_semaphores import phase_semaphores, ScanPhase
+            phase_semaphores.initialize()
+            phase_ctx = phase_semaphores.acquire(ScanPhase.ANALYSIS)
+        except ImportError:
+            phase_ctx = None
+
+        try:
+            if phase_ctx:
+                await phase_ctx.__aenter__()
+
             # 1. Prepare Context
             context = await self._run_prepare_context()
 
@@ -82,6 +93,10 @@ class DASTySASTAgent(BaseAgent):
             except Exception:
                 pass  # Best effort
             return {"error": str(e), "vulnerabilities": []}
+        finally:
+            # Release phase semaphore (v2.4)
+            if phase_ctx:
+                await phase_ctx.__aexit__(None, None, None)
 
     async def _run_prepare_context(self) -> Dict:
         """Prepare analysis context with OOB payload and HTML content."""

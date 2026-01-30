@@ -152,7 +152,8 @@ class AgenticValidator(BaseAgent):
     """
 
     # Configuration
-    MAX_CONCURRENT_VALIDATIONS = 3  # Parallel browser sessions
+    # Legacy constant (now uses settings.MAX_CONCURRENT_VALIDATION)
+    MAX_CONCURRENT_VALIDATIONS = 3  # Fallback if phase_semaphores not available
     SKIP_VISION_ON_CDP_CONFIRM = True  # Early exit optimization
     ENABLE_CACHE = True  # Result caching
     FAST_VALIDATION_TIMEOUT = 30.0  # Reduced from default
@@ -170,8 +171,13 @@ class AgenticValidator(BaseAgent):
         # OPTIMIZATION: Validation cache
         self._cache = ValidationCache(max_size=150)
 
-        # OPTIMIZATION: Concurrency semaphore for parallel validation
-        self._validation_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_VALIDATIONS)
+        # OPTIMIZATION: Use phase-specific validation semaphore (v2.4)
+        try:
+            from bugtrace.core.phase_semaphores import phase_semaphores, get_validation_semaphore
+            phase_semaphores.initialize()
+            self._validation_semaphore = get_validation_semaphore()
+        except ImportError:
+            self._validation_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_VALIDATIONS)
 
         # Statistics tracking
         self._stats = {

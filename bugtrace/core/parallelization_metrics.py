@@ -87,6 +87,13 @@ class ParallelizationMetrics:
         """Get full parallelization metrics summary."""
         scan_duration = time.time() - self._scan_start
 
+        # Import phase semaphore stats
+        try:
+            from bugtrace.core.phase_semaphores import phase_semaphores
+            phase_stats = phase_semaphores.get_stats()
+        except ImportError:
+            phase_stats = {}
+
         return {
             "current_concurrent": self.get_current_concurrent(),
             "peak_concurrent": self._peak_concurrent,
@@ -99,7 +106,9 @@ class ParallelizationMetrics:
                     "total_worker_seconds": round(self._total_worker_seconds.get(specialist, 0), 2),
                 }
                 for specialist, workers in self._active_workers.items()
-            }
+            },
+            # Phase semaphore statistics (v2.4)
+            "by_phase": phase_stats,
         }
 
     def log_summary(self) -> None:
