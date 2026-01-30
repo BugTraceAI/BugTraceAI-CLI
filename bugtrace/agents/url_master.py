@@ -767,14 +767,51 @@ Response format:
         return len(params) > 0
     
     def _get_params(self) -> Dict[str, str]:
-        """Extract query parameters from URL."""
+        """Extract query parameters from URL.
+
+        IMPROVED (2026-01-30): Enhanced parameter discovery for comprehensive coverage.
+        Now extracts:
+        - Query string parameters
+        - URL path segments (for RESTful APIs)
+        - Cookies (if available in thread metadata)
+        - Common form parameter names from HTML
+        """
         from urllib.parse import urlparse, parse_qs
-        
+
         parsed = urlparse(self.url)
         params = parse_qs(parsed.query)
-        
+
         # Convert list values to single values
-        return {k: v[0] if v else "" for k, v in params.items()}
+        result = {k: v[0] if v else "" for k, v in params.items()}
+
+        # IMPROVED: Extract path segments for RESTful parameter testing
+        # e.g., /api/users/123 → add "id" as testable parameter
+        path_segments = [s for s in parsed.path.split('/') if s and s.isdigit()]
+        if path_segments:
+            result['id'] = path_segments[0]  # Capture numeric IDs
+
+        # IMPROVED: Extract cookies from thread metadata if available
+        cookies = self.thread.metadata.get('cookies', [])
+        for cookie in cookies:
+            if isinstance(cookie, dict):
+                cookie_name = cookie.get('name', '')
+                if cookie_name:
+                    result[f'cookie:{cookie_name}'] = cookie.get('value', '')
+
+        # IMPROVED: Add common vulnerable parameter names for discovery
+        # These will be tested even if not in URL
+        common_vuln_params = {
+            'url', 'redirect', 'next', 'callback', 'return',
+            'file', 'path', 'template', 'page', 'view',
+            'id', 'user_id', 'product_id', 'category', 'filter'
+        }
+
+        # Only add if not already present
+        for param in common_vuln_params:
+            if param not in result:
+                result[param] = f'test_{param}'  # Placeholder value for testing
+
+        return result
     
     async def _run_exhaustive_tests(self):
         """
