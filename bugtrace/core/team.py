@@ -82,6 +82,9 @@ class TeamOrchestrator:
         self._stop_event = asyncio.Event()
         self.auth_creds: Optional[str] = None
 
+        # Scan context for event correlation (V3 pipeline)
+        self.scan_context = f"scan_{id(self)}_{int(__import__('time').time())}"
+
         # Initialize specialist agents
         self._init_specialist_agents()
 
@@ -104,7 +107,7 @@ class TeamOrchestrator:
 
         # Initialize ThinkingConsolidationAgent for V3 pipeline
         from bugtrace.agents.thinking_consolidation_agent import ThinkingConsolidationAgent
-        self.thinking_agent = ThinkingConsolidationAgent()
+        self.thinking_agent = ThinkingConsolidationAgent(scan_context=self.scan_context)
         logger.info("ThinkingConsolidationAgent initialized - V3 event-driven pipeline active")
 
         # Specialist worker pools will be initialized async in _run_hunter_core
@@ -1550,19 +1553,45 @@ class TeamOrchestrator:
         # ThinkingConsolidationAgent deduplicates and distributes to queues
         logger.info("=== PHASE 2: EVALUATION (Batch DAST) ===")
         dashboard.log(f"🔬 Running batch DAST on {len(self.urls_to_scan)} URLs", "INFO")
+        dashboard.set_phase("PHASE_2_ANALYSIS")
 
-        # Batch DAST processing happens in _phase_2_analysis
+        # Run batch DAST - this is the actual EVALUATION work
+        self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir)
+
+        # Signal EVALUATION complete AFTER batch DAST finishes
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.EVALUATION,
-            {'urls_analyzed': len(self.urls_to_scan)}
+            {'urls_analyzed': len(self.vulnerabilities_by_url)}
         )
+
+        if self._check_stop_requested(dashboard):
+            return
 
         # ========== PHASE 3: EXPLOITATION (Queue Consumption) ==========
         # Specialists consume from queues in true parallel
         logger.info("=== PHASE 3: EXPLOITATION (Specialist Queue Processing) ===")
         dashboard.log(f"⚡ Specialists processing findings from queues", "INFO")
 
-        await self._phase_2_analysis(dashboard, analysis_dir)  # Now uses batch mode
+        # Wait for ThinkingAgent to distribute to queues and specialists to process
+        batch_metrics.start_queue_drain()
+        queue_results = await self._wait_for_specialist_queues(dashboard, timeout=300.0)
+        batch_metrics.end_queue_drain(
+            findings_distributed=queue_results.get('items_distributed', 0),
+            by_specialist=queue_results.get('by_specialist', {})
+        )
+
+        dashboard.log(
+            f"Specialist execution complete: {queue_results.get('items_distributed', 0)} items processed",
+            "INFO"
+        )
+
+        # Log batch summary from ThinkingAgent
+        if self.thinking_agent and hasattr(self.thinking_agent, 'log_batch_summary'):
+            self.thinking_agent.log_batch_summary()
+
+        await self._checkpoint("Batch Analysis & Queue-based Exploitation")
+
+        # Signal EXPLOITATION complete AFTER queue drain finishes
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.EXPLOITATION,
             {'findings_exploited': self.thinking_agent.get_stats().get('distributed', 0) if self.thinking_agent else 0}
@@ -1687,7 +1716,11 @@ class TeamOrchestrator:
         async def analyze_url(url: str) -> tuple:
             async with analysis_semaphore:
                 url_dir = self._create_url_directory(url, analysis_dir)
-                dast = DASTySASTAgent(url, self.tech_profile, url_dir, state_manager=self.state_manager)
+                dast = DASTySASTAgent(
+                    url, self.tech_profile, url_dir,
+                    state_manager=self.state_manager,
+                    scan_context=self.scan_context
+                )
                 result = await dast.run()
                 return (url, result.get("vulnerabilities", []))
 
@@ -1717,7 +1750,12 @@ class TeamOrchestrator:
         return vulnerabilities_by_url
 
     async def _phase_2_analysis(self, dashboard, analysis_dir):
-        """Execute Phase 2: Batch DAST Analysis + Queue-based Specialist Execution."""
+        """Execute Phase 2: Batch DAST Analysis + Queue-based Specialist Execution.
+
+        DEPRECATED: This method is no longer called from _run_sequential_pipeline.
+        The logic is now inlined for proper phase signal timing.
+        Kept for backward compatibility with non-batch pipelines.
+        """
         dashboard.set_phase("PHASE_2_ANALYSIS")
 
         # Phase 2A: Batch DAST Discovery (runs in parallel)

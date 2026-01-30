@@ -867,12 +867,11 @@ Respond in JSON format:
         
         llm = LLMClient()
         
-        # Use a vision-capable model
-        # google/gemini-2.0-flash-001 is a good default, or use settings
+        # Use a vision-capable model from settings
         response = await llm.generate_with_image(
             prompt=prompt,
             image_path=screenshot_path,
-            model_override="google/gemini-2.0-flash-001",
+            model_override=settings.VISION_MODEL,
             temperature=0.1
         )
         

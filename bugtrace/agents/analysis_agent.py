@@ -150,6 +150,12 @@ class DASTySASTAgent(BaseAgent):
         from bugtrace.tools.exploitation.header_injection import header_detector
         tasks.append(self._check_header_injection(header_detector))
 
+        # Add SQLi Probe Check (active testing for error-based SQLi)
+        tasks.append(self._check_sqli_probes())
+
+        # Add Cookie SQLi Probe Check (cookies need level=2 testing)
+        tasks.append(self._check_cookie_sqli_probes())
+
         analyses = await asyncio.gather(*tasks, return_exceptions=True)
         valid_analyses = [a for a in analyses if isinstance(a, dict) and not a.get("error")]
 
@@ -288,6 +294,246 @@ class DASTySASTAgent(BaseAgent):
             return {"vulnerabilities": []}
         except Exception as e:
             logger.error(f"Header injection check failed: {e}", exc_info=True)
+            return {"vulnerabilities": []}
+
+    async def _check_sqli_probes(self) -> Dict:
+        """
+        Active SQLi probe: Send basic payloads to detect error-based SQL injection.
+        Uses two detection methods:
+        1. SQL error messages in response body
+        2. Status code differential (500 on ' but 200 on '' = classic SQLi)
+        """
+        import aiohttp
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        # SQL error patterns for major databases
+        SQL_ERRORS = [
+            # MySQL
+            "you have an error in your sql syntax",
+            "mysql_fetch", "mysql_num_rows", "mysql_query",
+            "warning: mysql",
+            # PostgreSQL
+            "postgresql.*error", "pg_query", "pg_exec",
+            "unterminated quoted string",
+            # MSSQL
+            "microsoft sql server", "mssql_query",
+            "unclosed quotation mark",
+            # Oracle
+            "ora-00933", "ora-00921", "ora-01756",
+            "oracle.*driver", "oracle.*error",
+            # SQLite
+            "sqlite3.operationalerror", "sqlite_error",
+            "unrecognized token",
+            # Generic
+            "sql syntax.*mysql", "valid sql statement",
+            "sqlstate", "odbc.*driver",
+        ]
+
+        try:
+            parsed = urlparse(self.url)
+            params = parse_qs(parsed.query)
+
+            if not params:
+                return {"vulnerabilities": []}
+
+            findings = []
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                for param_name in params:
+                    # Test: Single quote should break SQL, double quote should escape
+                    test_params_single = {k: v[0] if v else "" for k, v in params.items()}
+                    test_params_single[param_name] = "'"
+
+                    test_params_double = {k: v[0] if v else "" for k, v in params.items()}
+                    test_params_double[param_name] = "''"
+
+                    url_single = urlunparse((
+                        parsed.scheme, parsed.netloc, parsed.path,
+                        parsed.params, urlencode(test_params_single), parsed.fragment
+                    ))
+                    url_double = urlunparse((
+                        parsed.scheme, parsed.netloc, parsed.path,
+                        parsed.params, urlencode(test_params_double), parsed.fragment
+                    ))
+
+                    try:
+                        async with session.get(url_single, ssl=False) as resp_single:
+                            status_single = resp_single.status
+                            body_single = await resp_single.text()
+
+                        async with session.get(url_double, ssl=False) as resp_double:
+                            status_double = resp_double.status
+
+                        # Detection Method 1: Status code differential
+                        # If ' gives 500 but '' gives 200 = classic SQLi pattern
+                        if status_single >= 500 and status_double < 400:
+                            logger.info(f"[SQLi Probe] Status differential in {param_name}: '={status_single}, ''={status_double}")
+                            findings.append({
+                                "type": "SQLi",
+                                "vulnerability": "SQL Injection (Error-based)",
+                                "parameter": param_name,
+                                "payload": "'",
+                                "confidence": 0.9,
+                                "severity": "Critical",
+                                "validated": False,
+                                "fp_confidence": 0.85,
+                                "skeptical_score": 8,
+                                "evidence": f"Status code differential: single quote (') returns {status_single}, escaped quote ('') returns {status_double}",
+                                "description": f"Error-based SQL injection detected in parameter '{param_name}'. Single quote causes server error (500) while escaped quote works normally, indicating SQL query breakage.",
+                                "reproduction": f"curl -s -o /dev/null -w '%{{http_code}}' '{url_single}' # Returns {status_single}"
+                            })
+                            continue  # Found SQLi, next param
+
+                        # Detection Method 2: SQL error messages in body
+                        body_lower = body_single.lower()
+                        for error_pattern in SQL_ERRORS:
+                            if error_pattern in body_lower:
+                                logger.info(f"[SQLi Probe] Found SQL error '{error_pattern}' in {param_name}")
+                                findings.append({
+                                    "type": "SQLi",
+                                    "vulnerability": "SQL Injection (Error-based)",
+                                    "parameter": param_name,
+                                    "payload": "'",
+                                    "confidence": 0.95,
+                                    "severity": "Critical",
+                                    "validated": False,
+                                    "fp_confidence": 0.9,
+                                    "skeptical_score": 9,
+                                    "evidence": f"SQL error detected: '{error_pattern}' in response",
+                                    "description": f"Error-based SQL injection detected in parameter '{param_name}'. Database error message exposed in response.",
+                                    "reproduction": f"curl '{url_single}' | grep -i 'error\\|sql'"
+                                })
+                                break
+
+                    except Exception as e:
+                        logger.debug(f"[SQLi Probe] Network error testing {param_name}: {e}")
+                        continue
+
+            return {"vulnerabilities": findings}
+
+        except Exception as e:
+            logger.error(f"SQLi probe check failed: {e}", exc_info=True)
+            return {"vulnerabilities": []}
+
+    async def _check_cookie_sqli_probes(self) -> Dict:
+        """
+        Active SQLi probe for cookies: Test each cookie value for SQL injection.
+        Handles Base64-encoded values (like TrackingId with JSON inside).
+        """
+        import aiohttp
+        import base64
+        import json
+        from urllib.parse import urlparse
+
+        findings = []
+
+        try:
+            # Get cookies from browser session
+            from bugtrace.tools.visual.browser import browser_manager
+            session_data = await browser_manager.export_session_context()
+            cookies = session_data.get("cookies", [])
+
+            if not cookies:
+                return {"vulnerabilities": []}
+
+            parsed = urlparse(self.url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                for cookie in cookies:
+                    cookie_name = cookie.get("name", "")
+                    cookie_value = cookie.get("value", "")
+
+                    if not cookie_name or not cookie_value:
+                        continue
+
+                    # Skip session/auth cookies (don't want to break session)
+                    if cookie_name.lower() in ["session", "sessionid", "phpsessid", "jsessionid"]:
+                        continue
+
+                    # Prepare test values
+                    test_values = []
+
+                    # Test 1: Direct injection
+                    test_values.append(("direct", f"{cookie_value}'", f"{cookie_value}''"))
+
+                    # Test 2: Try Base64 decode and inject inside
+                    try:
+                        # Pad Base64 if needed
+                        padded = cookie_value + "=" * (4 - len(cookie_value) % 4) if len(cookie_value) % 4 else cookie_value
+                        decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+
+                        # Check if it's JSON
+                        if decoded.strip().startswith('{'):
+                            try:
+                                json_data = json.loads(decoded)
+                                # Inject in each JSON field
+                                for key in json_data:
+                                    if isinstance(json_data[key], str):
+                                        # Create modified JSON with injection
+                                        json_single = json_data.copy()
+                                        json_single[key] = "'"
+                                        json_double = json_data.copy()
+                                        json_double[key] = "''"
+
+                                        val_single = base64.b64encode(json.dumps(json_single).encode()).decode()
+                                        val_double = base64.b64encode(json.dumps(json_double).encode()).decode()
+                                        test_values.append((f"base64_json_{key}", val_single, val_double))
+                            except json.JSONDecodeError:
+                                pass
+                        else:
+                            # Plain Base64, inject in decoded value
+                            val_single = base64.b64encode(f"{decoded}'".encode()).decode()
+                            val_double = base64.b64encode(f"{decoded}''".encode()).decode()
+                            test_values.append(("base64_plain", val_single, val_double))
+                    except Exception:
+                        pass  # Not Base64, skip
+
+                    # Run tests
+                    for test_type, val_single, val_double in test_values:
+                        try:
+                            # Build cookie strings
+                            other_cookies = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
+
+                            cookies_single = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={val_single}"])
+                            cookies_double = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={val_double}"])
+
+                            headers_single = {"Cookie": cookies_single}
+                            headers_double = {"Cookie": cookies_double}
+
+                            async with session.get(base_url, headers=headers_single, ssl=False) as resp_single:
+                                status_single = resp_single.status
+
+                            async with session.get(base_url, headers=headers_double, ssl=False) as resp_double:
+                                status_double = resp_double.status
+
+                            # Detection: Status code differential
+                            if status_single >= 500 and status_double < 400:
+                                logger.info(f"[Cookie SQLi Probe] Status differential in cookie {cookie_name} ({test_type}): '={status_single}, ''={status_double}")
+                                findings.append({
+                                    "type": "SQLi",
+                                    "vulnerability": "SQL Injection in Cookie (Error-based)",
+                                    "parameter": f"Cookie: {cookie_name}",
+                                    "payload": "'" if "base64" not in test_type else f"Base64-encoded ' in {test_type}",
+                                    "confidence": 0.9,
+                                    "severity": "Critical",
+                                    "validated": False,
+                                    "fp_confidence": 0.85,
+                                    "skeptical_score": 8,
+                                    "evidence": f"Status code differential: single quote returns {status_single}, escaped quote returns {status_double}",
+                                    "description": f"Error-based SQL injection detected in cookie '{cookie_name}' ({test_type}). Single quote causes server error while escaped quote works normally.",
+                                    "reproduction": f"curl -b '{cookie_name}={val_single}' '{base_url}' # Returns {status_single}"
+                                })
+                                break  # Found SQLi in this cookie, move on
+
+                        except Exception as e:
+                            logger.debug(f"[Cookie SQLi Probe] Error testing {cookie_name}: {e}")
+                            continue
+
+            return {"vulnerabilities": findings}
+
+        except Exception as e:
+            logger.error(f"Cookie SQLi probe check failed: {e}", exc_info=True)
             return {"vulnerabilities": []}
 
     async def _analyze_with_approach(self, context: Dict, approach: str) -> Dict:

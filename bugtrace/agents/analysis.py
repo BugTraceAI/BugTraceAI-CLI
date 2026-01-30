@@ -57,7 +57,7 @@ class AnalysisAgent(BaseAgent):
         super().__init__("Analysis-1", "Vulnerability Analysis", event_bus=event_bus, agent_id="analysis_agent")
         
         # Using single model with 5 different analysis approaches (BugTraceAI methodology)
-        self.model = getattr(settings, "ANALYSIS_PENTESTER_MODEL", "google/gemini-2.0-flash-exp")
+        self.model = getattr(settings, "ANALYSIS_PENTESTER_MODEL", None) or settings.DEFAULT_MODEL
         
         # 5 different analysis approaches for maximum coverage
         self.approaches = ["pentester", "bug_bounty", "code_auditor", "red_team", "researcher"]

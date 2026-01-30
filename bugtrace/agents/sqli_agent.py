@@ -1206,6 +1206,8 @@ class SQLiAgent(BaseAgent):
         cmd_parts = [
             f"sqlmap -u '{self.url}'",
             "--batch",
+            "--level=2",  # Test cookies (level 1=URL params, 2=+cookies, 3=+headers)
+            "--risk=2",   # More aggressive tests
             f"-p {param}",
             f"--technique={tech_code}",
         ]

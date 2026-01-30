@@ -473,7 +473,7 @@ class ReportValidator(BaseAgent):
             response = await self.llm.generate_with_image(
                 prompt=prompt,
                 image_path=str(screenshot_path),
-                model_override="google/gemini-2.0-flash-001",
+                model_override=settings.VISION_MODEL,
                 module_name="ReportValidator",
                 temperature=0.1
             )
