@@ -47,6 +47,9 @@ from bugtrace.core.pipeline import (
     PipelineOrchestrator, PipelineLifecycle, PipelinePhase, PipelineState
 )
 
+# Centralized HTTP client management (v2.4)
+from bugtrace.core.http_manager import http_manager
+
 # Phase-specific semaphores (v2.4)
 from bugtrace.core.phase_semaphores import (
     phase_semaphores, ScanPhase,
@@ -72,7 +75,7 @@ async def run_agent_with_semaphore(semaphore: asyncio.Semaphore, agent, process_
 
 class TeamOrchestrator:
 
-    def __init__(self, target: str, resume: bool = False, max_depth: int = 2, max_urls: int = 15, use_vertical_agents: bool = False, output_dir: Optional[Path] = None):
+    def __init__(self, target: str, resume: bool = False, max_depth: int = 2, max_urls: int = 15, use_vertical_agents: bool = False, output_dir: Optional[Path] = None, scan_id: Optional[int] = None):
         self.target = target
         self.output_dir = output_dir
         self.resume = resume
@@ -91,8 +94,8 @@ class TeamOrchestrator:
         # Setup vertical agent architecture
         self._init_vertical_mode(use_vertical_agents)
 
-        # Setup persistence and resumption
-        self._init_database(resume)
+        # Setup persistence and resumption (use provided scan_id if available)
+        self._init_database(resume, existing_scan_id=scan_id)
 
     def _init_specialist_agents(self):
         """Initialize specialist agent instances."""
@@ -192,6 +195,9 @@ class TeamOrchestrator:
         await asyncio.gather(*shutdown_tasks, return_exceptions=True)
         logger.info("All specialist worker pools shutdown complete")
 
+        # Shutdown HTTP client manager (v2.4)
+        await http_manager.shutdown()
+
     def _init_vertical_mode(self, use_vertical_agents: bool):
         """Initialize vertical agent architecture settings."""
         self.use_vertical_agents = use_vertical_agents
@@ -207,15 +213,24 @@ class TeamOrchestrator:
                 f"Sequential Pipeline (V2) ENABLED "
                 f"(Analysis={settings.MAX_CONCURRENT_ANALYSIS}, "
                 f"Specialists={settings.MAX_CONCURRENT_SPECIALISTS}, "
-                f"Validation={settings.MAX_CONCURRENT_VALIDATION})"
+                f"Validation=1 (CDP hardcoded))"
             )
 
-    def _init_database(self, resume: bool):
-        """Initialize database and resumption logic."""
+    def _init_database(self, resume: bool, existing_scan_id: Optional[int] = None):
+        """Initialize database and resumption logic.
+
+        Args:
+            resume: Whether to resume an existing scan
+            existing_scan_id: Pre-created scan ID from ScanService (avoids duplicate creation)
+        """
         from bugtrace.core.database import get_db_manager
         self.db = get_db_manager()
 
-        if resume:
+        # If scan_id provided by ScanService, use it directly (avoids duplicate scan creation)
+        if existing_scan_id is not None:
+            self.scan_id = existing_scan_id
+            logger.info(f"Using existing scan ID: {self.scan_id} (from ScanService)")
+        elif resume:
             self.scan_id = self.db.get_active_scan(self.target)
             if not self.scan_id:
                 logger.warning(f"No active scan found to resume for {self.target}. Starting new.")
@@ -289,10 +304,20 @@ class TeamOrchestrator:
 
         # Run main logic
         if not dashboard.active:
-            with Live(dashboard, refresh_per_second=4, screen=True) as live:
-                dashboard.active = True
+            import sys
+            is_tty = sys.stdout.isatty()
+
+            if is_tty:
+                # Interactive mode: use full Rich dashboard with alternate screen
+                with Live(dashboard, refresh_per_second=4, screen=True) as live:
+                    dashboard.active = True
+                    await self._run_hunter_core()
+                    dashboard.active = False
+            else:
+                # Non-interactive mode (piped/redirected): log-only mode
+                logger.info("Running in non-interactive mode (output redirected)")
+                dashboard.active = False  # Disable dashboard updates
                 await self._run_hunter_core()
-                dashboard.active = False
         else:
             await self._run_hunter_core()
 
@@ -336,19 +361,33 @@ class TeamOrchestrator:
 
     def _configure_logging(self):
         """Configure logging for dashboard and file."""
+        import sys
+
         logger.remove()
-        logger.add(self._dashboard_sink, level="INFO")
+
+        is_tty = sys.stdout.isatty()
+
+        if is_tty:
+            # Interactive: send to dashboard
+            logger.add(self._dashboard_sink, level="INFO")
+        else:
+            # Non-interactive: send to stdout for redirection
+            logger.add(sys.stdout, level="INFO", format="{time:HH:mm:ss} | {level} | {message}")
+
+        # Always log to file
         logger.add("logs/execution.log", rotation="10 MB", level="DEBUG")
 
     async def _run_hunter_core(self):
         """Core Hunter logic separated from UI lifecycle."""
         dashboard.set_target(self.target)
+        dashboard.set_status("Running", "Pipeline starting...")
 
         # Run diagnostics
         if not await self._run_diagnostics():
             return
 
-        dashboard.set_phase("TEAM_ASSEMBLY")
+        dashboard.set_phase("🤖 ASSEMBLING CREW")
+        dashboard.set_status("Running", "Assembling team...")
 
         if not self.resume:
             self.state_manager.clear()
@@ -375,7 +414,8 @@ class TeamOrchestrator:
 
         await self._run_sequential_pipeline(dashboard)
 
-        dashboard.set_phase("COMPLETE")
+        dashboard.set_phase("🏆 MISSION COMPLETE")
+        dashboard.set_status("Complete", "Scan finished")
         await asyncio.sleep(2)
 
     async def _run_diagnostics(self) -> bool:
@@ -392,7 +432,7 @@ class TeamOrchestrator:
         if not self.auth_creds:
             return
 
-        dashboard.set_phase("AUTHENTICATION")
+        dashboard.set_phase("🔐 BREACHING GATES")
         dashboard.current_agent = "AuthAgent"
         dashboard.log(f"Initiating authenticated session for {self.auth_creds.split(':')[0]}...", "INFO")
 
@@ -1525,6 +1565,10 @@ class TeamOrchestrator:
         logger.info("Entering V3 Batch Processing Pipeline")
         start_time = datetime.now()
 
+        # Initialize HTTP client manager (v2.4 - prevents hung connections)
+        await http_manager.start()
+        logger.info("[HTTPClientManager] Connection pools initialized")
+
         # Initialize batch metrics
         reset_batch_metrics()
         batch_metrics.start_scan()
@@ -1553,7 +1597,8 @@ class TeamOrchestrator:
         # ThinkingConsolidationAgent deduplicates and distributes to queues
         logger.info("=== PHASE 2: EVALUATION (Batch DAST) ===")
         dashboard.log(f"🔬 Running batch DAST on {len(self.urls_to_scan)} URLs", "INFO")
-        dashboard.set_phase("PHASE_2_ANALYSIS")
+        dashboard.set_phase("🔬 HUNTING VULNS")
+        dashboard.set_status("Running", "Analysis in progress...")
 
         # Run batch DAST - this is the actual EVALUATION work
         self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir)
@@ -1635,7 +1680,8 @@ class TeamOrchestrator:
 
     async def _phase_1_reconnaissance(self, dashboard, recon_dir):
         """Execute Phase 1: Reconnaissance."""
-        dashboard.set_phase("PHASE_1_RECON")
+        dashboard.set_phase("👁️ RECON MODE")
+        dashboard.set_status("Running", "Discovery in progress...")
 
         if not await self._check_target_health(dashboard):
             return
@@ -1756,7 +1802,7 @@ class TeamOrchestrator:
         The logic is now inlined for proper phase signal timing.
         Kept for backward compatibility with non-batch pipelines.
         """
-        dashboard.set_phase("PHASE_2_ANALYSIS")
+        dashboard.set_phase("🔬 HUNTING VULNS")
 
         # Phase 2A: Batch DAST Discovery (runs in parallel)
         self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir)
@@ -1784,7 +1830,8 @@ class TeamOrchestrator:
     async def _phase_3_global_review(self, dashboard, scan_dir):
         """Execute Phase 3: Global Review."""
         logger.info("=== PHASE 3: GLOBAL REVIEW ===")
-        dashboard.set_phase("PHASE_3_REVIEW")
+        dashboard.set_phase("🎯 CONFIRMING HITS")
+        dashboard.set_status("Running", "Review in progress...")
         dashboard.log("🔍 Phase 3: Global Review and Chaining Analysis", "INFO")
 
         all_findings_for_review = self.state_manager.get_findings()
@@ -1796,7 +1843,8 @@ class TeamOrchestrator:
     async def _phase_4_reporting(self, dashboard, scan_dir):
         """Execute Phase 4: Reporting."""
         logger.info("=== PHASE 4: REPORTING ===")
-        dashboard.set_phase("PHASE_4_REPORTING")
+        dashboard.set_phase("📋 COMPILING INTEL")
+        dashboard.set_status("Running", "Generating reports...")
         dashboard.log("📊 Phase 4: Generating Final Reports", "INFO")
         dashboard.log("Generating final consolidated reports...", "INFO")
 

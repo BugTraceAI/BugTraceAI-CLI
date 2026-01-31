@@ -14,7 +14,7 @@ class DiagnosticSystem:
 
     async def run_all(self):
         """Runs a suite of health checks on the environment."""
-        dashboard.set_phase("DIAGNOSTICS")
+        dashboard.set_phase("⚡ SYSTEMS CHECK")
         dashboard.log("Running system health check...", "INFO")
 
         self._log_debug_paths()
