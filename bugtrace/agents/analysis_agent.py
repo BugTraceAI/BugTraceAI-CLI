@@ -1253,7 +1253,8 @@ Be RUTHLESS. False positives waste resources."""
                 llm_findings.append(v)
 
         # 1. Pre-filter based on fp_confidence threshold (Phase 17 enhancement)
-        threshold = getattr(settings, 'FP_CONFIDENCE_THRESHOLD', 0.5)
+        # FIX: Use correct config attribute name (was FP_CONFIDENCE_THRESHOLD, now THINKING_FP_THRESHOLD)
+        threshold = getattr(settings, 'THINKING_FP_THRESHOLD', 0.5)
 
         pre_filtered = []
         rejected_count = 0
