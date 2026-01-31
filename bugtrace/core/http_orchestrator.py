@@ -905,10 +905,51 @@ class DestinationClient:
             logger.debug(f"[DestinationClient:{self.destination.value}] Shutdown complete")
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
-        """Ensure session is available and healthy."""
+        """Ensure session is available and healthy, with auto-recovery."""
         if self._session is None or self._session.closed:
             await self.start()
+            return self._session
+
+        # Check if the session's event loop is still valid
+        # This can happen if playwright or other code corrupts the loop
+        try:
+            loop = asyncio.get_running_loop()
+            # Verify the connector is still usable by checking its internal state
+            if self._connector and hasattr(self._connector, '_loop'):
+                connector_loop = getattr(self._connector, '_loop', None)
+                if connector_loop is not None and connector_loop != loop:
+                    logger.warning(f"[DestinationClient:{self.destination.value}] "
+                                  f"Event loop mismatch detected, recreating session")
+                    await self._force_recreate_session()
+        except RuntimeError as e:
+            if "closed" in str(e).lower():
+                logger.warning(f"[DestinationClient:{self.destination.value}] "
+                              f"Event loop closed, recreating session")
+                await self._force_recreate_session()
+
         return self._session
+
+    async def _force_recreate_session(self):
+        """Force recreate session when event loop issues detected."""
+        async with self._lock:
+            # Close old resources if possible
+            if self._session:
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass
+            if self._connector:
+                try:
+                    await self._connector.close()
+                except Exception:
+                    pass
+
+            self._session = None
+            self._connector = None
+
+        # Recreate
+        await self.start()
+        logger.info(f"[DestinationClient:{self.destination.value}] Session recreated after event loop issue")
 
     def _extract_host(self, url: str) -> str:
         """Extract host from URL for circuit breaker."""
