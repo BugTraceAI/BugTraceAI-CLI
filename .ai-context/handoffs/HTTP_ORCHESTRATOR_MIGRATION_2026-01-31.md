@@ -101,6 +101,22 @@ async with orchestrator.session(DestinationType.TARGET) as session:
 - Detects zombie sessions (no activity >5 min)
 - Auto-restarts unhealthy clients
 
+## Auto-Start Feature (Added 2026-01-31)
+
+The orchestrator now auto-starts when any method is called:
+
+```python
+# No need to call orchestrator.start() first
+async with orchestrator.session(DestinationType.LLM) as session:
+    # Orchestrator starts automatically if not already started
+    async with session.get(url) as resp:
+        data = await resp.text()
+```
+
+Methods with auto-start: `get()`, `post()`, `head()`, `request()`, `session()`
+
+This fixes boot check failures when code uses orchestrator before explicit `start()` call.
+
 ## Remaining Work
 
 - `bugtrace/core/cdp_client.py` - Uses aiohttp for browser DevTools Protocol
