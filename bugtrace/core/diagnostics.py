@@ -1,10 +1,10 @@
 import shutil
 import asyncio
 import os
+import aiohttp
 from bugtrace.core.config import settings
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.ui import dashboard
-from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 
 logger = get_logger("core.diagnostics")
 
@@ -20,9 +20,11 @@ class DiagnosticSystem:
         self._log_debug_paths()
         await self._check_docker()
         await self._check_api_key()
-        await self._check_browser()
+        # IMPORTANT: Check connectivity BEFORE browser
+        # Playwright's stop() can interfere with the event loop
         await self._check_connectivity()
         await self._check_credits()
+        await self._check_browser()
 
         dashboard.log("Diagnostics complete.", "INFO")
         return all(self.results.values())
@@ -64,9 +66,12 @@ class DiagnosticSystem:
 
     async def _check_connectivity(self):
         """Check internet connectivity to OpenRouter."""
+        # Use a fresh isolated session to avoid event loop issues
+        # The orchestrator.session() can fail if boot.py left the loop in a bad state
         try:
-            async with orchestrator.session(DestinationType.LLM) as session:
-                async with session.get("https://openrouter.ai/api/v1/models", timeout=5) as resp:
+            timeout = aiohttp.ClientTimeout(total=10, connect=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get("https://openrouter.ai/api/v1/models") as resp:
                     self.results["connectivity"] = resp.status == 200
                     dashboard.log("Network Connectivity to AI: OK", "SUCCESS")
         except Exception as e:
@@ -82,8 +87,9 @@ class DiagnosticSystem:
         logger.info("Initiating OpenRouter credit check...")
         try:
             headers = {"Authorization": f"Bearer {settings.OPENROUTER_API_KEY}"}
-            async with orchestrator.session(DestinationType.LLM) as session:
-                async with session.get("https://openrouter.ai/api/v1/auth/key", headers=headers, timeout=5) as resp:
+            timeout = aiohttp.ClientTimeout(total=10, connect=5)
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get("https://openrouter.ai/api/v1/auth/key") as resp:
                     await self._handle_credit_response(resp)
         except Exception as e:
             logger.error(f"Credit check failed: {e}", exc_info=True)
