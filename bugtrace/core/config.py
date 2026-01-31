@@ -92,7 +92,7 @@ class Settings(BaseSettings):
     THINKING_BATCH_SIZE: int = 50  # Max findings per batch in batch mode
     THINKING_BATCH_TIMEOUT: float = 5.0  # Seconds to wait before processing incomplete batch
     THINKING_DEDUP_WINDOW: int = 1000  # Max dedup keys to track (LRU eviction)
-    THINKING_FP_THRESHOLD: float = 0.5  # Min fp_confidence to forward to specialists
+    THINKING_FP_THRESHOLD: float = 0.5  # Min fp_confidence to forward to specialists (configurable in .conf)
     THINKING_BACKPRESSURE_RETRIES: int = 3  # Max retries on queue full
     THINKING_BACKPRESSURE_DELAY: float = 0.5  # Seconds between retries
     THINKING_EMIT_EVENTS: bool = True  # Emit work_queued events
@@ -371,6 +371,20 @@ class Settings(BaseSettings):
         if "CUSTOM_PARAMS" in section:
             self.URL_PRIORITIZATION_CUSTOM_PARAMS = section["CUSTOM_PARAMS"].strip()
 
+    def _load_thinking_config(self, config):
+        """Load THINKING section config for ThinkingConsolidationAgent."""
+        if "THINKING" not in config:
+            return
+        section = config["THINKING"]
+        if "FP_THRESHOLD" in section:
+            self.THINKING_FP_THRESHOLD = section.getfloat("FP_THRESHOLD")
+        if "MODE" in section:
+            self.THINKING_MODE = section["MODE"].strip()
+        if "BATCH_SIZE" in section:
+            self.THINKING_BATCH_SIZE = section.getint("BATCH_SIZE")
+        if "DEDUP_WINDOW" in section:
+            self.THINKING_DEDUP_WINDOW = section.getint("DEDUP_WINDOW")
+
     def _load_llm_models_config(self, config):
         """Load LLM_MODELS section config."""
         if "LLM_MODELS" not in config:
@@ -469,6 +483,7 @@ class Settings(BaseSettings):
         self._load_scan_config(config)
         self._load_parallelization_config(config)
         self._load_url_prioritization_config(config)
+        self._load_thinking_config(config)
         self._load_llm_models_config(config)
         self._load_conductor_and_scanning_config(config)
         self._load_analysis_and_misc_config(config)
