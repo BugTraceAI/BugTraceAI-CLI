@@ -61,7 +61,8 @@ class Settings(BaseSettings):
     
     MIN_CREDITS: float = 2.0
     MAX_CONCURRENT_REQUESTS: int = 1
-    
+    LLM_REQUEST_TIMEOUT: float = 120.0  # Seconds to wait for LLM API response (prevent indefinite hang)
+
     # Model for skeptical analysis in DASTySAST agent
     SKEPTICAL_MODEL: str = "google/gemini-3-flash-preview"
 
@@ -339,6 +340,8 @@ class Settings(BaseSettings):
             self.MAX_URLS = config["SCAN"].getint("MAX_URLS")
         if "MAX_CONCURRENT_URL_AGENTS" in config["SCAN"]:
             self.MAX_CONCURRENT_URL_AGENTS = config["SCAN"].getint("MAX_CONCURRENT_URL_AGENTS")
+        if "GOSPIDER_NO_REDIRECT" in config["SCAN"]:
+            self.GOSPIDER_NO_REDIRECT = config["SCAN"].getboolean("GOSPIDER_NO_REDIRECT")
 
     def _load_parallelization_config(self, config):
         """Load PARALLELIZATION section config for granular per-phase concurrency."""
@@ -351,8 +354,8 @@ class Settings(BaseSettings):
             self.MAX_CONCURRENT_ANALYSIS = section.getint("MAX_CONCURRENT_ANALYSIS")
         if "MAX_CONCURRENT_SPECIALISTS" in section:
             self.MAX_CONCURRENT_SPECIALISTS = section.getint("MAX_CONCURRENT_SPECIALISTS")
-        if "MAX_CONCURRENT_VALIDATION" in section:
-            self.MAX_CONCURRENT_VALIDATION = section.getint("MAX_CONCURRENT_VALIDATION")
+        # NOTE: MAX_CONCURRENT_VALIDATION is NOT loaded from config
+        # CDP client only supports 1 concurrent session - hardcoded in defaults
 
     def _load_llm_models_config(self, config):
         """Load LLM_MODELS section config."""
@@ -486,8 +489,7 @@ class Settings(BaseSettings):
             errors.append("MAX_CONCURRENT_ANALYSIS must be >= 1")
         if self.MAX_CONCURRENT_SPECIALISTS < 1:
             errors.append("MAX_CONCURRENT_SPECIALISTS must be >= 1")
-        if self.MAX_CONCURRENT_VALIDATION < 1:
-            errors.append("MAX_CONCURRENT_VALIDATION must be >= 1")
+        # MAX_CONCURRENT_VALIDATION is hardcoded to 1 (CDP limitation) - no validation needed
 
         # Check confidence thresholds (0.0 - 1.0)
         if not 0.0 <= self.CONDUCTOR_MIN_CONFIDENCE <= 1.0:
@@ -666,12 +668,15 @@ class Settings(BaseSettings):
     MAX_DEPTH: int = 2
     MAX_URLS: int = 20
     MAX_CONCURRENT_URL_AGENTS: int = 10  # Parallel URLMasterAgents (legacy, alias for SPECIALISTS)
+    GOSPIDER_NO_REDIRECT: bool = False  # Don't follow redirects (catches .env, .htaccess leaks)
 
     # --- Granular Phase Concurrency (Phase 31: v2.4) ---
     MAX_CONCURRENT_DISCOVERY: int = 1      # GoSpider (single-threaded by design)
     MAX_CONCURRENT_ANALYSIS: int = 5       # DAST/SAST per URL
     MAX_CONCURRENT_SPECIALISTS: int = 10   # SQLi, XSS, CSTI paralelos
-    MAX_CONCURRENT_VALIDATION: int = 5     # CDP browser validation sessions
+    # HARDCODED: CDP client only supports 1 concurrent session (crashes with more)
+    # Playwright can handle multiple, but AgenticValidator uses CDP exclusively
+    MAX_CONCURRENT_VALIDATION: int = 1     # DO NOT CHANGE - CDP limitation
 
     # --- Visual / Browser ---
     HEADLESS_BROWSER: bool = True

@@ -68,7 +68,8 @@ class PhaseSemaphoreManager:
             ScanPhase.DISCOVERY: asyncio.Semaphore(settings.MAX_CONCURRENT_DISCOVERY),
             ScanPhase.ANALYSIS: asyncio.Semaphore(settings.MAX_CONCURRENT_ANALYSIS),
             ScanPhase.EXPLOITATION: asyncio.Semaphore(settings.MAX_CONCURRENT_SPECIALISTS),
-            ScanPhase.VALIDATION: asyncio.Semaphore(settings.MAX_CONCURRENT_VALIDATION),
+            # HARDCODED: CDP only supports 1 concurrent session (crashes with more)
+            ScanPhase.VALIDATION: asyncio.Semaphore(1),  # DO NOT CHANGE - CDP limitation
             ScanPhase.LLM_GLOBAL: asyncio.Semaphore(settings.MAX_CONCURRENT_REQUESTS),
         }
 
@@ -81,7 +82,7 @@ class PhaseSemaphoreManager:
             f"Discovery={settings.MAX_CONCURRENT_DISCOVERY}, "
             f"Analysis={settings.MAX_CONCURRENT_ANALYSIS}, "
             f"Specialists={settings.MAX_CONCURRENT_SPECIALISTS}, "
-            f"Validation={settings.MAX_CONCURRENT_VALIDATION}"
+            f"Validation=1 (CDP hardcoded)"
         )
 
     def get_semaphore(self, phase: ScanPhase) -> asyncio.Semaphore:

@@ -28,6 +28,7 @@ from loguru import logger
 
 from bugtrace.agents.base import BaseAgent
 from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
+from bugtrace.core.http_manager import http_manager, ConnectionProfile
 from bugtrace.core.queue import queue_manager
 from bugtrace.core.event_bus import EventType
 from bugtrace.tools.external import external_tools
@@ -1647,7 +1648,8 @@ Write the exploitation explanation section for the report."""
 
         findings = []
 
-        async with aiohttp.ClientSession() as session:
+        # Use HTTPClientManager for proper timeout and connection management (v2.4)
+        async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
             self._configure_session(session)
 
             try:
@@ -1959,7 +1961,8 @@ Write the exploitation explanation section for the report."""
         Uses existing validation pipeline optimized for queue processing.
         """
         try:
-            async with aiohttp.ClientSession() as session:
+            # Use HTTPClientManager for proper timeout and connection management (v2.4)
+            async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
                 # Initialize baseline if needed
                 if self._baseline_response_time == 0:
                     await self._initialize_baseline(session)

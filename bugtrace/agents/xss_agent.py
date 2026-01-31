@@ -26,6 +26,7 @@ from bugtrace.utils.logger import get_logger
 from bugtrace.core.config import settings
 from bugtrace.core.llm_client import llm_client
 from bugtrace.core.ui import dashboard
+from bugtrace.core.http_manager import http_manager, ConnectionProfile
 from bugtrace.tools.interactsh import InteractshClient
 from bugtrace.tools.visual.verifier import XSSVerifier
 from bugtrace.memory.payload_learner import PayloadLearner
@@ -2081,8 +2082,9 @@ class XSSAgent(BaseAgent):
         }
         
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(probe_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            # Use HTTPClientManager for proper connection management (v2.4)
+            async with http_manager.session(ConnectionProfile.PROBE) as session:
+                async with session.get(probe_url, headers=headers, ssl=False) as resp:
                     html = await resp.text()
                     logger.info(f"[{self.name}] Probe status: {resp.status} for {probe_url}")
                     return html, probe_url, resp.status
@@ -2713,8 +2715,9 @@ Response Format (XML-Like):
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(attack_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            # Use HTTPClientManager for proper connection management (v2.4)
+            async with http_manager.session(ConnectionProfile.PROBE) as session:
+                async with session.get(attack_url, headers=headers, ssl=False) as resp:
                     self._update_block_counter(resp.status)
                     return await resp.text()
         except Exception:
@@ -3188,8 +3191,9 @@ Return JSON:
 
         # 2. Extract from HTML forms
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self.url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            # Use HTTPClientManager for proper connection management (v2.4)
+            async with http_manager.session(ConnectionProfile.STANDARD) as session:
+                async with session.get(self.url, headers=headers, ssl=False) as resp:
                     html = await resp.text()
 
             soup = BeautifulSoup(html, 'html.parser')
@@ -3292,12 +3296,13 @@ Return JSON:
                 "Content-Type": "application/x-www-form-urlencoded"
             }
 
-            async with aiohttp.ClientSession() as session:
+            # Use HTTPClientManager for proper connection management (v2.4)
+            async with http_manager.session(ConnectionProfile.PROBE) as session:
                 async with session.post(
                     form_action,
                     data=test_data,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    ssl=False,
                     allow_redirects=True
                 ) as resp:
                     return await resp.text()
@@ -3432,11 +3437,12 @@ Return JSON:
             header_name: payload
         }
 
-        async with aiohttp.ClientSession() as session:
+        # Use HTTPClientManager for proper connection management (v2.4)
+        async with http_manager.session(ConnectionProfile.PROBE) as session:
             async with session.get(
                 self.url,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
+                ssl=False
             ) as resp:
                 return await resp.text()
 
@@ -3489,8 +3495,9 @@ Return JSON:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            # Use HTTPClientManager for proper connection management (v2.4)
+            async with http_manager.session(ConnectionProfile.STANDARD) as session:
+                async with session.get(url, headers=headers, ssl=False) as resp:
                     return await resp.text()
         except Exception as e:
             logger.warning(f"Failed to fetch page for form discovery: {e}")

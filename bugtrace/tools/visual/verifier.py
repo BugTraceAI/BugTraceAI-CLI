@@ -492,7 +492,7 @@ class XSSVerifier:
                 logger.warning(f"[{url}] ⚠️ XSS confirmed but SANDBOXED. Impact is LOW.")
 
             if impact_data.get('has_sensitive_tokens'):
-                logger.success(f"[{url}] 💰 CRITICAL IMPACT: Sensitive tokens found!")
+                logger.info(f"[{url}] 💰 CRITICAL IMPACT: Sensitive tokens found!")
 
             impact_data['is_sandboxed'] = is_sandboxed
             return impact_data

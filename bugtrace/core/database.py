@@ -205,11 +205,34 @@ class DatabaseManager:
 
     def _create_tables(self):
         try:
+            # Force import models to register with SQLModel metadata
+            from bugtrace.schemas.db_models import TargetTable, ScanTable, FindingTable, ScanStateTable
+
+            # Create all tables
             SQLModel.metadata.create_all(self.engine)
+
+            # Verify tables were created (especially critical for SQLite after file deletion)
+            self._verify_tables_exist()
+
             self._run_migrations()
             logger.info("SQL Tables initialized.")
         except Exception as e:
             logger.error(f"Failed to create SQL tables: {e}", exc_info=True)
+            raise  # Don't silently fail - this is critical
+
+    def _verify_tables_exist(self):
+        """Verify critical tables exist, recreate if needed."""
+        required_tables = ['target', 'scan', 'finding', 'scan_state']
+        with Session(self.engine) as session:
+            for table in required_tables:
+                try:
+                    session.exec(text(f"SELECT 1 FROM {table} LIMIT 1"))
+                except Exception:
+                    logger.warning(f"Table '{table}' not found, forcing recreation...")
+                    session.rollback()
+                    # Force recreate - drop metadata cache and recreate
+                    SQLModel.metadata.create_all(self.engine)
+                    break
 
     def _run_migrations(self):
         """Run lightweight schema migrations for new columns on existing tables."""

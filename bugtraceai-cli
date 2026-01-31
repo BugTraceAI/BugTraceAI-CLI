@@ -28,7 +28,7 @@ if [ "$CLEAN" = true ]; then
     if [ -d "logs" ]; then rm -rf logs/*; fi
     if [ -d "bugtrace/logs" ]; then rm -rf bugtrace/logs/*; fi
     echo "   - Removing database..."
-    if [ -f "bugtrace.db" ]; then rm -f bugtrace.db; fi
+    rm -f bugtrace.db bugtrace.db-shm bugtrace.db-wal 2>/dev/null
     echo "✅ Environment completely reset."
 elif [ "$RESUME" = false ]; then
     # No automatic cleanup — data is preserved between runs.

@@ -9,6 +9,7 @@ from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
 from bugtrace.core.ui import dashboard
 from bugtrace.core.job_manager import JobStatus
 from bugtrace.core.event_bus import EventType
+from bugtrace.core.http_manager import http_manager, ConnectionProfile
 from bugtrace.utils.logger import get_logger
 from bugtrace.utils.parsers import XmlParser
 from bugtrace.core.llm_client import llm_client
@@ -968,7 +969,8 @@ Response format (XML):
     async def _scan_all_parameters(self) -> List[Dict]:
         """Scan all parameters for template injection."""
         all_findings = []
-        async with aiohttp.ClientSession() as session:
+        # Use HTTPClientManager for proper connection management (v2.4)
+        async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
             html = await self._fetch_page(session)
             all_findings = await self._test_all_params(session, html)
         return all_findings
@@ -1509,7 +1511,8 @@ Response format (XML):
         Uses existing validation pipeline optimized for queue processing.
         """
         try:
-            async with aiohttp.ClientSession() as session:
+            # Use HTTPClientManager for proper connection management (v2.4)
+            async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
                 # Fetch page for template engine detection
                 html = await self._fetch_page(session)
 

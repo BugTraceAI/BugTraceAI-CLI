@@ -210,11 +210,11 @@ class ScanService:
             max_urls=ctx.options.max_urls,
             use_vertical_agents=ctx.options.use_vertical,
             output_dir=output_dir,
+            scan_id=ctx.scan_id,  # Pass existing scan_id to avoid duplicate creation
         )
 
         # CRITICAL: Monkey-patch stop_event for graceful shutdown
         orchestrator._stop_event = ctx.stop_event
-        orchestrator.scan_id = ctx.scan_id
 
         return orchestrator
 
@@ -230,7 +230,7 @@ class ScanService:
             "findings_count": ctx.findings_count,
         })
 
-        logger.success(f"Scan {ctx.scan_id} completed successfully")
+        logger.info(f"Scan {ctx.scan_id} completed successfully")
 
     async def _handle_scan_cancellation(self, ctx: ScanContext):
         """Handle scan cancellation."""
