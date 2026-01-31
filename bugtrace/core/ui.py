@@ -85,6 +85,7 @@ class Dashboard:
         self.current_vector: str = ""
         self.current_payload_status: str = "Idle"
         self.current_agent: str = ""
+        self._last_agent: str = ""  # Track last active agent for display fallback
         self.payload_retry_count: int = 0
         self.payloads_tested: int = 0
         self.payloads_success: int = 0
@@ -118,6 +119,7 @@ class Dashboard:
             self.paused = False
             self.current_payload = ""
             self.current_agent = ""
+            self._last_agent = ""
             self.phase = "IDLE"
             self.status_msg = "Starting..."
             self.start_time = datetime.now()
@@ -283,6 +285,10 @@ class Dashboard:
     def update_header2(self):
         with self._lock:
             agent = self.current_agent
+            # Track last active agent for fallback display
+            if agent:
+                self._last_agent = agent
+            last_agent = self._last_agent
             phase = self.phase
             cpu = self.cpu_usage
             ram = self.ram_usage
@@ -312,11 +318,21 @@ class Dashboard:
         cpu_color = self._get_color_for_percentage(cpu)
         ram_color = self._get_color_for_percentage(ram)
 
+        # Show agent name, or fall back to last agent, or phase-based status
+        if agent:
+            agent_display = agent
+        elif last_agent:
+            agent_display = f"({last_agent})"  # Parentheses indicate "was running"
+        elif phase and phase != "IDLE":
+            agent_display = f"[{phase}]"
+        else:
+            agent_display = "Initializing..."
+
         text = Text.assemble(
             ("Agent: ", "white"),
-            (agent or "Idle", "bright_magenta bold"),
+            (agent_display, "bright_magenta bold"),
             (" | Phase: ", "white"),
-            (phase, "bright_magenta"),
+            (phase or "BOOT", "bright_magenta"),
             (" | ", "white"),
             (spinner_char, "bright_cyan bold"),
             (" ", "white"),
