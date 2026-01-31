@@ -34,5 +34,9 @@ websockets
 cryptography
 opentelemetry-api
 opentelemetry-sdk
+# CPU-only PyTorch (much smaller, no CUDA warnings)
+# Must be installed BEFORE sentence_transformers
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
 sentence_transformers
 sqlalchemy
