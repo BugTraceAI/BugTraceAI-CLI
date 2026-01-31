@@ -8,7 +8,7 @@ from rich.text import Text
 from rich.traceback import install
 from rich.columns import Columns
 from rich.table import Table
-from rich.box import ROUNDED, SIMPLE
+from rich.box import SIMPLE, MINIMAL, HORIZONTALS
 import threading
 import time
 import logging  # Added missing import
@@ -48,12 +48,13 @@ class Dashboard:
         self._init_metrics()
 
     def _init_layout(self):
-        """Initialize dashboard layout."""
+        """Initialize dashboard layout with simple separators."""
         self.layout.split(
             Layout(name="header1", size=1),
             Layout(name="header2", size=1),
+            Layout(name="sep1", size=1),  # Separator line
             Layout(name="payloads", ratio=1, minimum_size=5),
-            Layout(name="tasks", ratio=1, minimum_size=3),
+            Layout(name="tasks", ratio=1, minimum_size=4),
             Layout(name="log", ratio=2, minimum_size=6),
             Layout(name="findings", ratio=1, minimum_size=5),
             Layout(name="footer", size=1)
@@ -243,6 +244,27 @@ class Dashboard:
         elif percentage < 85: return "bright_yellow"
         else: return "bright_red"
 
+    def _make_section_header(self, title: str, color: str = "bright_cyan") -> Text:
+        """Create a simple section header with line separators that don't touch."""
+        try:
+            width = self.console.size.width - 4
+        except Exception:
+            width = 76
+
+        # Title with padding
+        title_len = len(title) + 4  # space on each side + emoji
+        line_len = (width - title_len) // 2
+        left_line = "─" * max(0, line_len - 1)  # -1 so it doesn't touch
+        right_line = "─" * max(0, line_len - 1)
+
+        return Text.assemble(
+            (left_line, f"{color} dim"),
+            ("  ", "white"),
+            (title, f"{color} bold"),
+            ("  ", "white"),
+            (right_line, f"{color} dim")
+        )
+
     def update_header1(self):
         with self._lock:
              cost = self.session_cost
@@ -422,9 +444,9 @@ class Dashboard:
         return Text("\n").join(lines)
 
     def _build_payload_table(self, status_content: Text, payload_content: Text) -> Table:
-        """Build combined payload section table."""
-        table = Table(show_header=True, header_style="bold", box=ROUNDED, expand=True,
-                     border_style="bright_cyan", padding=(0, 1))
+        """Build combined payload section table with simple lines."""
+        table = Table(show_header=True, header_style="bold", box=SIMPLE, expand=True,
+                     border_style="bright_cyan", padding=(0, 1), show_edge=False)
         table.add_column("📌 STATUS", style="bright_cyan", ratio=1)
         table.add_column("🧪 PAYLOAD", style="bright_yellow", ratio=1)
         table.add_row(status_content, payload_content)
@@ -439,29 +461,26 @@ class Dashboard:
             term_height = 24
             term_width = 120
 
-        # Estimate available lines for log section
-        # Layout: header1(1) + header2(1) + payloads(~5) + tasks(~3) + findings(~5) + footer(1) = ~16 fixed
-        # Remaining goes to log with ratio=2, subtract 2 for panel borders
-        available_lines = max(5, term_height - 18)
+        # Estimate available lines for log section (subtract 1 for header line)
+        available_lines = max(4, term_height - 19)
 
         with self._lock:
             recent_logs = self.logs[-available_lines:] if len(self.logs) >= available_lines else self.logs
 
-        # Calculate max message width based on terminal width (account for timestamp, icon, panel borders)
-        max_msg_width = max(40, term_width - 25)
+        # Calculate max message width based on terminal width
+        max_msg_width = max(40, term_width - 22)
 
-        lines = []
+        lines = [self._make_section_header("📋 LOG", "cyan")]
         for timestamp, level, msg in recent_logs:
             icon, color = self._get_log_icon_and_color(level, msg)
             display_msg = str(msg)[:max_msg_width] + "..." if len(str(msg)) > max_msg_width else str(msg)
             lines.append(Text.assemble((f"[{timestamp}] ", "white dim"), (f"{icon} " if icon else "", color), (display_msg, "white")))
 
         # Pad to fill available space
-        while len(lines) < available_lines:
+        while len(lines) < available_lines + 1:
             lines.append(Text("", style="white"))
         content = Text("\n").join(lines)
-        panel = Panel(content, title="[bright_yellow bold]📋 LOG[/bright_yellow bold]", border_style="cyan", padding=(0, 1))
-        self.layout["log"].update(panel)
+        self.layout["log"].update(content)
 
     def _get_log_icon_and_color(self, level: str, msg) -> tuple:
         """Get icon and color for log message."""
@@ -477,7 +496,8 @@ class Dashboard:
         """Render active tasks with spinner for running tasks."""
         with self._lock:
             tasks = list(self.active_tasks.items())
-        lines = []
+
+        lines = [self._make_section_header("⚙️ TASKS", "bright_cyan")]
         if tasks:
             for task_id, info in tasks:
                 name = info.get("name", task_id)
@@ -499,12 +519,11 @@ class Dashboard:
                 lines.append(line)
         else:
             lines.append(Text("No active tasks", style="white dim"))
-        # Pad to fixed height (3 lines)
-        while len(lines) < 3:
+        # Pad to fixed height (3 lines + header)
+        while len(lines) < 4:
             lines.append(Text("", style="white"))
         content = Text("\n").join(lines)
-        panel = Panel(content, title="[bright_yellow bold]⚙️ TASKS[/bright_yellow bold]", border_style="bright_cyan", padding=(0,1))
-        self.layout["tasks"].update(panel)
+        self.layout["tasks"].update(content)
 
     def update_findings_section(self):
         with self._lock:
@@ -514,7 +533,7 @@ class Dashboard:
         severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
         sorted_findings = sorted(current_findings, key=lambda x: severity_order.get(x[2], 99))[:4]
 
-        lines = []
+        lines = [self._make_section_header(f"🔍 FINDINGS ({len(current_findings)} total)", "magenta")]
         if sorted_findings:
             for finding_type, details, severity in sorted_findings:
                 emoji, color = self._get_severity_icon_and_color(severity)
@@ -523,10 +542,9 @@ class Dashboard:
         else:
             lines.append(Text("No findings yet...", style="white dim"))
 
-        while len(lines) < 4: lines.append(Text("", style="white"))
+        while len(lines) < 5: lines.append(Text("", style="white"))
         content = Text("\n").join(lines)
-        panel = Panel(content, title=f"[bright_yellow bold]🔍 FINDINGS ({len(current_findings)} total)[/bright_yellow bold]", border_style="magenta", padding=(0, 1))
-        self.layout["findings"].update(panel)
+        self.layout["findings"].update(content)
 
     def _get_severity_icon_and_color(self, severity: str) -> tuple:
         """Get icon and color for severity level."""
@@ -543,12 +561,21 @@ class Dashboard:
         self.layout["footer"].update(text)
 
     def update_separators(self):
-        # Separators removed for cleaner design
-        pass
+        """Update separator lines - simple horizontal lines that don't touch edges."""
+        try:
+            width = self.console.size.width - 2
+        except Exception:
+            width = 78
+
+        # Simple line with small gap at edges
+        line = " " + "─" * (width - 2) + " "
+        sep_text = Text(line, style="bright_cyan dim")
+        self.layout["sep1"].update(sep_text)
 
     def render(self) -> Layout:
         self.update_header1()
         self.update_header2()
+        self.update_separators()
         self.update_payload_section()
         self.update_tasks_section()
         self.update_log_section()
