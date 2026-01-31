@@ -54,7 +54,7 @@ class Dashboard:
             Layout(name="header2", size=1),
             Layout(name="sep1", size=1),  # Separator line
             Layout(name="payloads", ratio=1, minimum_size=5),
-            Layout(name="tasks", ratio=1, minimum_size=4),
+            Layout(name="tasks", ratio=1, minimum_size=5),  # +1 for separator
             Layout(name="log", ratio=2, minimum_size=6),
             Layout(name="findings", ratio=1, minimum_size=5),
             Layout(name="footer", size=1)
@@ -504,7 +504,8 @@ class Dashboard:
         with self._lock:
             tasks = list(self.active_tasks.items())
 
-        lines = [self._make_section_header("⚙️ TASKS", "bright_cyan")]
+        # Separator line + header
+        lines = [self._make_separator("bright_cyan"), self._make_section_header("⚙️ TASKS", "bright_cyan")]
         if tasks:
             for task_id, info in tasks:
                 name = info.get("name", task_id)
@@ -526,8 +527,8 @@ class Dashboard:
                 lines.append(line)
         else:
             lines.append(Text("No active tasks", style="white dim"))
-        # Pad to fixed height (3 lines + header)
-        while len(lines) < 4:
+        # Pad to fixed height (3 lines + separator + header)
+        while len(lines) < 5:
             lines.append(Text("", style="white"))
         content = Text("\n").join(lines)
         self.layout["tasks"].update(content)
