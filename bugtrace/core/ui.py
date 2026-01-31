@@ -245,25 +245,32 @@ class Dashboard:
         else: return "bright_red"
 
     def _make_section_header(self, title: str, color: str = "bright_cyan") -> Text:
-        """Create a simple section header with line separators that don't touch."""
+        """Create a section header: ──── TITLE ────"""
         try:
-            width = self.console.size.width - 4
+            width = self.console.size.width - 2
         except Exception:
-            width = 76
+            width = 78
 
-        # Title with padding
-        title_len = len(title) + 4  # space on each side + emoji
-        line_len = (width - title_len) // 2
-        left_line = "─" * max(0, line_len - 1)  # -1 so it doesn't touch
-        right_line = "─" * max(0, line_len - 1)
+        # Title with spacing
+        title_with_spaces = f" {title} "
+        title_len = len(title_with_spaces)
+        remaining = width - title_len
+        left_len = remaining // 2
+        right_len = remaining - left_len
 
         return Text.assemble(
-            (left_line, f"{color} dim"),
-            ("  ", "white"),
-            (title, f"{color} bold"),
-            ("  ", "white"),
-            (right_line, f"{color} dim")
+            ("─" * left_len, f"{color} dim"),
+            (title_with_spaces, f"{color} bold"),
+            ("─" * right_len, f"{color} dim")
         )
+
+    def _make_separator(self, color: str = "bright_cyan") -> Text:
+        """Create a full horizontal separator line."""
+        try:
+            width = self.console.size.width - 2
+        except Exception:
+            width = 78
+        return Text("─" * width, style=f"{color} dim")
 
     def update_header1(self):
         with self._lock:
@@ -444,9 +451,9 @@ class Dashboard:
         return Text("\n").join(lines)
 
     def _build_payload_table(self, status_content: Text, payload_content: Text) -> Table:
-        """Build combined payload section table with simple lines."""
-        table = Table(show_header=True, header_style="bold", box=SIMPLE, expand=True,
-                     border_style="bright_cyan", padding=(0, 1), show_edge=False)
+        """Build combined payload section table with horizontal lines only."""
+        table = Table(show_header=True, header_style="bold", box=HORIZONTALS, expand=True,
+                     border_style="bright_cyan", padding=(0, 1))
         table.add_column("📌 STATUS", style="bright_cyan", ratio=1)
         table.add_column("🧪 PAYLOAD", style="bright_yellow", ratio=1)
         table.add_row(status_content, payload_content)
@@ -561,16 +568,8 @@ class Dashboard:
         self.layout["footer"].update(text)
 
     def update_separators(self):
-        """Update separator lines - simple horizontal lines that don't touch edges."""
-        try:
-            width = self.console.size.width - 2
-        except Exception:
-            width = 78
-
-        # Simple line with small gap at edges
-        line = " " + "─" * (width - 2) + " "
-        sep_text = Text(line, style="bright_cyan dim")
-        self.layout["sep1"].update(sep_text)
+        """Update separator lines between header and content."""
+        self.layout["sep1"].update(self._make_separator("bright_cyan"))
 
     def render(self) -> Layout:
         self.update_header1()
