@@ -357,6 +357,20 @@ class Settings(BaseSettings):
         # NOTE: MAX_CONCURRENT_VALIDATION is NOT loaded from config
         # CDP client only supports 1 concurrent session - hardcoded in defaults
 
+    def _load_url_prioritization_config(self, config):
+        """Load URL_PRIORITIZATION section config for intelligent URL ordering."""
+        if "URL_PRIORITIZATION" not in config:
+            return
+        section = config["URL_PRIORITIZATION"]
+        if "ENABLED" in section:
+            self.URL_PRIORITIZATION_ENABLED = section.getboolean("ENABLED")
+        if "LOG_SCORES" in section:
+            self.URL_PRIORITIZATION_LOG_SCORES = section.getboolean("LOG_SCORES")
+        if "CUSTOM_PATHS" in section:
+            self.URL_PRIORITIZATION_CUSTOM_PATHS = section["CUSTOM_PATHS"].strip()
+        if "CUSTOM_PARAMS" in section:
+            self.URL_PRIORITIZATION_CUSTOM_PARAMS = section["CUSTOM_PARAMS"].strip()
+
     def _load_llm_models_config(self, config):
         """Load LLM_MODELS section config."""
         if "LLM_MODELS" not in config:
@@ -454,6 +468,7 @@ class Settings(BaseSettings):
         self._load_crawler_config(config)
         self._load_scan_config(config)
         self._load_parallelization_config(config)
+        self._load_url_prioritization_config(config)
         self._load_llm_models_config(config)
         self._load_conductor_and_scanning_config(config)
         self._load_analysis_and_misc_config(config)
@@ -677,6 +692,12 @@ class Settings(BaseSettings):
     # HARDCODED: CDP client only supports 1 concurrent session (crashes with more)
     # Playwright can handle multiple, but AgenticValidator uses CDP exclusively
     MAX_CONCURRENT_VALIDATION: int = 1     # DO NOT CHANGE - CDP limitation
+
+    # --- URL Prioritization (Phase 38: v3.0) ---
+    URL_PRIORITIZATION_ENABLED: bool = True   # Enable/disable URL prioritization
+    URL_PRIORITIZATION_LOG_SCORES: bool = True  # Log priority scores for each URL
+    URL_PRIORITIZATION_CUSTOM_PATHS: str = ""   # Custom high-priority paths (comma-separated)
+    URL_PRIORITIZATION_CUSTOM_PARAMS: str = ""  # Custom high-priority params (comma-separated)
 
     # --- Visual / Browser ---
     HEADLESS_BROWSER: bool = True

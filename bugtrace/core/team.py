@@ -1204,7 +1204,7 @@ class TeamOrchestrator:
                 })
 
     def _normalize_urls(self, urls_to_scan: list) -> list:
-        """Deduplicate and normalize URLs."""
+        """Deduplicate, normalize, and prioritize URLs."""
         unique_urls = set()
         normalized_list = []
         has_parameterized = False
@@ -1227,12 +1227,36 @@ class TeamOrchestrator:
 
         urls_to_scan = normalized_list
         logger.info(f"Deduplicated URLs to scan: {len(urls_to_scan)}")
-        for u in urls_to_scan:
-            logger.info(f">> To Scan: {u}")
+
+        # Prioritize URLs (high-value targets first)
+        if settings.URL_PRIORITIZATION_ENABLED:
+            urls_to_scan = self._prioritize_urls(urls_to_scan)
+        else:
+            for u in urls_to_scan:
+                logger.info(f">> To Scan: {u}")
 
         self.url_queue = urls_to_scan
         self._save_checkpoint()
         return urls_to_scan
+
+    def _prioritize_urls(self, urls: list) -> list:
+        """Prioritize URLs by risk score (high-value targets first)."""
+        from bugtrace.core.url_prioritizer import prioritize_urls
+
+        # Parse custom paths/params from settings
+        custom_paths = [p.strip() for p in settings.URL_PRIORITIZATION_CUSTOM_PATHS.split(',') if p.strip()]
+        custom_params = [p.strip() for p in settings.URL_PRIORITIZATION_CUSTOM_PARAMS.split(',') if p.strip()]
+
+        scored_urls = prioritize_urls(urls, custom_paths, custom_params)
+
+        if settings.URL_PRIORITIZATION_LOG_SCORES:
+            logger.info(f"[Priority] URL prioritization complete:")
+            for i, (url, score) in enumerate(scored_urls[:10], 1):
+                logger.info(f"  {i:2d}. [score={score:3d}] {url[:70]}")
+            if len(scored_urls) > 10:
+                logger.info(f"  ... and {len(scored_urls) - 10} more URLs")
+
+        return [url for url, score in scored_urls]
 
     def _create_url_directory(self, url: str, analysis_dir: Path) -> Path:
         """Create unique directory for URL analysis outputs."""
