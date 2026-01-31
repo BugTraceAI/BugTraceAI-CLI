@@ -1218,10 +1218,14 @@ class TeamOrchestrator:
                 unique_urls.add(u_norm)
                 normalized_list.append(u)
 
-        # Smart Filter: If we have parameterized URLs, remove Root URL
+        # Smart Filter: If we have parameterized URLs, remove PLAIN root URL (no params)
+        # FIX: Only remove root if it has NO parameters (e.g., https://example.com/)
+        # If target itself has params (e.g., /catalog?category=X), keep it!
         if has_parameterized:
             root_norm = self.target.rstrip('/')
-            normalized_list = [u for u in normalized_list if u.rstrip('/') != root_norm]
+            # Only filter out root if it has no query params
+            if '?' not in root_norm and '=' not in root_norm:
+                normalized_list = [u for u in normalized_list if u.rstrip('/') != root_norm]
             if not normalized_list:
                 normalized_list = [self.target]
 
