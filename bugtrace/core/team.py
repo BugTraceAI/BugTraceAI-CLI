@@ -1811,22 +1811,23 @@ class TeamOrchestrator:
                     state_manager=self.state_manager,
                     scan_context=self.scan_context
                 )
-                result = await dast.run()
-                vulns = result.get("vulnerabilities", [])
+
+                # FIX v3.1: Timeout INSIDE semaphore - only counts analysis time,
+                # not time waiting for semaphore slot. This ensures ALL URLs get
+                # analyzed even with high concurrency limits.
+                try:
+                    result = await asyncio.wait_for(dast.run(), timeout=120.0)
+                    vulns = result.get("vulnerabilities", [])
+                except asyncio.TimeoutError:
+                    logger.warning(f"[DAST] Analysis timed out after 120s: {url[:50]}...")
+                    vulns = []
 
                 logger.info(f"[DAST] ✓ Completed ({len(vulns)} findings): {url[:60]}")
                 return (url, vulns)
 
-        async def analyze_url_with_timeout(url: str, timeout: float = 120.0) -> tuple:
-            """Wrapper with timeout to prevent indefinite blocking (v2.6 fix)."""
-            try:
-                return await asyncio.wait_for(analyze_url(url), timeout=timeout)
-            except asyncio.TimeoutError:
-                logger.warning(f"[DAST] URL analysis timed out after {timeout}s: {url[:50]}...")
-                return (url, [])  # Return empty results on timeout
-
-        # Run ALL URLs in parallel with per-URL timeout
-        tasks = [analyze_url_with_timeout(url) for url in self.urls_to_scan]
+        # Run ALL URLs in parallel - semaphore controls concurrency,
+        # timeout is per-analysis (not per-task including queue wait)
+        tasks = [analyze_url(url) for url in self.urls_to_scan]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Aggregate results
