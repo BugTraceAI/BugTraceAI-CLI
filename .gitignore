@@ -1,29 +1,62 @@
+# Python artifacts
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-*.backup
-*.backup.*
+
+# Environment files (sensitive)
 .env
+.env.local
+.env.*.local
 .venv
 env/
 venv/
+
+# IDE and editor files
 .idea/
 .vscode/
 .DS_Store
-*.log
-logs/
+Thumbs.db
+
+# Secrets and credentials (sensitive)
+*.key
+*.pem
+*.credentials
+credentials.json
+secrets.*
+config/secrets/
+.secrets/
+
+# Database files (sensitive)
 bugtrace.db
 bugtrace.db-shm
 bugtrace.db-wal
-reports/
-.claude/
+
+# Backup files
+*.backup
+*.backup.*
+*.orig
+*.bak
 backups/
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.ralph/
+
+# Logs
+*.log
+logs/
+
+# Runtime data
+reports/
 data/
 uploads/
-.pytest_cache/
-.ralph/
-alembic.ini
+
+# Claude artifacts
+.claude/
 
 # Dev scripts and archives (local-only)
 scripts/
@@ -43,5 +76,8 @@ COMPREHENSIVE_AUDIT_REPORT.md
 GEMINI_HANDOFF_TIERED_VALIDATION.md
 PENDING_TO_IMPLEMENTATION.md
 PROJECT_REVIEW_SESSION_*.md
+
+# Alembic (exclude from public release)
+alembic.ini
 
 # Keep .agent/ and alembic/versions to preserve framework logic and DB schema
