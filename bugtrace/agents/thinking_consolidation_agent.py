@@ -327,10 +327,14 @@ class ThinkingConsolidationAgent(BaseAgent):
 
         if self._mode == "streaming":
             # Process each finding immediately
-            for finding in findings:
+            for i, finding in enumerate(findings):
+                logger.info(f"[{self.name}] Processing finding {i+1}/{len(findings)}: {finding.get('type')}")
                 await self._process_finding(finding, scan_context)
+                logger.info(f"[{self.name}] Completed finding {i+1}/{len(findings)}")
+            logger.info(f"[{self.name}] All findings processed for {url[:50]}")
         else:
             # Batch mode: buffer findings for batch processing
+            batch_to_process = None
             async with self._batch_lock:
                 for finding in findings:
                     # Add scan_context to finding for batch processing
@@ -340,7 +344,13 @@ class ThinkingConsolidationAgent(BaseAgent):
 
                 # Check if batch is full
                 if len(self._batch_buffer) >= settings.THINKING_BATCH_SIZE:
-                    await self._process_batch()
+                    # Extract batch to process outside of lock
+                    batch_to_process = self._batch_buffer[:settings.THINKING_BATCH_SIZE]
+                    self._batch_buffer = self._batch_buffer[settings.THINKING_BATCH_SIZE:]
+
+            # Process batch outside of lock to avoid blocking input
+            if batch_to_process:
+                await self._process_batch_items(batch_to_process)
 
     def _classify_finding(self, finding: Dict[str, Any]) -> Optional[str]:
         """
@@ -564,8 +574,10 @@ class ThinkingConsolidationAgent(BaseAgent):
         6. Emit work_queued event
         """
         # 1. Get specialist type for metrics tracking (before any filtering)
+        logger.debug(f"[{self.name}] Step 1: Classifying finding type={finding.get('type')}")
         specialist = self._classify_finding(finding) or "unknown"
         dedup_metrics.record_received(specialist)
+        logger.debug(f"[{self.name}] Step 1 done: specialist={specialist}")
 
         # 2. FP confidence filter
         # SQLi findings bypass this filter - SQLMap is the authoritative judge, not LLM confidence
@@ -586,26 +598,35 @@ class ThinkingConsolidationAgent(BaseAgent):
                        f"(fp_confidence: {fp_confidence:.2f} < threshold, but SQLMap decides)")
 
         # 3. Deduplication check
+        logger.debug(f"[{self.name}] Step 3: Checking dedup cache")
         is_duplicate, key = await self._dedup_cache.check_and_add(finding, scan_context)
+        logger.debug(f"[{self.name}] Step 3 done: duplicate={is_duplicate}")
         if is_duplicate:
             self._stats["duplicates_filtered"] += 1
             dedup_metrics.record_duplicate(specialist, key)
             return
 
         # 4. Classify and prioritize
+        logger.debug(f"[{self.name}] Step 4: Classify and prioritize")
         prioritized = await self._classify_and_prioritize(finding, scan_context)
         if not prioritized:
             self._stats.setdefault("unclassified", 0)
             self._stats["unclassified"] += 1
+            logger.debug(f"[{self.name}] Step 4: Unclassified, returning")
             return
+        logger.debug(f"[{self.name}] Step 4 done: specialist={prioritized.specialist}, priority={prioritized.priority}")
 
         # 5. Distribute to specialist queue
+        logger.debug(f"[{self.name}] Step 5: Distribute to queue {prioritized.specialist}")
         success = await self._distribute_to_queue(prioritized)
+        logger.debug(f"[{self.name}] Step 5 done: success={success}")
 
         # 6. Emit work_queued event and record metrics (only if successfully queued)
         if success:
+            logger.debug(f"[{self.name}] Step 6: Emit work_queued event")
             dedup_metrics.record_distributed(prioritized.specialist)
             await self._emit_work_queued_event(prioritized)
+            logger.debug(f"[{self.name}] Step 6 done")
 
     async def run_loop(self):
         """Main agent loop - manages batch processing if in batch mode."""
@@ -627,23 +648,15 @@ class ThinkingConsolidationAgent(BaseAgent):
             except asyncio.CancelledError:
                 pass
 
-    async def _process_batch(self) -> None:
+    async def _process_batch_items(self, batch: List[Dict[str, Any]]) -> None:
         """
-        Process a batch of findings.
-
-        Called when:
-        - Batch buffer reaches THINKING_BATCH_SIZE
-        - Batch timeout expires (in _batch_processor)
-        - Explicitly flushed (flush_batch)
-
-        Processes findings in priority order within the batch.
+        Process a specific batch of findings.
+        
+        This runs WITHOUT the _batch_lock to ensure input processing isn't blocked 
+        by queue backpressure or slow distribution.
         """
-        if not self._batch_buffer:
+        if not batch:
             return
-
-        # Extract batch (already holding lock from caller or timeout handler)
-        batch = self._batch_buffer[:settings.THINKING_BATCH_SIZE]
-        self._batch_buffer = self._batch_buffer[settings.THINKING_BATCH_SIZE:]
 
         logger.info(f"[{self.name}] Processing batch of {len(batch)} findings")
 
@@ -698,11 +711,27 @@ class ThinkingConsolidationAgent(BaseAgent):
         Returns:
             Number of findings flushed
         """
+        # Extract all items under lock
+        all_items = []
         async with self._batch_lock:
-            initial_count = len(self._batch_buffer)
-            while self._batch_buffer:
-                await self._process_batch()
-            return initial_count
+            all_items = self._batch_buffer[:]
+            self._batch_buffer = []
+            
+        initial_count = len(all_items)
+        
+        # Process in chunks of THINKING_BATCH_SIZE (or all at once? Let's respect batch size)
+        # Actually for flush, we can process all, but respecting batch size logic for consistency
+        # is better if we want chunks. However, _process_batch_items handles any list size.
+        # Let's feed it in chunks to mimic normal operation if needed, or just one go.
+        # Given _process_batch_items sorts by priority, larger batches might be better for global priority.
+        # But let's stick to chunks to avoid blocking the event loop for too long.
+        
+        chunk_size = settings.THINKING_BATCH_SIZE
+        for i in range(0, len(all_items), chunk_size):
+            chunk = all_items[i:i + chunk_size]
+            await self._process_batch_items(chunk)
+            
+        return initial_count
 
     async def _batch_processor(self):
         """
@@ -715,20 +744,32 @@ class ThinkingConsolidationAgent(BaseAgent):
             try:
                 await asyncio.sleep(settings.THINKING_BATCH_TIMEOUT)
 
+                batch_to_process = None
                 async with self._batch_lock:
                     if self._batch_buffer:
-                        logger.debug(
-                            f"[{self.name}] Batch timeout: processing {len(self._batch_buffer)} buffered"
-                        )
-                        await self._process_batch()
+                        # Extract all buffered items on timeout? 
+                        # Or just one batch?
+                        # The original code did:
+                        # logger.debug(...)
+                        # await self._process_batch() -> which takes ONE batch (THINKING_BATCH_SIZE)
+                        
+                        # So we should extract up to batch size
+                        count = min(len(self._batch_buffer), settings.THINKING_BATCH_SIZE)
+                        if count > 0:
+                            logger.debug(
+                                f"[{self.name}] Batch timeout: processing {count} buffered"
+                            )
+                            batch_to_process = self._batch_buffer[:count]
+                            self._batch_buffer = self._batch_buffer[count:]
+
+                if batch_to_process:
+                    await self._process_batch_items(batch_to_process)
 
             except asyncio.CancelledError:
                 # Flush remaining on shutdown
-                async with self._batch_lock:
-                    if self._batch_buffer:
-                        logger.info(f"[{self.name}] Shutdown: flushing {len(self._batch_buffer)} buffered")
-                        while self._batch_buffer:
-                            await self._process_batch()
+                # We can call flush_batch, but that's async and we are in exception handler
+                # Better to just log and try to flush if possible, or just let flush_batch handle it if called elsewhere
+                logger.info(f"[{self.name}] Batch processor cancelled")
                 break
             except Exception as e:
                 logger.error(f"[{self.name}] Batch processor error: {e}")

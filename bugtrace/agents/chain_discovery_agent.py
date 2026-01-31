@@ -52,6 +52,9 @@ class ChainDiscoveryAgent(BaseAgent):
         self.discovered_chains: List[List[Dict]] = []
         self.exploited_chains: List[Dict] = []
 
+        # Lock for thread-safe state modification (v2.6 fix: prevent race conditions)
+        self._state_lock = asyncio.Lock()
+
         # Known chain patterns (templates)
         self.chain_templates = self._load_chain_templates()
 
@@ -78,13 +81,15 @@ class ChainDiscoveryAgent(BaseAgent):
         if data.get("specialist"):
             return  # Let handle_specialist_finding process it
 
-        self.discovered_vulns.append(vuln)
-        self.think(f"New vulnerability: {vuln.get('type')} - analyzing chains...")
+        # Protect state with lock (v2.6 fix: prevent race conditions)
+        async with self._state_lock:
+            self.discovered_vulns.append(vuln)
+            self.think(f"New vulnerability: {vuln.get('type')} - analyzing chains...")
 
-        # Add to graph
-        await self._add_vulnerability_to_graph(vuln)
+            # Add to graph
+            await self._add_vulnerability_to_graph(vuln)
 
-        # Look for exploitable chains
+        # Look for exploitable chains OUTSIDE lock (v2.6 fix: prevent deadlock)
         await self._analyze_chains()
 
     async def handle_specialist_finding(self, data: Dict[str, Any]):
@@ -111,11 +116,15 @@ class ChainDiscoveryAgent(BaseAgent):
         vuln = self._convert_specialist_finding(specialist, finding, status)
 
         if vuln:
-            self.discovered_vulns.append(vuln)
-            self.think(f"New {specialist} vulnerability: analyzing chains...")
+            # Protect state with lock (v2.6 fix: prevent race conditions)
+            async with self._state_lock:
+                self.discovered_vulns.append(vuln)
+                self.think(f"New {specialist} vulnerability: analyzing chains...")
 
-            # Add to graph and analyze
-            await self._add_vulnerability_to_graph(vuln)
+                # Add to graph
+                await self._add_vulnerability_to_graph(vuln)
+
+            # Analyze chains OUTSIDE lock (v2.6 fix: prevent deadlock)
             await self._analyze_chains()
 
     def _convert_specialist_finding(self, specialist: str, finding: Dict, status: str) -> Optional[Dict]:
@@ -294,6 +303,7 @@ class ChainDiscoveryAgent(BaseAgent):
         3. Auto-attempt exploitation if confidence > threshold
         """
         self.think("Analyzing exploitation chains...")
+        logger.debug(f"[{self.name}] Starting chain analysis with {len(self.exploit_graph.nodes)} vulns")
 
         # Get current vulnerability types
         discovered_types = set(
@@ -322,8 +332,9 @@ class ChainDiscoveryAgent(BaseAgent):
             self.discovered_chains.append(chain)
 
             # Attempt automatic exploitation if likelihood threshold met
+            # Use create_task to run in background (v2.6 fix: prevent blocking event loop)
             if template["likelihood"] > 0.6:
-                await self._attempt_chain_exploitation(chain, template)
+                asyncio.create_task(self._attempt_chain_exploitation(chain, template))
 
     async def _build_chain(self, template: Dict) -> Optional[List[Dict]]:
         """
@@ -473,8 +484,16 @@ Format as JSON:
 }}
 """
 
-        response = await llm_client.generate(prompt, "ChainExploiter")
-        return json.loads(response)
+        # Add timeout to prevent indefinite hangs (v2.6 fix)
+        try:
+            response = await asyncio.wait_for(
+                llm_client.generate(prompt, "ChainExploiter"),
+                timeout=30.0  # 30 second timeout for chain exploitation LLM
+            )
+            return json.loads(response)
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.name}] LLM timeout for chain step: {step_name}")
+            return {"action": "timeout", "error": "LLM response timeout"}
 
     def _step_execute_and_validate(self, step_name: str, guidance: Dict) -> Dict:
         """Execute step action and validate success."""

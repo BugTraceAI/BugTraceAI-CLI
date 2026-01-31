@@ -1786,8 +1786,16 @@ class TeamOrchestrator:
                 result = await dast.run()
                 return (url, result.get("vulnerabilities", []))
 
-        # Run ALL URLs in parallel
-        tasks = [analyze_url(url) for url in self.urls_to_scan]
+        async def analyze_url_with_timeout(url: str, timeout: float = 120.0) -> tuple:
+            """Wrapper with timeout to prevent indefinite blocking (v2.6 fix)."""
+            try:
+                return await asyncio.wait_for(analyze_url(url), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"[DAST] URL analysis timed out after {timeout}s: {url[:50]}...")
+                return (url, [])  # Return empty results on timeout
+
+        # Run ALL URLs in parallel with per-URL timeout
+        tasks = [analyze_url_with_timeout(url) for url in self.urls_to_scan]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Aggregate results
