@@ -1,87 +1,76 @@
-# BugtraceAI 2.0.0 (Phoenix Edition): AI Context Documentation
+# .ai-context - AI-Assisted Development Documentation
 
-> **Current Version**: 2.0.0 (Phoenix Edition)
-> **Architecture**: Reactor V4
-> **Last Updated**: January 2026
+This directory contains context documentation designed to help AI assistants (like Claude, GPT, Gemini) understand the BugTraceAI codebase architecture and make informed contributions.
 
-## Quick Links
+## What is this folder for?
 
-- **[Master Documentation](./BUGTRACE_MASTER_DOC.md)** - Complete technical architecture
-- **[Phase Architecture](./architecture/phases.md)** - Pipeline phase naming conventions
-- **[Architecture Diagrams](./architecture/diagrams.md)** - Visual system diagrams
-- **[Code Examples](./examples/code_examples.md)** - API usage examples
-- **[Audit Fix Tasks](./auditfix/)** - Code quality improvement tracking
-- **[Architecture Overview](./architecture/)** - System design documents
+When working with AI assistants on this codebase, you can reference files in this directory to provide the AI with architectural context, design decisions, and technical specifications. This helps ensure AI-generated code aligns with the existing architecture.
 
----
+## Directory Structure
 
-## 1. Executive Summary
+```
+.ai-context/
+├── README.md                      # This file
+├── ARCHITECTURE_V4.md             # Current system architecture overview
+├── BUGTRACE_MASTER_DOC.md         # Complete technical reference
+├── PROJECT_STORYLINE.md           # Development history and evolution
+├── QUICKSTART_GUIDE.md            # Getting started guide
+├── report_generation_spec.md      # Report generation specification
+│
+├── architecture/                  # Architecture documentation
+│   ├── phases.md                  # Pipeline phase conventions
+│   └── diagrams.md                # System diagrams
+│
+├── technical_specs/               # Detailed technical specifications
+│   ├── CDP_VS_PLAYWRIGHT_XSS.md   # XSS validation approaches
+│   ├── feature_inventory.md       # Feature catalog
+│   ├── REPORTING_SPEC.md          # Reporting system spec
+│   └── WHY_VALIDATOR_FOR_XSS.md   # Validation design rationale
+│
+├── examples/                      # Code examples
+│   └── code_examples.md           # API usage examples
+│
+└── roadmap/                       # Future development plans
+    ├── README.md                  # Roadmap overview
+    ├── 00-privacy-principles.md   # Privacy-first design
+    ├── 01-observability.md        # Observability features
+    └── ...                        # Additional roadmap items
+```
 
-This document summarizes the massive architectural overhaul executed in mid-January 2026 to transition BugtraceAI from a simple scanner to a **Full Autonomous Pentagon-Grade Framework**.
+## Key Documents
 
-The key achievement is the **"Reactor V4"**, a fully event-driven, autonomous orchestration engine that combines specialized agents, browser-based verification (CDP/Playwright), and Vision AI validation.
+### For Understanding the Architecture
 
----
+- **ARCHITECTURE_V4.md** - Start here for an overview of the current system design
+- **BUGTRACE_MASTER_DOC.md** - Comprehensive technical reference
+- **architecture/phases.md** - Understanding the 5-phase pipeline (Discovery → Evaluation → Exploitation → Validation → Reporting)
 
-## 2. Key Architectural Components
+### For Contributing Code
 
-### 2.1. The Reactor (Core Engine)
+- **examples/code_examples.md** - See how to use the API
+- **technical_specs/** - Detailed specifications for specific subsystems
+- **QUICKSTART_GUIDE.md** - Development setup and workflow
 
-- **Role**: Replaced the linear `Conductor`. Acts as the central nervous system.
-- **Mechanism**:
-  - Uses an `EventBus` to dispatch jobs asynchronously.
-  - Manages a pool of specialized "Worker Agents" (XSS, SQLi, RCE, LFI, etc.).
-  - Implements **"Smart Scheduling"**: Prioritizes likely vulnerabilities (e.g., if finding `/admin`, prioritize Auth Bypass).
+### For Planning Features
 
-### 2.2. Specialized Agent Ecosystem
+- **roadmap/** - Planned features and architectural direction
+- **PROJECT_STORYLINE.md** - Historical context and evolution
 
-We moved from generic DAST to specialized "Vertical Agents". Each agent is an expert in ONE class of vulnerability.
+## How to Use This with AI Assistants
 
-| Agent | Capability | Key Improvement |
-| :--- | :--- | :--- |
-| **XSSAgent** | DOM/Reflected/Stored XSS | Uses **Interactive Verification** (clicks/hovers) & Impact Analysis (Cookies/Storage). |
-| **SQLMapAgent** | SQL Injection | Wraps `sqlmap` via Docker for 100% confirmation reliability. |
-| **RCEAgent** | Command Injection / Sandbox Escape | Uses time-based and OOB payloads. Detects `eval()` context. |
-| **LFIAgent** | Local File Inclusion | Detecting `/etc/passwd` or `win.ini`. Smart path traversal fuzzing. |
-| **JWTAgent** | JWT Vulnerabilities | Autonomous "None" algo attacks and key confusion. |
-| **SSRFAgent** | Server-Side Request Forgery | Targets cloud metadata and internal ports (localhost scanning). |
+When asking an AI to work on BugTraceAI code:
 
-### 2.3. The Validation Triad (Accuracy Engine)
+1. **Reference relevant docs**: "Using the architecture described in .ai-context/ARCHITECTURE_V4.md, implement..."
+2. **Provide context**: "Following the patterns in .ai-context/technical_specs/REPORTING_SPEC.md, add..."
+3. **Ensure alignment**: "Check .ai-context/roadmap/01-observability.md for planned observability features before implementing..."
 
-To solve the "False Positive" problem, we implemented a 3-layer validation system:
+## Maintaining This Documentation
 
-1. **Payload Verification**: The agent itself confirms the syntax (e.g., SQL syntax error).
-2. **Browser Verification (CDP/Playwright)**: A headless browser executes the exploit. If `alert(1)` pops or cookies are stolen, it is confirmed.
-3. **Vision AI (Agentic Validator)**: A "Senior Pentester" AI Model (default: `qwen/qwen3-vl-8b-thinking`) looks at the screenshot of the exploit to apply human reasoning (e.g., "Yes, that is a PHP error dump, not just text"). Configurable via `VALIDATION_VISION_MODEL` in `bugtraceaicli.conf`.
-
----
-
-## 3. Major Optimizations
-
-### 3.1. "Stop-on-Success" (Efficiency)
-
-- **Previous**: Continued testing 500 payloads even after finding XSS.
-- **Current**: Agents immediately stop testing a specific parameter once a vulnerability is confirmed.
-
-### 3.2. Deduplication Logic
-
-- **Previous**: Reported 10 instances of the same vulnerability if found with different payloads.
-- **Current**: The `DataCollector` normalizes findings by `(Type + URL + Parameter)` to ensure clean reports.
-
-### 3.3. Impact-Aware Scoring
-
-- **Previous**: A `alert(1)` inside a sandbox was treated as CRITICAL.
-- **Current**: XSS findings are downgraded if no sensitive data (cookies/storage) can be accessed.
+- Keep architecture docs updated when making significant changes
+- Add new specs to technical_specs/ when introducing new subsystems
+- Update roadmap/ as features are completed or priorities change
+- Examples should reflect current API usage patterns
 
 ---
 
-## 4. Current State (January 15, 2026)
-
-- **Status**: Stable & Running.
-- **Testing**: Validated against "Extreme Mixed Dojo" with high success rate. See [DOJO_GUIDE.md](./DOJO_GUIDE.md) for environment details.
-- **Vision Pipeline**: Currently processing a large-scale scan with Vision AI for final report generation.
-
-## 5. Next Steps
-
-- **Performance Tuning**: Parallelize Vision AI requests (currently sequential).
-- **Report Polish**: Enhance HTML reports with interactive proof-of-concept steps.
+**Note**: This folder is for AI context only. End-user documentation lives in the main `docs/` directory.
