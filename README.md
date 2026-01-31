@@ -1,82 +1,280 @@
-# BugtraceAI-CLI 🛡️🤖
+# BugTraceAI-CLI
 
-**Autonomous Offensive Security Framework v1.2.0**
-*Powered by Visual "Thinking" Intelligence, Multi-Agent Orchestration, and Strategy Shifting.*
+[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white)](https://bugtraceai.com)
+[![Wiki Documentation](https://img.shields.io/badge/Wiki%20Documentation-000?logo=wikipedia&logoColor=white)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
+![License](https://img.shields.io/badge/License-Proprietary-red.svg)
+![Status](https://img.shields.io/badge/Status-Beta-orange)
+![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Required-blue?logo=docker)
+![Made with](https://img.shields.io/badge/Made%20with-❤️-red)
 
-BugtraceAI-CLI is a next-generation offensive security tool designed to think, see, and adapt like a professional pentester. It moves beyond simple pattern matching into deep, LLM-driven reasoning for vulnerability discovery and exploitatiaon.
+****
 
-## 🚀 Key Features
+## 📑 Table of Contents
+- [🚨 Disclaimer](#-disclaimer)
+- [✨ Features](#-features)
+- [🔬 Core Methodology](#-core-methodology)
+- [🏗️ Architecture](#️-architecture)
+- [🛠️ Technology Stack](#️-technology-stack)
+- [🚀 Getting Started](#-getting-started)
+- [⚙️ Configuration](#️-configuration)
+- [📊 Output](#-output)
+- [📜 License](#-license)
 
-* **Multi-Agent Team Orchestration**:
-  * `Recon Agent`: Deep visual discovery and asset mapping.
-  * `Exploit Agent`: Strategy Shifting and mutant payload generation.
-  * `Skeptical Agent`: Visual verification of findings to eliminate false positives.
-* **Thinking Visual Intelligence**: Uses `Qwen 3 VL` and Thinking Models to analyze screenshots, identify attack surfaces, and confirm XSS triggers.
-* **Intelligence Shifting**: Dynamic fallback through a tiered list of high-performance models:
-  * `Gemini 2.0 Thinking` (Planning)
-  * `Grok-Code` / `Qwen 2.5 Coder` (Bypass Generation)
-  * `DeepSeek` / `Claude 3.5 Haiku` (WAF Analysis)
-* **Real-time Dashboard**: Dynamic terminal UI built with `Rich` featuring:
-  * **Live Engagement Panel**: Track active payloads and URLs in real-time.
-  * **Agent "Thoughts"**: See the reasoning process behind every action.
-* **Professional HTML Reporting**: Automatic generation of executive and technical reports in `/reports`.
-* **Diagnostic Suite**: Auto-health checks for Docker (Nuclei/SQLMap), API connectivity, and Visual Browser status.
+***
 
-## 🛠️ Installation
+BugTraceAI-CLI is an autonomous offensive security framework that combines LLM-driven analysis with deterministic exploitation tools. Unlike passive analysis tools, BugTraceAI-CLI actively exploits vulnerabilities using real payloads, SQLMap integration, and browser-based validation to deliver confirmed, actionable findings.
+
+The core philosophy is **"Think like a pentester, execute like a machine, validate like an auditor"** - using AI for intelligent hypothesis generation, but relying on real tools for exploitation and validation.
+
+## 🚨 Disclaimer
+
+This tool is for **authorized security testing only**.
+
+BugTraceAI-CLI performs **active exploitation** including:
+- Real SQL injection payloads via SQLMap
+- XSS payload execution in browsers
+- Template injection testing
+- Server-side request forgery probing
+
+**By using this tool, you acknowledge and agree that:**
+- You will only test applications for which you have explicit, written permission
+- You understand this tool sends actual attack payloads to targets
+- The creators assume no liability for any misuse or damage caused
+
+**Unauthorized access to computer systems is illegal.**
+
+## ✨ Features
+
+BugTraceAI-CLI implements a 5-phase pipeline that mirrors a professional penetration testing workflow.
+
+### Phase 1: Discovery
+- 🕷️ **GoSpider Integration**: Fast async crawling with JavaScript rendering and sitemap parsing
+- 🎯 **Nuclei CVE Scanning**: Template-based detection of known vulnerabilities
+- 🔍 **Parameter Extraction**: Automatic identification of injectable parameters
+
+### Phase 2: Analysis (DASTySAST)
+- 🧠 **Multi-Persona Analysis**: 5 different AI "personas" analyze each URL (bug bounty hunter, code auditor, pentester, etc.)
+- ✅ **Consensus Voting**: Requires 4/5 agreement to reduce false positives
+- 🔎 **Skeptical Review**: Claude Haiku performs final filtering before exploitation
+
+### Phase 3: Intelligent Consolidation
+- 🎯 **ThinkingConsolidationAgent**: Central brain that routes findings to specialists
+- 🔄 **Deduplication**: Eliminates redundant findings across URLs
+- ⚡ **Priority Routing**: High-confidence findings get tested first
+- 🛡️ **SQLi Bypass**: SQL injection candidates always reach SQLMap (tool decides, not LLM)
+
+### Phase 4: Exploitation
+Real tools, real payloads, real results:
+
+| Agent | Target | Method |
+|-------|--------|--------|
+| 🔥 **XSSAgent** | Cross-Site Scripting | Playwright browser + context-aware payloads |
+| 💉 **SQLiAgent** | SQL Injection | SQLMap with WAF bypass tamper scripts |
+| 🎭 **CSTIAgent** | Client-Side Template Injection | AngularJS, Vue, React expressions |
+| 🌐 **SSRFAgent** | Server-Side Request Forgery | OOB callback verification |
+| 📄 **XXEAgent** | XML External Entity | DTD injection + OOB exfiltration |
+| 🔓 **IDORAgent** | Insecure Direct Object Reference | ID manipulation testing |
+| 📁 **LFIAgent** | Local File Inclusion | Path traversal with filter evasion |
+
+### Phase 5: Validation
+- 🖥️ **Chrome DevTools Protocol**: Low-level browser verification for XSS
+- 👁️ **Vision AI**: Screenshot analysis confirms visual vulnerabilities
+- 📸 **Evidence Capture**: Every confirmed finding includes proof
+
+### Intelligence Systems
+- 🔀 **LLM Shifting**: Automatic fallback through model tiers (Gemini → DeepSeek → Claude → Qwen)
+- 🛡️ **WAF Detection**: Identifies Cloudflare, Akamai, AWS WAF, ModSecurity
+- 🎯 **Adaptive Bypass**: Encoding, chunking, and case mixing strategies per WAF type
+
+## 🔬 Core Methodology
+
+BugTraceAI-CLI uses a multi-layered approach to maximize accuracy while minimizing false positives.
+
+### Multi-Persona Analysis
+Instead of a single AI scan, each URL is analyzed by 5 different "personas":
+- **Bug Bounty Hunter**: Focuses on exploitable, reward-worthy issues
+- **Code Auditor**: Deep analysis of code patterns and logic flaws
+- **Pentester**: Attack-surface mapping and exploitation paths
+- **Security Researcher**: Novel attack vectors and edge cases
+- **DevSecOps Engineer**: Infrastructure and configuration issues
+
+### Consensus + Skeptical Review
+```
+5 Personas analyze URL
+        ↓
+Consensus voting (4/5 required)
+        ↓
+Claude Haiku skeptical review (score >= 5/10)
+        ↓
+Passed to specialist agents
+```
+
+### Tool-Based Validation
+The key differentiator: **AI hypothesizes, tools validate**.
+
+- SQLi findings → SQLMap confirms with real injection
+- XSS findings → Playwright executes payload in browser
+- All findings → CDP + Vision AI provides evidence
+
+This eliminates the "hallucination problem" of pure-AI scanners.
+
+## 🏗️ Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      BUGTRACE PIPELINE                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐     │
+│  │ Discovery│ → │ Analysis │ → │ Thinking │ → │Specialist│     │
+│  │ GoSpider │   │ DASTySAST│   │ Consolid.│   │  Agents  │     │
+│  │ Nuclei   │   │ 5 Personas   │ Dedup    │   │ SQLMap   │     │
+│  └──────────┘   │ Consensus│   │ Priority │   │ Playwright    │
+│                 └──────────┘   └──────────┘   └────┬─────┘     │
+│                                                     │           │
+│                                                     ▼           │
+│                                              ┌──────────┐       │
+│                                              │Validation│       │
+│                                              │ CDP      │       │
+│                                              │ Vision AI│       │
+│                                              └──────────┘       │
+│                                                     │           │
+│                                                     ▼           │
+│                                              ┌──────────┐       │
+│                                              │  Report  │       │
+│                                              │JSON/MD/HTML     │
+│                                              └──────────┘       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Parallelization Control
+
+Each phase runs with independent concurrency:
+
+| Phase | Concurrency | Configurable | Notes |
+|-------|-------------|--------------|-------|
+| Discovery | 1 | No | GoSpider is already fast |
+| Analysis | 5 | Yes | Parallel DAST per URL |
+| Exploitation | 10 | Yes | Parallel specialist agents |
+| Validation | 1 | **No** | CDP limitation (hardcoded) |
+
+> **Why is Validation = 1?** Chrome DevTools Protocol doesn't support multiple simultaneous connections. Additionally, `alert()` popups from XSS payloads block CDP indefinitely. Single-threaded with timeouts prevents crashes.
+
+## 🛠️ Technology Stack
+
+- **Language**: Python 3.10+
+- **AI Provider**: OpenRouter (Gemini, Claude, DeepSeek, Qwen)
+- **Browser Automation**: Playwright (exploitation), Chrome CDP (validation)
+- **SQL Injection**: SQLMap via Docker
+- **Crawling**: GoSpider via Docker
+- **CVE Scanning**: Nuclei via Docker
+- **Database**: SQLite with WAL mode
+- **Async**: asyncio + aiohttp
+
+## 🚀 Getting Started
+
+### Prerequisites
+- Python 3.10+
+- Docker & Docker Compose
+- Chrome/Chromium browser
+- OpenRouter API key
+
+### Installation
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/your-org/bugtrace-cli
-cd bugtrace-cli
+# Clone the repository
+git clone https://github.com/BugTraceAI/BugTraceAI-CLI
+cd BugTraceAI-CLI
 
-# 2. Setup environment
+# Create virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
+
+# Install browser
 playwright install chromium
 
-# 3. Configure
-cp .env.example .env
-# REQUIRED: Add OPENROUTER_API_KEY to .env for AI features
+# Configure
+cp bugtraceaicli.conf.example bugtraceaicli.conf
+# Edit and add your OPENROUTER_API_KEY
 ```
 
-## 💻 Usage
-
-> **📖 READ THE QUICKSTART GUIDE FIRST:** [.ai-context/QUICKSTART_GUIDE.md](.ai-context/QUICKSTART_GUIDE.md)
-
-### Standard Scan
+### Quick Start
 
 ```bash
-# Scan a target (Asset Discovery -> Vulnerability Hunting -> Validation)
-./bugtraceai-cli "https://ginandjuice.shop"
+# Full scan
+./bugtraceai-cli https://target.com
+
+# Clean scan (reset database)
+./bugtraceai-cli https://target.com --clean
+
+# Resume interrupted scan
+./bugtraceai-cli https://target.com --resume
 ```
 
-### Resume / Validate Only
+## ⚙️ Configuration
 
-```bash
-# Resume validation for existing findings in DB
-./bugtraceai-cli audit "https://ginandjuice.shop"
+All settings in `bugtraceaicli.conf`:
+
+```ini
+[API]
+OPENROUTER_API_KEY = sk-or-v1-xxxxx
+
+[SCAN]
+MAX_URLS = 100
+MAX_CONCURRENT_ANALYSIS = 5
+MAX_CONCURRENT_SPECIALISTS = 10
+
+[SCANNING]
+MANDATORY_SQLMAP_VALIDATION = True
+STOP_ON_CRITICAL = False
+
+[VALIDATION]
+CDP_ENABLED = True
+VISION_ENABLED = True
 ```
 
-### Targeted Single URL Scan
+### Model Configuration
 
-1. Edit `bugtraceaicli.conf`: Set `MAX_URLS = 1`
-2. Run: `./bugtraceai-cli "https://ginandjuice.shop/catalog?category=vulnerable"`
+```ini
+[LLM_MODELS]
+DEFAULT_MODEL = google/gemini-2.0-flash-thinking-exp:free
+SKEPTICAL_MODEL = anthropic/claude-3.5-haiku:beta
+VISION_MODEL = google/gemini-2.0-flash-thinking-exp:free
+```
 
-## 📊 Observability
+## 📊 Output
 
-* **Audit Journal**: `logs/llm_audit.jsonl` - Every prompt and AI response is logged for transparency.
-* **Execution Logs**: `logs/bugtrace.jsonl` - Detailed process logging.
-* **Visual Evidence**: Screenshots of confirmed vulnerabilities saved automatically.
-* **Final Reports**: Check the `/reports` folder after a scan is complete.
+### Reports
+Generated in `/reports/`:
+- `report_*.json` - Machine-readable findings
+- `report_*.md` - Markdown summary
+- `report_*.html` - Executive presentation
 
-## 🏗️ Architecture (v1.2)
+### Logs
+Located in `/logs/`:
+- `execution.log` - Detailed trace
+- `llm_audit.jsonl` - Every AI prompt/response
+- `errors.log` - Error tracking
 
-1. **TeamOrchestrator**: Asynchronously coordinates specialized agents.
-2. **LLMClient**: High-performance multi-model gateway with automatic fallback (Shift).
-3. **Memory Manager (GraphRAG)**: Combines NetworkX (Knowledge Graph) with LanceDB (Vector) for long-term intelligence.
-4. **Diagnostic System**: Ensures the environment is ready for industrial-grade pentesting.
+### Finding Status Flow
+```
+CANDIDATE → PENDING_VALIDATION → CONFIRMED / FALSE_POSITIVE → PROBE_VALIDATED
+```
 
-## ⚠️ Disclaimer
+## 📜 License
 
-This tool is for educational and authorized testing purposes only. Usage against targets without prior mutual consent is illegal. The developers assume no liability for misuse.
+Proprietary - All Rights Reserved
+
+Copyright (c) 2026 BugTraceAI
+
+See [bugtraceai.com](https://bugtraceai.com) for licensing information.
+
+---
+
+Made with ❤️ by Albert C. [@yz9yt](https://x.com/yz9yt)
+
+[bugtraceai.com](https://bugtraceai.com)
