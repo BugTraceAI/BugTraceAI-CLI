@@ -1777,6 +1777,10 @@ class TeamOrchestrator:
 
         async def analyze_url(url: str) -> tuple:
             async with analysis_semaphore:
+                # Log concurrency status
+                active = settings.MAX_CONCURRENT_ANALYSIS - analysis_semaphore._value
+                logger.info(f"[DAST] ▶ Starting ({active}/{settings.MAX_CONCURRENT_ANALYSIS} active): {url[:60]}")
+
                 url_dir = self._create_url_directory(url, analysis_dir)
                 dast = DASTySASTAgent(
                     url, self.tech_profile, url_dir,
@@ -1784,7 +1788,10 @@ class TeamOrchestrator:
                     scan_context=self.scan_context
                 )
                 result = await dast.run()
-                return (url, result.get("vulnerabilities", []))
+                vulns = result.get("vulnerabilities", [])
+
+                logger.info(f"[DAST] ✓ Completed ({len(vulns)} findings): {url[:60]}")
+                return (url, vulns)
 
         async def analyze_url_with_timeout(url: str, timeout: float = 120.0) -> tuple:
             """Wrapper with timeout to prevent indefinite blocking (v2.6 fix)."""
