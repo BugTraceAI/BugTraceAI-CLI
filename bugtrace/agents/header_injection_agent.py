@@ -25,6 +25,7 @@ from bugtrace.agents.base import BaseAgent
 from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
 from bugtrace.core.event_bus import EventType
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 
 logger = get_logger("agents.header_injection")
 
@@ -126,7 +127,7 @@ class HeaderInjectionAgent(BaseAgent):
                 return {"findings": [], "status": JobStatus.COMPLETED, "stats": self._stats}
 
             # Test each parameter
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 for param in params_to_test:
                     await self._test_parameter(session, param)
 
@@ -371,7 +372,7 @@ class HeaderInjectionAgent(BaseAgent):
     async def _test_parameter_from_queue(self, param: str) -> Optional[Dict]:
         """Test a single parameter from queue for CRLF injection."""
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 for payload in self.CRLF_PAYLOADS:
                     test_url = self._build_test_url(param, payload)
                     finding = await self._check_injection(session, test_url, param, payload)

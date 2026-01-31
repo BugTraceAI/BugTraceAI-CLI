@@ -13,6 +13,7 @@ from bugtrace.core.ui import dashboard
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 from bugtrace.utils.logger import get_logger
 from bugtrace.tools.external import external_tools
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -151,12 +152,12 @@ class SSRFAgent(BaseAgent):
         test_url = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
         
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 start_time = asyncio.get_event_loop().time()
                 async with session.get(test_url, timeout=5) as response:
                     text = await response.text()
                     elapsed = asyncio.get_event_loop().time() - start_time
-                    
+
                     return {
                         "param": param,
                         "payload": payload,

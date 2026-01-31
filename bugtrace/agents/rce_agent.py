@@ -10,6 +10,7 @@ from bugtrace.core.queue import queue_manager
 from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -95,7 +96,7 @@ class RCEAgent(BaseAgent):
         all_findings = []
         time_payloads = self._get_time_payloads()
 
-        async with aiohttp.ClientSession() as session:
+        async with orchestrator.session(DestinationType.TARGET) as session:
             for param in self.params:
                 logger.info(f"[{self.name}] Testing RCE on {self.url} (Param: {param})")
                 finding = await self._test_parameter(session, param, time_payloads)
@@ -215,7 +216,7 @@ class RCEAgent(BaseAgent):
     async def _test_single_param_from_queue(self, url: str, param: str, finding: dict) -> Optional[Dict]:
         """Test a single parameter from queue for RCE."""
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 time_payloads = self._get_time_payloads()
                 return await self._test_parameter(session, param, time_payloads)
         except Exception as e:

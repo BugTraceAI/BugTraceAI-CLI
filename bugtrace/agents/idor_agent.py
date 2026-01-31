@@ -10,6 +10,7 @@ from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
 from bugtrace.utils.logger import get_logger
 from bugtrace.tools.external import external_tools
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -89,7 +90,7 @@ class IDORAgent(BaseAgent):
         dashboard.log(f"[{self.name}] 🚀 Starting IDOR analysis on {self.url}", "INFO")
 
         all_findings = []
-        async with aiohttp.ClientSession() as session:
+        async with orchestrator.session(DestinationType.TARGET) as session:
             for item in self.params:
                 finding = await self._test_idor_param(item)
                 if finding:

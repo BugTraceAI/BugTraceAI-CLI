@@ -4,6 +4,7 @@ import os
 from bugtrace.core.config import settings
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.ui import dashboard
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 
 logger = get_logger("core.diagnostics")
 
@@ -63,9 +64,8 @@ class DiagnosticSystem:
 
     async def _check_connectivity(self):
         """Check internet connectivity to OpenRouter."""
-        import aiohttp
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.LLM) as session:
                 async with session.get("https://openrouter.ai/api/v1/models", timeout=5) as resp:
                     self.results["connectivity"] = resp.status == 200
                     dashboard.log("Network Connectivity to AI: OK", "SUCCESS")
@@ -79,11 +79,10 @@ class DiagnosticSystem:
         if not (self.results.get("api_key") and self.results.get("connectivity")):
             return
 
-        import aiohttp
         logger.info("Initiating OpenRouter credit check...")
         try:
             headers = {"Authorization": f"Bearer {settings.OPENROUTER_API_KEY}"}
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.LLM) as session:
                 async with session.get("https://openrouter.ai/api/v1/auth/key", headers=headers, timeout=5) as resp:
                     await self._handle_credit_response(resp)
         except Exception as e:

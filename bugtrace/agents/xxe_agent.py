@@ -2,6 +2,7 @@ import logging
 from typing import Dict, List, Optional, Any
 import aiohttp
 from bugtrace.agents.base import BaseAgent
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
 from bugtrace.core.queue import queue_manager
 from bugtrace.core.event_bus import EventType
@@ -141,7 +142,8 @@ class XXEAgent(BaseAgent):
     async def run_loop(self) -> Dict:
         logger.info(f"[{self.name}] Testing XML Injection on {self.url}")
 
-        async with aiohttp.ClientSession() as session:
+        # Use orchestrator for lifecycle-tracked connections
+        async with orchestrator.session(DestinationType.TARGET) as session:
             # Phase 1: Heuristic Checks
             successful_payloads, best_payload = await self._test_heuristic_payloads(session)
 
@@ -286,7 +288,8 @@ class XXEAgent(BaseAgent):
     async def _test_single_url_from_queue(self, url: str, finding: dict) -> Optional[Dict]:
         """Test a single URL from queue for XXE."""
         try:
-            async with aiohttp.ClientSession() as session:
+            # Use orchestrator for lifecycle-tracked connections
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 # Test with heuristic payloads
                 successful_payloads, best_payload = await self._test_heuristic_payloads(session)
 

@@ -15,6 +15,7 @@ from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
 from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.utils.logger import get_logger
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -149,7 +150,7 @@ class PrototypePollutionAgent(BaseAgent):
         Most prototype pollution occurs via JSON body, so this is priority check.
         """
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 # Test with empty JSON object to check acceptance
                 async with session.post(
                     self.url,
@@ -219,7 +220,7 @@ class PrototypePollutionAgent(BaseAgent):
         vectors = []
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 # Test basic __proto__ query pollution
                 test_url = f"{self.url}{'&' if '?' in self.url else '?'}__proto__[test]=probe"
 
@@ -256,7 +257,7 @@ class PrototypePollutionAgent(BaseAgent):
         vectors = []
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 async with session.get(
                     self.url,
                     timeout=aiohttp.ClientTimeout(total=10)
@@ -433,7 +434,7 @@ class PrototypePollutionAgent(BaseAgent):
             # Measure response time for timing attack detection
             start_time = time.time()
 
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 async with session.post(
                     self.url,
                     json=payload_obj,
@@ -566,7 +567,7 @@ class PrototypePollutionAgent(BaseAgent):
             test_url = f"{self.url}{'&' if '?' in self.url else '?'}{query}"
 
             try:
-                async with aiohttp.ClientSession() as session:
+                async with orchestrator.session(DestinationType.TARGET) as session:
                     async with session.get(
                         test_url,
                         timeout=aiohttp.ClientTimeout(total=5)

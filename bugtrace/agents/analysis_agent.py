@@ -6,6 +6,7 @@ from loguru import logger
 from bugtrace.core.llm_client import llm_client
 from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 from bugtrace.utils.parsers import XmlParser
 from bugtrace.core.event_bus import event_bus, EventType
 
@@ -305,7 +306,6 @@ class DASTySASTAgent(BaseAgent):
         1. SQL error messages in response body
         2. Status code differential (500 on ' but 200 on '' = classic SQLi)
         """
-        import aiohttp
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
         # SQL error patterns for major databases
@@ -340,7 +340,8 @@ class DASTySASTAgent(BaseAgent):
 
             findings = []
 
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            # Use orchestrator for lifecycle-tracked connections
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 for param_name in params:
                     # Test: Single quote should break SQL, double quote should escape
                     test_params_single = {k: v[0] if v else "" for k, v in params.items()}
@@ -493,7 +494,6 @@ class DASTySASTAgent(BaseAgent):
         Handles Base64-encoded values (like TrackingId with JSON inside).
         Also tests synthetic cookies for common vulnerable patterns.
         """
-        import aiohttp
         import base64
         import json
         from urllib.parse import urlparse
@@ -538,7 +538,8 @@ class DASTySASTAgent(BaseAgent):
 
             logger.debug(f"[Cookie SQLi Probe] Will test against {len(test_paths)} paths: {test_paths}")
 
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            # Use orchestrator for lifecycle-tracked connections
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 # Test each cookie against each path (cookies are domain-wide)
                 for test_path in test_paths:
                     test_url = f"{base_scheme_host}{test_path}"

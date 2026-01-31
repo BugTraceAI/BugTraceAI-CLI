@@ -13,6 +13,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from bugtrace.core.ui import dashboard
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.config import settings
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 
 logger = get_logger("core.llm_client")
 
@@ -229,7 +230,7 @@ class LLMClient:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.LLM) as session:
                 async with session.post(self.base_url, headers=headers, json=payload, timeout=5) as resp:
                     return self._log_ping_result(model, resp.status)
         except Exception as e:
@@ -468,8 +469,9 @@ class LLMClient:
         payload = self._build_request_payload(current_model, messages, temperature, max_tokens)
         start_time = time.time()
 
+        # Use orchestrator with LLM destination for proper timeout and lifecycle tracking
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.LLM) as session:
                 async with session.post(self.base_url, headers=headers, json=payload) as resp:
                     latency_ms = (time.time() - start_time) * 1000
                     return await self._handle_api_response(
@@ -569,8 +571,9 @@ class LLMClient:
         if settings.OPENROUTER_ONLINE:
             payload["online"] = True
 
+        # Use orchestrator with LLM destination for proper timeout and lifecycle tracking
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.LLM) as session:
                 async with session.post(self.base_url, headers=headers, json=payload) as resp:
                     return await self._handle_thread_response(
                         resp, current_model, module_name, thread, prompt
@@ -618,7 +621,7 @@ class LLMClient:
 
         try:
             headers = {"Authorization": f"Bearer {self.api_key}"}
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.LLM) as session:
                 async with session.get("https://openrouter.ai/api/v1/auth/key", headers=headers, timeout=5) as resp:
                     await self._process_balance_response(resp)
         except Exception as e:
@@ -658,8 +661,9 @@ class LLMClient:
         headers = self._build_vision_headers(module_name)
         payload = self._build_vision_payload(prompt, base64_image)
 
+        # Use orchestrator with LLM destination for proper timeout and lifecycle tracking
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.LLM) as session:
                 async with session.post(self.base_url, headers=headers, json=payload) as resp:
                     return await self._process_vision_response(resp, module_name, prompt)
         except Exception as e:
@@ -792,21 +796,21 @@ class LLMClient:
         temperature: float
     ) -> str:
         """Call vision API with image messages."""
-        async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-            payload = {
-                "model": model_override or "qwen/qwen3-vl-8b-thinking",
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": 100
-            }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model_override or "qwen/qwen3-vl-8b-thinking",
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": 100
+        }
 
-            try:
-                async with session.post(self.base_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        try:
+            async with orchestrator.session(DestinationType.LLM) as session:
+                async with session.post(self.base_url, headers=headers, json=payload) as resp:
                     return await self._extract_vision_result(resp, module_name)
-            except Exception as e:
-                logger.error(f"[{module_name}] Vision call failed: {e}", exc_info=True)
-                return ""
+        except Exception as e:
+            logger.error(f"[{module_name}] Vision call failed: {e}", exc_info=True)
+            return ""
 
     async def _extract_vision_result(self, resp: aiohttp.ClientResponse, module_name: str) -> str:
         """Extract result from vision API response."""
@@ -1067,18 +1071,18 @@ class LLMClient:
         """Execute streaming API request."""
         full_response = ""
 
+        # Use orchestrator's isolated_session for streaming (LLM destination)
         try:
-            session = aiohttp.ClientSession()
-            resp = await session.post(self.base_url, headers=headers, json=payload)
+            async with orchestrator.isolated_session(DestinationType.LLM, headers) as session:
+                resp = await session.post(self.base_url, headers=headers, json=payload)
 
-            try:
-                async for chunk, full_response in self._handle_stream_response(
-                    resp, full_response, on_chunk
-                ):
-                    yield chunk, full_response
-            finally:
-                await resp.close()
-                await session.close()
+                try:
+                    async for chunk, full_response in self._handle_stream_response(
+                        resp, full_response, on_chunk
+                    ):
+                        yield chunk, full_response
+                finally:
+                    await resp.close()
 
             await self._audit_log(module_name, model, prompt, full_response)
         except Exception as e:

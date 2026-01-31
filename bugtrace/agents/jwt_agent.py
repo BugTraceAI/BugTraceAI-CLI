@@ -16,6 +16,7 @@ from bugtrace.core.queue import queue_manager
 from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
 from bugtrace.core.validation_status import ValidationStatus
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -319,7 +320,7 @@ class JWTAgent(BaseAgent):
         elif "param" in loc or loc == "manual":
             final_url, headers = self._token_inject_param(target_url, token, loc, headers)
 
-        async with aiohttp.ClientSession() as session:
+        async with orchestrator.session(DestinationType.TARGET) as session:
             async with session.get(final_url, headers=headers, timeout=5) as r:
                 body = await r.text()
                 return r.status, body, final_url
@@ -644,10 +645,8 @@ class JWTAgent(BaseAgent):
 
     async def _key_confusion_download_jwks(self, jwks_url: str) -> List:
         """Download and parse JWKS keys from URL."""
-        import aiohttp
-
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 async with session.get(jwks_url, timeout=5) as resp:
                     return await self._key_confusion_process_jwks_response(resp, jwks_url)
         except Exception as e:

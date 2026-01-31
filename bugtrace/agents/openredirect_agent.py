@@ -14,6 +14,7 @@ from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
 from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.utils.logger import get_logger
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -203,7 +204,7 @@ class OpenRedirectAgent(BaseAgent):
         vectors = []
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 async with session.get(
                     self.url,
                     allow_redirects=False,  # Don't follow - inspect redirect headers
@@ -378,7 +379,7 @@ class OpenRedirectAgent(BaseAgent):
         test_url = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 async with session.get(
                     test_url,
                     allow_redirects=False,  # CRITICAL: Don't follow - inspect redirect
@@ -502,7 +503,7 @@ class OpenRedirectAgent(BaseAgent):
                     test_url = urlunparse(parsed._replace(path=test_path, query=''))
 
                     try:
-                        async with aiohttp.ClientSession() as session:
+                        async with orchestrator.session(DestinationType.TARGET) as session:
                             async with session.get(
                                 test_url,
                                 allow_redirects=False,

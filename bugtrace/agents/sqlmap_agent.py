@@ -162,6 +162,7 @@ from bugtrace.tools.external import external_tools
 from bugtrace.core.ui import dashboard
 from bugtrace.agents.base import BaseAgent
 from bugtrace.core.config import settings
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 
 # Import framework's WAF intelligence (Q-Learning based)
 from bugtrace.tools.waf import waf_fingerprinter, strategy_router, encoding_techniques
@@ -1249,8 +1250,6 @@ class SQLMapAgent(BaseAgent):
         Quick probe to fingerprint DB and detect WAF.
         Uses framework's intelligent WAF fingerprinter.
         """
-        import aiohttp
-
         result = {
             "db_type": DBType.UNKNOWN,
             "waf": None,
@@ -1263,7 +1262,7 @@ class SQLMapAgent(BaseAgent):
             await self._detect_waf(result)
 
             # PHASE 2: Probe for DB fingerprinting and quick vuln check
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 await self._probe_db_and_vuln(session, result)
 
         except Exception as e:
@@ -1577,14 +1576,12 @@ class SQLMapAgent(BaseAgent):
 
     async def _detect_sql_error(self, param: str) -> Optional[Dict]:
         """Detect SQL injection by looking for SQL error messages in response."""
-        import aiohttp
-
         try:
             parsed = urlparse(self.url)
             base_url, existing_params = self._parse_target_url(parsed)
             payloads_to_test = self.test_payloads[:10] if self.test_payloads else self._default_test_payloads()
 
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 req_headers = self._build_error_detection_headers()
                 return await self._test_error_payloads(session, base_url, existing_params, param,
                                                        payloads_to_test, req_headers)

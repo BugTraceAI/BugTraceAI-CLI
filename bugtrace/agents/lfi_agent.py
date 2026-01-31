@@ -9,6 +9,7 @@ from bugtrace.core.ui import dashboard
 from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
 from bugtrace.tools.external import external_tools
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -150,7 +151,7 @@ class LFIAgent(BaseAgent):
         dashboard.log(f"[{self.name}] 🚀 Starting LFI analysis on {self.url}", "INFO")
 
         all_findings = []
-        async with aiohttp.ClientSession() as session:
+        async with orchestrator.session(DestinationType.TARGET) as session:
             for param in self.params:
                 logger.info(f"[{self.name}] Testing LFI on {self.url} (param: {param})")
 
@@ -324,7 +325,7 @@ class LFIAgent(BaseAgent):
                 return self._create_lfi_finding_from_hit(hit, param)
 
             # Fallback to PHP wrappers
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 wrapper_finding = await self._test_php_wrappers(session, param)
                 if wrapper_finding:
                     return wrapper_finding

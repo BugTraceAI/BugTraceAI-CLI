@@ -14,7 +14,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from bugtrace.core.config import settings
-# Lazy import for llm_client to avoid circular or early init issues if possible, 
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+# Lazy import for llm_client to avoid circular or early init issues if possible,
 # but verifying connectivity requires it.
 from bugtrace.core.llm_client import llm_client
 
@@ -133,9 +134,8 @@ class BootSequence:
 
     async def _check_network(self) -> Tuple[str, str]:
         """Simple ping to external world."""
-        import aiohttp
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.LLM) as session:
                 async with session.get("https://openrouter.ai", timeout=3) as resp:
                     return self._evaluate_network_response(resp.status)
         except Exception as e:

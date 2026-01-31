@@ -5,6 +5,7 @@ import aiohttp
 from bugtrace.agents.base import BaseAgent
 from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +57,10 @@ class FileUploadAgent(BaseAgent):
     async def _discover_upload_forms(self) -> List[Dict]:
         """Scrape page for forms containing file inputs."""
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 async with session.get(self.url) as resp:
                     html = await resp.text()
-                    
+
             soup = BeautifulSoup(html, 'html.parser')
             forms = []
             for form in soup.find_all('form'):
@@ -172,18 +173,17 @@ class FileUploadAgent(BaseAgent):
 
     async def _upload_file(self, form, filename, content, content_type) -> Tuple[bool, str, str]:
         """Perform the actual HTTP multipart upload."""
-        import aiohttp
         from urllib.parse import urljoin
-        
+
         action_url = urljoin(self.url, form['action'])
         data = aiohttp.FormData()
         data.add_field(form['input_name'],
                       content,
                       filename=filename,
                       content_type=content_type)
-        
+
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 async with session.post(action_url, data=data) as resp:
                     text = await resp.text()
                     # Heuristic: if it's 200/201
@@ -197,7 +197,7 @@ class FileUploadAgent(BaseAgent):
     async def _validate_execution(self, url: str) -> bool:
         """Check if the uploaded file actually executes code."""
         try:
-            async with aiohttp.ClientSession() as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 return await self._check_execution_markers(session, url)
         except Exception as e:
             logger.debug(f"_validate_execution failed: {e}")

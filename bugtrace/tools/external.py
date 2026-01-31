@@ -9,6 +9,7 @@ from bugtrace.utils.logger import get_logger
 logger = get_logger("tools.external")
 from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
+from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 
 # Security constants for JSON parsing
 MAX_JSON_SIZE = 10_000_000  # 10MB max
@@ -493,6 +494,13 @@ class ExternalToolManager:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             cmd.extend(["--cookie", cookie_str])
 
+        # Optional: Don't follow redirects to catch .env, .htaccess, .git/config leaks
+        # When a sensitive file redirects to 403/404, the original response may contain info
+        from bugtrace.core.config import settings
+        if settings.GOSPIDER_NO_REDIRECT:
+            cmd.append("--no-redirect")
+            logger.info("[GoSpider] No-redirect mode enabled (catching redirect leaks)")
+
         output = await self._run_container("trickest/gospider", cmd)
 
         target_domain = urlparse(url).hostname.lower()
@@ -533,7 +541,6 @@ class ExternalToolManager:
         Returns:
             List of URLs with discovered parameters (e.g., /blog?search=FUZZ)
         """
-        import aiohttp
         from bs4 import BeautifulSoup
 
         param_urls = []
@@ -544,9 +551,7 @@ class ExternalToolManager:
         if cookies:
             cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
-        timeout = aiohttp.ClientTimeout(total=10)
-
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with orchestrator.session(DestinationType.TARGET) as session:
             for form_url in form_urls:
                 try:
                     req_headers = headers.copy()
