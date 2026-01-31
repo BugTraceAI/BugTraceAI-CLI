@@ -1364,7 +1364,8 @@ class HTTPClientOrchestrator:
         Returns:
             Tuple of (status_code, body)
         """
-        self._ensure_started()
+        if not self._started:
+            await self.start()
         return await self._clients[destination].get(url, **kwargs)
 
     async def post(
@@ -1384,7 +1385,8 @@ class HTTPClientOrchestrator:
         Returns:
             Tuple of (status_code, body)
         """
-        self._ensure_started()
+        if not self._started:
+            await self.start()
         return await self._clients[destination].post(url, **kwargs)
 
     async def head(
@@ -1399,7 +1401,8 @@ class HTTPClientOrchestrator:
         Returns:
             HTTP status code (0 for timeout, -1 for error)
         """
-        self._ensure_started()
+        if not self._started:
+            await self.start()
         return await self._clients[destination].head(url, **kwargs)
 
     async def request(
@@ -1415,7 +1418,8 @@ class HTTPClientOrchestrator:
         Returns:
             Tuple of (status_code, body, metrics)
         """
-        self._ensure_started()
+        if not self._started:
+            await self.start()
         return await self._clients[destination].request(method, url, **kwargs)
 
     @asynccontextmanager
@@ -1427,13 +1431,17 @@ class HTTPClientOrchestrator:
         Get raw aiohttp session for custom operations.
 
         Note: Bypass retry and circuit breaker when using raw session.
+        Auto-starts orchestrator if not already started.
 
         Usage:
             async with orchestrator.session(DestinationType.LLM) as session:
                 async with session.post(url, json=data) as resp:
                     result = await resp.json()
         """
-        self._ensure_started()
+        # Auto-start if needed (safe for boot checks and lazy initialization)
+        if not self._started:
+            await self.start()
+
         client = self._clients[destination]
         session = await client._ensure_session()
         yield session
