@@ -87,6 +87,9 @@ class Settings(BaseSettings):
     FP_VOTES_WEIGHT: float = 0.3  # Weight of votes in fp_confidence calc
     FP_EVIDENCE_WEIGHT: float = 0.3  # Weight of evidence quality in fp_confidence calc
 
+    # --- DAST Analysis Timeout (Phase 38: v3.2) ---
+    DAST_ANALYSIS_TIMEOUT: float = 180.0  # Seconds per URL analysis (probes + LLM)
+
     # --- ThinkingConsolidationAgent settings (Phase 18: v2.3) ---
     THINKING_MODE: str = "streaming"  # "streaming" | "batch"
     THINKING_BATCH_SIZE: int = 50  # Max findings per batch in batch mode
@@ -354,6 +357,8 @@ class Settings(BaseSettings):
             self.MAX_CONCURRENT_ANALYSIS = section.getint("MAX_CONCURRENT_ANALYSIS")
         if "MAX_CONCURRENT_SPECIALISTS" in section:
             self.MAX_CONCURRENT_SPECIALISTS = section.getint("MAX_CONCURRENT_SPECIALISTS")
+        if "DAST_ANALYSIS_TIMEOUT" in section:
+            self.DAST_ANALYSIS_TIMEOUT = section.getfloat("DAST_ANALYSIS_TIMEOUT")
         # NOTE: MAX_CONCURRENT_VALIDATION is NOT loaded from config
         # CDP client only supports 1 concurrent session - hardcoded in defaults
 

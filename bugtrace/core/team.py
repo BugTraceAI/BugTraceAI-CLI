@@ -1815,11 +1815,14 @@ class TeamOrchestrator:
                 # FIX v3.1: Timeout INSIDE semaphore - only counts analysis time,
                 # not time waiting for semaphore slot. This ensures ALL URLs get
                 # analyzed even with high concurrency limits.
+                # FIX v3.2: Increased timeout from 120s to configurable value (default 180s)
+                # to allow probes + LLM analysis to complete
+                analysis_timeout = getattr(settings, 'DAST_ANALYSIS_TIMEOUT', 180.0)
                 try:
-                    result = await asyncio.wait_for(dast.run(), timeout=120.0)
+                    result = await asyncio.wait_for(dast.run(), timeout=analysis_timeout)
                     vulns = result.get("vulnerabilities", [])
                 except asyncio.TimeoutError:
-                    logger.warning(f"[DAST] Analysis timed out after 120s: {url[:50]}...")
+                    logger.warning(f"[DAST] Analysis timed out after {analysis_timeout}s: {url[:50]}...")
                     vulns = []
 
                 logger.info(f"[DAST] ✓ Completed ({len(vulns)} findings): {url[:60]}")
