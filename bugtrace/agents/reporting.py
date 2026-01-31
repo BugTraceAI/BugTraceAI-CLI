@@ -909,6 +909,7 @@ class ReportingAgent(BaseAgent):
         self._md_build_header(lines, validated, manual_review, pending)
         self._md_build_validated_findings(lines, validated)
         self._md_build_manual_review(lines, manual_review)
+        self._md_build_pending_findings(lines, pending)  # FIX: Include pending findings in report
 
         # Write file
         with open(path, "w", encoding="utf-8") as f:
@@ -1163,6 +1164,59 @@ class ReportingAgent(BaseAgent):
             if f.get("validator_notes"):
                 lines.append(f"- **AI Notes:** {f.get('validator_notes')}")
             lines.append("")
+
+    def _md_build_pending_findings(self, lines: List[str], pending: List[Dict]):
+        """Build pending findings section of markdown report.
+
+        These are findings detected by specialists but not yet confirmed via CDP.
+        They often represent valid vulnerabilities that require manual verification.
+        """
+        if not pending:
+            return
+
+        lines.append("---\n")
+        lines.append("## Pending Validation (High Confidence)\n")
+        lines.append("> ⚠️ These findings were detected by specialist agents but could not be confirmed via browser automation.")
+        lines.append("> They likely represent valid vulnerabilities. Manual verification recommended.\n")
+
+        # Sort by severity
+        severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+        pending_sorted = sorted(pending, key=lambda x: severity_order.get((x.get("severity") or "HIGH").upper(), 5))
+
+        for i, f in enumerate(pending_sorted, 1):
+            vuln_type = f.get('type', 'Unknown')
+            severity = f.get('severity', 'HIGH').upper()
+            severity_badges = {
+                "CRITICAL": "🔴 CRITICAL",
+                "HIGH": "🟠 HIGH",
+                "MEDIUM": "🟡 MEDIUM",
+                "LOW": "🔵 LOW",
+                "INFO": "⚪ INFO"
+            }
+            severity_badge = severity_badges.get(severity, severity)
+
+            lines.append(f"### P-{i}. {vuln_type}\n")
+            lines.append(f"| Field | Value |")
+            lines.append(f"|-------|-------|")
+            lines.append(f"| **Severity** | {severity_badge} |")
+            lines.append(f"| **Status** | ⏳ PENDING |")
+            lines.append("")
+            lines.append(f"**URL:** `{f.get('url', '')}`")
+            lines.append(f"**Parameter:** `{f.get('parameter', '')}`")
+            lines.append(f"**Payload:** `{f.get('payload', '')}`")
+            lines.append("")
+
+            if f.get("description"):
+                lines.append("#### Description\n")
+                lines.append(f"{f.get('description')}")
+                lines.append("")
+
+            if f.get("validator_notes"):
+                lines.append("#### Validator Notes\n")
+                lines.append(f"{f.get('validator_notes')}")
+                lines.append("")
+
+            lines.append("---\n")
 
     def _copy_html_template(self) -> Path:
         """Copy the static HTML template that loads engagement_data.json."""
