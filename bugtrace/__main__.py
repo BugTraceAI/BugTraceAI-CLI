@@ -1,10 +1,16 @@
+# Apply aiohttp timeout patch FIRST - before any other imports
+# This ensures all ClientSession instances have default timeouts
+import bugtrace.utils.aiohttp_patch  # noqa: F401, E402
+
 import asyncio
+import sys
 import typer
 import warnings
 from typing import Optional
 from datetime import datetime
 from rich.console import Console
 from bugtrace.core.config import settings
+from bugtrace.core.instance_lock import acquire_instance_lock
 from pathlib import Path
 
 # Suppress subprocess cleanup warnings (cosmetic issue only)
@@ -32,6 +38,35 @@ def _save_qlearning_data():
 CONTEXT_SETTINGS = dict(allow_interspersed_args=True)
 app = typer.Typer(context_settings=CONTEXT_SETTINGS, add_completion=False)
 console = Console()
+
+# Commands that don't need instance locking (read-only or special)
+SKIP_LOCK_COMMANDS = {'agents', 'summary', 'mcp'}
+
+
+@app.callback(invoke_without_command=True)
+def main_callback(ctx: typer.Context):
+    """
+    Check for existing BugTraceAI instances before running commands.
+    """
+    # Get the invoked command name
+    command_name = ctx.invoked_subcommand
+
+    # Skip instance check for read-only commands
+    if command_name in SKIP_LOCK_COMMANDS:
+        return
+
+    # Skip if no command was invoked (just `bugtrace` with no args)
+    if command_name is None:
+        return
+
+    # Build command string for lock file
+    command_str = f"bugtrace {command_name}"
+    if len(sys.argv) > 2:
+        command_str = f"bugtrace {' '.join(sys.argv[1:])}"
+
+    # Check for existing instance and acquire lock
+    if not acquire_instance_lock(command_str):
+        raise typer.Exit(code=1)
 
 @app.command(name="scan")
 def scan(
@@ -248,6 +283,7 @@ async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, sc
 
     with Live(dashboard, refresh_per_second=4, screen=True):
         dashboard.active = True
+        dashboard.set_status("Running", "Initializing pipeline...")
 
         # Execute Hunter phase
         orchestrator = None
@@ -450,6 +486,7 @@ def _run_focused_agent_with_dashboard(target: str, params, report_dir: Path, xss
 
     with Live(dashboard, refresh_per_second=4, screen=True):
         dashboard.active = True
+        dashboard.set_status("Running", "Initializing focused agent...")
         result = asyncio.run(_execute_focused_agent(target, params, report_dir, xss, sqli, jwt, lfi, idor, ssrf))
         dashboard.active = False
 
