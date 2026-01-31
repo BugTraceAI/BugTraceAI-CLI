@@ -258,24 +258,25 @@ class SpecialistQueue:
         """
         Wait for rate limit token (token bucket algorithm).
         Tokens replenish at rate_limit/second.
-        """
-        async with self._lock:
-            # Replenish tokens based on elapsed time
-            now = time.monotonic()
-            elapsed = now - self._last_replenish
-            self._tokens = min(self.rate_limit, self._tokens + (elapsed * self.rate_limit))
-            self._last_replenish = now
 
-            # Wait until we have at least 1 token
-            while self._tokens < 1.0:
-                await asyncio.sleep(0.01)  # Small sleep to avoid busy wait
+        IMPORTANT: Sleep happens OUTSIDE the lock to prevent deadlock when
+        multiple coroutines try to enqueue to the same queue simultaneously.
+        """
+        while True:
+            async with self._lock:
+                # Replenish tokens based on elapsed time
                 now = time.monotonic()
                 elapsed = now - self._last_replenish
                 self._tokens = min(self.rate_limit, self._tokens + (elapsed * self.rate_limit))
                 self._last_replenish = now
 
-            # Consume 1 token
-            self._tokens -= 1.0
+                # Check if we have a token available
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return  # Got token, exit
+
+            # No token available - sleep OUTSIDE the lock to allow other coroutines
+            await asyncio.sleep(0.01)
 
 
 class QueueManager:
