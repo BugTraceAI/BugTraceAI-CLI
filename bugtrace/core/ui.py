@@ -63,12 +63,17 @@ class Dashboard:
         """Initialize dashboard state."""
         self.target: str = "Unknown"
         self.phase: str = "IDLE"
-        self.status_msg: str = "Initializing..."
+        self.status_msg: str = "Starting..."
         self.progress_msg: str = "Ready"
         self.logs: List[tuple] = []
         self.findings: List[tuple] = []
         self.active_tasks: Dict[str, Dict] = {}
         self.start_time = datetime.now()
+
+        # Animated spinner for activity indicator
+        self._spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        self._spinner_idx = 0
+        self._last_activity = time.time()
 
         self.credits: float = 0.0
         self.total_requests: int = 0
@@ -114,8 +119,10 @@ class Dashboard:
             self.current_payload = ""
             self.current_agent = ""
             self.phase = "IDLE"
-            self.status_msg = "Initializing..."
+            self.status_msg = "Starting..."
             self.start_time = datetime.now()
+            self._spinner_idx = 0
+            self._last_activity = time.time()
 
     def start_keyboard_listener(self):
         """Start a background thread to listen for q/p keys."""
@@ -280,33 +287,47 @@ class Dashboard:
             cpu = self.cpu_usage
             ram = self.ram_usage
             paused = self.paused
-        
+            # Advance spinner
+            self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
+            spinner_char = self._spinner_frames[self._spinner_idx]
+
+        # Calculate elapsed time
+        elapsed = datetime.now() - self.start_time
+        elapsed_str = str(elapsed).split('.')[0]  # HH:MM:SS without microseconds
+
         if paused:
-            status_text, status_color = "PAUSED", "white dim"
+            status_text, status_color = "⏸ PAUSED", "white dim"
+            spinner_char = "⏸"
         elif "ERROR" in phase:
             status_text, status_color = "ERROR", "bright_red bold"
+            spinner_char = "✗"
         elif phase == "COMPLETE":
             status_text, status_color = "COMPLETE", "bright_green bold"
+            spinner_char = "✓"
         else:
             status_text, status_color = "ACTIVE", "bright_green bold"
-        
+
         cpu_bar = self._get_cpu_ram_bar(cpu)
         ram_bar = self._get_cpu_ram_bar(ram)
         cpu_color = self._get_color_for_percentage(cpu)
         ram_color = self._get_color_for_percentage(ram)
-        
+
         text = Text.assemble(
             ("Agent: ", "white"),
             (agent or "Idle", "bright_magenta bold"),
             (" | Phase: ", "white"),
             (phase, "bright_magenta"),
-            (" | ⚡ ", "white"),
+            (" | ", "white"),
+            (spinner_char, "bright_cyan bold"),
+            (" ", "white"),
             (status_text, status_color),
+            (" | ⏱ ", "white"),
+            (elapsed_str, "bright_cyan"),
             (" | CPU: ", "white"),
-            (f"{cpu:.0f}% ", cpu_color),
+            (f"{cpu:.0f}%", cpu_color),
             (cpu_bar, cpu_color),
             (" | RAM: ", "white"),
-            (f"{ram:.0f}% ", ram_color),
+            (f"{ram:.0f}%", ram_color),
             (ram_bar, ram_color)
         )
         self.layout["header2"].update(text)
@@ -339,7 +360,8 @@ class Dashboard:
             "failed": self.payloads_failed,
             "rate": self.payload_rate,
             "phase": self.phase,
-            "status_msg": self.status_msg
+            "status_msg": self.status_msg,
+            "progress_msg": self.progress_msg
         }
 
     def _get_panel_width(self) -> int:
@@ -352,10 +374,14 @@ class Dashboard:
 
     def _build_status_content(self, data: dict) -> Text:
         """Build status column content."""
+        # Show progress_msg if available, otherwise status_msg
+        status_display = data.get("progress_msg") or data["status_msg"] or "Ready"
+        status_display = status_display[:35] if len(status_display) > 35 else status_display
+
         lines = [
             Text.assemble(("📍 Phase: ", "white"), (data["phase"] or "IDLE", "bright_cyan bold")),
             Text.assemble(("🤖 Agent: ", "white"), (data["agent"] or "Idle", "bright_magenta bold")),
-            Text.assemble(("📊 Status: ", "white"), (data["status_msg"][:30] if data["status_msg"] else "Ready", "bright_yellow")),
+            Text.assemble(("📊 Status: ", "white"), (status_display, "bright_yellow")),
             Text.assemble(("⏱️  Progress: ", "white"), (f"{data['tested']} tested | {data['success']}✓ | {data['failed']}✗", "white dim"))
         ]
         return Text("\n").join(lines)
@@ -389,16 +415,34 @@ class Dashboard:
         return table
 
     def update_log_section(self):
+        # Calculate available lines based on terminal height
+        try:
+            term_height = self.console.size.height
+            term_width = self.console.size.width
+        except Exception:
+            term_height = 24
+            term_width = 120
+
+        # Estimate available lines for log section
+        # Layout: header1(1) + header2(1) + payloads(~5) + tasks(~3) + findings(~5) + footer(1) = ~16 fixed
+        # Remaining goes to log with ratio=2, subtract 2 for panel borders
+        available_lines = max(5, term_height - 18)
+
         with self._lock:
-            recent_logs = self.logs[-5:] if len(self.logs) >= 5 else self.logs
+            recent_logs = self.logs[-available_lines:] if len(self.logs) >= available_lines else self.logs
+
+        # Calculate max message width based on terminal width (account for timestamp, icon, panel borders)
+        max_msg_width = max(40, term_width - 25)
 
         lines = []
         for timestamp, level, msg in recent_logs:
             icon, color = self._get_log_icon_and_color(level, msg)
-            display_msg = str(msg)[:75] + "..." if len(str(msg)) > 75 else str(msg)
+            display_msg = str(msg)[:max_msg_width] + "..." if len(str(msg)) > max_msg_width else str(msg)
             lines.append(Text.assemble((f"[{timestamp}] ", "white dim"), (f"{icon} " if icon else "", color), (display_msg, "white")))
 
-        while len(lines) < 5: lines.append(Text("", style="white"))
+        # Pad to fill available space
+        while len(lines) < available_lines:
+            lines.append(Text("", style="white"))
         content = Text("\n").join(lines)
         panel = Panel(content, title="[bright_yellow bold]📋 LOG[/bright_yellow bold]", border_style="cyan", padding=(0, 1))
         self.layout["log"].update(panel)
