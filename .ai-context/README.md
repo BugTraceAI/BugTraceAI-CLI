@@ -16,6 +16,7 @@ When working with AI assistants on this codebase, you can reference files in thi
 ├── PROJECT_STORYLINE.md           # Development history and evolution
 ├── QUICKSTART_GUIDE.md            # Getting started guide
 ├── report_generation_spec.md      # Report generation specification
+├── DEBUG_SESSION_20260131.md      # Burp comparison debug session
 │
 ├── architecture/                  # Architecture documentation
 │   ├── phases.md                  # Pipeline phase conventions
@@ -38,6 +39,10 @@ When working with AI assistants on this codebase, you can reference files in thi
 ```
 
 ## Key Documents
+
+### Debug Sessions
+
+- **DEBUG_SESSION_20260131.md** - Critical bug fixes found comparing BugTraceAI vs Burp Scanner (5 fixes: timeout architecture, FP threshold, config attribute, report generation)
 
 ### For Understanding the Architecture
 
