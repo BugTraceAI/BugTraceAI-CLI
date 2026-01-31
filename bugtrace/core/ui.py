@@ -62,7 +62,7 @@ class Dashboard:
     def _init_state(self):
         """Initialize dashboard state."""
         self.target: str = "Unknown"
-        self.phase: str = "IDLE"
+        self.phase: str = "🚀 WARMING UP"
         self.status_msg: str = "Starting..."
         self.progress_msg: str = "Ready"
         self.logs: List[tuple] = []
@@ -120,7 +120,7 @@ class Dashboard:
             self.current_payload = ""
             self.current_agent = ""
             self._last_agent = ""
-            self.phase = "IDLE"
+            self.phase = "🚀 WARMING UP"
             self.status_msg = "Starting..."
             self.start_time = datetime.now()
             self._spinner_idx = 0
@@ -307,8 +307,8 @@ class Dashboard:
         elif "ERROR" in phase:
             status_text, status_color = "ERROR", "bright_red bold"
             spinner_char = "✗"
-        elif phase == "COMPLETE":
-            status_text, status_color = "COMPLETE", "bright_green bold"
+        elif "COMPLETE" in phase or "MISSION" in phase:
+            status_text, status_color = "DONE", "bright_green bold"
             spinner_char = "✓"
         else:
             status_text, status_color = "ACTIVE", "bright_green bold"
@@ -323,7 +323,7 @@ class Dashboard:
             agent_display = agent
         elif last_agent:
             agent_display = f"({last_agent})"  # Parentheses indicate "was running"
-        elif phase and phase != "IDLE":
+        elif phase and "WARMING" not in phase:
             agent_display = f"[{phase}]"
         else:
             agent_display = "Initializing..."
