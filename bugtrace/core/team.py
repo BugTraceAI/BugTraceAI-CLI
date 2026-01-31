@@ -178,6 +178,22 @@ class TeamOrchestrator:
             except Exception as e:
                 logger.error(f"Failed to stop ThinkingAgent: {e}")
 
+        # Stop auxiliary agents (v2.6 fix: these were missing from shutdown)
+        auxiliary_agents = [
+            ('chain_discovery_agent', 'ChainDiscoveryAgent'),
+            ('api_security_agent', 'APISecurityAgent'),
+            ('agentic_validator', 'AgenticValidator'),
+        ]
+        for attr_name, display_name in auxiliary_agents:
+            if hasattr(self, attr_name):
+                agent = getattr(self, attr_name)
+                if hasattr(agent, 'stop'):
+                    try:
+                        await agent.stop()
+                        logger.info(f"{display_name} stopped")
+                    except Exception as e:
+                        logger.error(f"Failed to stop {display_name}: {e}")
+
         # Stop specialist workers
         shutdown_tasks = [
             self.sqli_worker_agent.stop_queue_consumer(),

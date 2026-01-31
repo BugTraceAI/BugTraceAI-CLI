@@ -346,6 +346,11 @@ Respond in JSON format:
         """Typically triggered by orchestrator, not continuous."""
         pass
 
+    async def stop(self):
+        """Stop agent and queue processor (v2.6 fix: proper lifecycle management)."""
+        await super().stop()
+        await self.stop_queue_processor()
+
     # =========================================================================
     # Phase 21: Event-Driven Validation (PENDING_VALIDATION filtering)
     # =========================================================================
