@@ -81,3 +81,6 @@ PROJECT_REVIEW_SESSION_*.md
 alembic.ini
 
 # Keep .agent/ and alembic/versions to preserve framework logic and DB schema
+
+# Internal testing/training tools (dojos, benchmarks)
+testing/
