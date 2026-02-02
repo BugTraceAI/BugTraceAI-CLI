@@ -15,6 +15,7 @@ Version: 1.0.0
 """
 
 import asyncio
+import json
 import time
 from typing import Dict, List, Any, Optional, Set
 from collections import OrderedDict
@@ -171,6 +172,46 @@ class DeduplicationCache:
         self._cache: OrderedDict[str, FindingRecord] = OrderedDict()
         self._lock = asyncio.Lock()
 
+    def _normalize_parameter(self, param: str, vuln_type: str) -> str:
+        """
+        Normalize parameter names for better deduplication.
+
+        This prevents duplicate findings caused by inconsistent parameter naming
+        from the LLM (e.g., "POST Body", "POST Body (Stock Check)", "XML Payload").
+
+        Args:
+            param: Raw parameter string from finding
+            vuln_type: Vulnerability type (e.g., "xxe", "sqli")
+
+        Returns:
+            Normalized parameter name
+        """
+        param_lower = param.lower()
+
+        # XXE: Normalize all POST body variations
+        if vuln_type == "xxe":
+            if ("post" in param_lower and "body" in param_lower) or "xml" in param_lower:
+                return "post_body"
+
+        # SQLi: Normalize cookie names (keep just the cookie name)
+        if "cookie:" in param_lower:
+            # Extract cookie name: "Cookie: TrackingId" -> "cookie:trackingid"
+            parts = param_lower.split("cookie:")
+            if len(parts) > 1:
+                cookie_name = parts[1].strip().split()[0]  # Get first word after "cookie:"
+                return f"cookie:{cookie_name}"
+
+        # Header injection: Normalize header names
+        if "header" in param_lower and ":" in param:
+            # "Header: X-Forwarded-For" -> "header:x-forwarded-for"
+            parts = param_lower.split(":", 1)
+            if len(parts) > 1:
+                header_name = parts[1].strip().split()[0]
+                return f"header:{header_name}"
+
+        # Default: return lowercase
+        return param_lower
+
     def _make_key(self, finding: Dict[str, Any]) -> str:
         """
         Create deduplication key from finding.
@@ -180,8 +221,11 @@ class DeduplicationCache:
         Example: "XSS:id:/api/users"
         """
         vuln_type = finding.get("type", "Unknown").lower()
-        parameter = finding.get("parameter", "unknown").lower()
+        parameter_raw = finding.get("parameter", "unknown")
         url = finding.get("url", "")
+
+        # Normalize parameter for better deduplication
+        parameter = self._normalize_parameter(parameter_raw, vuln_type)
 
         # Extract path from URL (remove protocol and domain)
         url_path = url
@@ -192,6 +236,18 @@ class DeduplicationCache:
         # Normalize: remove query params for dedup purposes
         if "?" in url_path:
             url_path = url_path.split("?")[0]
+
+        # GLOBAL PARAMETER CHECK
+        # If the parameter is global (Cookie, Header), the URL path is irrelevant.
+        # Use the host instead to deduplicate across the entire domain.
+        if any(p in parameter for p in ["cookie", "header", "user-agent", "referer", "bearer", "authorization"]):
+            # Extract host
+            from urllib.parse import urlparse
+            try:
+                parsed = urlparse(url)
+                url_path = f"GLOBAL_HOST:{parsed.netloc}"
+            except:
+                url_path = "GLOBAL_HOST:unknown"
 
         return f"{vuln_type}:{parameter}:{url_path}"
 
@@ -266,6 +322,12 @@ class ThinkingConsolidationAgent(BaseAgent):
         )
 
         self.scan_context = scan_context or f"thinking_{id(self)}"
+        self.scan_id: Optional[int] = None  # To be set by TeamOrchestrator for DB access
+        
+        # Determine scan directory for persistence
+        self.scan_dir = None
+        self._queues_dir_cached = None
+        self._queues_initialized = False
 
         # Deduplication cache
         self._dedup_cache = DeduplicationCache(
@@ -291,10 +353,48 @@ class ThinkingConsolidationAgent(BaseAgent):
 
         logger.info(f"[{self.name}] Initialized in {self._mode} mode")
 
+    def _get_queues_dir(self):
+        """Helper to find and ensure queues directory, initializes file queues if needed."""
+        if self._queues_dir_cached:
+            return self._queues_dir_cached
+
+        report_dir = settings.REPORT_DIR
+        found_dir = None
+        
+        # Locate scan directory
+        if report_dir.exists():
+            for p in report_dir.iterdir():
+                if p.is_dir() and self.scan_context in p.name:
+                    found_dir = p
+                    break
+        
+        if not found_dir:
+            # Fallback
+            found_dir = report_dir / f"{settings.APP_NAME}_scan_{self.scan_context}"
+            found_dir.mkdir(parents=True, exist_ok=True)
+            
+        queues_dir = found_dir / "queues"
+        queues_dir.mkdir(exist_ok=True)
+        
+        self._queues_dir_cached = queues_dir
+        
+        # Initialize SpecialistQueues for file tailing
+        if not self._queues_initialized:
+            queue_manager.initialize_file_queues(queues_dir)
+            self._queues_initialized = True
+            
+        return queues_dir
+
     def _setup_event_subscriptions(self):
-        """Subscribe to url_analyzed events from Discovery phase."""
-        self.event_bus.subscribe(EventType.URL_ANALYZED.value, self._handle_url_analyzed)
-        logger.info(f"[{self.name}] Subscribed to {EventType.URL_ANALYZED.value}")
+        """Subscribe to url_analyzed events from Discovery phase.
+
+        NOTE: In v3 sequential pipeline, ThinkingAgent starts AFTER DISCOVERY
+        completes, so this subscription is not used. We process from JSON files
+        instead of real-time events.
+        """
+        # Disable event-driven processing (use batch file processing instead)
+        logger.info(f"[{self.name}] Event subscriptions disabled (batch mode)")
+        # self.event_bus.subscribe(EventType.URL_ANALYZED.value, self._handle_url_analyzed)
 
     def _cleanup_event_subscriptions(self):
         """Unsubscribe from events on shutdown."""
@@ -316,10 +416,12 @@ class ThinkingConsolidationAgent(BaseAgent):
         - scan_context: Context for ordering
         - findings: List of findings with fp_confidence
         - stats: Summary statistics
+        - report_files: Paths to JSON/MD reports (v2.1.0)
         """
         url = data.get("url", "unknown")
         scan_context = data.get("scan_context", self.scan_context)
         findings = data.get("findings", [])
+        report_files = data.get("report_files", {})  # v2.1.0: JSON/MD report paths
 
         logger.info(f"[{self.name}] Processing batch: {len(findings)} findings from {url[:50]}")
 
@@ -328,6 +430,8 @@ class ThinkingConsolidationAgent(BaseAgent):
         if self._mode == "streaming":
             # Process each finding immediately
             for i, finding in enumerate(findings):
+                # Attach report files reference (v2.1.0)
+                finding["_report_files"] = report_files
                 logger.info(f"[{self.name}] Processing finding {i+1}/{len(findings)}: {finding.get('type')}")
                 await self._process_finding(finding, scan_context)
                 logger.info(f"[{self.name}] Completed finding {i+1}/{len(findings)}")
@@ -337,9 +441,10 @@ class ThinkingConsolidationAgent(BaseAgent):
             batch_to_process = None
             async with self._batch_lock:
                 for finding in findings:
-                    # Add scan_context to finding for batch processing
+                    # Add scan_context and report files to finding for batch processing (v2.1.0)
                     finding_with_context = finding.copy()
                     finding_with_context["_scan_context"] = scan_context
+                    finding_with_context["_report_files"] = report_files  # v2.1.0: Attach JSON/MD paths
                     self._batch_buffer.append(finding_with_context)
 
                 # Check if batch is full
@@ -457,6 +562,91 @@ class ThinkingConsolidationAgent(BaseAgent):
 
         return prioritized
 
+        logger.error(
+            f"[{self.name}] Dropped finding: {prioritized.finding.get('type')} -> "
+            f"{specialist} (queue full after {settings.THINKING_BACKPRESSURE_RETRIES} retries)"
+        )
+        return False
+
+    async def _persist_queue_item(self, specialist: str, finding: Dict[str, Any]) -> None:
+        """
+        Persist finding to a file-based queue for durability and auditing.
+        Also appends to the concatenated findings log.
+
+        File structure (v3.1 - XML-like with Base64 encoded JSON for payload integrity):
+        - reports/{scan_id}/queues/{specialist}.queue
+        - reports/{scan_id}/concatenated_findings.queue
+        
+        Format:
+        <QUEUE_ITEM>
+          <TIMESTAMP>1706882445.123</TIMESTAMP>
+          <SPECIALIST>xss</SPECIALIST>
+          <SCAN_CONTEXT>ginandjuice_12345</SCAN_CONTEXT>
+          <FINDING_B64>eyJ0eXBlIjogIlhTUyIsICJwYXlsb2FkIjogIjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD4ifQ==</FINDING_B64>
+        </QUEUE_ITEM>
+        
+        Why Base64? Security payloads often contain characters that break JSON Lines:
+        - Newlines in payloads
+        - Unicode control characters
+        - Nested quotes and escape sequences
+        Base64 guarantees 100% fidelity.
+        """
+        import base64
+        
+        try:
+            # Determine scan report directory
+            # We construct this dynamically based on scan_context
+            # Reuse cached directory logic which ensures file queues are initialized
+            queues_dir = self._get_queues_dir()
+            found_dir = queues_dir.parent
+            
+            # Prepare data - encode finding as Base64 JSON
+            finding_json = json.dumps(finding, ensure_ascii=False, separators=(',', ':'))
+            finding_b64 = base64.b64encode(finding_json.encode('utf-8')).decode('ascii')
+            
+            # Build XML-like queue entry (one block per item)
+            queue_entry = (
+                f"<QUEUE_ITEM>\n"
+                f"  <TIMESTAMP>{time.time()}</TIMESTAMP>\n"
+                f"  <SPECIALIST>{specialist}</SPECIALIST>\n"
+                f"  <SCAN_CONTEXT>{self.scan_context}</SCAN_CONTEXT>\n"
+                f"  <FINDING_B64>{finding_b64}</FINDING_B64>\n"
+                f"</QUEUE_ITEM>\n"
+            )
+
+            # 1. Append to specialist queue file
+            queue_file = queues_dir / f"{specialist}.queue"
+            async with asyncio.Lock(): # Simple lock for file safety
+                with open(queue_file, "a", encoding="utf-8") as f:
+                    f.write(queue_entry)
+
+            # 2. Append to concatenated findings file
+            concat_file = found_dir / "concatenated_findings.queue"
+            async with asyncio.Lock():
+                 with open(concat_file, "a", encoding="utf-8") as f:
+                     f.write(queue_entry)
+
+            # 3. Persist to SQLite Database (if scan_id available)
+            if self.scan_id:
+                try:
+                    from bugtrace.core.database import get_db_manager
+                    db = get_db_manager()
+                    
+                    # Adapt finding data for save_scan_result
+                    # save_scan_result expects a list of findings
+                    # It handles deduplication internally
+                    await asyncio.to_thread(
+                        db.save_scan_result, 
+                        target_url=finding.get("url", "unknown"),
+                        findings=[finding],
+                        scan_id=self.scan_id
+                    )
+                except Exception as db_err:
+                    logger.error(f"[{self.name}] Failed to save finding to DB: {db_err}")
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to persist queue item: {e}")
+
     async def _distribute_to_queue(self, prioritized: PrioritizedFinding) -> bool:
         """
         Distribute a prioritized finding to the appropriate specialist queue.
@@ -469,6 +659,9 @@ class ThinkingConsolidationAgent(BaseAgent):
         Returns:
             True if successfully queued, False if queue full after retries
         """
+        # Persist to file first (Durability)
+        await self._persist_queue_item(prioritized.specialist, prioritized.finding)
+
         specialist = prioritized.specialist
         queue = queue_manager.get_queue(specialist)
 
@@ -732,6 +925,48 @@ class ThinkingConsolidationAgent(BaseAgent):
             await self._process_batch_items(chunk)
             
         return initial_count
+
+    async def process_batch_from_list(
+        self, findings: List[Dict[str, Any]], scan_context: str = None
+    ) -> int:
+        """
+        Process a batch of findings from a Python list (not events).
+
+        This is used for STRATEGY phase batch processing when reading
+        from JSON files instead of URL_ANALYZED events.
+
+        Args:
+            findings: List of finding dictionaries loaded from JSON
+            scan_context: Scan context for tracking
+
+        Returns:
+            Number of findings successfully processed and queued
+        """
+        if not findings:
+            logger.info(f"[{self.name}] No findings to process")
+            return 0
+
+        scan_ctx = scan_context or self.scan_context
+        logger.info(f"[{self.name}] Processing batch of {len(findings)} findings from list")
+
+        # Add scan_context to each finding if missing
+        for finding in findings:
+            if "_scan_context" not in finding:
+                finding["_scan_context"] = scan_ctx
+
+        # Process using existing batch infrastructure
+        # This reuses _process_batch_items which handles:
+        # - FP filtering
+        # - Deduplication
+        # - Classification
+        # - Prioritization
+        # - Queue distribution
+        await self._process_batch_items(findings)
+
+        # Return count of distributed items
+        distributed = self._stats.get("distributed", 0)
+        logger.info(f"[{self.name}] Distributed {distributed} findings to specialist queues")
+        return distributed
 
     async def _batch_processor(self):
         """

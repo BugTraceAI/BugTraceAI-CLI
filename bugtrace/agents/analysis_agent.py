@@ -1,5 +1,6 @@
 import asyncio
 import aiohttp
+import json
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 from loguru import logger
@@ -20,13 +21,14 @@ class DASTySASTAgent(BaseAgent):
     Phase 2 (Part A) of the Sequential Pipeline.
     """
     
-    def __init__(self, url: str, tech_profile: Dict, report_dir: Path, state_manager: Any = None, scan_context: str = None):
+    def __init__(self, url: str, tech_profile: Dict, report_dir: Path, state_manager: Any = None, scan_context: str = None, url_index: int = None):
         super().__init__("DASTySASTAgent", "Security Analysis", agent_id="analysis_agent")
         self.url = url
         self.tech_profile = tech_profile
         self.report_dir = report_dir
         self.state_manager = state_manager
         self.scan_context = scan_context or f"scan_{id(self)}"  # Default scan context
+        self.url_index = url_index  # URL index for numbered reports
 
         # 6 different analysis approaches for maximum coverage
         # 5 core LLM approaches + 1 skeptical approach for early FP elimination
@@ -75,10 +77,18 @@ class DASTySASTAgent(BaseAgent):
             # 5. Emit url_analyzed event (Phase 17: DISC-04)
             await self._emit_url_analyzed(vulnerabilities)
 
+            # Determine base filename based on url_index
+            if self.url_index is not None:
+                base_filename = str(self.url_index)
+            else:
+                # Fallback for compatibility with old calls
+                base_filename = f"vulnerabilities_{self._get_safe_name()}"
+
             return {
                 "url": self.url,
                 "vulnerabilities": vulnerabilities,
-                "report_file": str(self.report_dir / f"vulnerabilities_{self._get_safe_name()}.md"),
+                "json_report_file": str(self.report_dir / f"{base_filename}.json"),
+                "url_index": self.url_index,
                 "fp_stats": {
                     "total_findings": len(vulnerabilities),
                     "high_confidence": len([v for v in vulnerabilities if v.get('fp_confidence', 0) >= 0.7]),
@@ -101,7 +111,11 @@ class DASTySASTAgent(BaseAgent):
                 await phase_ctx.__aexit__(None, None, None)
 
     async def _run_prepare_context(self) -> Dict:
-        """Prepare analysis context with OOB payload and HTML content."""
+        """Prepare analysis context with OOB payload, HTML content, and ACTIVE PROBES.
+
+        IMPROVED (2026-02-01): Now runs active reconnaissance probes BEFORE LLM analysis.
+        This ensures the LLM has CONCRETE evidence about parameter behavior, not just speculation.
+        """
         from bugtrace.tools.interactsh import interactsh_client, get_oob_payload
 
         # Ensure registered (lazy init)
@@ -118,7 +132,8 @@ class DASTySASTAgent(BaseAgent):
                 "callback_url": oob_url,
                 "payload_template": oob_payload,
                 "instructions": "Use this callback URL for Blind XSS/SSRF/RCE testing. If you inject this and it's triggered, we will detect it Out-of-Band."
-            }
+            },
+            "reflection_probes": []  # ADDED: Active recon results
         }
 
         # Fetch HTML Content
@@ -137,7 +152,158 @@ class DASTySASTAgent(BaseAgent):
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to fetch HTML content: {e}")
 
+        # ADDED (2026-02-01): Run active reconnaissance probes
+        if settings.ACTIVE_RECON_PROBES:
+            try:
+                probes = await self._run_reflection_probes()
+                context["reflection_probes"] = probes
+                logger.info(f"[{self.name}] Active recon: {len(probes)} parameters probed")
+            except Exception as e:
+                logger.warning(f"[{self.name}] Active recon probes failed: {e}")
+
         return context
+
+    async def _run_reflection_probes(self) -> List[Dict]:
+        """
+        ADDED (2026-02-01): Active reconnaissance probes.
+
+        Sends an Omni-Probe to each URL parameter and analyzes HOW it reflects.
+        This provides CONCRETE evidence for the LLM instead of speculation.
+
+        Returns:
+            List of probe results with reflection context analysis.
+        """
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        import re
+
+        probes = []
+        marker = settings.OMNI_PROBE_MARKER
+
+        parsed = urlparse(self.url)
+        params = parse_qs(parsed.query)
+
+        if not params:
+            return probes
+
+        # Use orchestrator for lifecycle-tracked connections
+        async with orchestrator.session(DestinationType.TARGET) as session:
+            for param_name in params:
+                try:
+                    # Build probe URL with marker
+                    test_params = {k: v[0] if v else "" for k, v in params.items()}
+                    test_params[param_name] = marker
+                    probe_url = urlunparse((
+                        parsed.scheme, parsed.netloc, parsed.path,
+                        parsed.params, urlencode(test_params), parsed.fragment
+                    ))
+
+                    async with session.get(probe_url, ssl=False, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        html = await resp.text()
+                        status = resp.status
+
+                    # Analyze reflection
+                    probe_result = self._analyze_reflection(param_name, marker, html, status)
+                    probes.append(probe_result)
+
+                    if probe_result["reflects"]:
+                        logger.info(f"[{self.name}] 🔍 {param_name}: {probe_result['context']} (chars survive: {probe_result['chars_survive']})")
+                        dashboard.log(f"[{self.name}] Probe: {param_name} → {probe_result['context']}", "INFO")
+
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Probe failed for {param_name}: {e}")
+                    probes.append({
+                        "parameter": param_name,
+                        "reflects": False,
+                        "context": "error",
+                        "error": str(e)
+                    })
+
+        return probes
+
+    def _analyze_reflection(self, param: str, marker: str, html: str, status: int) -> Dict:
+        """
+        Analyze HOW the marker reflects in the HTML response.
+
+        Detects reflection context:
+        - html_text: Inside HTML body text (XSS possible with <script>)
+        - html_attribute: Inside an attribute (XSS possible with " onmouseover=)
+        - script_block: Inside <script> (XSS possible with ')
+        - url_context: Inside href/src (Open Redirect possible)
+        - no_reflection: Marker not found
+        """
+        import re
+
+        result = {
+            "parameter": param,
+            "reflects": False,
+            "context": "no_reflection",
+            "html_snippet": "",
+            "chars_survive": "",
+            "line_number": None,
+            "status_code": status
+        }
+
+        if marker not in html:
+            return result
+
+        result["reflects"] = True
+
+        # Find the reflection location
+        lines = html.split('\n')
+        for i, line in enumerate(lines, 1):
+            if marker in line:
+                result["line_number"] = i
+                # Extract snippet around marker (100 chars context)
+                idx = line.find(marker)
+                start = max(0, idx - 50)
+                end = min(len(line), idx + len(marker) + 50)
+                result["html_snippet"] = line[start:end].strip()
+                break
+
+        # Detect context
+        # 1. Inside <script> block
+        script_pattern = rf'<script[^>]*>[^<]*{re.escape(marker)}[^<]*</script>'
+        if re.search(script_pattern, html, re.IGNORECASE | re.DOTALL):
+            result["context"] = "script_block"
+        # 2. Inside an attribute
+        elif re.search(rf'["\'][^"\']*{re.escape(marker)}[^"\']*["\']', html):
+            result["context"] = "html_attribute"
+        # 3. Inside href/src (URL context)
+        elif re.search(rf'(?:href|src|action)=["\'][^"\']*{re.escape(marker)}', html, re.IGNORECASE):
+            result["context"] = "url_context"
+        # 4. Plain HTML text
+        else:
+            result["context"] = "html_text"
+
+        # Test which dangerous chars survive
+        # Send follow-up probes with special chars
+        chars_to_test = "<>\"'`"
+        result["chars_survive"] = ""  # Will be populated by follow-up probes
+
+        return result
+
+    async def _probe_char_survival(self, param: str, original_params: Dict, char: str) -> bool:
+        """Test if a specific character survives (not encoded) in the response."""
+        from urllib.parse import urlparse, urlencode, urlunparse
+
+        parsed = urlparse(self.url)
+        test_params = original_params.copy()
+        test_marker = f"{settings.OMNI_PROBE_MARKER}{char}end"
+        test_params[param] = test_marker
+
+        probe_url = urlunparse((
+            parsed.scheme, parsed.netloc, parsed.path,
+            parsed.params, urlencode(test_params), parsed.fragment
+        ))
+
+        try:
+            async with orchestrator.session(DestinationType.TARGET) as session:
+                async with session.get(probe_url, ssl=False, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    html = await resp.text()
+                    # Check if character survives unencoded
+                    return test_marker in html
+        except Exception:
+            return False
 
     async def _run_execute_analyses(self, context: Dict) -> List[Dict]:
         """Execute parallel analyses with all approaches."""
@@ -169,16 +335,91 @@ class DASTySASTAgent(BaseAgent):
 
         return valid_analyses
 
+    def _deduplicate_vulnerabilities(self, vulns: List[Dict]) -> List[Dict]:
+        """
+        Remove duplicate vulnerabilities based on type+normalized_parameter+url.
+
+        This is a safety net deduplication layer that catches duplicates missed
+        by the LLM (e.g., when the LLM generates slightly different parameter names
+        for the same vulnerability).
+
+        Args:
+            vulns: List of vulnerability findings
+
+        Returns:
+            Deduplicated list of findings
+        """
+        if not vulns:
+            return vulns
+
+        seen = {}
+        deduped = []
+
+        def _normalize_param(param: str, vuln_type: str) -> str:
+            """Normalize parameter name for deduplication."""
+            param_lower = param.lower()
+
+            # XXE: Normalize POST body variations
+            if vuln_type.lower() == "xxe":
+                if ("post" in param_lower and "body" in param_lower) or "xml" in param_lower:
+                    return "post_body"
+
+            # SQLi: Normalize cookie names
+            if "cookie:" in param_lower:
+                parts = param_lower.split("cookie:")
+                if len(parts) > 1:
+                    cookie_name = parts[1].strip().split()[0]
+                    return f"cookie:{cookie_name}"
+
+            return param_lower
+
+        for v in vulns:
+            vuln_type = v.get('type', 'Unknown')
+            param_raw = v.get('parameter', 'unknown')
+            url = v.get('url', self.url)
+
+            # Create dedup key with normalized parameter
+            param_normalized = _normalize_param(param_raw, vuln_type)
+            key = (vuln_type.lower(), param_normalized, url)
+
+            if key not in seen:
+                seen[key] = v
+                deduped.append(v)
+            else:
+                # Keep the one with higher fp_confidence
+                existing = seen[key]
+                if v.get('fp_confidence', 0) > existing.get('fp_confidence', 0):
+                    deduped.remove(existing)
+                    deduped.append(v)
+                    seen[key] = v
+
+        if len(vulns) != len(deduped):
+            logger.info(f"[{self.name}] Post-deduplication: {len(vulns)} → {len(deduped)} findings ({len(vulns)-len(deduped)} duplicates removed)")
+
+        return deduped
+
     async def _run_save_results(self, vulnerabilities: List[Dict]):
-        """Save vulnerabilities to state manager and markdown report."""
+        """Save vulnerabilities to state manager, JSON (structured data), and markdown report (human-readable)."""
+        # Apply post-deduplication (safety net for LLM-generated duplicates)
+        vulnerabilities = self._deduplicate_vulnerabilities(vulnerabilities)
+
         logger.info(f"🔍 DASTySAST Result: {len(vulnerabilities)} candidates for {self.url[:50]}")
 
         for v in vulnerabilities:
             self._save_single_vulnerability(v)
 
-        # Save markdown report
-        report_path = self.report_dir / f"vulnerabilities_{self._get_safe_name()}.md"
-        self._save_markdown_report(report_path, vulnerabilities)
+        # Determine base filename
+        if self.url_index is not None:
+            base_filename = str(self.url_index)
+        else:
+            # Fallback for compatibility with old calls
+            base_filename = f"vulnerabilities_{self._get_safe_name()}"
+
+        # Save JSON report ONLY (structured data - 100% robust, no character interpretation)
+        # NOTE: Markdown reports removed in v3.1 - payloads must be preserved exactly
+        # JSON with ensure_ascii=False + indent=2 guarantees no payload corruption
+        json_path = self.report_dir / f"{base_filename}.json"
+        self._save_json_report(json_path, vulnerabilities)
 
         dashboard.log(f"[{self.name}] Found {len(vulnerabilities)} potential vulnerabilities.", "SUCCESS")
 
@@ -808,45 +1049,97 @@ class DASTySASTAgent(BaseAgent):
         return ""
 
     def _approach_build_prompt(self, context: Dict, skill_context: str) -> str:
-        """Build analysis prompt with context."""
-        return f"""Analyze this URL for security vulnerabilities:
+        """Build analysis prompt with context and ACTIVE PROBE RESULTS.
+
+        IMPROVED (2026-02-01): Now includes reflection probe results.
+        The LLM receives CONCRETE evidence about parameter behavior.
+        """
+        # Format reflection probes as evidence section
+        probe_section = self._format_probe_evidence(context.get("reflection_probes", []))
+
+        return f"""Analyze this URL for security vulnerabilities.
 
 URL: {self.url}
 Technology Stack: {self.tech_profile.get('frameworks', [])}
-Page HTML Source (Snippet):
-{context.get('html_content', 'Not available')[:10000]}
 
-REQUIRED ANALYSIS (SURGICAL PRECISION):
-1. Extract ALL parameters from the URL.
-2. For EACH parameter, evaluate if it is a vector for vulnerabilities based on CONCRETE evidence.
-3. Assign a CONFIDENCE SCORE from 0 to 10:
-   - 0-3: Weak - parameter name only, no evidence
-   - 4-5: Low - some patterns but unconfirmed
-   - 6-7: Medium - clear patterns, worth testing
-   - 8-9: High - error messages, unescaped reflection
-   - 10: Confirmed - obvious vulnerability
+=== ACTIVE RECONNAISSANCE RESULTS (MANDATORY EVIDENCE) ===
+{probe_section if probe_section else "No parameters detected in URL."}
 
-4. IMPORTANT: Be skeptical. Real vulnerabilities require concrete evidence. Do NOT report vulnerabilities based solely on parameter names.
-5. Provide a specific 'payload' for the specialist agent. This MUST be a raw, executable string (e.g., specific SQLi injection or XSS script). Do NOT provide a description.
+=== PAGE HTML SOURCE (Snippet) ===
+{context.get('html_content', 'Not available')[:8000]}
+
+=== ANALYSIS RULES (STRICT - NO SMOKE ALLOWED) ===
+
+MANDATORY: Base your analysis ONLY on the probe results above.
+- If a parameter REFLECTS, specify the EXACT context (html_text, html_attribute, script_block, url_context)
+- If characters like < > " ' survive, that is EVIDENCE of XSS potential
+- If NO reflection is detected, you CANNOT claim XSS - the parameter does NOT reflect
+
+CONFIDENCE SCORING (Evidence-Based):
+- 0-3: No probe evidence, speculation only → DO NOT REPORT
+- 4-5: Reflection detected but chars are encoded → Low priority
+- 6-7: Reflection in dangerous context (attribute/script) with some chars surviving
+- 8-9: Reflection with < > " ' all surviving in dangerous context
+- 10: Confirmed execution (script block with unfiltered input)
+
+=== PROHIBITED (Will be rejected) ===
+- "Could be vulnerable" without probe evidence
+- "Potentially exploitable" without concrete context
+- XSS claims on parameters that DO NOT reflect
+- SQLi claims without error response or behavioral evidence
+- Vague descriptions like "try injecting", "test for", "might work"
+
+=== REQUIRED OUTPUT FORMAT ===
+
+For EACH vulnerability, you MUST provide:
+- html_evidence: The EXACT line/snippet where the vulnerability exists (from probe results)
+- xss_context: For XSS, specify ONE OF: html_text, html_attribute, script_block, url_context, none
+- chars_survive: Which special chars survive unencoded (< > " ' `)
 
 OOB Callback: {context.get('oob_info', {}).get('callback_url', 'http://oast.fun')}
 
 {f"=== SPECIALIZED KNOWLEDGE ==={chr(10)}{skill_context}{chr(10)}" if skill_context else ""}
 
-EXAMPLE OUTPUT FORMAT (XML-Like):
+OUTPUT FORMAT (XML):
 <vulnerabilities>
   <vulnerability>
-    <type>SQL Injection</type>
-    <parameter>id</parameter>
-    <confidence_score>7</confidence_score>
-    <reasoning>Numeric ID in path is likely used in raw SQL query</reasoning>
+    <type>XSS (Reflected)</type>
+    <parameter>search</parameter>
+    <confidence_score>8</confidence_score>
+    <xss_context>html_attribute</xss_context>
+    <html_evidence>Line 47: &lt;input value="bugtraceomni7x9z"&gt;</html_evidence>
+    <chars_survive>&lt; &gt; "</chars_survive>
+    <reasoning>Parameter reflects in input value attribute at line 47. Chars &lt; &gt; survive unencoded.</reasoning>
     <severity>High</severity>
-    <payload>' OR 1=1--</payload>
+    <payload>" onfocus=alert(1) autofocus="</payload>
   </vulnerability>
 </vulnerabilities>
 
-Return ONLY valid XML tags. Do not add markdown code blocks.
+Return ONLY valid XML tags. No markdown. No explanations.
 """
+
+    def _format_probe_evidence(self, probes: List[Dict]) -> str:
+        """Format probe results as evidence section for LLM."""
+        if not probes:
+            return ""
+
+        lines = []
+        for p in probes:
+            param = p.get("parameter", "unknown")
+            reflects = p.get("reflects", False)
+            context = p.get("context", "unknown")
+            snippet = p.get("html_snippet", "")
+            line_num = p.get("line_number", "?")
+            status = p.get("status_code", "?")
+
+            if reflects:
+                lines.append(f"✓ {param}: REFLECTS in {context} (line {line_num}, status {status})")
+                if snippet:
+                    lines.append(f"  Snippet: {snippet[:100]}")
+            else:
+                lines.append(f"✗ {param}: NO REFLECTION (status {status})")
+
+        return "\n".join(lines)
 
     def _approach_parse_response(self, response: str) -> Dict:
         """Parse LLM response into vulnerabilities."""
@@ -866,13 +1159,21 @@ Return ONLY valid XML tags. Do not add markdown code blocks.
         try:
             conf = self._parse_confidence_score(parser, vc)
 
+            # Extract payload/exploitation_strategy with HTML unescaping to preserve special chars
+            # (e.g., convert &lt;?xml to <?xml)
+            payload = (
+                parser.extract_tag(vc, "payload", unescape_html=True) or
+                parser.extract_tag(vc, "exploitation_strategy", unescape_html=True) or
+                ""
+            )
+
             return {
                 "type": parser.extract_tag(vc, "type") or "Unknown",
                 "parameter": parser.extract_tag(vc, "parameter") or "unknown",
                 "confidence_score": conf,
                 "reasoning": parser.extract_tag(vc, "reasoning") or "",
                 "severity": parser.extract_tag(vc, "severity") or "Medium",
-                "exploitation_strategy": parser.extract_tag(vc, "payload") or parser.extract_tag(vc, "exploitation_strategy") or ""
+                "exploitation_strategy": payload
             }
         except Exception as ex:
             logger.warning(f"Failed to parse vulnerability entry: {ex}")
@@ -1154,8 +1455,14 @@ Be RUTHLESS. False positives waste resources."""
         """
         Consolidate findings from different approaches using voting/merging.
 
-        Now incorporates skeptical_agent scores to reduce false positives early.
-        Findings with low skeptical_score (<=3) are filtered BEFORE specialist dispatch.
+        IMPROVED (2026-02-01): Technical deduplication - keep the finding with
+        the most precise HTML evidence, not the one that "explains better".
+
+        Evidence quality scoring:
+        - html_evidence field present: +3 points
+        - xss_context specified: +2 points
+        - chars_survive specified: +1 point
+        - probe_validated: +5 points (highest priority)
         """
         merged = {}
         skeptical_data = {}  # Track skeptical scores separately
@@ -1165,6 +1472,23 @@ Be RUTHLESS. False positives waste resources."""
                 return float(val)
             except (ValueError, TypeError):
                 return default
+
+        def _evidence_quality(vuln: Dict) -> int:
+            """Score a finding's evidence quality. Higher = better evidence."""
+            score = 0
+            if vuln.get("probe_validated"):
+                score += 5
+            if vuln.get("html_evidence"):
+                score += 3
+            if vuln.get("xss_context") and vuln.get("xss_context") != "none":
+                score += 2
+            if vuln.get("chars_survive"):
+                score += 1
+            # Bonus for specific reasoning with line numbers
+            reasoning = vuln.get("reasoning", "")
+            if "line" in reasoning.lower() or "snippet" in reasoning.lower():
+                score += 1
+            return score
 
         # First pass: collect all findings
         for analysis in analyses:
@@ -1189,18 +1513,23 @@ Be RUTHLESS. False positives waste resources."""
                         merged[key] = vuln.copy()
                         merged[key]["votes"] = vuln.get("votes", 1)  # Preserve probe's boost
                         merged[key]["confidence_score"] = conf
+                        merged[key]["_evidence_score"] = _evidence_quality(vuln)
                     else:
-                        # If existing is probe_validated, don't overwrite - just add votes
-                        if merged[key].get("probe_validated"):
-                            merged[key]["votes"] += 1
-                            # Keep probe's scores, just add LLM's vote as confirmation
-                        elif vuln.get("probe_validated"):
-                            # New finding is probe-validated, replace existing LLM finding
+                        # TECHNICAL DEDUPLICATION: Keep finding with BETTER EVIDENCE
+                        existing_evidence = merged[key].get("_evidence_score", 0)
+                        new_evidence = _evidence_quality(vuln)
+
+                        if new_evidence > existing_evidence:
+                            # New finding has better evidence - replace but keep vote count
                             old_votes = merged[key].get("votes", 1)
+                            old_conf = merged[key].get("confidence_score", 5)
                             merged[key] = vuln.copy()
-                            merged[key]["votes"] = vuln.get("votes", 1) + old_votes
+                            merged[key]["votes"] = old_votes + 1
+                            merged[key]["confidence_score"] = int((old_conf + conf) / 2)
+                            merged[key]["_evidence_score"] = new_evidence
+                            logger.debug(f"[{self.name}] Dedup: Replaced {key} with better evidence ({new_evidence} > {existing_evidence})")
                         else:
-                            # Both are LLM findings - merge normally
+                            # Existing has better or equal evidence - just add vote
                             merged[key]["votes"] += 1
                             merged[key]["confidence_score"] = int((merged[key]["confidence_score"] + conf) / 2)
 
@@ -1427,11 +1756,26 @@ Return XML:
         - scan_context: Context for ordering guarantees
         - findings: List of findings with fp_confidence
         - stats: Summary statistics
+        - report_files: Paths to JSON and MD reports (v2.1.0)
 
         This event is consumed by:
         - ThinkingConsolidationAgent (Phase 18): For deduplication and queue distribution
         - Dashboard: For real-time progress updates
+
+        v2.1.0: Added report_files to allow specialists to read full payloads from JSON
+        when event payload is truncated (>200 chars).
         """
+        # Determine base filename based on url_index
+        if self.url_index is not None:
+            base_filename = str(self.url_index)
+        else:
+            # Fallback for compatibility with old calls
+            base_filename = f"vulnerabilities_{self._get_safe_name()}"
+
+        # Calculate report file paths
+        json_report_path = str(self.report_dir / f"{base_filename}.json")
+        md_report_path = str(self.report_dir / f"{base_filename}.md")
+
         # Prepare findings payload with essential fields
         findings_payload = []
         for v in vulnerabilities:
@@ -1445,7 +1789,7 @@ Return XML:
                 "votes": v.get("votes", 1),
                 "severity": v.get("severity", "Medium"),
                 "reasoning": v.get("reasoning", "")[:500],  # Truncate for event size
-                "payload": v.get("exploitation_strategy", v.get("payload", ""))[:200],
+                "payload": v.get("exploitation_strategy", v.get("payload", ""))[:200],  # Truncated - full version in JSON
                 "fp_reason": v.get("fp_reason", "")[:200]
             })
 
@@ -1461,6 +1805,11 @@ Return XML:
             },
             "tech_profile": {
                 "frameworks": self.tech_profile.get("frameworks", [])[:5]  # Limit for event size
+            },
+            "report_files": {  # v2.1.0: Allow specialists to read full payloads from JSON
+                "json": json_report_path,
+                "markdown": md_report_path,
+                "url_index": self.url_index  # For correlation with urls.txt
             },
             "timestamp": __import__('time').time()
         }
@@ -1495,21 +1844,113 @@ Return XML:
                 fp_conf = v.get('fp_confidence', 0.5)
                 fp_indicator = '++' if fp_conf >= 0.7 else '+' if fp_conf >= 0.5 else '-'
 
-                content += f"| {v.get('type', 'Unknown')} | {v.get('parameter', 'N/A')} | "
+                # Wrap parameter in code block to preserve special chars
+                param_safe = f"`{v.get('parameter', 'N/A')}`"
+                content += f"| {v.get('type', 'Unknown')} | {param_safe} | "
                 content += f"{fp_conf:.2f} {fp_indicator} | {v.get('skeptical_score', 5)}/10 | "
                 content += f"{v.get('votes', 1)}/5 |\n"
 
             content += "\n## Details\n\n"
 
             for v in vulnerabilities:
-                content += f"### {v.get('type')} on `{v.get('parameter')}`\n\n"
+                # Wrap parameter in code block
+                param_safe = f"`{v.get('parameter', 'N/A')}`"
+                content += f"### {v.get('type')} on {param_safe}\n\n"
                 content += f"- **FP Confidence**: {v.get('fp_confidence', 0.5):.2f}\n"
                 content += f"- **Skeptical Score**: {v.get('skeptical_score', 5)}/10\n"
                 content += f"- **Votes**: {v.get('votes', 1)}/5 approaches\n"
-                content += f"- **Reasoning**: {v.get('reasoning', 'N/A')}\n"
+
+                # Wrap reasoning in code block if it contains payloads/evidence
+                reasoning = v.get('reasoning', 'N/A')
+                content += f"- **Reasoning**: {reasoning}\n"
+
+                # Add payload in code block if present
+                if v.get('payload') or v.get('exploitation_strategy'):
+                    payload = v.get('payload') or v.get('exploitation_strategy')
+                    content += f"- **Payload**: `{payload}`\n"
+
+                # Add evidence in code block if present
+                if v.get('evidence'):
+                    evidence = v.get('evidence')
+                    # If evidence is long, use code fence; otherwise inline code
+                    if len(str(evidence)) > 100:
+                        content += f"- **Evidence**:\n```\n{evidence}\n```\n"
+                    else:
+                        content += f"- **Evidence**: `{evidence}`\n"
+
                 if v.get('fp_reason'):
                     content += f"- **FP Analysis**: {v.get('fp_reason')}\n"
                 content += "\n"
 
         with open(path, "w") as f:
             f.write(content)
+
+    def _save_json_report(self, path: Path, vulnerabilities: List[Dict]):
+        """
+        Saves JSON report with complete structured data for 100% payload preservation.
+
+        This format ensures all special characters in payloads, parameters, and evidence
+        are preserved exactly as-is, without any Markdown interpretation issues.
+        """
+        import time
+
+        # Build complete report structure
+        report = {
+            "metadata": {
+                "url": self.url,
+                "url_index": self.url_index,
+                "scan_context": self.scan_context,
+                "timestamp": time.time(),
+                "tech_profile": {
+                    "frameworks": self.tech_profile.get("frameworks", []),
+                    "libraries": self.tech_profile.get("libraries", []),
+                    "server": self.tech_profile.get("server", ""),
+                    "language": self.tech_profile.get("language", "")
+                }
+            },
+            "statistics": {
+                "total_vulnerabilities": len(vulnerabilities),
+                "high_confidence": len([v for v in vulnerabilities if v.get('fp_confidence', 0) >= 0.7]),
+                "medium_confidence": len([v for v in vulnerabilities if 0.5 <= v.get('fp_confidence', 0) < 0.7]),
+                "low_confidence": len([v for v in vulnerabilities if v.get('fp_confidence', 0) < 0.5]),
+                "by_type": self._count_by_type(vulnerabilities)
+            },
+            "vulnerabilities": []
+        }
+
+        # Add vulnerabilities with all fields preserved
+        for v in vulnerabilities:
+            vuln_data = {
+                "type": v.get("type", "Unknown"),
+                "parameter": v.get("parameter", "N/A"),
+                "fp_confidence": v.get("fp_confidence", 0.5),
+                "skeptical_score": v.get("skeptical_score", 5),
+                "votes": v.get("votes", 1),
+                "severity": v.get("severity", "Medium"),
+                "confidence_score": v.get("confidence_score", 5),
+                "reasoning": v.get("reasoning", ""),
+                "payload": v.get("payload", v.get("exploitation_strategy", "")),
+                "evidence": v.get("evidence", ""),
+                "fp_reason": v.get("fp_reason", ""),
+                "validation_result": v.get("validation_result"),
+                "http_method": v.get("http_method", ""),
+                "url": v.get("url", self.url)
+            }
+
+            # Include any additional fields that might be present
+            for key, value in v.items():
+                if key not in vuln_data:
+                    vuln_data[key] = value
+
+            report["vulnerabilities"].append(vuln_data)
+
+        # Sort vulnerabilities by FP confidence (highest first)
+        report["vulnerabilities"].sort(key=lambda x: x.get('fp_confidence', 0), reverse=True)
+
+        # Save JSON with proper formatting
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
+            logger.debug(f"[{self.name}] Saved JSON report to {path}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to save JSON report to {path}: {e}")

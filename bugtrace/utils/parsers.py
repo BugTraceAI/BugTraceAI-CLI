@@ -1,4 +1,5 @@
 import re
+import html
 from typing import Dict, List, Optional
 
 class XmlParser:
@@ -8,65 +9,72 @@ class XmlParser:
     """
 
     @staticmethod
-    def extract_tag(content: str, tag: str) -> Optional[str]:
+    def extract_tag(content: str, tag: str, unescape_html: bool = False) -> Optional[str]:
         """
         Extracts content between <tag> and </tag>.
-        
+
         Features:
         - Case-insensitive tag matching (<TAG>, <tag>, <Tag>)
         - DOTALL matching (captures content across newlines)
         - Non-greedy matching (finds the first valid block)
         - Strips whitespace from the result
-        
+        - Optional HTML entity decoding (converts &lt; to <, &gt; to >, etc.)
+
         Args:
             content: The full text to search.
             tag: The tag name to look for (without brackets).
-            
+            unescape_html: If True, decode HTML entities in the result.
+                          Use for fields like 'payload' to preserve special characters.
+
         Returns:
             Extracted content string or None if not found.
         """
         if not content:
             return None
-            
+
+        result = None
+
         try:
             # Pattern 1: <tag>(content)</tag>
             # Escape tag to prevent regex injection or flag errors if tag has special chars
             safe_tag = re.escape(tag)
             pattern = f"<{safe_tag}>(.*?)</{safe_tag}>"
             match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
-            
+
             if match:
-                return match.group(1).strip()
+                result = match.group(1).strip()
         except re.error:
             # Fallback if regex fails (e.g. global flags issue)
             pass
-            
+
         # Pattern 2 (Fallback): <tag>(content) - Handles truncated responses
         # Only use if Pattern 1 failed and we see the start tag
-        fallback_pattern = f"<{tag}>((?:(?!<{tag}>).)*)$"
-        # Actually, simpler: just find the LAST occurrence of <tag> and take everything until the next <tag> or end
-        # But for now, let's just use a more targeted fallback
-        if f"<{tag}>" in content.lower() and f"</{tag}>" not in content.lower():
+        if result is None and f"<{tag}>" in content.lower() and f"</{tag}>" not in content.lower():
             start_index = content.lower().rfind(f"<{tag}>") + len(tag) + 2
-            return content[start_index:].strip()
-            
-        return None
+            result = content[start_index:].strip()
+
+        # Apply HTML decoding if requested
+        if result and unescape_html:
+            result = html.unescape(result)
+
+        return result
 
     @staticmethod
-    def extract_tags(content: str, tags: List[str]) -> Dict[str, Optional[str]]:
+    def extract_tags(content: str, tags: List[str], unescape_html: bool = False) -> Dict[str, Optional[str]]:
         """
         Extracts multiple tags from content efficiently.
-        
+
         Args:
             content: The full text to search.
             tags: List of tag names to extract.
-            
+            unescape_html: If True, decode HTML entities in all results.
+
         Returns:
             Dictionary mapping tag names to their extracted content (or None).
         """
         results = {}
         for tag in tags:
-            results[tag] = XmlParser.extract_tag(content, tag)
+            results[tag] = XmlParser.extract_tag(content, tag, unescape_html)
         return results
 
     @staticmethod
