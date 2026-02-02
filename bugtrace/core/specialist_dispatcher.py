@@ -17,7 +17,7 @@ logger = get_logger(__name__)
 async def dispatch_specialists(
     specialist_agents: Dict[str, Any],
     scan_context: str,
-    max_concurrent: int = 3
+    max_concurrent: int
 ) -> Dict[str, Any]:
     """
     Dispatcher with concurrency control: Check queues → Wake specialists → Wait for completion.
@@ -26,8 +26,8 @@ async def dispatch_specialists(
         specialist_agents: Map of queue_name -> agent instance
             Example: {"sqli": SQLiAgent(), "xss": XSSAgent(), ...}
         scan_context: Scan context to pass to specialists
-        max_concurrent: Max specialists executing simultaneously (default: 3)
-                       Values: 1 (sequential), 3 (balanced), 5+ (aggressive)
+        max_concurrent: Max specialists executing simultaneously
+                       (Loaded from bugtraceaicli.conf [PARALLELIZATION] MAX_CONCURRENT_SPECIALISTS)
 
     Returns:
         Dict with dispatch summary:

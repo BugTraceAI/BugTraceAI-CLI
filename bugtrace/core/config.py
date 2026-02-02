@@ -119,8 +119,8 @@ class Settings(BaseSettings):
     WORKER_POOL_EMIT_EVENTS: bool = True  # Emit vulnerability_detected events
 
     # --- Specialist Concurrency Control (Phase 20: WET→DRY) ---
-    SPECIALIST_MAX_CONCURRENT: int = 3  # Max specialists executing simultaneously
-    # Values: 1 (sequential), 3 (balanced, default), 5-10 (aggressive)
+    # REMOVED: SPECIALIST_MAX_CONCURRENT (duplicate of MAX_CONCURRENT_SPECIALISTS)
+    # Use MAX_CONCURRENT_SPECIALISTS from .conf instead (loaded at line 388-389)
 
     # --- Validation Optimization Configuration (Phase 21: v2.3) ---
     VALIDATION_METRICS_ENABLED: bool = True  # Track validation load metrics

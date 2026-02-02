@@ -170,7 +170,7 @@ class TeamOrchestrator:
         }
 
         # Dispatch specialists with concurrency control (dispatcher handles queue checks and specialist startup)
-        max_concurrent = settings.SPECIALIST_MAX_CONCURRENT
+        max_concurrent = settings.MAX_CONCURRENT_SPECIALISTS  # From bugtraceaicli.conf [PARALLELIZATION]
         dispatch_result = await dispatch_specialists(specialist_map, scan_ctx, max_concurrent=max_concurrent)
 
         if dispatch_result["specialists_dispatched"] > 0:
