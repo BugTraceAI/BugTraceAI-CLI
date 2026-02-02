@@ -1,23 +1,82 @@
-# Expert Deduplication Implementation Status - 2026-02-02
+# WET→DRY Two-Phase Processing Implementation Status - 2026-02-02
 
-## ✅ Fully Implemented (12 agents) - 100% COMPLETE
+## Progress Summary
 
-All specialist agents now have **complete expert deduplication** with fingerprint methods and checks:
+**Phase 1 (Simple Agents): ✅ COMPLETE (6/6)**
+**Phase 2 (Complex Agents): ✅ COMPLETE (3/3)**
+**Phase 3 (Global Dedup Agents): ✅ COMPLETE (2/2)**
+**Phase 4 (System Integration): ⏳ PENDING (Testing required)**
 
-| # | Agent | File | Status | Commits |
-|---|-------|------|--------|---------|
-| 1 | XXEAgent | xxe_agent.py | ✅ Complete | 7e7a69f |
-| 2 | SQLiAgent | sqli_agent.py | ✅ Complete | 7e7a69f |
-| 3 | XSSAgent | xss_agent.py | ✅ Complete | 7e7a69f |
-| 4 | SSRFAgent | ssrf_agent.py | ✅ Complete | 7e7a69f |
-| 5 | RCEAgent | rce_agent.py | ✅ Complete | 08a48a6 |
-| 6 | LFIAgent | lfi_agent.py | ✅ Complete | 08a48a6 |
-| 7 | CSTIAgent | csti_agent.py | ✅ Complete | Current |
-| 8 | OpenRedirectAgent | openredirect_agent.py | ✅ Complete | Current |
-| 9 | IDORAgent | idor_agent.py | ✅ Complete | Current |
-| 10 | JWTAgent | jwt_agent.py | ✅ Complete | Current |
-| 11 | PrototypePollutionAgent | prototype_pollution_agent.py | ✅ Complete | Current |
-| 12 | HeaderInjectionAgent | header_injection_agent.py | ✅ Complete | Current |
+**Total Progress: 100% (11/11 specialist agents complete)**
+
+---
+
+## ✅ Phase 1 Complete - Simple Agents (6/6) - 100%
+
+All Phase 1 agents have **complete WET→DRY two-phase processing**:
+
+| # | Agent | File | Status | Compile | Implementation |
+|---|-------|------|--------|---------|----------------|
+| 1 | XXEAgent | xxe_agent.py | ✅ Complete | ✅ OK | Endpoint-based dedup |
+| 2 | IDORAgent | idor_agent.py | ✅ Complete | ✅ OK | Endpoint + resource type |
+| 3 | OpenRedirectAgent | openredirect_agent.py | ✅ Complete | ✅ OK | Param-based |
+| 4 | LFIAgent | lfi_agent.py | ✅ Complete | ✅ OK | Param-based |
+| 5 | RCEAgent | rce_agent.py | ✅ Complete | ✅ OK | Param-based |
+| 6 | SSRFAgent | ssrf_agent.py | ✅ Complete | ✅ OK | Param-based |
+
+**Phase 1 Features Implemented:**
+- ✅ `_dry_findings` attribute in `__init__`
+- ✅ `analyze_and_dedup_queue()` method (Phase A)
+- ✅ `_llm_analyze_and_dedup()` helper
+- ✅ `_fallback_fingerprint_dedup()` helper
+- ✅ `exploit_dry_list()` method (Phase B)
+- ✅ `_generate_specialist_report()` method
+- ✅ Refactored `start_queue_consumer()` (removed infinite loop)
+
+---
+
+## ✅ Phase 2 Complete - Complex Agents (3/3) - 100%
+
+| # | Agent | File | Status | Compile | Implementation |
+|---|-------|------|--------|---------|----------------|
+| 7 | XSSAgent | xss_agent.py | ✅ Complete | ✅ OK | Context-aware dedup |
+| 8 | CSTIAgent | csti_agent.py | ✅ Complete | ✅ OK | Template engine detection |
+| 9 | PrototypePollutionAgent | prototype_pollution_agent.py | ✅ Complete | ✅ OK | JavaScript-specific |
+
+**Phase 2 Features Implemented:**
+- ✅ `_dry_findings` attribute in `__init__`
+- ✅ `analyze_and_dedup_queue()` method (Phase A)
+- ✅ `_llm_analyze_and_dedup()` with agent-specific rules
+- ✅ `_fallback_fingerprint_dedup()` helper
+- ✅ `exploit_dry_list()` method (Phase B)
+- ✅ `_generate_specialist_report()` method
+- ✅ Refactored `start_queue_consumer()` (removed infinite loop)
+
+---
+
+## ✅ Phase 3 Complete - Global Dedup Agents (2/2) - 100%
+
+| # | Agent | File | Status | Compile | Dedup Scope |
+|---|-------|------|--------|---------|-------------|
+| 10 | JWTAgent | jwt_agent.py | ✅ Complete | ✅ OK | Token-based (netloc-only) |
+| 11 | HeaderInjectionAgent | header_injection_agent.py | ✅ Complete | ✅ OK | Header name-only |
+
+**Phase 3 Features Implemented:**
+- ✅ `_dry_findings` attribute in `__init__`
+- ✅ `analyze_and_dedup_queue()` method (Phase A)
+- ✅ `_llm_analyze_and_dedup()` with global dedup rules
+- ✅ `_fallback_fingerprint_dedup()` helper
+- ✅ `exploit_dry_list()` method (Phase B)
+- ✅ `_generate_specialist_report()` method
+- ✅ Refactored `start_queue_consumer()` (removed infinite loop)
+
+---
+
+## Already Complete - SQLiAgent Reference
+
+| # | Agent | File | Status | Notes |
+|---|-------|------|--------|-------|
+| 0 | SQLiAgent | sqli_agent.py | ✅ Complete | Reference implementation |
 
 ---
 

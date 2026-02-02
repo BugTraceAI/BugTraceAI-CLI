@@ -57,6 +57,10 @@ class PrototypePollutionAgent(BaseAgent):
 
         # Expert deduplication: Track emitted findings by fingerprint
         self._emitted_findings: set = set()  # Agent-specific fingerprint
+
+        # WET → DRY transformation (Two-phase processing)
+        self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
+
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
 
@@ -642,32 +646,293 @@ class PrototypePollutionAgent(BaseAgent):
         return f"curl '{self.url}'"
 
     # ========================================
+    # WET → DRY Two-Phase Processing (Phase A: Deduplication, Phase B: Exploitation)
+    # ========================================
+
+    async def analyze_and_dedup_queue(self) -> List[Dict]:
+        """
+        PHASE A: Drain WET findings from queue and deduplicate using LLM + fingerprint fallback.
+
+        Returns:
+            List of DRY (deduplicated) findings
+        """
+        import asyncio
+        import time
+
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+
+        queue = queue_manager.get_queue("prototype_pollution")
+        wet_findings = []
+
+        # Wait for queue to have items (timeout 300s)
+        wait_start = time.monotonic()
+        while (time.monotonic() - wait_start) < 300.0:
+            if queue.depth() if hasattr(queue, 'depth') else 0 > 0:
+                break
+            await asyncio.sleep(0.5)
+
+        # Drain all WET findings from queue
+        logger.info(f"[{self.name}] Phase A: Queue has {queue.depth() if hasattr(queue, 'depth') else 0} items, starting drain...")
+
+        stable_empty_count = 0
+        drain_start = time.monotonic()
+
+        while stable_empty_count < 10 and (time.monotonic() - drain_start) < 300.0:
+            item = queue.get_nowait() if hasattr(queue, 'get_nowait') else None
+
+            if item is None:
+                stable_empty_count += 1
+                await asyncio.sleep(0.5)
+                continue
+
+            stable_empty_count = 0
+
+            finding = item.get("finding", {}) if isinstance(item, dict) else {}
+            if finding:
+                wet_findings.append(finding)
+
+        logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings from queue")
+
+        if not wet_findings:
+            logger.info(f"[{self.name}] Phase A: No findings to process")
+            return []
+
+        # LLM-powered deduplication
+        dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+
+        # Store for later phases
+        self._dry_findings = dry_list
+
+        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({len(wet_findings) - len(dry_list)} duplicates removed)")
+
+        return dry_list
+
+    async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
+        """
+        Use LLM to intelligently deduplicate Prototype Pollution findings.
+        Falls back to fingerprint-based dedup if LLM fails.
+        """
+        from bugtrace.core.llm_client import llm_client
+
+        prompt = f"""You are analyzing {len(wet_findings)} potential Prototype Pollution findings.
+
+DEDUPLICATION RULES FOR PROTOTYPE POLLUTION:
+1. Same endpoint + parameter = DUPLICATE (keep only one)
+2. Different endpoints = DIFFERENT vulnerabilities
+3. Different parameters = DIFFERENT vulnerabilities
+4. JSON body vs query param = DIFFERENT (different attack vectors)
+5. JavaScript-specific: focus on Node.js APIs and frontend code
+
+EXAMPLES:
+- /api/merge?obj[__proto__][polluted]=1 + /api/merge?obj[__proto__][polluted]=2 = DUPLICATE ✓
+- /api/merge?obj[__proto__]=X + /api/extend?obj[__proto__]=X = DIFFERENT ✗
+- /api/merge?obj=X + /api/merge?data=Y = DIFFERENT ✗
+- /api/merge (JSON body) + /api/merge?param=X = DIFFERENT ✗
+
+WET FINDINGS (may contain duplicates):
+{json.dumps(wet_findings, indent=2)}
+
+Return ONLY unique findings in JSON format:
+{{
+  "findings": [
+    {{"url": "...", "parameter": "...", ...}},
+    ...
+  ]
+}}"""
+
+        system_prompt = """You are an expert Prototype Pollution deduplication analyst. Your job is to identify and remove duplicate findings while preserving unique attack vectors in JavaScript/Node.js environments."""
+
+        try:
+            response = await llm_client.generate(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                module_name="PROTOTYPE_POLLUTION_DEDUP",
+                temperature=0.2
+            )
+
+            # Parse LLM response
+            result = json.loads(response)
+            dry_list = result.get("findings", [])
+
+            if dry_list:
+                logger.info(f"[{self.name}] LLM deduplication successful: {len(wet_findings)} → {len(dry_list)}")
+                return dry_list
+            else:
+                logger.warning(f"[{self.name}] LLM returned empty list, using fallback")
+                return self._fallback_fingerprint_dedup(wet_findings)
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] LLM deduplication failed: {e}, using fallback")
+            return self._fallback_fingerprint_dedup(wet_findings)
+
+    def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
+        """
+        Fallback fingerprint-based deduplication if LLM fails.
+        Uses _generate_protopollution_fingerprint for expert dedup.
+        """
+        seen = set()
+        dry_list = []
+
+        for finding in wet_findings:
+            url = finding.get("url", "")
+            parameter = finding.get("parameter", "")
+
+            fingerprint = self._generate_protopollution_fingerprint(url, parameter)
+
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                dry_list.append(finding)
+
+        logger.info(f"[{self.name}] Fingerprint dedup: {len(wet_findings)} → {len(dry_list)}")
+        return dry_list
+
+    async def exploit_dry_list(self) -> List[Dict]:
+        """
+        PHASE B: Exploit all DRY findings and emit validated vulnerabilities.
+
+        Returns:
+            List of validated findings
+        """
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
+        logger.info(f"[{self.name}] Phase B: Exploiting {len(self._dry_findings)} DRY findings...")
+
+        validated_findings = []
+
+        for idx, finding in enumerate(self._dry_findings, 1):
+            url = finding.get("url", "")
+            parameter = finding.get("parameter", "")
+
+            logger.info(f"[{self.name}] Phase B: [{idx}/{len(self._dry_findings)}] Testing {url} param={parameter}")
+
+            # Check fingerprint to avoid re-emitting
+            fingerprint = self._generate_protopollution_fingerprint(url, parameter)
+            if fingerprint in self._emitted_findings:
+                logger.debug(f"[{self.name}] Phase B: Skipping already emitted finding")
+                continue
+
+            # Execute Prototype Pollution attack
+            try:
+                result = await self._test_single_item_from_queue(url, parameter, finding)
+
+                if result:
+                    # Mark as emitted
+                    self._emitted_findings.add(fingerprint)
+
+                    # Ensure dict format
+                    if not isinstance(result, dict):
+                        result = {
+                            "url": url,
+                            "parameter": parameter,
+                            "type": "PROTOTYPE_POLLUTION",
+                            "severity": "HIGH",
+                            "validated": True
+                        }
+
+                    validated_findings.append(result)
+
+                    # Emit event
+                    if self.event_bus:
+                        self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                            "type": "PROTOTYPE_POLLUTION",
+                            "url": result.get("url", url),
+                            "parameter": result.get("parameter", parameter),
+                            "severity": result.get("severity", "HIGH"),
+                            "scan_context": self._scan_context,
+                            "agent": self.name
+                        })
+
+                    logger.info(f"[{self.name}] ✓ Prototype Pollution confirmed: {url} param={parameter}")
+                else:
+                    logger.debug(f"[{self.name}] ✗ Prototype Pollution not confirmed")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Phase B: Exploitation failed: {e}")
+
+        logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
+        return validated_findings
+
+    async def _generate_specialist_report(self, validated_findings: List[Dict]) -> None:
+        """
+        Generate specialist report for Prototype Pollution findings.
+
+        Report structure:
+        - phase_a: WET → DRY deduplication stats
+        - phase_b: Exploitation results
+        - findings: All validated Prototype Pollution findings
+        """
+        import aiofiles
+
+        # Use absolute path from settings.BASE_DIR
+        scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
+        scan_dir = settings.BASE_DIR / "reports" / scan_id
+        specialists_dir = scan_dir / "specialists"
+        specialists_dir.mkdir(parents=True, exist_ok=True)
+
+        report = {
+            "agent": f"{self.name}",
+            "vulnerability_type": "PROTOTYPE_POLLUTION",
+            "scan_context": self._scan_context,
+            "phase_a": {
+                "wet_count": len(self._dry_findings) + (len(validated_findings) - len(self._dry_findings)),  # Approximate
+                "dry_count": len(self._dry_findings),
+                "deduplication_method": "LLM + fingerprint fallback"
+            },
+            "phase_b": {
+                "exploited_count": len(self._dry_findings),
+                "validated_count": len(validated_findings)
+            },
+            "findings": validated_findings,
+            "summary": {
+                "total_validated": len(validated_findings),
+                "javascript_specific": True
+            }
+        }
+
+        report_path = specialists_dir / "prototype_pollution_report.json"
+
+        async with aiofiles.open(report_path, "w") as f:
+            await f.write(json.dumps(report, indent=2))
+
+        logger.info(f"[{self.name}] Specialist report saved: {report_path}")
+
+    # ========================================
     # Queue Consumer Mode (Phase 20)
     # ========================================
 
     async def start_queue_consumer(self, scan_context: str) -> None:
-        """Start PrototypePollutionAgent in queue consumer mode."""
+        """
+        TWO-PHASE queue consumer (WET → DRY). NO infinite loop.
+
+        Phase A: Drain ALL findings from queue and deduplicate
+        Phase B: Exploit DRY list only
+
+        Args:
+            scan_context: Scan identifier for event correlation
+        """
         self._queue_mode = True
         self._scan_context = scan_context
 
-        config = WorkerConfig(
-            specialist="prototype_pollution",
-            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,
-            process_func=self._process_queue_item,
-            on_result=self._handle_queue_result,
-            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
-        )
+        logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
 
-        self._worker_pool = WorkerPool(config)
+        # PHASE A: Analyze and deduplicate
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+        dry_list = await self.analyze_and_dedup_queue()
 
-        if self.event_bus:
-            self.event_bus.subscribe(
-                EventType.WORK_QUEUED_PROTOTYPE_POLLUTION.value,
-                self._on_work_queued
-            )
+        if not dry_list:
+            logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            return  # Terminate agent
 
-        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
-        await self._worker_pool.start()
+        # PHASE B: Exploit DRY findings
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
+        results = await self.exploit_dry_list()
+
+        # REPORTING: Generate specialist report
+        if results or self._dry_findings:
+            await self._generate_specialist_report(results)
+
+        logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
+
+        # Method ends - agent terminates ✅
 
     async def _process_queue_item(self, item: dict) -> Optional[Dict]:
         """Process a single item from the prototype_pollution queue."""

@@ -220,6 +220,9 @@ class XSSAgent(BaseAgent):
         # Expert deduplication: Track emitted findings by fingerprint
         self._emitted_findings: set = set()  # (url, param, context)
 
+        # WET → DRY transformation (Two-phase processing)
+        self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
+
     def _get_snippet(self, text: str, target: str, max_len: int = 200) -> str:
         """Extract snippet around the target string."""
         idx = text.find(target)
@@ -927,41 +930,125 @@ class XSSAgent(BaseAgent):
                 logger.debug(f"Header injection testing failed: {e}")
 
     # =========================================================================
-    # Queue Consumption Mode (Phase 19)
+    # Queue Consumption Mode (Phase 19) - WET→DRY
     # =========================================================================
 
+    async def analyze_and_dedup_queue(self) -> List[Dict]:
+        import asyncio, time
+        from bugtrace.core.queue import queue_manager
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+        queue = queue_manager.get_queue("xss")
+        wet_findings = []
+        wait_start = time.monotonic()
+        while (time.monotonic() - wait_start) < 300.0:
+            if queue.depth() if hasattr(queue, 'depth') else 0 > 0:
+                break
+            await asyncio.sleep(0.5)
+        else:
+            return []
+        empty_count = 0
+        while empty_count < 10:
+            item = await queue.dequeue(timeout=0.5)
+            if item is None:
+                empty_count += 1
+                await asyncio.sleep(0.5)
+                continue
+            empty_count = 0
+            finding = item.get("finding", {})
+            if finding.get("url") and finding.get("parameter"):
+                wet_findings.append({"url": finding["url"], "parameter": finding["parameter"], "context": finding.get("context","html"), "finding": finding, "scan_context": item.get("scan_context", self._scan_context)})
+        logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings")
+        if not wet_findings:
+            return []
+        try:
+            dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+        except:
+            dry_list = self._fallback_fingerprint_dedup(wet_findings)
+        self._dry_findings = dry_list
+        logger.info(f"[{self.name}] Phase A: {len(wet_findings)} WET → {len(dry_list)} DRY ({len(wet_findings)-len(dry_list)} duplicates removed)")
+        return dry_list
+
+    async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
+        from bugtrace.core.llm_client import llm_client
+        import json
+        response = await llm_client.generate(
+            prompt=f"Deduplicate {len(wet_findings)} XSS findings. Same URL+param+context=DUPLICATE. Different context=DIFFERENT (HTML vs JS). Return JSON: {{\"findings\":[...]}}. WET: {json.dumps(wet_findings, indent=2)}",
+            system_prompt="Expert XSS context-aware deduplication analyst.",
+            module_name="XSS_DEDUP",
+            temperature=0.2
+        )
+        try:
+            return json.loads(response).get("findings", wet_findings)
+        except:
+            return self._fallback_fingerprint_dedup(wet_findings)
+
+    def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
+        seen, dry_list = set(), []
+        for f in wet_findings:
+            fp = self._generate_xss_fingerprint(f.get("url",""), f.get("parameter",""), f.get("context","html"))
+            if fp not in seen:
+                seen.add(fp)
+                dry_list.append(f)
+        return dry_list
+
+    async def exploit_dry_list(self) -> List[Dict]:
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting {len(self._dry_findings)} DRY findings =====")
+        validated = []
+        for idx, f in enumerate(self._dry_findings, 1):
+            try:
+                self.url = f["url"]
+                result = await self._test_single_param_from_queue(f["url"], f["parameter"], f.get("finding",{}))
+                if result and result.get("validated"):
+                    validated.append(result)
+                    fp = self._generate_xss_fingerprint(f["url"], f["parameter"], result.get("context","html"))
+                    if fp not in self._emitted_findings:
+                        self._emitted_findings.add(fp)
+                        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+                            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                                "specialist": "xss",
+                                "finding": {"type": "XSS", "url": result.get("url"), "parameter": result.get("parameter"), "payload": result.get("payload"), "context": result.get("context")},
+                                "status": result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value),
+                                "validation_requires_cdp": result.get("status") == ValidationStatus.PENDING_VALIDATION.value,
+                                "scan_context": self._scan_context,
+                            })
+                        logger.info(f"[{self.name}] ✅ Emitted unique XSS: {f['url']}?{f['parameter']} (context: {result.get('context','html')})")
+            except Exception as e:
+                logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: {e}")
+        logger.info(f"[{self.name}] Phase B complete: {len(validated)} validated")
+        return validated
+
+    async def _generate_specialist_report(self, findings: List[Dict]) -> str:
+        import json, aiofiles
+        from datetime import datetime
+        from bugtrace.core.config import settings
+        scan_dir = settings.BASE_DIR / "reports" / self._scan_context.split("/")[-1]
+        (scan_dir / "specialists").mkdir(parents=True, exist_ok=True)
+        report_path = scan_dir / "specialists" / "xss_report.json"
+        async with aiofiles.open(report_path, 'w') as f:
+            await f.write(json.dumps({
+                "agent": self.name,
+                "timestamp": datetime.now().isoformat(),
+                "scan_context": self._scan_context,
+                "phase_a": {"wet_count": len(self._dry_findings), "dry_count": len(self._dry_findings), "dedup_method": "llm_context_aware"},
+                "phase_b": {"validated_count": len([x for x in findings if x.get("validated")]), "total_findings": len(findings)},
+                "findings": findings
+            }, indent=2))
+        logger.info(f"[{self.name}] Report saved: {report_path}")
+        return str(report_path)
+
     async def start_queue_consumer(self, scan_context: str) -> None:
-        """
-        Start XSSAgent in queue consumer mode.
-
-        Spawns a worker pool that consumes from the xss queue and
-        processes findings in parallel.
-
-        Args:
-            scan_context: Scan identifier for event correlation
-        """
+        """TWO-PHASE queue consumer (WET → DRY). Context-aware dedup. NO infinite loop."""
         self._queue_mode = True
         self._scan_context = scan_context
-
-        # Configure worker pool
-        config = WorkerConfig(
-            specialist="xss",
-            pool_size=settings.WORKER_POOL_XSS_SIZE,
-            process_func=self._process_queue_item,
-            on_result=self._handle_queue_result,
-            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
-        )
-
-        self._worker_pool = WorkerPool(config)
-
-        # Subscribe to work_queued_xss events (optional notification)
-        self.event_bus.subscribe(
-            EventType.WORK_QUEUED_XSS.value,
-            self._on_work_queued
-        )
-
-        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
-        await self._worker_pool.start()
+        logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+        dry_list = await self.analyze_and_dedup_queue()
+        if not dry_list:
+            logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            return
+        results = await self.exploit_dry_list()
+        if results or self._dry_findings:
+            await self._generate_specialist_report(results)
+        logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
     async def stop_queue_consumer(self) -> None:
         """Stop queue consumer mode gracefully."""

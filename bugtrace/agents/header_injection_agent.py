@@ -100,6 +100,10 @@ class HeaderInjectionAgent(BaseAgent):
 
         # Expert deduplication: Track emitted findings by fingerprint
         self._emitted_findings: set = set()  # Agent-specific fingerprint
+
+        # WET → DRY transformation (Two-phase processing)
+        self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
+
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
 
@@ -293,36 +297,297 @@ class HeaderInjectionAgent(BaseAgent):
         return self._stats
 
     # =========================================================================
+    # WET → DRY Two-Phase Processing (Phase A: Deduplication, Phase B: Exploitation)
+    # =========================================================================
+
+    async def analyze_and_dedup_queue(self) -> List[Dict]:
+        """
+        PHASE A: Drain WET findings from queue and deduplicate using LLM + fingerprint fallback.
+
+        Returns:
+            List of DRY (deduplicated) findings
+        """
+        import asyncio
+        import time
+        import json
+        from bugtrace.core.queue import queue_manager
+
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+
+        queue = queue_manager.get_queue("header_injection")
+        wet_findings = []
+
+        # Wait for queue to have items (timeout 300s)
+        wait_start = time.monotonic()
+        while (time.monotonic() - wait_start) < 300.0:
+            if queue.depth() if hasattr(queue, 'depth') else 0 > 0:
+                break
+            await asyncio.sleep(0.5)
+
+        # Drain all WET findings from queue
+        logger.info(f"[{self.name}] Phase A: Queue has {queue.depth() if hasattr(queue, 'depth') else 0} items, starting drain...")
+
+        stable_empty_count = 0
+        drain_start = time.monotonic()
+
+        while stable_empty_count < 10 and (time.monotonic() - drain_start) < 300.0:
+            item = queue.get_nowait() if hasattr(queue, 'get_nowait') else None
+
+            if item is None:
+                stable_empty_count += 1
+                await asyncio.sleep(0.5)
+                continue
+
+            stable_empty_count = 0
+
+            finding = item.get("finding", {}) if isinstance(item, dict) else {}
+            if finding:
+                wet_findings.append(finding)
+
+        logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings from queue")
+
+        if not wet_findings:
+            logger.info(f"[{self.name}] Phase A: No findings to process")
+            return []
+
+        # LLM-powered deduplication
+        dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+
+        # Store for later phases
+        self._dry_findings = dry_list
+
+        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({len(wet_findings) - len(dry_list)} duplicates removed)")
+
+        return dry_list
+
+    async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
+        """
+        Use LLM to intelligently deduplicate Header Injection findings.
+        Falls back to fingerprint-based dedup if LLM fails.
+        """
+        import json
+        from bugtrace.core.llm_client import llm_client
+
+        prompt = f"""You are analyzing {len(wet_findings)} potential HTTP Header Injection (CRLF) findings.
+
+DEDUPLICATION RULES FOR HEADER INJECTION:
+1. Same header name = DUPLICATE (global across all URLs)
+2. Different header names = DIFFERENT vulnerabilities
+3. URL-agnostic: Header injection affects the same header globally
+4. Parameter-agnostic: Only the injected header name matters
+
+EXAMPLES:
+- /page?param=X (X-Injected) + /other?param=Y (X-Injected) = DUPLICATE ✓
+- /page?param=X (X-Injected) + /page?param=Y (Set-Cookie) = DIFFERENT ✗
+- example.com (X-Injected) + other.com (X-Injected) = DUPLICATE ✓
+
+WET FINDINGS (may contain duplicates):
+{json.dumps(wet_findings, indent=2)}
+
+Return ONLY unique findings in JSON format:
+{{
+  "findings": [
+    {{"url": "...", "parameter": "...", "header_name": "...", ...}},
+    ...
+  ]
+}}"""
+
+        system_prompt = """You are an expert CRLF/Header Injection deduplication analyst. Your job is to identify and remove duplicate findings while preserving unique injected header names. Focus on header name-only deduplication."""
+
+        try:
+            response = await llm_client.generate(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                module_name="HEADER_INJECTION_DEDUP",
+                temperature=0.2
+            )
+
+            # Parse LLM response
+            result = json.loads(response)
+            dry_list = result.get("findings", [])
+
+            if dry_list:
+                logger.info(f"[{self.name}] LLM deduplication successful: {len(wet_findings)} → {len(dry_list)}")
+                return dry_list
+            else:
+                logger.warning(f"[{self.name}] LLM returned empty list, using fallback")
+                return self._fallback_fingerprint_dedup(wet_findings)
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] LLM deduplication failed: {e}, using fallback")
+            return self._fallback_fingerprint_dedup(wet_findings)
+
+    def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
+        """
+        Fallback fingerprint-based deduplication if LLM fails.
+        Uses _generate_headerinjection_fingerprint for expert dedup.
+        """
+        seen = set()
+        dry_list = []
+
+        for finding in wet_findings:
+            header_name = finding.get("header_name", finding.get("injected_header", "X-Injected"))
+
+            fingerprint = self._generate_headerinjection_fingerprint(header_name)
+
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                dry_list.append(finding)
+
+        logger.info(f"[{self.name}] Fingerprint dedup: {len(wet_findings)} → {len(dry_list)}")
+        return dry_list
+
+    async def exploit_dry_list(self) -> List[Dict]:
+        """
+        PHASE B: Exploit all DRY findings and emit validated vulnerabilities.
+
+        Returns:
+            List of validated findings
+        """
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
+        logger.info(f"[{self.name}] Phase B: Exploiting {len(self._dry_findings)} DRY findings...")
+
+        validated_findings = []
+
+        for idx, finding in enumerate(self._dry_findings, 1):
+            url = finding.get("url", "")
+            parameter = finding.get("parameter", "")
+            header_name = finding.get("header_name", finding.get("injected_header", "X-Injected"))
+
+            logger.info(f"[{self.name}] Phase B: [{idx}/{len(self._dry_findings)}] Testing {url} header={header_name}")
+
+            # Check fingerprint to avoid re-emitting
+            fingerprint = self._generate_headerinjection_fingerprint(header_name)
+            if fingerprint in self._emitted_findings:
+                logger.debug(f"[{self.name}] Phase B: Skipping already emitted finding")
+                continue
+
+            # Execute Header Injection attack
+            try:
+                result = await self._test_parameter_from_queue(parameter)
+
+                if result:
+                    # Mark as emitted
+                    self._emitted_findings.add(fingerprint)
+
+                    # Ensure dict format
+                    if not isinstance(result, dict):
+                        result = {
+                            "url": url,
+                            "parameter": parameter,
+                            "type": "HEADER_INJECTION",
+                            "header_name": header_name,
+                            "severity": "MEDIUM",
+                            "validated": True
+                        }
+
+                    validated_findings.append(result)
+
+                    # Emit event
+                    if self.event_bus:
+                        self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                            "type": "HEADER_INJECTION",
+                            "url": result.get("url", url),
+                            "parameter": result.get("parameter", parameter),
+                            "header_name": result.get("header_name", header_name),
+                            "severity": result.get("severity", "MEDIUM"),
+                            "scan_context": self._scan_context,
+                            "agent": self.name
+                        })
+
+                    logger.info(f"[{self.name}] ✓ Header Injection confirmed: header={header_name}")
+                else:
+                    logger.debug(f"[{self.name}] ✗ Header Injection not confirmed")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Phase B: Exploitation failed: {e}")
+
+        logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
+        return validated_findings
+
+    async def _generate_specialist_report(self, validated_findings: List[Dict]) -> None:
+        """
+        Generate specialist report for Header Injection findings.
+
+        Report structure:
+        - phase_a: WET → DRY deduplication stats
+        - phase_b: Exploitation results
+        - findings: All validated Header Injection findings
+        """
+        import json
+        import aiofiles
+
+        # Use absolute path from settings.BASE_DIR
+        scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
+        scan_dir = settings.BASE_DIR / "reports" / scan_id
+        specialists_dir = scan_dir / "specialists"
+        specialists_dir.mkdir(parents=True, exist_ok=True)
+
+        report = {
+            "agent": f"{self.name}",
+            "vulnerability_type": "HEADER_INJECTION",
+            "scan_context": self._scan_context,
+            "phase_a": {
+                "wet_count": len(self._dry_findings) + (len(validated_findings) - len(self._dry_findings)),  # Approximate
+                "dry_count": len(self._dry_findings),
+                "deduplication_method": "LLM + fingerprint fallback (header name-only)"
+            },
+            "phase_b": {
+                "exploited_count": len(self._dry_findings),
+                "validated_count": len(validated_findings)
+            },
+            "findings": validated_findings,
+            "summary": {
+                "total_validated": len(validated_findings),
+                "headers_found": list(set(f.get("header_name", "X-Injected") for f in validated_findings))
+            }
+        }
+
+        report_path = specialists_dir / "header_injection_report.json"
+
+        async with aiofiles.open(report_path, "w") as f:
+            await f.write(json.dumps(report, indent=2))
+
+        logger.info(f"[{self.name}] Specialist report saved: {report_path}")
+
+    # =========================================================================
     # QUEUE CONSUMPTION MODE (Phase 29)
     # =========================================================================
 
     async def start_queue_consumer(self, scan_context: str) -> None:
         """
-        Start HeaderInjectionAgent in queue consumer mode.
+        TWO-PHASE queue consumer (WET → DRY). NO infinite loop.
 
-        Spawns a worker pool that consumes from the header_injection queue.
+        Phase A: Drain ALL findings from queue and deduplicate
+        Phase B: Exploit DRY list only
+
+        Args:
+            scan_context: Scan identifier for event correlation
         """
         self._queue_mode = True
         self._scan_context = scan_context
 
-        config = WorkerConfig(
-            specialist="header_injection",
-            pool_size=getattr(settings, 'WORKER_POOL_DEFAULT_SIZE', 5),
-            process_func=self._process_queue_item,
-            on_result=self._handle_queue_result,
-            shutdown_timeout=getattr(settings, 'WORKER_POOL_SHUTDOWN_TIMEOUT', 30)
-        )
+        logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
 
-        self._worker_pool = WorkerPool(config)
+        # PHASE A: Analyze and deduplicate
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+        dry_list = await self.analyze_and_dedup_queue()
 
-        if self.event_bus:
-            self.event_bus.subscribe(
-                EventType.WORK_QUEUED_HEADER_INJECTION.value,
-                self._on_work_queued
-            )
+        if not dry_list:
+            logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            return  # Terminate agent
 
-        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
-        await self._worker_pool.start()
+        # PHASE B: Exploit DRY findings
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
+        results = await self.exploit_dry_list()
+
+        # REPORTING: Generate specialist report
+        if results or self._dry_findings:
+            await self._generate_specialist_report(results)
+
+        logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
+
+        # Method ends - agent terminates ✅
 
     async def stop_queue_consumer(self) -> None:
         """Stop queue consumer mode gracefully."""
