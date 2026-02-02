@@ -40,6 +40,9 @@ class RCEAgent(BaseAgent):
         self._queue_mode = False
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
+
+        # Expert deduplication: Track emitted findings by fingerprint
+        self._emitted_findings: set = set()  # (url, param)
         
     def _get_time_payloads(self) -> list:
         """Get time-based RCE payloads."""
@@ -223,6 +226,29 @@ class RCEAgent(BaseAgent):
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
+    def _generate_rce_fingerprint(self, url: str, parameter: str) -> tuple:
+        """
+        Generate RCE finding fingerprint for expert deduplication.
+
+        RCE is URL-specific and parameter-specific.
+
+        Args:
+            url: Target URL
+            parameter: Parameter name
+
+        Returns:
+            Tuple fingerprint for deduplication
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        normalized_path = parsed.path.rstrip('/')
+
+        # RCE signature: (host, path, parameter)
+        fingerprint = ("RCE", parsed.netloc, normalized_path, parameter.lower())
+
+        return fingerprint
+
     async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
         """
         Handle completed queue item processing.
@@ -251,6 +277,16 @@ class RCEAgent(BaseAgent):
                 needs_cdp = True
                 if status == "VALIDATED_CONFIRMED":
                     status = ValidationStatus.PENDING_VALIDATION.value
+
+        # EXPERT DEDUPLICATION: Check if we already emitted this finding
+        fingerprint = self._generate_rce_fingerprint(result.get("url", ""), result.get("parameter", ""))
+
+        if fingerprint in self._emitted_findings:
+            logger.info(f"[{self.name}] Skipping duplicate RCE finding: {result.get('url')}?{result.get('parameter')} (already reported)")
+            return
+
+        # Mark as emitted
+        self._emitted_findings.add(fingerprint)
 
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
