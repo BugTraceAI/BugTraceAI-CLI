@@ -53,7 +53,8 @@ from bugtrace.core.http_manager import http_manager
 # Phase-specific semaphores (v2.4)
 from bugtrace.core.phase_semaphores import (
     phase_semaphores, ScanPhase,
-    get_exploitation_semaphore, get_analysis_semaphore, get_validation_semaphore
+    get_exploitation_semaphore, get_analysis_semaphore, get_validation_semaphore,
+    get_reporting_semaphore
 )
 
 # Batch metrics (v3.1)
@@ -263,6 +264,11 @@ class TeamOrchestrator:
 
         # Initialize state
         self.processed_urls = set()
+
+        # Inject scan_id into ThinkingConsolidationAgent for DB persistence
+        if hasattr(self, 'thinking_agent'):
+            self.thinking_agent.scan_id = self.scan_id
+            logger.info(f"Injected Scan ID {self.scan_id} into ThinkingConsolidationAgent")
         self.url_queue = []
         self.vulnerabilities_by_url: Dict[str, list] = {}
 
@@ -408,17 +414,6 @@ class TeamOrchestrator:
         if not self.resume:
             self.state_manager.clear()
 
-        # Start specialist worker pools (async initialization)
-        if not self._specialist_workers_started:
-            await self._init_specialist_workers()
-            self._specialist_workers_started = True
-            logger.info("Specialist worker pools initialized")
-
-        # Start ThinkingConsolidationAgent for batch processing
-        if hasattr(self.thinking_agent, 'start'):
-            asyncio.create_task(self.thinking_agent.start())
-            logger.info("ThinkingConsolidationAgent started for batch processing")
-
         # Authentication phase
         await self._handle_authentication()
 
@@ -482,10 +477,12 @@ class TeamOrchestrator:
             report_dir = self._create_report_directory()
             url_folders = self._create_url_folders(report_dir, urls_scanned)
             linked_screenshots = self._organize_artifacts(findings, url_folders, report_dir)
+            # Cleanup unlinked screenshots
             self._cleanup_unlinked_screenshots(linked_screenshots)
 
             # Generate AI report
-            await self._invoke_reporting_agent(findings, urls_scanned, metadata, report_dir)
+            async with get_reporting_semaphore():
+                await self._invoke_reporting_agent(findings, urls_scanned, metadata, report_dir)
 
             # Cleanup redundant folders
             self._cleanup_redundant_folders(report_dir)
@@ -496,8 +493,8 @@ class TeamOrchestrator:
             logger.critical(f"[ReportingAgent] ⏳ CRASH DETECTED: Report generation exceeded timeout. Killing tool. Error: {e}")
         except Exception as e:
             logger.error(f"Failed to generate vertical report: {e}", exc_info=True)
-            import traceback
-            logger.debug(traceback.format_exc())
+            # import traceback
+            # logger.debug(traceback.format_exc())
             dashboard.log(f"❌ Report generation failed: {e}", "ERROR")
 
     def _create_report_directory(self) -> Path:
@@ -559,10 +556,34 @@ class TeamOrchestrator:
             linked_screenshots.add(original_name)
 
     def _write_finding_details(self, target_folder: Path, finding: dict):
-        """Write finding details to JSON file."""
-        with open(target_folder / "finding_details.json", "a") as fd:
-            import json
-            fd.write(json.dumps(finding, default=str) + "\n")
+        """Write finding details using XML-like format with Base64 for payload integrity.
+        
+        Format (v3.1):
+        <FINDING>
+          <TIMESTAMP>...</TIMESTAMP>
+          <TYPE>...</TYPE>  
+          <DATA_B64>base64_encoded_json</DATA_B64>
+        </FINDING>
+        """
+        import json
+        import base64
+        import time
+        
+        # Encode finding as Base64 JSON to preserve all payload characters
+        finding_json = json.dumps(finding, default=str, ensure_ascii=False)
+        finding_b64 = base64.b64encode(finding_json.encode('utf-8')).decode('ascii')
+        
+        entry = (
+            f"<FINDING>\n"
+            f"  <TIMESTAMP>{time.time()}</TIMESTAMP>\n"
+            f"  <TYPE>{finding.get('type', 'Unknown')}</TYPE>\n"
+            f"  <DATA_B64>{finding_b64}</DATA_B64>\n"
+            f"</FINDING>\n"
+        )
+        
+        # Use .findings extension for new format
+        with open(target_folder / "finding_details.findings", "a", encoding="utf-8") as fd:
+            fd.write(entry)
 
     def _cleanup_unlinked_screenshots(self, linked_screenshots: set):
         """Delete unreferenced screenshots."""
@@ -576,8 +597,27 @@ class TeamOrchestrator:
     async def _invoke_reporting_agent(self, findings: list, urls_scanned: list, metadata: dict, report_dir: Path):
         """Invoke ReportingAgent for final report."""
         dashboard.log(f"🤖 Deploying ReportingAgent for final assessment...", "INFO")
-        reporting_agent = ReportingAgent(self.target)
-        await reporting_agent.generate_final_report(findings, urls_scanned, metadata, report_dir)
+        
+        from bugtrace.agents.reporting import ReportingAgent
+        
+        # Ensure scan_id is available (should be initialized in __init__)
+        if not self.scan_id:
+            logger.warning("Scan ID missing for ReportingAgent, attempting to retrieve from DB...")
+            self.scan_id = self.db.get_active_scan(self.target) or 0
+            
+        reporting_agent = ReportingAgent(
+            scan_id=self.scan_id, 
+            target_url=self.target, 
+            output_dir=report_dir
+        )
+        
+        # ReportingAgent pulls findings from DB, so we don't need to pass 'findings' list
+        generated_paths = await reporting_agent.generate_all_deliverables()
+        
+        if generated_paths:
+            dashboard.log(f"✅ ReportingAgent finished. Reports saved to {report_dir}", "SUCCESS")
+        else:
+            dashboard.log("⚠️ ReportingAgent completed but returned no paths.", "WARN")
 
     def _cleanup_redundant_folders(self, report_dir: Path):
         """Cleanup redundant artifact folders."""
@@ -644,7 +684,7 @@ class TeamOrchestrator:
 
         if tech_report:
             tech_report = self._embed_screenshots(tech_report, screenshots)
-            with open(self.report_dir / "TECHNICAL_REPORT.md", "w") as f:
+            with open(self.scan_dir / "TECHNICAL_REPORT.md", "w") as f:
                 f.write(tech_report)
             dashboard.log("✅ Technical Report generated", "SUCCESS")
 
@@ -733,7 +773,7 @@ class TeamOrchestrator:
         exec_report = await llm_client.generate(exec_prompt, "Report-Exec")
 
         if exec_report:
-            with open(self.report_dir / "EXECUTIVE_SUMMARY.md", "w") as f:
+            with open(self.scan_dir / "EXECUTIVE_SUMMARY.md", "w") as f:
                 f.write(exec_report)
             dashboard.log("✅ Executive Summary generated", "SUCCESS")
 
@@ -1239,6 +1279,11 @@ class TeamOrchestrator:
             for u in urls_to_scan:
                 logger.info(f">> To Scan: {u}")
 
+        # Enforce strict MAX_URLS limit (Final Safety Net)
+        if len(urls_to_scan) > self.max_urls:
+            logger.info(f"Enforcing MAX_URLS={self.max_urls}: Trimming {len(urls_to_scan)} -> {self.max_urls} URLs")
+            urls_to_scan = urls_to_scan[:self.max_urls]
+
         self.url_queue = urls_to_scan
         self._save_checkpoint()
         return urls_to_scan
@@ -1625,40 +1670,85 @@ class TeamOrchestrator:
         scan_dir, recon_dir, analysis_dir, captures_dir = self._setup_scan_directory(start_time)
         dashboard.log(f"Scan directory created: {scan_dir.name}", "INFO")
 
+        # Update ThinkingConsolidationAgent with correct scan_dir
+        self.thinking_agent.scan_dir = scan_dir
+
         # ========== PHASE 1: DISCOVERY ==========
         # GoSpider crawls target, discovers URLs
         await self._phase_1_reconnaissance(dashboard, recon_dir)
+
+        # Update dashboard with discovery metrics
+        dashboard.set_progress_metrics(
+            urls_discovered=len(self.urls_to_scan),
+            urls_total=len(self.urls_to_scan),
+            scan_id=self.scan_id
+        )
+
         await self._lifecycle.signal_phase_complete(
-            PipelinePhase.DISCOVERY,
+            PipelinePhase.RECONNAISSANCE,
             {'urls_found': len(self.urls_to_scan)}
         )
 
         if self._check_stop_requested(dashboard):
             return
 
-        # ========== PHASE 2: EVALUATION (Batch DAST) ==========
+        # ========== PHASE 2: DISCOVERY (Batch DAST) ==========
         # DASTySASTAgent analyzes ALL URLs in parallel
         # ThinkingConsolidationAgent deduplicates and distributes to queues
-        logger.info("=== PHASE 2: EVALUATION (Batch DAST) ===")
+        logger.info("=== PHASE 2: DISCOVERY (Batch DAST) ===")
         dashboard.log(f"🔬 Running batch DAST on {len(self.urls_to_scan)} URLs", "INFO")
         dashboard.set_phase("🔬 HUNTING VULNS")
         dashboard.set_status("Running", "Analysis in progress...")
 
-        # Run batch DAST - this is the actual EVALUATION work
+        # Run batch DAST - this is the actual DISCOVERY work
         self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir)
 
-        # Signal EVALUATION complete AFTER batch DAST finishes
+        # Signal DISCOVERY complete AFTER batch DAST finishes
         await self._lifecycle.signal_phase_complete(
-            PipelinePhase.EVALUATION,
+            PipelinePhase.DISCOVERY,
             {'urls_analyzed': len(self.vulnerabilities_by_url)}
         )
 
         if self._check_stop_requested(dashboard):
             return
 
-        # ========== PHASE 3: EXPLOITATION (Queue Consumption) ==========
+        # ========== PHASE 3: STRATEGY (Batch Processing) ==========
+        # ThinkingAgent reads JSON files, deduplicates, and distributes to queues
+        logger.info("=== PHASE 3: STRATEGY (Deduplication & Queue Distribution) ===")
+        dashboard.log("🧠 ThinkingAgent processing findings batch", "INFO")
+        dashboard.set_phase("🧠 STRATEGY")
+        dashboard.set_status("Running", "Deduplication in progress...")
+
+        # Initialize specialist workers NOW (before ThinkingAgent fills queues)
+        if not self._specialist_workers_started:
+            await self._init_specialist_workers()
+            self._specialist_workers_started = True
+            logger.info("Specialist worker pools initialized and listening to queues")
+
+        # Start ThinkingAgent NOW (not before)
+        # Start ThinkingAgent NOW (not before)
+        if hasattr(self.thinking_agent, 'start'):
+            # Run in background as it has a continuous loop
+            asyncio.create_task(self.thinking_agent.start())
+            logger.info("ThinkingConsolidationAgent started for batch processing")
+
+        # Process all JSON files from scan_dir/dastysast/ (where Phase 2 saves them)
+        # NOTE: Phase 2 saves to self.scan_dir/dastysast/, NOT analysis_dir/dastysast/
+        analysis_json_dir = self.scan_dir / "dastysast"
+        findings_count = await self._phase_3_strategy(dashboard, analysis_json_dir)
+
+        # Signal STRATEGY complete
+        await self._lifecycle.signal_phase_complete(
+            PipelinePhase.STRATEGY,
+            {'findings_processed': findings_count}
+        )
+
+        if self._check_stop_requested(dashboard):
+            return
+
+        # ========== PHASE 4: EXPLOITATION (Queue Consumption) ==========
         # Specialists consume from queues in true parallel
-        logger.info("=== PHASE 3: EXPLOITATION (Specialist Queue Processing) ===")
+        logger.info("=== PHASE 4: EXPLOITATION (Specialist Queue Processing) ===")
         dashboard.log(f"⚡ Specialists processing findings from queues", "INFO")
 
         # Wait for ThinkingAgent to distribute to queues and specialists to process
@@ -1689,9 +1779,9 @@ class TeamOrchestrator:
         if self._check_stop_requested(dashboard):
             return
 
-        # ========== PHASE 4: VALIDATION ==========
+        # ========== PHASE 5: VALIDATION ==========
         all_findings_for_review = self.state_manager.get_findings()
-        logger.info("=== PHASE 4: VALIDATION (Global Review) ===")
+        logger.info("=== PHASE 5: VALIDATION (Global Review) ===")
         await self._phase_3_global_review(dashboard, scan_dir)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.VALIDATION,
@@ -1701,8 +1791,8 @@ class TeamOrchestrator:
         if self._check_stop_requested(dashboard):
             return
 
-        # ========== PHASE 5: REPORTING ==========
-        logger.info("=== PHASE 5: REPORTING ===")
+        # ========== PHASE 6: REPORTING ==========
+        logger.info("=== PHASE 6: REPORTING ===")
         await self._phase_4_reporting(dashboard, scan_dir)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.REPORTING,
@@ -1762,10 +1852,18 @@ class TeamOrchestrator:
                 try:
                     queue = queue_manager.get_queue(specialist)
                     depth = queue.depth() if hasattr(queue, 'depth') else 0
-                    queue_stats[specialist] = depth
+                    total_enqueued = queue.total_enqueued if hasattr(queue, 'total_enqueued') else 0
+                    total_dequeued = queue.total_dequeued if hasattr(queue, 'total_dequeued') else 0
+                    queue_stats[specialist] = {
+                        'depth': depth,
+                        'processed': total_dequeued
+                    }
                     total_pending += depth
                 except Exception:
-                    queue_stats[specialist] = 0
+                    queue_stats[specialist] = {'depth': 0, 'processed': 0}
+
+            # Update dashboard with queue stats in real-time
+            dashboard.set_progress_metrics(queue_stats=queue_stats, scan_id=self.scan_id)
 
             # Log progress every 10 seconds
             if (time.monotonic() - last_log_time) >= 10.0:
@@ -1803,17 +1901,24 @@ class TeamOrchestrator:
         # Use analysis semaphore for DAST concurrency
         analysis_semaphore = get_analysis_semaphore()
 
-        async def analyze_url(url: str) -> tuple:
+        # Progress tracking
+        completed_count = {"value": 0}
+
+        async def analyze_url(url: str, url_index: int) -> tuple:
             async with analysis_semaphore:
                 # Log concurrency status
                 active = settings.MAX_CONCURRENT_ANALYSIS - analysis_semaphore._value
                 logger.info(f"[DAST] ▶ Starting ({active}/{settings.MAX_CONCURRENT_ANALYSIS} active): {url[:60]}")
 
-                url_dir = self._create_url_directory(url, analysis_dir)
+                # Create dastysast/ folder for numbered reports
+                dastysast_dir = self.scan_dir / "dastysast"
+                dastysast_dir.mkdir(exist_ok=True)
+
                 dast = DASTySASTAgent(
-                    url, self.tech_profile, url_dir,
+                    url, self.tech_profile, dastysast_dir,
                     state_manager=self.state_manager,
-                    scan_context=self.scan_context
+                    scan_context=self.scan_context,
+                    url_index=url_index
                 )
 
                 # FIX v3.1: Timeout INSIDE semaphore - only counts analysis time,
@@ -1830,11 +1935,17 @@ class TeamOrchestrator:
                     vulns = []
 
                 logger.info(f"[DAST] ✓ Completed ({len(vulns)} findings): {url[:60]}")
+
+                # Update progress counter and dashboard
+                completed_count["value"] += 1
+                dashboard.set_progress_metrics(urls_analyzed=completed_count["value"], scan_id=self.scan_id)
+
                 return (url, vulns)
 
         # Run ALL URLs in parallel - semaphore controls concurrency,
         # timeout is per-analysis (not per-task including queue wait)
-        tasks = [analyze_url(url) for url in self.urls_to_scan]
+        # Enumerate URLs to pass index (starting at 1) for numbered reports
+        tasks = [analyze_url(url, idx + 1) for idx, url in enumerate(self.urls_to_scan)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Aggregate results
@@ -1857,6 +1968,100 @@ class TeamOrchestrator:
         )
 
         return vulnerabilities_by_url
+
+    async def _phase_3_strategy(self, dashboard, analysis_json_dir: Path) -> int:
+        """
+        Execute Phase 3: STRATEGY - Batch processing of DAST findings.
+
+        Reads all JSON files from analysis_dir, passes to ThinkingAgent
+        for deduplication, classification, prioritization, and queue distribution.
+
+        Args:
+            dashboard: UI dashboard
+            analysis_json_dir: Directory containing numbered JSON reports from DAST
+
+        Returns:
+            Total number of findings processed
+        """
+        import json
+
+        logger.info(f"Reading JSON files from {analysis_json_dir}")
+
+        # Find all JSON files (numbered format: 1.json, 2.json, etc.)
+        json_files = sorted(analysis_json_dir.glob("*.json"))
+
+        if not json_files:
+            logger.warning(f"No JSON files found in {analysis_json_dir}")
+            return 0
+
+        dashboard.log(f"Found {len(json_files)} JSON files to process", "INFO")
+
+        # Load all findings from JSON files
+        all_findings = []
+        for json_file in json_files:
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                findings = data.get("vulnerabilities", [])
+
+                # Attach metadata for traceability
+                for finding in findings:
+                    finding["_source_file"] = str(json_file)
+                    finding["_scan_context"] = self.scan_context
+                    # Attach report_files reference (v2.1.0 payload preservation)
+                    finding["_report_files"] = {
+                        "json": str(json_file),
+                        "markdown": str(json_file.with_suffix(".md"))
+                    }
+
+                all_findings.extend(findings)
+                logger.debug(f"Loaded {len(findings)} findings from {json_file.name}")
+
+            except Exception as e:
+                logger.error(f"Failed to read {json_file}: {e}")
+                continue
+
+        logger.info(f"Loaded {len(all_findings)} total findings from {len(json_files)} files")
+        dashboard.log(f"Processing {len(all_findings)} findings...", "INFO")
+
+        # Pass to ThinkingAgent for batch processing
+        processed_count = 0
+        if self.thinking_agent and hasattr(self.thinking_agent, 'process_batch_from_list'):
+            processed_count = await self.thinking_agent.process_batch_from_list(
+                all_findings,
+                scan_context=self.scan_context
+            )
+            logger.info(f"ThinkingAgent processed {processed_count} findings")
+        else:
+            logger.warning("ThinkingAgent does not support batch processing from list")
+
+        # Flush any remaining batch buffer
+        if self.thinking_agent and hasattr(self.thinking_agent, 'flush_batch'):
+            flushed = await self.thinking_agent.flush_batch()
+            logger.info(f"Flushed {flushed} buffered findings")
+
+        # Log statistics
+        if self.thinking_agent and hasattr(self.thinking_agent, 'log_batch_summary'):
+            self.thinking_agent.log_batch_summary()
+
+        dashboard.log(
+            f"Strategy phase complete: {processed_count} findings distributed to queues",
+            "INFO"
+        )
+
+        # Update dashboard with deduplication metrics
+        if self.thinking_agent and hasattr(self.thinking_agent, 'get_stats'):
+            stats = self.thinking_agent.get_stats()
+            dashboard.set_progress_metrics(
+                findings_before_dedup=stats.get('total_findings', len(all_findings)),
+                findings_after_dedup=stats.get('unique_findings', processed_count),
+                findings_distributed=stats.get('distributed', processed_count),
+                dedup_effectiveness=stats.get('dedup_rate', 0.0) * 100,  # Convert to percentage
+                scan_id=self.scan_id
+            )
+
+        return processed_count
 
     async def _phase_2_analysis(self, dashboard, analysis_dir):
         """Execute Phase 2: Batch DAST Analysis + Queue-based Specialist Execution.
@@ -1915,6 +2120,7 @@ class TeamOrchestrator:
         logger.info(f"Retrieved {len(all_findings)} findings from state manager")
 
         self._save_raw_findings(scan_dir, all_findings)
+        await self._generate_specialist_reports(scan_dir)  # v3.1: Generate specialists/ directory structure
         await self._generate_initial_report(scan_dir)
 
         dashboard.log(f"📄 Final report in {scan_dir}", "INFO")
@@ -1952,6 +2158,120 @@ class TeamOrchestrator:
             logger.info("Generated initial Hunter report")
         except Exception as e:
             logger.error(f"Failed to generate initial report: {e}", exc_info=True)
+
+    async def _generate_specialist_reports(self, scan_dir: Path) -> None:
+        """
+        Generate specialist reports for Phase 4 auditing and traceability.
+        
+        Creates the following structure:
+        specialists/
+        ├── queues/              # What each specialist received (queue input)
+        │   ├── xss.jsonl
+        │   ├── sqli.jsonl
+        │   └── ...
+        ├── warmup/              # Pre-analysis dedup summary per specialist
+        │   ├── xss_warmup.json
+        │   ├── sqli_warmup.json
+        │   └── ...
+        └── results/             # Exploitation results per specialist
+            ├── xss_results.json
+            ├── sqli_results.json
+            └── ...
+        """
+        specialists_dir = scan_dir / "specialists"
+        specialists_dir.mkdir(exist_ok=True)
+        
+        queues_dir = specialists_dir / "queues"
+        warmup_dir = specialists_dir / "warmup"
+        results_dir = specialists_dir / "results"
+        
+        queues_dir.mkdir(exist_ok=True)
+        warmup_dir.mkdir(exist_ok=True)
+        results_dir.mkdir(exist_ok=True)
+        
+        specialist_names = [
+            "xss", "sqli", "csti", "lfi", "idor", "rce", 
+            "ssrf", "xxe", "jwt", "openredirect", "prototype_pollution"
+        ]
+        
+        # Collect statistics from queue manager
+        from bugtrace.core.queue import queue_manager
+        
+        for specialist in specialist_names:
+            try:
+                queue = queue_manager.get_queue(specialist)
+                
+                # 1. Queue input (copy existing .queue file if available)
+                # NOTE: v3.1 uses .queue extension with XML-like format and Base64 payloads
+                source_queue_file = self.scan_dir / "queues" / f"{specialist}.queue"
+                if source_queue_file.exists():
+                    import shutil
+                    shutil.copy(source_queue_file, queues_dir / f"{specialist}.queue")
+                
+                # 2. Warmup summary - what the specialist analyzed before attacking
+                warmup_data = {
+                    "specialist": specialist,
+                    "scan_id": self.scan_id,
+                    "target": self.target,
+                    "queue_stats": {
+                        "total_enqueued": getattr(queue, 'total_enqueued', 0),
+                        "total_dequeued": getattr(queue, 'total_dequeued', 0),
+                        "current_depth": queue.depth() if hasattr(queue, 'depth') else 0,
+                    },
+                    "work_items_received": getattr(queue, 'total_enqueued', 0),
+                    "status": "COMPLETE" if queue.depth() == 0 else "TIMEOUT_PENDING"
+                }
+                
+                warmup_file = warmup_dir / f"{specialist}_warmup.json"
+                with open(warmup_file, "w", encoding="utf-8") as f:
+                    json.dump(warmup_data, f, indent=2, default=str)
+                
+                # 3. Results - findings confirmed by this specialist
+                # Get findings from state manager filtered by specialist type
+                all_findings = self.state_manager.get_findings()
+                specialist_findings = []
+                
+                # Map specialist name to finding types
+                type_mapping = {
+                    "xss": ["XSS", "Cross-Site Scripting", "DOM XSS", "Reflected XSS", "Stored XSS"],
+                    "sqli": ["SQLI", "SQL Injection", "SQLi"],
+                    "csti": ["CSTI", "Client-Side Template Injection", "SSTI", "Template Injection"],
+                    "lfi": ["LFI", "Local File Inclusion", "Path Traversal"],
+                    "idor": ["IDOR", "Insecure Direct Object Reference"],
+                    "rce": ["RCE", "Remote Code Execution", "Command Injection"],
+                    "ssrf": ["SSRF", "Server-Side Request Forgery"],
+                    "xxe": ["XXE", "XML External Entity"],
+                    "jwt": ["JWT", "JWT Bypass", "JWT Vulnerability"],
+                    "openredirect": ["Open Redirect", "URL Redirect"],
+                    "prototype_pollution": ["Prototype Pollution"],
+                }
+                
+                valid_types = type_mapping.get(specialist, [])
+                for finding in all_findings:
+                    finding_type = str(finding.get("type", "")).upper()
+                    if any(vt.upper() in finding_type for vt in valid_types):
+                        specialist_findings.append(finding)
+                
+                results_data = {
+                    "specialist": specialist,
+                    "scan_id": self.scan_id,
+                    "target": self.target,
+                    "findings_count": len(specialist_findings),
+                    "findings": specialist_findings,
+                    "summary": {
+                        "confirmed": sum(1 for f in specialist_findings if f.get("validated")),
+                        "pending_validation": sum(1 for f in specialist_findings if not f.get("validated")),
+                    }
+                }
+                
+                results_file = results_dir / f"{specialist}_results.json"
+                with open(results_file, "w", encoding="utf-8") as f:
+                    json.dump(results_data, f, indent=2, default=str)
+                    
+            except Exception as e:
+                logger.warning(f"[Specialist Reports] Failed to generate report for {specialist}: {e}")
+        
+        logger.info(f"Generated specialist reports in {specialists_dir}")
 
     async def _decide_specialist(self, vuln: dict) -> str:
         """Uses LLM to classify vulnerability and select best specialist agent."""

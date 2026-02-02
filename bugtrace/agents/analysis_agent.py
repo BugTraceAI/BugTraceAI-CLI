@@ -359,9 +359,11 @@ class DASTySASTAgent(BaseAgent):
             """Normalize parameter name for deduplication."""
             param_lower = param.lower()
 
-            # XXE: Normalize POST body variations
+            # XXE: Normalize all POST body variations
+            # Catch all variants: "POST Body", "XML Body", "stockCheckForm", etc.
             if vuln_type.lower() == "xxe":
-                if ("post" in param_lower and "body" in param_lower) or "xml" in param_lower:
+                xxe_indicators = ["post", "body", "xml", "stock", "form"]
+                if any(indicator in param_lower for indicator in xxe_indicators):
                     return "post_body"
 
             # SQLi: Normalize cookie names

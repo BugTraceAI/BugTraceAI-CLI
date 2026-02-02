@@ -17,6 +17,7 @@ Version: 1.0.0
 import asyncio
 import json
 import time
+from pathlib import Path
 from typing import Dict, List, Any, Optional, Set
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -190,7 +191,9 @@ class DeduplicationCache:
 
         # XXE: Normalize all POST body variations
         if vuln_type == "xxe":
-            if ("post" in param_lower and "body" in param_lower) or "xml" in param_lower:
+            # Catch all variants: "POST Body", "XML Body", "stockCheckForm", etc.
+            xxe_indicators = ["post", "body", "xml", "stock", "form"]
+            if any(indicator in param_lower for indicator in xxe_indicators):
                 return "post_body"
 
         # SQLi: Normalize cookie names (keep just the cookie name)
@@ -314,7 +317,7 @@ class ThinkingConsolidationAgent(BaseAgent):
     to specialist queues.
     """
 
-    def __init__(self, scan_context: str = None):
+    def __init__(self, scan_context: str = None, scan_dir: Path = None):
         super().__init__(
             name="ThinkingConsolidationAgent",
             role="Evaluation Coordinator",
@@ -323,9 +326,9 @@ class ThinkingConsolidationAgent(BaseAgent):
 
         self.scan_context = scan_context or f"thinking_{id(self)}"
         self.scan_id: Optional[int] = None  # To be set by TeamOrchestrator for DB access
-        
+
         # Determine scan directory for persistence
-        self.scan_dir = None
+        self.scan_dir = scan_dir  # Accept scan_dir from TeamOrchestrator
         self._queues_dir_cached = None
         self._queues_initialized = False
 
@@ -358,31 +361,36 @@ class ThinkingConsolidationAgent(BaseAgent):
         if self._queues_dir_cached:
             return self._queues_dir_cached
 
-        report_dir = settings.REPORT_DIR
-        found_dir = None
-        
-        # Locate scan directory
-        if report_dir.exists():
-            for p in report_dir.iterdir():
-                if p.is_dir() and self.scan_context in p.name:
-                    found_dir = p
-                    break
-        
-        if not found_dir:
-            # Fallback
-            found_dir = report_dir / f"{settings.APP_NAME}_scan_{self.scan_context}"
-            found_dir.mkdir(parents=True, exist_ok=True)
-            
+        # Use scan_dir from TeamOrchestrator if available
+        if self.scan_dir:
+            found_dir = self.scan_dir
+        else:
+            # Fallback: search for scan directory
+            report_dir = settings.REPORT_DIR
+            found_dir = None
+
+            # Locate scan directory
+            if report_dir.exists():
+                for p in report_dir.iterdir():
+                    if p.is_dir() and self.scan_context in p.name:
+                        found_dir = p
+                        break
+
+            if not found_dir:
+                # Fallback
+                found_dir = report_dir / f"{settings.APP_NAME}_scan_{self.scan_context}"
+                found_dir.mkdir(parents=True, exist_ok=True)
+
         queues_dir = found_dir / "queues"
         queues_dir.mkdir(exist_ok=True)
-        
+
         self._queues_dir_cached = queues_dir
-        
+
         # Initialize SpecialistQueues for file tailing
         if not self._queues_initialized:
             queue_manager.initialize_file_queues(queues_dir)
             self._queues_initialized = True
-            
+
         return queues_dir
 
     def _setup_event_subscriptions(self):
