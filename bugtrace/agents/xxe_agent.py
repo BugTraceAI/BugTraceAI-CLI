@@ -1,4 +1,3 @@
-import logging
 from typing import Dict, List, Optional, Any
 import aiohttp
 from bugtrace.agents.base import BaseAgent
@@ -14,8 +13,9 @@ from bugtrace.reporting.standards import (
     get_remediation_for_vuln,
     normalize_severity,
 )
+from bugtrace.utils.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 class XXEAgent(BaseAgent):
     """
