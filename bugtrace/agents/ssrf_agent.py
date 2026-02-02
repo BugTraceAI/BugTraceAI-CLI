@@ -46,6 +46,9 @@ class SSRFAgent(BaseAgent):
         self._queue_mode = False
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
+
+        # Expert deduplication: Track emitted findings by fingerprint
+        self._emitted_findings: set = set()  # (url, param, callback_domain)
         
     async def _test_with_go_fuzzer(self, param: str) -> list:
         """Test parameter with Go SSRF fuzzer."""
@@ -343,6 +346,32 @@ class SSRFAgent(BaseAgent):
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
+    def _generate_ssrf_fingerprint(self, url: str, parameter: str, payload: str) -> tuple:
+        """
+        Generate SSRF finding fingerprint for expert deduplication.
+
+        SSRF is URL-specific and parameter-specific. SSRF to different callback
+        domains from the same parameter = SAME vulnerability (just different proof).
+
+        Args:
+            url: Target URL
+            parameter: Parameter name
+            payload: SSRF payload (contains callback domain)
+
+        Returns:
+            Tuple fingerprint for deduplication
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        normalized_path = parsed.path.rstrip('/')
+
+        # SSRF signature: (host, path, parameter)
+        # Multiple callbacks from same param = same vulnerability
+        fingerprint = ("SSRF", parsed.netloc, normalized_path, parameter.lower())
+
+        return fingerprint
+
     async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
         """Handle completed queue item processing."""
         if result is None:
@@ -361,6 +390,16 @@ class SSRFAgent(BaseAgent):
 
         # Determine validation status
         status = self._get_validation_status(evidence)
+
+        # EXPERT DEDUPLICATION: Check if we already emitted this finding
+        fingerprint = self._generate_ssrf_fingerprint(self.url, result.get("param", ""), result.get("payload", ""))
+
+        if fingerprint in self._emitted_findings:
+            logger.info(f"[{self.name}] Skipping duplicate SSRF finding: {self.url}?{result.get('param')} (already reported)")
+            return
+
+        # Mark as emitted
+        self._emitted_findings.add(fingerprint)
 
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {

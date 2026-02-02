@@ -217,6 +217,9 @@ class XSSAgent(BaseAgent):
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
 
+        # Expert deduplication: Track emitted findings by fingerprint
+        self._emitted_findings: set = set()  # (url, param, context)
+
     def _get_snippet(self, text: str, target: str, max_len: int = 200) -> str:
         """Extract snippet around the target string."""
         idx = text.find(target)
@@ -1213,6 +1216,33 @@ class XSSAgent(BaseAgent):
             logger.debug(f"[{self.name}] Browser validation error: {e}")
             return None
 
+    def _generate_xss_fingerprint(self, url: str, parameter: str, context: str) -> tuple:
+        """
+        Generate XSS finding fingerprint for expert deduplication.
+
+        XSS is URL-specific and parameter-specific, but the SAME XSS
+        in the SAME parameter with different payloads = DUPLICATE.
+
+        Args:
+            url: Target URL
+            parameter: Parameter name
+            context: Reflection context (e.g., "html_attribute", "script_tag")
+
+        Returns:
+            Tuple fingerprint for deduplication
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        normalized_path = parsed.path.rstrip('/')
+
+        # XSS signature: (host, path, parameter, context)
+        # Different contexts in same parameter = distinct vulnerabilities
+        # Example: XSS in <script> vs XSS in attribute = different
+        fingerprint = ("XSS", parsed.netloc, normalized_path, parameter.lower(), context)
+
+        return fingerprint
+
     async def _handle_queue_result(self, item: dict, result: Optional[XSSFinding]) -> None:
         """
         Handle completed queue item processing.
@@ -1236,6 +1266,16 @@ class XSSAgent(BaseAgent):
         }
         validation_status = get_validation_status(finding_data, result.confidence)
         needs_cdp = requires_cdp_validation(finding_data)
+
+        # EXPERT DEDUPLICATION: Check if we already emitted this finding
+        fingerprint = self._generate_xss_fingerprint(result.url, result.parameter, result.context)
+
+        if fingerprint in self._emitted_findings:
+            logger.info(f"[{self.name}] Skipping duplicate XSS finding: {result.url}?{result.parameter} in {result.context} (already reported)")
+            return
+
+        # Mark as emitted
+        self._emitted_findings.add(fingerprint)
 
         # Emit vulnerability_detected event
         if settings.WORKER_POOL_EMIT_EVENTS:

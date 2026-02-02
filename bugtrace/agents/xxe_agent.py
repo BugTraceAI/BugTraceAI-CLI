@@ -38,6 +38,9 @@ class XXEAgent(BaseAgent):
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
 
+        # Expert deduplication: Track emitted findings by fingerprint
+        self._emitted_findings: set = set()  # (url_normalized, vuln_signature)
+
     def _determine_validation_status(self, payload: str, evidence: str = "success") -> str:
         """
         Determine tiered validation status for XXE finding.
@@ -306,6 +309,35 @@ class XXEAgent(BaseAgent):
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
+    def _generate_xxe_fingerprint(self, url: str) -> tuple:
+        """
+        Generate XXE finding fingerprint for expert deduplication.
+
+        XXE in XML endpoints is typically tied to the endpoint itself,
+        not specific parameters. Multiple findings on the same XML endpoint
+        are considered duplicates.
+
+        Args:
+            url: Target URL
+
+        Returns:
+            Tuple of (normalized_url, vuln_type) for deduplication
+        """
+        from urllib.parse import urlparse, parse_qs
+
+        parsed = urlparse(url)
+
+        # Normalize URL: remove query params (productId doesn't matter for XXE)
+        # /catalog/product?productId=2 → /catalog/product
+        # /catalog/product?productId=10 → /catalog/product (SAME VULNERABILITY)
+        normalized_path = parsed.path.rstrip('/')
+
+        # XXE signature: (scheme, host, path)
+        # This groups all XXE findings on the same XML endpoint together
+        fingerprint = (parsed.scheme, parsed.netloc, normalized_path, "XXE")
+
+        return fingerprint
+
     async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
         """Handle completed queue item processing."""
         if result is None:
@@ -323,6 +355,17 @@ class XXEAgent(BaseAgent):
 
         # Determine validation status
         status = self._get_validation_status_from_evidence(evidence)
+
+        # EXPERT DEDUPLICATION: Check if we already emitted this finding
+        url = result.get("url", "")
+        fingerprint = self._generate_xxe_fingerprint(url)
+
+        if fingerprint in self._emitted_findings:
+            logger.info(f"[{self.name}] Skipping duplicate XXE finding: {url} (already reported)")
+            return
+
+        # Mark as emitted
+        self._emitted_findings.add(fingerprint)
 
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
