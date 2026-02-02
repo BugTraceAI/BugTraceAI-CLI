@@ -606,9 +606,10 @@ class TeamOrchestrator:
             self.scan_id = self.db.get_active_scan(self.target) or 0
             
         reporting_agent = ReportingAgent(
-            scan_id=self.scan_id, 
-            target_url=self.target, 
-            output_dir=report_dir
+            scan_id=self.scan_id,
+            target_url=self.target,
+            output_dir=report_dir,
+            tech_profile=self.tech_profile
         )
         
         # ReportingAgent pulls findings from DB, so we don't need to pass 'findings' list
@@ -1212,11 +1213,19 @@ class TeamOrchestrator:
         dashboard.log("Starting Phase 1: Reconnaissance (Nuclei + GoSpider)", "INFO")
 
         try:
+            # Run Nuclei for tech detection (Phase 1: Tech-Detect + Auto-Scan)
+            nuclei_agent = NucleiAgent(self.target, recon_dir)
+            self.tech_profile = await nuclei_agent.run()
+            logger.info(f"[Recon] Tech Profile: {len(self.tech_profile.get('frameworks', []))} frameworks, "
+                       f"{len(self.tech_profile.get('infrastructure', []))} infrastructure components")
+
+            # Run GoSpider for URL discovery
             urls_to_scan = await self._run_gospider(recon_dir)
             await self._scan_for_tokens(urls_to_scan)
         except Exception as e:
-            logger.error(f"GoSpiderAgent crash: {e}", exc_info=True)
+            logger.error(f"Reconnaissance crash: {e}", exc_info=True)
             urls_to_scan = [self.target]
+            self.tech_profile = self.tech_profile or {"frameworks": [], "infrastructure": []}
 
         return self._normalize_urls(urls_to_scan)
 
@@ -2153,7 +2162,7 @@ class TeamOrchestrator:
         """Generate initial Hunter report."""
         try:
             from bugtrace.agents.reporting import ReportingAgent
-            reporter = ReportingAgent(self.scan_id, self.target, scan_dir)
+            reporter = ReportingAgent(self.scan_id, self.target, scan_dir, self.tech_profile)
             await reporter.generate_all_deliverables()
             logger.info("Generated initial Hunter report")
         except Exception as e:

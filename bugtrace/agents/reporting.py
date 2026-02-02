@@ -41,11 +41,12 @@ class ReportingAgent(BaseAgent):
     Final Agent responsible for generating all report deliverables.
     """
 
-    def __init__(self, scan_id: int, target_url: str, output_dir: Path):
+    def __init__(self, scan_id: int, target_url: str, output_dir: Path, tech_profile: Dict = None):
         super().__init__("ReportingAgent", "Reporting Specialist", agent_id="reporting_agent")
         self.scan_id = scan_id
         self.target_url = target_url
         self.output_dir = Path(output_dir)
+        self.tech_profile = tech_profile or {}
         self.db = get_db_manager()
 
         # Event-driven finding accumulation
@@ -939,6 +940,54 @@ class ReportingAgent(BaseAgent):
         lines.append(f"| **URLs Scanned** | {stats.get('urls_scanned', 0)} |")
         lines.append("")
 
+        # Technology Stack Section (NEW)
+        if self.tech_profile:
+            lines.append("## Technology Stack\n")
+
+            # Infrastructure
+            if self.tech_profile.get("infrastructure"):
+                lines.append("### Infrastructure")
+                for tech in self.tech_profile["infrastructure"]:
+                    lines.append(f"- {tech}")
+                lines.append("")
+
+            # Frameworks & Libraries
+            if self.tech_profile.get("frameworks"):
+                lines.append("### Frameworks & Libraries")
+                for framework in self.tech_profile["frameworks"]:
+                    lines.append(f"- {framework}")
+                lines.append("")
+
+            # Web Servers
+            if self.tech_profile.get("servers"):
+                lines.append("### Web Servers")
+                for server in self.tech_profile["servers"]:
+                    lines.append(f"- {server}")
+                lines.append("")
+
+            # Security Controls
+            security_controls = []
+            if self.tech_profile.get("waf"):
+                security_controls.append(("WAF", self.tech_profile["waf"]))
+            if self.tech_profile.get("cdn"):
+                security_controls.append(("CDN", self.tech_profile["cdn"]))
+
+            if security_controls:
+                lines.append("### Security Controls")
+                for control_type, controls in security_controls:
+                    for control in controls:
+                        lines.append(f"- **{control_type}**: {control}")
+                lines.append("")
+
+            # CMS
+            if self.tech_profile.get("cms"):
+                lines.append("### Content Management System")
+                for cms in self.tech_profile["cms"]:
+                    lines.append(f"- {cms}")
+                lines.append("")
+
+            lines.append("---\n")
+
         # Executive Summary
         lines.append("## Executive Summary\n")
 
@@ -1333,10 +1382,10 @@ class ReportingAgent(BaseAgent):
 
                                 <h4 class="font-bold mt-4 mb-2">Steps to Reproduce</h4>
                                 <ol class="list-decimal list-inside mb-4">
-                                    ${f.reproduction.steps.map(s => '<li>' + s + '</li>').join('')}
+                                    ${(f.reproduction && f.reproduction.steps) ? f.reproduction.steps.map(s => '<li>' + s + '</li>').join('') : '<li>No specific reproduction steps provided.</li>'}
                                 </ol>
 
-                                ${(f.reproduction.poc && !f.reproduction.poc.trim().startsWith('#')) ?
+                                ${(f.reproduction && f.reproduction.poc && !f.reproduction.poc.trim().startsWith('#')) ?
                                 `<h4 class="font-bold mt-4 mb-2">Proof of Concept</h4>
                                 <pre class="whitespace-pre-wrap">${f.reproduction.poc}</pre>` : ''}
 

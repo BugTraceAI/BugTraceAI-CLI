@@ -1059,10 +1059,33 @@ class DASTySASTAgent(BaseAgent):
         # Format reflection probes as evidence section
         probe_section = self._format_probe_evidence(context.get("reflection_probes", []))
 
+        # Format tech profile for LLM context
+        tech_info_parts = []
+        if self.tech_profile.get('infrastructure'):
+            tech_info_parts.append(f"Infrastructure: {', '.join(self.tech_profile['infrastructure'])}")
+        if self.tech_profile.get('frameworks'):
+            tech_info_parts.append(f"Frameworks: {', '.join(self.tech_profile['frameworks'])}")
+        if self.tech_profile.get('servers'):
+            tech_info_parts.append(f"Servers: {', '.join(self.tech_profile['servers'])}")
+        if self.tech_profile.get('waf'):
+            tech_info_parts.append(f"⚠️ WAF Detected: {', '.join(self.tech_profile['waf'])}")
+        if self.tech_profile.get('cdn'):
+            tech_info_parts.append(f"CDN: {', '.join(self.tech_profile['cdn'])}")
+
+        tech_stack_summary = "\n".join(tech_info_parts) if tech_info_parts else "Basic web application (no specific technologies detected)"
+
         return f"""Analyze this URL for security vulnerabilities.
 
 URL: {self.url}
-Technology Stack: {self.tech_profile.get('frameworks', [])}
+
+=== TECHNOLOGY STACK (Use this to craft precise exploits) ===
+{tech_stack_summary}
+
+NOTE: Use detected technologies to:
+- Generate version-specific exploits (e.g., AngularJS 1.7.7 CSTI bypasses)
+- Identify infrastructure-specific attack vectors (e.g., AWS ALB header manipulation)
+- Avoid wasting time on irrelevant attacks (e.g., PHP attacks on Node.js)
+- Craft payloads that bypass detected WAF/CDN protections
 
 === ACTIVE RECONNAISSANCE RESULTS (MANDATORY EVIDENCE) ===
 {probe_section if probe_section else "No parameters detected in URL."}

@@ -294,61 +294,112 @@ class ExternalToolManager:
         finally:
             await self._cleanup_docker_process(proc)
 
-    async def run_nuclei(self, target: str, cookies: List[Dict] = None) -> List[Dict]:
+    async def run_nuclei(self, target: str, cookies: List[Dict] = None) -> Dict[str, Any]:
         """
-        Runs Nuclei scan on the target with optional session cookies.
+        Runs two-phase Nuclei scan:
+        1. Tech Detection (-tags tech): Fast detection of technologies/infrastructure
+        2. Automatic Scan (-as): Smart vulnerability scan based on detected tech
+
+        Returns:
+            Dict with 'tech_findings' and 'vuln_findings' lists
         """
-        if not self.docker_cmd: return []
+        if not self.docker_cmd:
+            return {"tech_findings": [], "vuln_findings": []}
 
         self._record_tool_run("nuclei")
-        logger.info(f"Starting Nuclei Scan on {target}...")
-        dashboard.log(f"[External] Launching Nuclei Engine against {target}", "INFO")
-        dashboard.update_task("nuclei", name="Nuclei Engine", status=f"Scanning: {target}")
-        
-        # Nuclei args: -u target -silent -jsonl -severity critical,high
-        cmd = [
+        logger.info(f"Starting Two-Phase Nuclei Scan on {target}...")
+        dashboard.log(f"[External] Launching Nuclei Engine (2-Phase) against {target}", "INFO")
+
+        # === PHASE 1: Tech Detection ===
+        dashboard.update_task("nuclei", name="Nuclei Tech-Detect", status=f"Phase 1/2: Tech Detection")
+        logger.info(f"[Nuclei] Phase 1: Tech Detection with -tags tech")
+
+        tech_cmd = [
             "-u", target,
+            "-tags", "tech",
             "-silent",
-            "-jsonl",
-            "-severity", "critical,high,medium,low,info"
+            "-jsonl"
         ]
-        
-        # Add Cookies if present
+
+        # Add cookies to tech detection too
         if cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-            cmd.extend(["-H", f"Cookie: {cookie_str}"])
-            cmd.extend(["-H", "User-Agent: BugtraceAI/1.0"]) # Standard UA
+            tech_cmd.extend(["-H", f"Cookie: {cookie_str}"])
 
-        # Use projectdiscovery/nuclei image
-        output = await self._run_container("projectdiscovery/nuclei:latest", cmd)
-        
-        findings = []
-        for line in output.splitlines():
+        tech_output = await self._run_container("projectdiscovery/nuclei:latest", tech_cmd)
+
+        tech_findings = []
+        for line in tech_output.splitlines():
             try:
                 if line.strip().startswith("{"):
-                    findings.append(json.loads(line))
+                    tech_findings.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-                
-        logger.info(f"Nuclei found {len(findings)} issues.")
-        if len(findings) > 0:
-            dashboard.log(f"[External] Nuclei found {len(findings)} vulnerabilities.", "SUCCESS")
-        return findings
+
+        logger.info(f"[Nuclei] Phase 1: Found {len(tech_findings)} tech/infrastructure detections")
+        dashboard.log(f"[External] Tech-Detect: {len(tech_findings)} technologies identified", "INFO")
+
+        # === PHASE 2: Automatic Scan ===
+        dashboard.update_task("nuclei", name="Nuclei Auto-Scan", status=f"Phase 2/2: Smart Vulnerability Scan")
+        logger.info(f"[Nuclei] Phase 2: Automatic Scan with -as (tech-aware)")
+
+        auto_cmd = [
+            "-u", target,
+            "-as",  # Automatic scan with template clustering
+            "-silent",
+            "-jsonl"
+        ]
+
+        # Add cookies
+        if cookies:
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            auto_cmd.extend(["-H", f"Cookie: {cookie_str}"])
+            auto_cmd.extend(["-H", "User-Agent: BugtraceAI/1.0"])
+
+        auto_output = await self._run_container("projectdiscovery/nuclei:latest", auto_cmd)
+
+        vuln_findings = []
+        for line in auto_output.splitlines():
+            try:
+                if line.strip().startswith("{"):
+                    vuln_findings.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        logger.info(f"[Nuclei] Phase 2: Found {len(vuln_findings)} vulnerability detections")
+
+        total_findings = len(tech_findings) + len(vuln_findings)
+        if total_findings > 0:
+            dashboard.log(f"[External] Nuclei 2-Phase Complete: {len(tech_findings)} tech + {len(vuln_findings)} vulns", "SUCCESS")
+
+        return {
+            "tech_findings": tech_findings,
+            "vuln_findings": vuln_findings
+        }
 
     def _build_sqlmap_command(
         self,
         url: str,
         target_param: Optional[str],
-        cookies: Optional[List[Dict]]
+        cookies: Optional[List[Dict]],
+        technique: Optional[str] = None,
+        exploit_mode: bool = False
     ) -> tuple[List[str], str]:
-        """Build SQLMap command and reproduction command."""
-        reproduction_cmd = f"sqlmap -u '{url}' --batch --random-agent --technique=BEUSTQ --level 2 --risk 2"
+        """Build SQLMap command and reproduction command.
+
+        Args:
+            technique: SQLMap technique hint from internal checks.
+                       E=Error, B=Boolean, U=Union, S=Stacked, T=Time, Q=Inline
+                       If None, uses all techniques (BEUSTQ).
+        """
+        tech = technique if technique else "BEUSTQ"
+        reproduction_cmd = f"sqlmap -u '{url}' --batch --random-agent --technique={tech} --level 2 --risk 2"
 
         cmd = [
             "-u", url,
             "--batch",
             "--random-agent",
-            "--technique=BEUSTQ",
+            f"--technique={tech}",
             "--level", "2",
             "--risk", "2",
             "--parse-errors",
@@ -363,6 +414,11 @@ class ExternalToolManager:
         else:
             cmd.append("--forms")
             reproduction_cmd += " --forms"
+
+        if exploit_mode:
+            # Aggressive extraction for confirmed flaws
+            cmd.extend(["--dbs", "--users", "--passwords"])
+            reproduction_cmd += " --dbs --users --passwords"
 
         if cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
@@ -380,20 +436,32 @@ class ExternalToolManager:
             return param_match.group(1), type_match.group(1)
         return None
 
-    async def run_sqlmap(self, url: str, cookies: List[Dict] = None, target_param: str = None) -> Optional[Dict]:
+    async def run_sqlmap(
+        self,
+        url: str,
+        cookies: List[Dict] = None,
+        target_param: str = None,
+        technique: str = None,
+        exploit_mode: bool = False
+    ) -> Optional[Dict]:
         """
         Runs SQLMap active scan with session context on specific URL/Param.
         AVOIDS redundant crawling by targeting specific parameters found by GoSpider.
+
+        Args:
+            technique: Technique hint from internal checks (E/B/U/S/T/Q or combination).
+                       If provided, SQLMap will try this technique first for faster detection.
         """
         if not self.docker_cmd:
             return None
 
         self._record_tool_run("sqlmap")
         target_info = f"param '{target_param}' on {url}" if target_param else url
-        logger.info(f"Starting SQLMap Scan on {target_info}...")
-        dashboard.log(f"[External] Launching SQLMap (Sniper Mode) against {target_info}", "INFO")
+        tech_info = f" (technique hint: {technique})" if technique else ""
+        logger.info(f"Starting SQLMap Scan on {target_info}{tech_info}...")
+        dashboard.log(f"[External] Launching SQLMap (Sniper Mode) against {target_info}{tech_info}", "INFO")
 
-        cmd, reproduction_cmd = self._build_sqlmap_command(url, target_param, cookies)
+        cmd, reproduction_cmd = self._build_sqlmap_command(url, target_param, cookies, technique, exploit_mode=exploit_mode)
         output = await self._run_container("googlesky/sqlmap:latest", cmd)
 
         result = self._parse_sqlmap_output(output)
@@ -460,66 +528,130 @@ class ExternalToolManager:
             logger.debug(f"URL parsing error in GoSpider output: {e}")
         return None
 
-    async def run_gospider(self, url: str, cookies: List[Dict] = None, depth: int = 3) -> List[str]:
+    async def run_gospider(self, url: str, cookies: List[Dict] = None, depth: int = 3, max_urls: int = None) -> List[str]:
         """
         Runs GoSpider to crawl the target with session.
+        Respects max_urls to stop crawling early (Optimization).
 
         Args:
             url: Target URL to crawl
             cookies: Optional session cookies
-            depth: Crawl depth (default 3 to find parameterized URLs)
+            depth: Crawl depth
+            max_urls: Stop after finding this many URLs (approximate)
         """
         if not self.docker_cmd:
             return []
 
         self._record_tool_run("gospider")
-        logger.info(f"Starting GoSpider on {url} (depth={depth})...")
+        logger.info(f"Starting GoSpider on {url} (depth={depth}, limit={max_urls})...")
         dashboard.log(f"[External] Launching GoSpider (depth={depth}) against {url}", "INFO")
         dashboard.update_task("gospider", name="GoSpider", status=f"Crawling: {url}")
 
         # IMPROVED 2026-01-30: Use GoSpider's full power
-        # -a: Query Wayback Machine, CommonCrawl, VirusTotal, AlienVault for historical URLs
-        # --sitemap: Parse sitemap.xml for additional URLs
-        # --robots: Parse robots.txt (enabled by default)
-        # --js: Extract links from JavaScript (enabled by default)
         cmd = [
             "-s", url,
             "-d", str(depth),
             "-c", "10",
-            "-a",           # OTHER SOURCES: Wayback, CommonCrawl, VirusTotal, AlienVault
-            "--sitemap",    # Parse sitemap.xml
+            "-a",           
+            "--sitemap",    
         ]
 
         if cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             cmd.extend(["--cookie", cookie_str])
 
-        # Optional: Don't follow redirects to catch .env, .htaccess, .git/config leaks
-        # When a sensitive file redirects to 403/404, the original response may contain info
         from bugtrace.core.config import settings
         if settings.GOSPIDER_NO_REDIRECT:
             cmd.append("--no-redirect")
-            logger.info("[GoSpider] No-redirect mode enabled (catching redirect leaks)")
 
-        output = await self._run_container("trickest/gospider", cmd)
+        # Use streaming execution if limit is set
+        if max_urls and max_urls > 0:
+            # We set a slightly higher buffer (1.5x) because GoSpider finds many dupes/junk
+            kill_limit = int(max_urls * 2.5) + 10 
+            output = await self._run_container_with_limit("trickest/gospider", cmd, line_limit=kill_limit)
+        else:
+            output = await self._run_container("trickest/gospider", cmd)
 
         target_domain = urlparse(url).hostname.lower()
-        logger.info(f"GoSpider raw output (first 10 lines):\n{chr(10).join(output.splitlines()[:10])}")
+        if output:
+            lines = output.splitlines()
+            logger.info(f"GoSpider raw output examples:\n{chr(10).join(lines[:5])}")
 
-        # Parse URLs AND identify forms (IMPROVED 2026-01-30)
         unique_urls, form_urls = self._parse_gospider_urls(output, target_domain)
         logger.info(f"GoSpider found {len(unique_urls)} in-scope URLs, {len(form_urls)} forms.")
 
-        # Extract parameters from forms (CRITICAL for CSTI, SQLi detection)
+        # Extract parameters from forms
         if form_urls:
-            logger.info(f"[GoSpider] Extracting parameters from {len(form_urls)} forms...")
-            param_urls = await self._extract_form_params(form_urls, cookies)
-            if param_urls:
-                logger.info(f"[GoSpider] Extracted {len(param_urls)} parameterized URLs from forms")
-                unique_urls = list(set(unique_urls + param_urls))
+             # Respect limit for form extraction too
+            if max_urls and len(unique_urls) >= max_urls:
+                logger.info("[GoSpider] Skipping form extraction (Max URLs reached)")
+            else:
+                logger.info(f"[GoSpider] Extracting parameters from {len(form_urls)} forms...")
+                param_urls = await self._extract_form_params(form_urls, cookies)
+                if param_urls:
+                    unique_urls = list(set(unique_urls + param_urls))
 
-        dashboard.log(f"[External] GoSpider discovered {len(unique_urls)} endpoints (including form params).", "INFO")
+        dashboard.log(f"[External] GoSpider discovered {len(unique_urls)} endpoints.", "INFO")
         return unique_urls
+
+    async def _run_container_with_limit(
+        self,
+        image: str,
+        command: List[str],
+        line_limit: int,
+        timeout: int = 600
+    ) -> str:
+        """
+        Runs a Docker container and KILLS it after N lines of output.
+        Used for optimization (stop crawling when we have enough URLs).
+        """
+        if not self.docker_cmd or not _validate_docker_image(image):
+            return ""
+
+        full_cmd = self._build_docker_command(image, command, "512m", "1.0", "bridge")
+        logger.debug(f"Docker Streaming Exec: {' '.join(full_cmd)}")
+
+        process = await asyncio.create_subprocess_exec(
+            *full_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        output_lines = []
+        try:
+            # Read line by line until limit or EOF
+            while len(output_lines) < line_limit:
+                try:
+                    line_bytes = await asyncio.wait_for(process.stdout.readline(), timeout=30)
+                    if not line_bytes:
+                        break # EOF
+                    line = line_bytes.decode('utf-8', errors='replace')
+                    output_lines.append(line)
+                except asyncio.TimeoutError:
+                    if len(output_lines) > 0:
+                        break # Stop if it hangs but we have data
+                    else:
+                        raise # Real timeout
+            
+            # If we reached limit, kill process
+            if len(output_lines) >= line_limit:
+                logger.info(f"GoSpider limit reached ({line_limit} lines). Terminating crawler...")
+                try:
+                    process.kill()
+                except:
+                    pass
+        
+        except Exception as e:
+            logger.error(f"Streaming execution failed: {e}")
+            try:
+                process.kill()
+            except:
+                pass
+        
+        # Ensure cleanup
+        await self._cleanup_docker_process(process)
+        
+        return "".join(output_lines)
 
     async def _extract_form_params(self, form_urls: List[str], cookies: List[Dict] = None) -> List[str]:
         """
