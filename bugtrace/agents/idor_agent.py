@@ -280,6 +280,23 @@ class IDORAgent(BaseAgent):
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
+    def _generate_idor_fingerprint(self, url: str, resource_type: str) -> tuple:
+        """
+        Generate IDOR finding fingerprint for expert deduplication.
+
+        Returns:
+            Tuple fingerprint for deduplication
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        normalized_path = parsed.path.rstrip('/')
+
+        # IDOR signature: Endpoint + resource type (parameter)
+        fingerprint = ("IDOR", parsed.netloc, normalized_path, resource_type)
+
+        return fingerprint
+
     async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
         """
         Handle completed queue item processing.
@@ -305,6 +322,18 @@ class IDORAgent(BaseAgent):
         if status == "PENDING_VALIDATION":
             # IDOR findings without clear PII/user data markers need validation
             needs_cdp = True
+
+        # EXPERT DEDUPLICATION: Check if we already emitted this finding
+        url = result.get("url")
+        parameter = result.get("parameter")
+        fingerprint = self._generate_idor_fingerprint(url, parameter)
+
+        if fingerprint in self._emitted_findings:
+            logger.info(f"[{self.name}] Skipping duplicate IDOR finding (already reported)")
+            return
+
+        # Mark as emitted
+        self._emitted_findings.add(fingerprint)
 
         # Emit vulnerability_detected event
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:

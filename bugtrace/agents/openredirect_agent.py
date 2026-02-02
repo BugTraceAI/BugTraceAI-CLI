@@ -719,6 +719,23 @@ class OpenRedirectAgent(BaseAgent):
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
+    def _generate_openredirect_fingerprint(self, url: str, parameter: str) -> tuple:
+        """
+        Generate Open Redirect finding fingerprint for expert deduplication.
+
+        Returns:
+            Tuple fingerprint for deduplication
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        normalized_path = parsed.path.rstrip('/')
+
+        # Open Redirect signature: URL + parameter
+        fingerprint = ("OPEN_REDIRECT", parsed.netloc, normalized_path, parameter.lower())
+
+        return fingerprint
+
     async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
         """Handle completed queue item processing."""
         if result is None:
@@ -737,6 +754,18 @@ class OpenRedirectAgent(BaseAgent):
 
         # Determine validation status
         status = self._get_validation_status(evidence)
+
+        # EXPERT DEDUPLICATION: Check if we already emitted this finding
+        url = result.get("url", result.get("test_url"))
+        parameter = result.get("param") or result.get("parameter")
+        fingerprint = self._generate_openredirect_fingerprint(url, parameter)
+
+        if fingerprint in self._emitted_findings:
+            logger.info(f"[{self.name}] Skipping duplicate OPEN_REDIRECT finding (already reported)")
+            return
+
+        # Mark as emitted
+        self._emitted_findings.add(fingerprint)
 
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {

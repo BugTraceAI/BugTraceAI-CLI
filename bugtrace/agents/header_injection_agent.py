@@ -389,6 +389,18 @@ class HeaderInjectionAgent(BaseAgent):
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
+    def _generate_headerinjection_fingerprint(self, header_name: str) -> tuple:
+        """
+        Generate Header Injection finding fingerprint for expert deduplication.
+
+        Returns:
+            Tuple fingerprint for deduplication
+        """
+        # Header injection is global (same header = same vulnerability)
+        fingerprint = ("HEADER_INJECTION", header_name.lower())
+
+        return fingerprint
+
     async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
         """
         Handle completed queue item processing.
@@ -397,6 +409,17 @@ class HeaderInjectionAgent(BaseAgent):
         """
         if result is None:
             return
+
+        # EXPERT DEDUPLICATION: Check if we already emitted this finding
+        header_name = result["parameter"]
+        fingerprint = self._generate_headerinjection_fingerprint(header_name)
+
+        if fingerprint in self._emitted_findings:
+            logger.info(f"[{self.name}] Skipping duplicate HEADER_INJECTION finding (already reported)")
+            return
+
+        # Mark as emitted
+        self._emitted_findings.add(fingerprint)
 
         # Emit vulnerability_detected event
         if self.event_bus and getattr(settings, 'WORKER_POOL_EMIT_EVENTS', True):

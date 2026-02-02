@@ -1739,6 +1739,23 @@ Response format (XML):
             evidence=result.get("evidence", {}),
         )
 
+    def _generate_csti_fingerprint(self, url: str, parameter: str, template_engine: str) -> tuple:
+        """
+        Generate CSTI finding fingerprint for expert deduplication.
+
+        Returns:
+            Tuple fingerprint for deduplication
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        normalized_path = parsed.path.rstrip('/')
+
+        # CSTI signature: URL + parameter + template engine
+        fingerprint = ("CSTI", parsed.netloc, normalized_path, parameter.lower(), template_engine)
+
+        return fingerprint
+
     async def _handle_queue_result(self, item: dict, result: Optional[CSTIFinding]) -> None:
         """
         Handle completed queue item processing.
@@ -1766,6 +1783,16 @@ Response format (XML):
             "evidence": result.evidence,
         }
         needs_cdp = requires_cdp_validation(finding_data)
+
+        # EXPERT DEDUPLICATION: Check if we already emitted this finding
+        fingerprint = self._generate_csti_fingerprint(result.url, result.parameter, result.template_engine)
+
+        if fingerprint in self._emitted_findings:
+            logger.info(f"[{self.name}] Skipping duplicate CSTI finding (already reported)")
+            return
+
+        # Mark as emitted
+        self._emitted_findings.add(fingerprint)
 
         # Emit vulnerability_detected event
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:

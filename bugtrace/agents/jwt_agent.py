@@ -889,6 +889,23 @@ class JWTAgent(BaseAgent):
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
+    def _generate_jwt_fingerprint(self, url: str, vuln_type: str) -> tuple:
+        """
+        Generate JWT finding fingerprint for expert deduplication.
+
+        Returns:
+            Tuple fingerprint for deduplication
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+
+        # JWT signature: Token-specific (netloc + vulnerability type)
+        # JWT vulnerabilities are token-specific, not URL-specific
+        fingerprint = ("JWT", parsed.netloc, vuln_type)
+
+        return fingerprint
+
     async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
         """Handle completed queue item processing."""
         if result is None:
@@ -896,6 +913,18 @@ class JWTAgent(BaseAgent):
 
         # Determine validation status from finding
         status = self._get_validation_status(result)
+
+        # EXPERT DEDUPLICATION: Check if we already emitted this finding
+        url = result.get("url")
+        vuln_type = result.get("vulnerability_type", result.get("type"))
+        fingerprint = self._generate_jwt_fingerprint(url, vuln_type)
+
+        if fingerprint in self._emitted_findings:
+            logger.info(f"[{self.name}] Skipping duplicate JWT finding (already reported)")
+            return
+
+        # Mark as emitted
+        self._emitted_findings.add(fingerprint)
 
         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
