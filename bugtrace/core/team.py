@@ -76,12 +76,13 @@ async def run_agent_with_semaphore(semaphore: asyncio.Semaphore, agent, process_
 
 class TeamOrchestrator:
 
-    def __init__(self, target: str, resume: bool = False, max_depth: int = 2, max_urls: int = 15, use_vertical_agents: bool = False, output_dir: Optional[Path] = None, scan_id: Optional[int] = None):
+    def __init__(self, target: str, resume: bool = False, max_depth: int = 2, max_urls: int = 15, use_vertical_agents: bool = False, output_dir: Optional[Path] = None, scan_id: Optional[int] = None, url_list: Optional[List[str]] = None):
         self.target = target
         self.output_dir = output_dir
         self.resume = resume
         self.max_depth = max_depth
         self.max_urls = max_urls
+        self.url_list_provided = url_list  # Store provided URL list for Phase 1
         self.agents: List[BaseAgent] = []
         self._stop_event = asyncio.Event()
         self.auth_creds: Optional[str] = None
@@ -148,24 +149,36 @@ class TeamOrchestrator:
         self.open_redirect_worker_agent = OpenRedirectAgent(url="", event_bus=self.event_bus)
         self.prototype_pollution_worker_agent = PrototypePollutionAgent(url="", event_bus=self.event_bus)
 
-        # Start worker pools for each specialist
-        # scan_context will be passed in actual scan, use global for now
-        scan_ctx = "scan_global"
-        await asyncio.gather(
-            self.sqli_worker_agent.start_queue_consumer(scan_ctx),
-            self.xss_worker_agent.start_queue_consumer(scan_ctx),
-            self.csti_worker_agent.start_queue_consumer(scan_ctx),
-            self.lfi_worker_agent.start_queue_consumer(scan_ctx),
-            self.idor_worker_agent.start_queue_consumer(scan_ctx),
-            self.rce_worker_agent.start_queue_consumer(scan_ctx),
-            self.ssrf_worker_agent.start_queue_consumer(scan_ctx),
-            self.xxe_worker_agent.start_queue_consumer(scan_ctx),
-            self.jwt_agent.start_queue_consumer(scan_ctx),
-            self.open_redirect_worker_agent.start_queue_consumer(scan_ctx),
-            self.prototype_pollution_worker_agent.start_queue_consumer(scan_ctx),
-        )
+        # Use specialist dispatcher to check queues and start necessary specialists
+        from bugtrace.core.specialist_dispatcher import dispatch_specialists
 
-        logger.info("Started 11 specialist worker pools for V3 pipeline")
+        scan_ctx = self.scan_context or "scan_global"
+
+        # Map queue names to specialist agents
+        specialist_map = {
+            "sqli": self.sqli_worker_agent,
+            "xss": self.xss_worker_agent,
+            "csti": self.csti_worker_agent,
+            "lfi": self.lfi_worker_agent,
+            "idor": self.idor_worker_agent,
+            "rce": self.rce_worker_agent,
+            "ssrf": self.ssrf_worker_agent,
+            "xxe": self.xxe_worker_agent,
+            "jwt": self.jwt_agent,
+            "openredirect": self.open_redirect_worker_agent,
+            "prototype_pollution": self.prototype_pollution_worker_agent,
+        }
+
+        # Dispatch specialists with concurrency control (dispatcher handles queue checks and specialist startup)
+        max_concurrent = settings.SPECIALIST_MAX_CONCURRENT
+        dispatch_result = await dispatch_specialists(specialist_map, scan_ctx, max_concurrent=max_concurrent)
+
+        if dispatch_result["specialists_dispatched"] > 0:
+            logger.info(
+                f"[PHASE 4] Specialists completed: {', '.join(dispatch_result['activated'])}"
+            )
+        else:
+            logger.warning("[PHASE 4] No specialists were dispatched (no work in queues)")
 
     async def _shutdown_specialist_workers(self):
         """Shutdown specialist worker pools gracefully."""
@@ -1210,6 +1223,27 @@ class TeamOrchestrator:
             self.tech_profile = loaded_state.get("tech_profile", self.tech_profile)
             return self.url_queue
 
+        # ========== URL List Mode (NEW) ==========
+        if self.url_list_provided:
+            dashboard.log(f"📋 URL List Mode: Using {len(self.url_list_provided)} provided URLs", "INFO")
+            dashboard.log("⏩ Bypassing GoSpider (list provided)", "INFO")
+
+            try:
+                # Run Nuclei ONLY on main target domain (not on every URL)
+                nuclei_agent = NucleiAgent(self.target, recon_dir)
+                self.tech_profile = await nuclei_agent.run()
+                logger.info(f"[Recon] Tech Profile: {len(self.tech_profile.get('frameworks', []))} frameworks detected on {self.target}")
+            except Exception as e:
+                logger.warning(f"Nuclei detection failed: {e}")
+                self.tech_profile = {"frameworks": [], "infrastructure": []}
+
+            # Use provided URLs directly
+            urls_to_scan = self.url_list_provided
+            await self._scan_for_tokens(urls_to_scan)
+
+            return self._normalize_urls(urls_to_scan)
+
+        # ========== Normal Mode (GoSpider) ==========
         dashboard.log("Starting Phase 1: Reconnaissance (Nuclei + GoSpider)", "INFO")
 
         try:
@@ -1728,23 +1762,13 @@ class TeamOrchestrator:
         dashboard.set_phase("🧠 STRATEGY")
         dashboard.set_status("Running", "Deduplication in progress...")
 
-        # Initialize specialist workers NOW (before ThinkingAgent fills queues)
-        if not self._specialist_workers_started:
-            await self._init_specialist_workers()
-            self._specialist_workers_started = True
-            logger.info("Specialist worker pools initialized and listening to queues")
-
-        # Start ThinkingAgent NOW (not before)
-        # Start ThinkingAgent NOW (not before)
-        if hasattr(self.thinking_agent, 'start'):
-            # Run in background as it has a continuous loop
-            asyncio.create_task(self.thinking_agent.start())
-            logger.info("ThinkingConsolidationAgent started for batch processing")
-
         # Process all JSON files from scan_dir/dastysast/ (where Phase 2 saves them)
+        # ThinkingAgent processes batch, fills queues, and TERMINATES
         # NOTE: Phase 2 saves to self.scan_dir/dastysast/, NOT analysis_dir/dastysast/
         analysis_json_dir = self.scan_dir / "dastysast"
         findings_count = await self._phase_3_strategy(dashboard, analysis_json_dir)
+
+        logger.info("ThinkingConsolidationAgent finished - queues ready for specialists")
 
         # Signal STRATEGY complete
         await self._lifecycle.signal_phase_complete(
@@ -1760,7 +1784,13 @@ class TeamOrchestrator:
         logger.info("=== PHASE 4: EXPLOITATION (Specialist Queue Processing) ===")
         dashboard.log(f"⚡ Specialists processing findings from queues", "INFO")
 
-        # Wait for ThinkingAgent to distribute to queues and specialists to process
+        # Initialize specialist workers NOW (consume WET → create DRY → attack DRY)
+        if not self._specialist_workers_started:
+            await self._init_specialist_workers()
+            self._specialist_workers_started = True
+            logger.info("Specialist worker pools initialized and consuming queues")
+
+        # Wait for specialists to drain queues and complete exploitation
         batch_metrics.start_queue_drain()
         queue_results = await self._wait_for_specialist_queues(dashboard, timeout=300.0)
         batch_metrics.end_queue_drain(

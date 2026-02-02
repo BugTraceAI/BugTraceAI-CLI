@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     CODE_MODEL: str = "qwen/qwen-2.5-coder-32b-instruct"
     ANALYSIS_MODEL: str = "x-ai/grok-code-fast-1"
     
+    # --- AUTHORITY Configuration ---
+    ENABLE_SELF_VALIDATION: bool = True
+    XSS_SELF_VALIDATE: bool = True
+    SQLI_SELF_VALIDATE: bool = True
+    RCE_SELF_VALIDATE: bool = True
+
+    # Number of models required to agree for "consensus"
+    # 1 = highest sensitivity, 2 = more balanced, 3 = maximum precision
+    CONSENSUS_VOTES: int = 1
+    
     # Ordered list (Shifts if one fails)
     PRIMARY_MODELS: str = ""
     
@@ -107,6 +117,10 @@ class Settings(BaseSettings):
     WORKER_POOL_SHUTDOWN_TIMEOUT: float = 30.0  # Max seconds to drain on shutdown
     WORKER_POOL_DEQUEUE_TIMEOUT: float = 5.0  # Seconds to wait for queue item
     WORKER_POOL_EMIT_EVENTS: bool = True  # Emit vulnerability_detected events
+
+    # --- Specialist Concurrency Control (Phase 20: WET→DRY) ---
+    SPECIALIST_MAX_CONCURRENT: int = 3  # Max specialists executing simultaneously
+    # Values: 1 (sequential), 3 (balanced, default), 5-10 (aggressive)
 
     # --- Validation Optimization Configuration (Phase 21: v2.3) ---
     VALIDATION_METRICS_ENABLED: bool = True  # Track validation load metrics
@@ -315,12 +329,28 @@ class Settings(BaseSettings):
     # Early exit after first finding per URL (saves 70%+ scan time)
     # When True: Stop testing remaining params after first vuln found
     # When False: Test ALL params for comprehensive coverage
-    EARLY_EXIT_ON_FINDING: bool = True
+    # CHANGED (2026-02-01): Default to False for Burp-equivalent coverage
+    EARLY_EXIT_ON_FINDING: bool = False
 
     # --- TRACING & OOB Configuration (v1.6) ---
     TRACING_ENABLED: bool = True
     INTERACTSH_SERVER: str = "oast.fun"
     INTERACTSH_POLL_INTERVAL: int = 60 # seconds
+
+    # --- ANALYSIS STRATEGY Configuration (v2.7) ---
+    # When True: Include raw reflection probe results in analysis reports
+    # This forces analysis to be based on CONCRETE evidence, not speculation
+    RAW_REFLECTIONS_IN_STRATEGY: bool = True
+
+    # Run active reconnaissance probes BEFORE LLM analysis
+    # Sends Omni-Probe to each parameter to detect reflection context
+    ACTIVE_RECON_PROBES: bool = True
+
+    # Omni-Probe marker for detecting reflections (unique string unlikely to exist)
+    OMNI_PROBE_MARKER: str = "bugtraceomni7x9z"
+
+    # Require evidence in analysis reports (prohibit vague statements)
+    REQUIRE_EVIDENCE_IN_ANALYSIS: bool = True
 
 
 
@@ -433,6 +463,20 @@ class Settings(BaseSettings):
             if "SKIP_VALIDATED_PARAMS" in section:
                 self.SKIP_VALIDATED_PARAMS = section.getboolean("SKIP_VALIDATED_PARAMS")
 
+    def _load_authority_config(self, config):
+        """Load AUTHORITY section config."""
+        if "AUTHORITY" not in config:
+            return
+        section = config["AUTHORITY"]
+        if "ENABLE_SELF_VALIDATION" in section:
+            self.ENABLE_SELF_VALIDATION = section.getboolean("ENABLE_SELF_VALIDATION")
+        if "XSS_SELF_VALIDATE" in section:
+            self.XSS_SELF_VALIDATE = section.getboolean("XSS_SELF_VALIDATE")
+        if "SQLI_SELF_VALIDATE" in section:
+            self.SQLI_SELF_VALIDATE = section.getboolean("SQLI_SELF_VALIDATE")
+        if "RCE_SELF_VALIDATE" in section:
+            self.RCE_SELF_VALIDATE = section.getboolean("RCE_SELF_VALIDATE")
+
     def _load_analysis_and_misc_config(self, config):
         """Load ANALYSIS, BROWSER, ADVANCED, REPORT, OPTIMIZATION sections."""
         if "ANALYSIS" in config:
@@ -492,6 +536,7 @@ class Settings(BaseSettings):
         self._load_llm_models_config(config)
         self._load_conductor_and_scanning_config(config)
         self._load_analysis_and_misc_config(config)
+        self._load_authority_config(config)
 
     # --- Configuration Validation (TASK-120) ---
     def validate_config(self) -> List[str]:
@@ -775,6 +820,15 @@ class Settings(BaseSettings):
     # Crawler
     SPA_WAIT_MS: int = 1000
     MAX_QUEUE_SIZE: int = 100
+
+    # --- MANIPULATOR Configuration (Intelligent Breakouts System) ---
+    # Global rate limiting across XSS/CSTI Skills
+    MANIPULATOR_GLOBAL_RATE_LIMIT: float = 2.0  # req/s total
+    MANIPULATOR_USE_GLOBAL_RATE_LIMITER: bool = True
+    MANIPULATOR_ENABLE_LLM_EXPANSION: bool = True
+    MANIPULATOR_ENABLE_AGENTIC_FALLBACK: bool = False
+    MANIPULATOR_BREAKOUT_PRIORITY_LEVEL: int = 3
+    MANIPULATOR_MAX_LLM_PAYLOADS: int = 100
 
 
 # Singleton Instance
