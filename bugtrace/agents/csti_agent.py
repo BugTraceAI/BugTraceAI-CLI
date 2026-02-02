@@ -353,6 +353,9 @@ class CSTIAgent(BaseAgent):
 
         # Queue consumption mode (Phase 20)
         self._queue_mode = False
+
+        # Expert deduplication: Track emitted findings by fingerprint
+        self._emitted_findings: set = set()  # Agent-specific fingerprint
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
 
