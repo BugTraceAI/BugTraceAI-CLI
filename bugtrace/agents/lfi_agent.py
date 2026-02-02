@@ -45,6 +45,9 @@ class LFIAgent(BaseAgent):
         self._emitted_findings: set = set()  # (url, param)
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
+
+        # WET → DRY transformation (Two-phase processing)
+        self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
         
     def _determine_validation_status(self, response_text: str, payload: str) -> str:
         """
@@ -226,42 +229,239 @@ class LFIAgent(BaseAgent):
         return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
     # =========================================================================
-    # Queue Consumption Mode (Phase 20)
+    # Queue Consumption Mode (Phase 20) - WET→DRY
     # =========================================================================
 
+    async def analyze_and_dedup_queue(self) -> List[Dict]:
+        """Phase A: Global analysis of WET list with LLM-powered deduplication."""
+        import asyncio
+        import time
+        from bugtrace.core.queue import queue_manager
+
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+
+        queue = queue_manager.get_queue("lfi")
+        wet_findings = []
+
+        wait_start = time.monotonic()
+        max_wait = 300.0
+
+        while (time.monotonic() - wait_start) < max_wait:
+            depth = queue.depth() if hasattr(queue, 'depth') else 0
+            if depth > 0:
+                logger.info(f"[{self.name}] Phase A: Queue has {depth} items, starting drain...")
+                break
+            await asyncio.sleep(0.5)
+        else:
+            return []
+
+        empty_count = 0
+        max_empty_checks = 10
+
+        while empty_count < max_empty_checks:
+            item = await queue.dequeue(timeout=0.5)
+            if item is None:
+                empty_count += 1
+                await asyncio.sleep(0.5)
+                continue
+
+            empty_count = 0
+            finding = item.get("finding", {})
+            url = finding.get("url", "")
+            parameter = finding.get("parameter", "")
+
+            if url and parameter:
+                wet_findings.append({
+                    "url": url,
+                    "parameter": parameter,
+                    "finding": finding,
+                    "scan_context": item.get("scan_context", self._scan_context)
+                })
+
+        logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings from queue")
+
+        if not wet_findings:
+            return []
+
+        try:
+            dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+        except Exception as e:
+            logger.error(f"[{self.name}] LLM dedup failed: {e}. Falling back to fingerprint dedup")
+            dry_list = self._fallback_fingerprint_dedup(wet_findings)
+
+        self._dry_findings = dry_list
+        dup_count = len(wet_findings) - len(dry_list)
+        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({dup_count} duplicates removed)")
+
+        return dry_list
+
+    async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
+        """LLM-powered intelligent deduplication."""
+        from bugtrace.core.llm_client import llm_client
+        import json
+
+        prompt = f"""You are analyzing {len(wet_findings)} potential LFI findings.
+
+DEDUPLICATION RULES FOR LFI:
+- Same URL + parameter = DUPLICATE
+- Different parameter = DIFFERENT
+
+WET LIST:
+{json.dumps(wet_findings, indent=2)}
+
+Return JSON array of UNIQUE findings only:
+{{"findings": [...]}}
+"""
+
+        response = await llm_client.generate(
+            prompt=prompt,
+            system_prompt="You are an expert security analyst specializing in LFI deduplication.",
+            module_name="LFI_DEDUP",
+            temperature=0.2
+        )
+
+        try:
+            result = json.loads(response)
+            return result.get("findings", wet_findings)
+        except json.JSONDecodeError:
+            logger.warning(f"[{self.name}] LLM returned invalid JSON, using fallback")
+            return self._fallback_fingerprint_dedup(wet_findings)
+
+    def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
+        """Fallback fingerprint-based deduplication."""
+        seen_fingerprints = set()
+        dry_list = []
+
+        for finding_data in wet_findings:
+            url = finding_data.get("url", "")
+            parameter = finding_data.get("parameter", "")
+
+            if not url or not parameter:
+                continue
+
+            fingerprint = self._generate_lfi_fingerprint(url, parameter)
+
+            if fingerprint not in seen_fingerprints:
+                seen_fingerprints.add(fingerprint)
+                dry_list.append(finding_data)
+
+        return dry_list
+
+    async def exploit_dry_list(self) -> List[Dict]:
+        """Phase B: Exploit DRY list."""
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
+        logger.info(f"[{self.name}] Phase B: Exploiting {len(self._dry_findings)} DRY findings...")
+
+        validated_findings = []
+
+        for idx, finding_data in enumerate(self._dry_findings, 1):
+            url = finding_data.get("url", "")
+            parameter = finding_data.get("parameter", "")
+            finding = finding_data.get("finding", {})
+
+            logger.info(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Testing {url}?{parameter}")
+
+            try:
+                self.url = url
+                result = await self._test_single_param_from_queue(url, parameter, finding)
+
+                if result and result.get("validated"):
+                    validated_findings.append(result)
+
+                    fingerprint = self._generate_lfi_fingerprint(url, parameter)
+
+                    if fingerprint not in self._emitted_findings:
+                        self._emitted_findings.add(fingerprint)
+
+                        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+                            status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
+
+                            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                                "specialist": "lfi",
+                                "finding": {
+                                    "type": "LFI",
+                                    "url": result.get("url"),
+                                    "parameter": result.get("parameter"),
+                                    "payload": result.get("payload"),
+                                },
+                                "status": status,
+                                "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
+                                "scan_context": self._scan_context,
+                            })
+
+                        logger.info(f"[{self.name}] ✅ Emitted unique finding: {url}?{parameter}")
+                    else:
+                        logger.debug(f"[{self.name}] ⏭️  Skipped duplicate: {fingerprint}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Attack failed: {e}")
+                continue
+
+        logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
+
+        return validated_findings
+
+    async def _generate_specialist_report(self, findings: List[Dict]) -> str:
+        """Generate specialist report."""
+        import json
+        import aiofiles
+        from datetime import datetime
+        from bugtrace.core.config import settings
+
+        scan_id = self._scan_context.split("/")[-1]
+        scan_dir = settings.BASE_DIR / "reports" / scan_id
+        specialists_dir = scan_dir / "specialists"
+        specialists_dir.mkdir(parents=True, exist_ok=True)
+
+        report = {
+            "agent": f"{self.name}",
+            "timestamp": datetime.now().isoformat(),
+            "scan_context": self._scan_context,
+            "phase_a": {
+                "wet_count": len(self._dry_findings) + (len(findings) if findings else 0),
+                "dry_count": len(self._dry_findings),
+                "dedup_method": "llm_with_fingerprint_fallback"
+            },
+            "phase_b": {
+                "validated_count": len([f for f in findings if f.get("validated")]),
+                "pending_count": len([f for f in findings if not f.get("validated")]),
+                "total_findings": len(findings)
+            },
+            "findings": findings
+        }
+
+        report_path = specialists_dir / "lfi_report.json"
+        async with aiofiles.open(report_path, 'w') as f:
+            await f.write(json.dumps(report, indent=2))
+
+        logger.info(f"[{self.name}] Specialist report saved: {report_path}")
+
+        return str(report_path)
+
     async def start_queue_consumer(self, scan_context: str) -> None:
-        """
-        Start LFIAgent in queue consumer mode.
-
-        Spawns a worker pool that consumes from the lfi queue and
-        processes findings in parallel.
-
-        Args:
-            scan_context: Scan identifier for event correlation
-        """
+        """TWO-PHASE queue consumer (WET → DRY). NO infinite loop."""
         self._queue_mode = True
         self._scan_context = scan_context
 
-        # Configure worker pool
-        config = WorkerConfig(
-            specialist="lfi",
-            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,
-            process_func=self._process_queue_item,
-            on_result=self._handle_queue_result,
-            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
-        )
+        logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
 
-        self._worker_pool = WorkerPool(config)
+        # PHASE A
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+        dry_list = await self.analyze_and_dedup_queue()
 
-        # Subscribe to work_queued_lfi events (optional notification)
-        if self.event_bus:
-            self.event_bus.subscribe(
-                EventType.WORK_QUEUED_LFI.value,
-                self._on_work_queued
-            )
+        if not dry_list:
+            logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            return
 
-        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
-        await self._worker_pool.start()
+        # PHASE B
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
+        results = await self.exploit_dry_list()
+
+        # REPORTING
+        if results or self._dry_findings:
+            await self._generate_specialist_report(results)
+
+        logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
     async def stop_queue_consumer(self) -> None:
         """Stop queue consumer mode gracefully."""

@@ -21,6 +21,7 @@ import re
 import json
 import time
 import aiohttp
+from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, Set
 from urllib.parse import urlparse, parse_qs, urlencode, unquote
 from dataclasses import dataclass, field
@@ -307,9 +308,13 @@ class SQLiAgent(BaseAgent):
         self._queue_mode = False  # True when consuming from queue
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
+        self._stop_requested = False  # Flag to stop continuous loop
 
         # Expert deduplication: Track emitted findings by fingerprint
         self._emitted_findings: set = set()  # (param_type, param_name)
+
+        # WET → DRY transformation (Two-phase processing)
+        self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
 
     def _finding_to_dict(self, finding: SQLiFinding) -> Dict:
         """Convert SQLiFinding object to dictionary for report."""
@@ -2020,38 +2025,351 @@ Write the exploitation explanation section for the report."""
         return names.get(technique, "Unknown")
 
     # =========================================================================
+    # WET → DRY TWO-PHASE PROCESSING
+    # =========================================================================
+
+    async def analyze_and_dedup_queue(self) -> List[Dict]:
+        """
+        Phase A: Global analysis of WET list with LLM-powered deduplication.
+
+        Steps:
+        1. Wait for queue to have items (polling loop)
+        2. Drain ALL items from queue until stable empty (WET list)
+        3. Load global context (Nuclei tech stack, discovered URLs)
+        4. Call LLM with expert system prompt for deduplication
+        5. LLM returns DRY list (deduplicated findings)
+        6. Save DRY list to self._dry_findings
+
+        Returns:
+            List of unique findings (DRY list) to attack in Phase B
+        """
+        from bugtrace.core.llm_client import llm_client
+        import time
+
+        queue = queue_manager.get_queue("sqli")
+        wet_findings = []
+
+        # 1. Wait for queue to have items (max 300s - matches _wait_for_specialist_queues timeout)
+        logger.info(f"[{self.name}] Phase A: Waiting for queue to receive items...")
+        wait_start = time.monotonic()
+        max_wait = 300.0  # 300 seconds max wait (matches PHASE 4 timeout)
+
+        while (time.monotonic() - wait_start) < max_wait:
+            depth = queue.depth() if hasattr(queue, 'depth') else 0
+            if depth > 0:
+                logger.info(f"[{self.name}] Phase A: Queue has {depth} items, starting drain...")
+                break
+            await asyncio.sleep(0.5)  # Check every 500ms
+        else:
+            logger.info(f"[{self.name}] Phase A: No items received after {max_wait}s")
+            return []
+
+        # 2. Drain ALL items until queue is stable empty
+        empty_count = 0
+        max_empty_checks = 10  # Queue must be empty for 10 consecutive checks (5s)
+
+        while empty_count < max_empty_checks:
+            item = await queue.dequeue(timeout=0.5)  # 500ms timeout per item
+
+            if item is None:
+                empty_count += 1
+                await asyncio.sleep(0.5)  # Wait before next check
+                continue
+
+            # Reset empty counter - queue is still receiving items
+            empty_count = 0
+
+            # Extract finding data
+            finding = item.get("finding", {})
+            wet_findings.append({
+                "url": finding.get("url", ""),
+                "parameter": finding.get("parameter", ""),
+                "technique": finding.get("technique", ""),
+                "priority": item.get("priority", 0),
+                "finding_data": finding  # Keep full finding for Phase B
+            })
+
+        logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings from queue")
+
+        if not wet_findings:
+            logger.info(f"[{self.name}] Phase A: No findings in WET list")
+            return []
+
+        # 3. Load global context (simplified - no filesystem deps)
+        context = {
+            "target_url": self.url or "unknown",
+            "wet_count": len(wet_findings),
+            "tech_stack": "unknown",  # TODO: Load from scan metadata
+            "urls_scanned": [],  # TODO: Load from scan metadata
+        }
+
+        # 4. Call LLM for global analysis
+        dry_list = await self._llm_analyze_and_dedup(wet_findings, context)
+
+        # 5. Save DRY list
+        self._dry_findings = dry_list
+
+        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({len(wet_findings) - len(dry_list)} duplicates removed)")
+
+        return dry_list
+
+    async def _llm_analyze_and_dedup(
+        self,
+        wet_findings: List[Dict],
+        context: Dict
+    ) -> List[Dict]:
+        """
+        Call LLM to analyze WET list and generate DRY list.
+
+        Uses: llm_client from bugtrace.core.llm_client with SQLi expert prompt.
+        """
+        from bugtrace.core.llm_client import llm_client
+
+        # Build system prompt with SQLi expert rules
+        system_prompt = f"""You are an expert SQL Injection security analyst.
+
+Context:
+- Target: {context['target_url']}
+- Tech Stack: {context.get('tech_stack', 'unknown')}
+- URLs Scanned: {len(context.get('urls_scanned', []))}
+
+WET List ({context['wet_count']} findings):
+{json.dumps(wet_findings, indent=2)}
+
+Task:
+1. Analyze each finding for real exploitability
+2. Identify attack paths worth testing
+3. Apply expert deduplication rules:
+   - Cookie-based SQLi: GLOBAL (same cookie on different URLs = DUPLICATE)
+   - Header-based SQLi: GLOBAL (same header on different URLs = DUPLICATE)
+   - URL param SQLi: PER-ENDPOINT (same param on different URLs = DIFFERENT)
+   - POST param SQLi: PER-ENDPOINT (same param on different endpoints = DIFFERENT)
+4. Return DRY list in JSON format
+
+Examples:
+- Cookie: TrackingId @ /blog/post?id=3 = Cookie: TrackingId @ /catalog?id=1 (DUPLICATE)
+- URL param 'id' @ /blog/post?id=3 ≠ URL param 'id' @ /catalog?id=1 (DIFFERENT endpoints)
+
+Output format (JSON only, no markdown):
+{{
+  "dry_findings": [
+    {{
+      "url": "...",
+      "parameter": "...",
+      "rationale": "why this is unique and exploitable",
+      "attack_priority": 1-5
+    }}
+  ],
+  "duplicates_removed": 10,
+  "reasoning": "Brief explanation of deduplication strategy"
+}}"""
+
+        try:
+            response = await llm_client.generate(
+                system=system_prompt,
+                user="Analyze the WET list above and return DRY findings in JSON format.",
+                response_format="json"
+            )
+
+            # Parse LLM response
+            dry_data = json.loads(response)
+            dry_list = dry_data.get("dry_findings", [])
+
+            logger.info(f"[{self.name}] LLM deduplication: {dry_data.get('reasoning', 'No reasoning provided')}")
+
+            return dry_list
+
+        except Exception as e:
+            logger.error(f"[{self.name}] LLM deduplication failed: {e}. Falling back to fingerprint dedup.")
+            # Fallback: Use fingerprint-based deduplication
+            return self._fallback_fingerprint_dedup(wet_findings)
+
+    def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
+        """Fallback deduplication using fingerprints if LLM fails."""
+        seen_fingerprints = set()
+        dry_list = []
+
+        for finding in wet_findings:
+            fingerprint = self._generate_sqli_fingerprint(
+                finding["parameter"],
+                finding["url"]
+            )
+
+            if fingerprint not in seen_fingerprints:
+                seen_fingerprints.add(fingerprint)
+                dry_list.append(finding)
+
+        logger.info(f"[{self.name}] Fallback fingerprint dedup: {len(wet_findings)} → {len(dry_list)}")
+        return dry_list
+
+    async def exploit_dry_list(self) -> List[Dict]:
+        """
+        Phase B: Attack each DRY finding with specialized SQLi techniques.
+
+        Steps:
+        1. For each DRY item:
+           a. Execute specialized attack (error, boolean, union, time-based, OOB)
+           b. Validate result
+           c. Emit VULNERABILITY_DETECTED event if confirmed
+        2. Generate specialist report
+
+        Returns:
+            List of validated findings
+        """
+        results = []
+
+        logger.info(f"[{self.name}] Phase B: Exploiting {len(self._dry_findings)} DRY findings...")
+
+        for dry_item in self._dry_findings:
+            url = dry_item.get("url")
+            param = dry_item.get("parameter")
+
+            if not url or not param:
+                continue
+
+            # Configure agent for this specific test
+            self.url = url
+            self.param = param
+
+            # Check if cookie-based or regular param
+            if param.startswith("Cookie:"):
+                cookie_name = param.replace("Cookie:", "").strip()
+                result = await self._test_cookie_sqli_from_queue(url, cookie_name, dry_item)
+            else:
+                result = await self._test_single_param_from_queue(url, param, dry_item)
+
+            if result:
+                # Convert to dict and emit event
+                finding_dict = self._finding_to_dict(result)
+
+                # Emit VULNERABILITY_DETECTED event
+                if settings.WORKER_POOL_EMIT_EVENTS:
+                    await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                        "specialist": "sqli",
+                        "finding": {
+                            "type": "SQLI",
+                            "url": result.url,
+                            "parameter": result.parameter,
+                            "payload": result.working_payload,
+                            "technique": result.injection_type,
+                            "dbms": result.dbms_detected,
+                        },
+                        "status": "VALIDATED_CONFIRMED",
+                        "validation_requires_cdp": False,
+                        "scan_context": self._scan_context,
+                    })
+
+                logger.info(f"[{self.name}] Confirmed SQLi: {result.url}?{result.parameter} ({result.injection_type})")
+
+                # Update Dashboard UI
+                dashboard.add_finding(
+                    "SQL Injection",
+                    f"{result.url} [{result.parameter}] ({result.injection_type})",
+                    "CRITICAL"
+                )
+                dashboard.log(f"[{self.name}] 🚨 SQLI CONFIRMED: {result.parameter} vulnerable via {result.injection_type}", "SUCCESS")
+
+                results.append(finding_dict)
+
+        logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(results)} validated findings")
+
+        # Generate specialist report
+        await self._generate_specialist_report(results)
+
+        return results
+
+    async def _generate_specialist_report(self, findings: List[Dict]) -> str:
+        """
+        Generate specialist report after exploitation.
+
+        Steps:
+        1. Summarize findings (validated vs pending)
+        2. Technical analysis per finding
+        3. Save to: reports/scan_{id}/specialists/sqli_report.json
+
+        Returns:
+            Path to generated report
+        """
+        from datetime import datetime
+        from bugtrace.core.config import settings
+
+        # Create specialists directory (use absolute path)
+        # _scan_context format: "scan_130008889105184_1770059687"
+        scan_id = self._scan_context.split("/")[-1]  # Extract scan ID from context
+        scan_dir = settings.BASE_DIR / "reports" / scan_id
+        specialists_dir = scan_dir / "specialists"
+        specialists_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build report
+        report = {
+            "agent": "SQLiAgent",
+            "scan_id": self._scan_context.split("/")[-1],
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "phase_a": {
+                "wet_count": len(self._dry_findings) + (len(findings) - len(self._dry_findings)),  # Estimate
+                "dry_count": len(self._dry_findings),
+                "duplicates_removed": max(0, len(self._dry_findings) - len(findings)),
+                "analysis_duration_s": 0,  # TODO: Track timing
+            },
+            "phase_b": {
+                "attacks_executed": len(self._dry_findings),
+                "validated_confirmed": len([f for f in findings if f.get("status") == "VALIDATED_CONFIRMED"]),
+                "validated_likely": 0,
+                "pending_validation": len([f for f in findings if f.get("status") == "PENDING_VALIDATION"]),
+                "exploitation_duration_s": 0,  # TODO: Track timing
+            },
+            "findings": findings
+        }
+
+        # Save report
+        report_path = specialists_dir / "sqli_report.json"
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+
+        logger.info(f"[{self.name}] Specialist report saved: {report_path}")
+
+        return str(report_path)
+
+    # =========================================================================
     # QUEUE CONSUMPTION MODE (PHASE 19)
     # =========================================================================
 
     async def start_queue_consumer(self, scan_context: str) -> None:
         """
-        Start SQLiAgent in queue consumer mode.
+        Start SQLiAgent in TWO-PHASE queue consumer mode (V3.1 architecture).
 
-        Spawns a worker pool that consumes from the sqli queue and
-        processes findings in parallel.
+        Architecture:
+        - Launched by _init_specialist_workers() with asyncio.gather()
+        - Waits for ThinkingConsolidation to fill queue (max 300s)
+        - Phase A: Drains ALL WET items → LLM deduplication → DRY list
+        - Phase B: Attacks DRY list → Emits VULNERABILITY_DETECTED events
+        - Returns when done (asyncio.gather() continues to next phase)
+
+        WET → DRY Transformation:
+        - Phase A: Read ALL WET files, LLM deduplication → DRY list
+        - Phase B: Attack DRY list only → Generate specialist report
         """
         self._queue_mode = True
         self._scan_context = scan_context
 
-        # Configure worker pool
-        config = WorkerConfig(
-            specialist="sqli",
-            pool_size=settings.WORKER_POOL_SQLI_SIZE,
-            process_func=self._process_queue_item,
-            on_result=self._handle_queue_result,
-            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
-        )
+        logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
 
-        self._worker_pool = WorkerPool(config)
+        # PHASE A: ANALYSIS & DEDUPLICATION
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+        dry_list = await self.analyze_and_dedup_queue()
 
-        # Subscribe to work_queued_sqli events (optional notification)
-        self.event_bus.subscribe(
-            EventType.WORK_QUEUED_SQLI.value,
-            self._on_work_queued
-        )
+        if not dry_list:
+            logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            return
 
-        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
-        await self._worker_pool.start()
+        logger.info(f"[{self.name}] DRY list: {len(dry_list)} unique findings to attack")
+
+        # PHASE B: EXPLOITATION
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
+        results = await self.exploit_dry_list()
+
+        logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
+        logger.info(f"[{self.name}] Specialist report saved to: {self._scan_context}/specialists/sqli_report.json")
 
     async def _process_queue_item(self, item: dict) -> Optional[SQLiFinding]:
         """
@@ -2349,17 +2667,16 @@ Write the exploitation explanation section for the report."""
 
     async def stop_queue_consumer(self) -> None:
         """Stop queue consumer mode gracefully."""
+        # Set stop flag to break out of continuous loop
+        self._stop_requested = True
+
+        # Legacy WorkerPool cleanup (if still present)
         if self._worker_pool:
             await self._worker_pool.stop()
             self._worker_pool = None
 
-        self.event_bus.unsubscribe(
-            EventType.WORK_QUEUED_SQLI.value,
-            self._on_work_queued
-        )
-
         self._queue_mode = False
-        logger.info(f"[{self.name}] Queue consumer stopped")
+        logger.info(f"[{self.name}] Queue consumer stop requested")
 
     def get_queue_stats(self) -> dict:
         """Get queue consumer statistics."""

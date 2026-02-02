@@ -41,6 +41,9 @@ class XXEAgent(BaseAgent):
         # Expert deduplication: Track emitted findings by fingerprint
         self._emitted_findings: set = set()  # (url_normalized, vuln_signature)
 
+        # WET → DRY transformation (Two-phase processing)
+        self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
+
     def _determine_validation_status(self, payload: str, evidence: str = "success") -> str:
         """
         Determine tiered validation status for XXE finding.
@@ -244,37 +247,309 @@ class XXEAgent(BaseAgent):
         return XmlParser.extract_tags(response, tags)
 
     # =========================================================================
-    # QUEUE CONSUMPTION MODE (Phase 20)
+    # QUEUE CONSUMPTION MODE (Phase 20) - WET→DRY Two-Phase Processing
     # =========================================================================
+
+    async def analyze_and_dedup_queue(self) -> List[Dict]:
+        """
+        Phase A: Global analysis of WET list with LLM-powered deduplication.
+
+        Process:
+        1. Wait for queue to have items (max 300s - matches team.py timeout)
+        2. Drain ALL items until queue is stable empty (10 consecutive checks)
+        3. LLM analysis with agent-specific dedup rules (fallback to fingerprints)
+        4. Return DRY list (deduplicated findings)
+
+        Returns:
+            List of deduplicated findings (DRY list)
+        """
+        import asyncio
+        import time
+        from bugtrace.core.queue import queue_manager
+
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+
+        queue = queue_manager.get_queue("xxe")
+        wet_findings = []
+
+        # 1. Wait for queue to have items (max 300s - matches team.py timeout)
+        wait_start = time.monotonic()
+        max_wait = 300.0
+
+        while (time.monotonic() - wait_start) < max_wait:
+            depth = queue.depth() if hasattr(queue, 'depth') else 0
+            if depth > 0:
+                logger.info(f"[{self.name}] Phase A: Queue has {depth} items, starting drain...")
+                break
+            await asyncio.sleep(0.5)
+        else:
+            logger.info(f"[{self.name}] Phase A: Queue timeout - no items appeared")
+            return []
+
+        # 2. Drain ALL items until queue is stable empty (10 consecutive empty checks)
+        empty_count = 0
+        max_empty_checks = 10
+
+        while empty_count < max_empty_checks:
+            item = await queue.dequeue(timeout=0.5)
+            if item is None:
+                empty_count += 1
+                await asyncio.sleep(0.5)
+                continue
+
+            empty_count = 0  # Reset on successful dequeue
+
+            # Extract finding from queue item
+            finding = item.get("finding", {})
+            url = finding.get("url", "")
+
+            if url:
+                wet_findings.append({
+                    "url": url,
+                    "finding": finding,
+                    "scan_context": item.get("scan_context", self._scan_context)
+                })
+
+        logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings from queue")
+
+        if not wet_findings:
+            logger.info(f"[{self.name}] Phase A: No findings to deduplicate")
+            return []
+
+        # 3. LLM analysis and dedup (with fingerprint fallback)
+        try:
+            dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+        except Exception as e:
+            logger.error(f"[{self.name}] LLM dedup failed: {e}. Falling back to fingerprint dedup")
+            dry_list = self._fallback_fingerprint_dedup(wet_findings)
+
+        # 4. Store and return DRY list
+        self._dry_findings = dry_list
+
+        dup_count = len(wet_findings) - len(dry_list)
+        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({dup_count} duplicates removed)")
+
+        return dry_list
+
+    async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
+        """
+        LLM-powered intelligent deduplication with agent-specific rules.
+
+        Returns:
+            Deduplicated list of findings (DRY list)
+        """
+        from bugtrace.core.llm_client import llm_client
+        import json
+
+        prompt = f"""You are analyzing {len(wet_findings)} potential XXE findings.
+
+DEDUPLICATION RULES FOR XXE:
+- Same endpoint = DUPLICATE (regardless of query params)
+- Example: /api/product?id=1 and /api/product?id=2 = DUPLICATE (keep 1)
+- XXE is endpoint-based, not parameter-specific
+
+WET LIST:
+{json.dumps(wet_findings, indent=2)}
+
+Return JSON array of UNIQUE findings only:
+{{"findings": [...]}}
+"""
+
+        response = await llm_client.generate(
+            prompt=prompt,
+            system_prompt="You are an expert security analyst specializing in XXE deduplication.",
+            module_name="XXE_DEDUP",
+            temperature=0.2  # Low temperature for consistent dedup
+        )
+
+        try:
+            result = json.loads(response)
+            return result.get("findings", wet_findings)
+        except json.JSONDecodeError:
+            logger.warning(f"[{self.name}] LLM returned invalid JSON, using fallback")
+            return self._fallback_fingerprint_dedup(wet_findings)
+
+    def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
+        """
+        Fallback fingerprint-based deduplication (no LLM).
+
+        Uses existing `_generate_xxe_fingerprint()` method to identify duplicates.
+
+        Args:
+            wet_findings: All findings from queue
+
+        Returns:
+            Deduplicated findings list
+        """
+        seen_fingerprints = set()
+        dry_list = []
+
+        for finding_data in wet_findings:
+            url = finding_data.get("url", "")
+
+            if not url:
+                continue
+
+            # Generate fingerprint using existing method
+            fingerprint = self._generate_xxe_fingerprint(url)
+
+            if fingerprint not in seen_fingerprints:
+                seen_fingerprints.add(fingerprint)
+                dry_list.append(finding_data)
+
+        return dry_list
+
+    async def exploit_dry_list(self) -> List[Dict]:
+        """
+        Phase B: Exploit DRY list (deduplicated findings only).
+
+        Process:
+        1. For each DRY finding, execute XXE attack
+        2. Check fingerprint before emitting (prevent race conditions)
+        3. Emit VULNERABILITY_DETECTED events for validated findings
+
+        Returns:
+            List of validated findings
+        """
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
+        logger.info(f"[{self.name}] Phase B: Exploiting {len(self._dry_findings)} DRY findings...")
+
+        validated_findings = []
+
+        for idx, finding_data in enumerate(self._dry_findings, 1):
+            url = finding_data.get("url", "")
+            finding = finding_data.get("finding", {})
+
+            logger.info(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Testing {url}")
+
+            try:
+                # Execute XXE attack using existing method
+                self.url = url
+                result = await self._test_single_url_from_queue(url, finding)
+
+                if result and result.get("validated"):
+                    validated_findings.append(result)
+
+                    # FINGERPRINT CHECK: Prevent duplicate emissions
+                    fingerprint = self._generate_xxe_fingerprint(url)
+
+                    if fingerprint not in self._emitted_findings:
+                        self._emitted_findings.add(fingerprint)
+
+                        # Emit VULNERABILITY_DETECTED event
+                        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+                            status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
+
+                            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                                "specialist": "xxe",
+                                "finding": {
+                                    "type": "XXE",
+                                    "url": result.get("url"),
+                                    "payload": result.get("payload"),
+                                    "severity": result.get("severity"),
+                                    "description": result.get("description"),
+                                    "reproduction": result.get("reproduction"),
+                                },
+                                "status": status,
+                                "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
+                                "scan_context": self._scan_context,
+                            })
+
+                        logger.info(f"[{self.name}] ✅ Emitted unique XXE finding: {url}")
+                    else:
+                        logger.debug(f"[{self.name}] ⏭️  Skipped duplicate: {fingerprint}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Attack failed: {e}")
+                continue
+
+        logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
+
+        return validated_findings
+
+    async def _generate_specialist_report(self, findings: List[Dict]) -> str:
+        """
+        Generate specialist report after exploitation.
+
+        Steps:
+        1. Summarize findings (validated vs pending)
+        2. Technical analysis per finding
+        3. Save to: reports/scan_{id}/specialists/xxe_report.json
+
+        Returns:
+            Path to generated report
+        """
+        import json
+        import aiofiles
+        from datetime import datetime
+        from bugtrace.core.config import settings
+
+        # Create specialists directory (use absolute path)
+        scan_id = self._scan_context.split("/")[-1]  # Extract scan ID
+        scan_dir = settings.BASE_DIR / "reports" / scan_id
+        specialists_dir = scan_dir / "specialists"
+        specialists_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build report
+        report = {
+            "agent": f"{self.name}",
+            "timestamp": datetime.now().isoformat(),
+            "scan_context": self._scan_context,
+            "phase_a": {
+                "wet_count": len(self._dry_findings) + (len(findings) if findings else 0),  # Approximate
+                "dry_count": len(self._dry_findings),
+                "duplicates_removed": 0,  # Calculated in analyze_and_dedup_queue
+                "dedup_method": "llm_with_fingerprint_fallback"
+            },
+            "phase_b": {
+                "validated_count": len([f for f in findings if f.get("validated")]),
+                "pending_count": len([f for f in findings if not f.get("validated")]),
+                "total_findings": len(findings)
+            },
+            "findings": findings
+        }
+
+        # Write report
+        report_path = specialists_dir / "xxe_report.json"
+        async with aiofiles.open(report_path, 'w') as f:
+            await f.write(json.dumps(report, indent=2))
+
+        logger.info(f"[{self.name}] Specialist report saved: {report_path}")
+
+        return str(report_path)
 
     async def start_queue_consumer(self, scan_context: str) -> None:
         """
-        Start XXEAgent in queue consumer mode.
+        TWO-PHASE queue consumer (WET → DRY).
 
-        Spawns a worker pool that consumes from the xxe queue and
-        processes findings in parallel.
+        Phase A: Analyze and deduplicate ALL WET findings from queue
+        Phase B: Exploit DRY list (deduplicated findings only)
+
+        NO infinite loop - processes once and terminates.
         """
         self._queue_mode = True
         self._scan_context = scan_context
 
-        config = WorkerConfig(
-            specialist="xxe",
-            pool_size=settings.WORKER_POOL_DEFAULT_SIZE,
-            process_func=self._process_queue_item,
-            on_result=self._handle_queue_result,
-            shutdown_timeout=settings.WORKER_POOL_SHUTDOWN_TIMEOUT
-        )
+        logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
 
-        self._worker_pool = WorkerPool(config)
+        # PHASE A: ANALYSIS & DEDUPLICATION
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+        dry_list = await self.analyze_and_dedup_queue()
 
-        if self.event_bus:
-            self.event_bus.subscribe(
-                EventType.WORK_QUEUED_XXE.value,
-                self._on_work_queued
-            )
+        if not dry_list:
+            logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            return  # ✅ Terminate (no loop)
 
-        logger.info(f"[{self.name}] Starting queue consumer with {config.pool_size} workers")
-        await self._worker_pool.start()
+        # PHASE B: EXPLOITATION
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
+        results = await self.exploit_dry_list()
+
+        # REPORTING
+        if results or self._dry_findings:
+            await self._generate_specialist_report(results)
+
+        logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
+        # Method ends - agent terminates ✅
 
     async def _process_queue_item(self, item: dict) -> Optional[Dict]:
         """Process a single item from the xxe queue."""
