@@ -188,7 +188,8 @@ class ExternalToolManager:
             "--pids-limit", "100",
             # Security options
             "--security-opt", "no-new-privileges",
-            "--read-only",
+            # Note: --read-only removed - Nuclei needs write access to /root/.config
+            # for templates download and config storage
             "--tmpfs", "/tmp:size=100m,mode=1777",
             # Network isolation (TASK-114)
             "--network", network_mode,

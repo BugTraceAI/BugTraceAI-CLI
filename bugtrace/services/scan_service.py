@@ -391,11 +391,17 @@ class ScanService:
             }
 
     def _build_scans_query(self, status_filter: Optional[str]):
-        """Build scans query with optional status filter."""
+        """Build scans query with optional status filter and eager-loaded target."""
         from sqlmodel import select
+        from sqlalchemy.orm import selectinload
         from bugtrace.schemas.db_models import ScanTable
 
-        statement = select(ScanTable).order_by(ScanTable.id.desc())
+        # Use selectinload to prevent N+1 queries when accessing scan.target
+        statement = (
+            select(ScanTable)
+            .options(selectinload(ScanTable.target))
+            .order_by(ScanTable.id.desc())
+        )
         if status_filter:
             statement = statement.where(ScanTable.status == ScanStatus[status_filter.upper()])
         return statement
@@ -411,14 +417,16 @@ class ScanService:
         return session.exec(count_statement).one()
 
     def _format_scan_results(self, session, scans) -> List[Dict[str, Any]]:
-        """Format scan results with report status."""
-        from bugtrace.schemas.db_models import TargetTable
+        """Format scan results with report status.
 
+        Note: Assumes scans were loaded with selectinload(ScanTable.target)
+        to prevent N+1 queries.
+        """
         report_base = settings.REPORT_DIR
         results = []
         for scan in scans:
-            target = session.get(TargetTable, scan.target_id)
-            target_url = target.url if target else None
+            # Use already-loaded relationship (no extra query due to selectinload)
+            target_url = scan.target.url if scan.target else None
             has_report = self._has_report_dir(report_base, scan.id, target_url, scan.timestamp)
 
             results.append({
@@ -669,6 +677,9 @@ class ScanService:
         """
         Get findings for a scan with filtering and pagination.
 
+        V3.2: Reads from FILES (source of truth) instead of database.
+        Files: specialists/wet/*.json, specialists/dry/*.json, specialists/results/*.json
+
         Args:
             scan_id: Scan ID to get findings for
             severity: Optional severity filter (CRITICAL, HIGH, MEDIUM, LOW, INFO)
@@ -679,65 +690,214 @@ class ScanService:
         Returns:
             Dictionary with findings, total, page, per_page
         """
+        # Load all findings from files (source of truth)
+        all_findings = self._load_findings_from_files(scan_id)
+
+        # Apply filters
+        filtered = self._filter_findings(all_findings, severity, vuln_type)
+
+        # Paginate
+        total = len(filtered)
         offset = (page - 1) * per_page
+        paginated = filtered[offset:offset + per_page]
 
-        with self.db.get_session() as session:
-            from sqlmodel import select, func
-            from bugtrace.schemas.db_models import FindingTable
+        # Format for API response
+        results = self._format_file_findings(paginated)
 
-            statement = self._build_findings_query(scan_id, severity, vuln_type)
-            total = self._count_findings(session, scan_id, severity, vuln_type, func)
-            findings = session.exec(statement.offset(offset).limit(per_page)).all()
-            results = self._format_findings(findings)
+        return {
+            "findings": results,
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+        }
 
-            return {
-                "findings": results,
-                "total": total,
-                "page": page,
-                "per_page": per_page,
-            }
+    def _find_report_dir_for_scan(self, scan_id: int) -> Optional[Path]:
+        """
+        Find the report directory for a scan_id.
 
-    def _build_findings_query(self, scan_id: int, severity: Optional[str], vuln_type: Optional[str]):
-        """Build findings query with filters."""
-        from sqlmodel import select
-        from bugtrace.schemas.db_models import FindingTable
+        Searches two patterns:
+        1. scan_{id}/ (created by ReportService API)
+        2. {domain}_{timestamp}/ (created by scan pipeline)
+        """
+        report_base = settings.REPORT_DIR
 
-        statement = select(FindingTable).where(FindingTable.scan_id == scan_id)
+        # Pattern 1: API-generated reports
+        api_dir = report_base / f"scan_{scan_id}"
+        if api_dir.is_dir():
+            return api_dir
+
+        # Pattern 2: Pipeline-generated reports ({domain}_{timestamp})
+        try:
+            with self.db.get_session() as session:
+                from bugtrace.schemas.db_models import ScanTable, TargetTable
+                scan = session.get(ScanTable, scan_id)
+                if not scan:
+                    return None
+                target = session.get(TargetTable, scan.target_id)
+                if not target:
+                    return None
+
+                # Extract domain from URL
+                domain = urlparse(target.url).hostname or ""
+
+                # Find matching report directories, sorted newest first
+                matches = sorted(
+                    report_base.glob(f"{domain}_*"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if matches:
+                    return matches[0]
+        except Exception as e:
+            logger.warning(f"Error resolving report dir for scan {scan_id}: {e}")
+
+        return None
+
+    def _load_findings_from_files(self, scan_id: int) -> List[Dict[str, Any]]:
+        """
+        Load all findings from files for a scan.
+
+        Reads from (in priority order):
+        1. specialists/results/*.json (validated findings)
+        2. specialists/dry/*.json (deduplicated findings)
+        3. specialists/wet/*.json (raw findings)
+
+        Returns:
+            List of finding dictionaries
+        """
+        import json
+        from bugtrace.core.payload_format import decode_finding_payloads
+
+        report_dir = self._find_report_dir_for_scan(scan_id)
+        if not report_dir:
+            logger.debug(f"No report directory found for scan {scan_id}")
+            return []
+
+        specialists_dir = report_dir / "specialists"
+        if not specialists_dir.exists():
+            logger.debug(f"No specialists dir in {report_dir}")
+            return []
+
+        all_findings = []
+        finding_id_counter = 1
+
+        # Priority: results > dry > wet
+        for subdir in ["results", "dry", "wet"]:
+            subdir_path = specialists_dir / subdir
+            if not subdir_path.exists():
+                continue
+
+            for json_file in subdir_path.glob("*.json"):
+                try:
+                    findings_from_file = self._read_findings_file(json_file)
+                    for finding in findings_from_file:
+                        # Decode base64 payloads if present
+                        finding = decode_finding_payloads(finding)
+                        finding["_source_file"] = str(json_file)
+                        finding["_source_dir"] = subdir
+                        finding["_id"] = finding_id_counter
+                        finding_id_counter += 1
+                        all_findings.append(finding)
+                except Exception as e:
+                    logger.warning(f"Failed to read {json_file}: {e}")
+
+            # If we found findings in results/, don't look in dry/wet
+            if all_findings and subdir == "results":
+                break
+            # If we found findings in dry/, don't look in wet
+            if all_findings and subdir == "dry":
+                break
+
+        logger.debug(f"Loaded {len(all_findings)} findings from files for scan {scan_id}")
+        return all_findings
+
+    def _read_findings_file(self, file_path: Path) -> List[Dict[str, Any]]:
+        """
+        Read findings from a JSON or JSON Lines file.
+
+        Supports both formats:
+        - JSON Lines: One JSON object per line (v3.2 format)
+        - JSON Array: Array of finding objects
+        """
+        import json
+
+        findings = []
+        content = file_path.read_text(encoding="utf-8").strip()
+
+        if not content:
+            return []
+
+        # Try JSON Lines first (one object per line)
+        if content.startswith("{"):
+            for line in content.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    # Handle v3.2 format with nested "finding" key
+                    if "finding" in entry:
+                        findings.append(entry["finding"])
+                    else:
+                        findings.append(entry)
+                except json.JSONDecodeError:
+                    continue
+        # Try JSON Array
+        elif content.startswith("["):
+            try:
+                data = json.loads(content)
+                if isinstance(data, list):
+                    findings = data
+            except json.JSONDecodeError:
+                pass
+
+        return findings
+
+    def _filter_findings(
+        self,
+        findings: List[Dict[str, Any]],
+        severity: Optional[str],
+        vuln_type: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """Filter findings by severity and/or vulnerability type."""
+        filtered = findings
+
         if severity:
-            statement = statement.where(FindingTable.severity == severity.upper())
+            sev_upper = severity.upper()
+            filtered = [f for f in filtered if f.get("severity", "").upper() == sev_upper]
+
         if vuln_type:
-            statement = statement.where(FindingTable.type == vuln_type.upper())
-        return statement
+            type_upper = vuln_type.upper()
+            filtered = [
+                f for f in filtered
+                if type_upper in (f.get("type", "") or "").upper()
+            ]
 
-    def _count_findings(self, session, scan_id: int, severity: Optional[str], vuln_type: Optional[str], func) -> int:
-        """Count total findings matching filters."""
-        from sqlmodel import select
-        from bugtrace.schemas.db_models import FindingTable
+        return filtered
 
-        count_statement = select(func.count()).select_from(FindingTable).where(
-            FindingTable.scan_id == scan_id
-        )
-        if severity:
-            count_statement = count_statement.where(FindingTable.severity == severity.upper())
-        if vuln_type:
-            count_statement = count_statement.where(FindingTable.type == vuln_type.upper())
-        return session.exec(count_statement).one()
-
-    def _format_findings(self, findings) -> List[Dict[str, Any]]:
-        """Format finding records for API response."""
+    def _format_file_findings(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Format file-based findings for API response."""
         results = []
         for finding in findings:
+            # Determine status from source directory or explicit status field
+            source_dir = finding.get("_source_dir", "wet")
+            status = finding.get("status", "PENDING_VALIDATION")
+            if source_dir == "results":
+                status = "VALIDATED_CONFIRMED"
+            elif source_dir == "dry":
+                status = "PENDING_VALIDATION"
+
             results.append({
-                "finding_id": finding.id,
-                "type": finding.type.value if hasattr(finding.type, 'value') else str(finding.type),
-                "severity": finding.severity,
-                "details": finding.details,
-                "payload": finding.payload_used,
-                "url": finding.attack_url,
-                "parameter": finding.vuln_parameter,
-                "validated": finding.visual_validated,
-                "status": finding.status.value,
-                "confidence": finding.confidence_score,
+                "finding_id": finding.get("_id", 0),
+                "type": finding.get("type", "Unknown"),
+                "severity": finding.get("severity", "MEDIUM"),
+                "details": finding.get("evidence") or finding.get("description") or finding.get("note", ""),
+                "payload": finding.get("payload", ""),
+                "url": finding.get("url", ""),
+                "parameter": finding.get("parameter", ""),
+                "validated": source_dir == "results",
+                "status": status,
+                "confidence": finding.get("confidence", 0.0),
             })
         return results
 

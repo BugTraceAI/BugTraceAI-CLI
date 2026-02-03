@@ -8,6 +8,10 @@ class MutationStrategy(str, Enum):
     LOGIC_INVERSION = "LOGIC_INVERSION"
     HEADER_MANIPULATION = "HEADER_MANIPULATION"
     METHOD_TAMPERING = "METHOD_TAMPERING"
+    # Extended attack vectors
+    SSTI_INJECTION = "SSTI_INJECTION"
+    CMD_INJECTION = "CMD_INJECTION"
+    PATH_TRAVERSAL = "PATH_TRAVERSAL"
 
 class FeedbackStatus(str, Enum):
     SUCCESS = "SUCCESS"  # Validated/Exploited

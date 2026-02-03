@@ -1,5 +1,6 @@
 import os
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Optional
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from .models import ReportContext
@@ -67,10 +68,24 @@ class HTMLGenerator(ReportGenerator):
             self._write_context_as_js(context, data_dest_path)
 
     def _write_context_as_js(self, context, dest_path: str):
-        """Write ReportContext as JSONP variable."""
-        json_content = context.model_dump_json(indent=4)
+        """Write ReportContext as JSONP variable with validation."""
+        try:
+            json_content = context.model_dump_json(indent=4)
+        except Exception as e:
+            raise RuntimeError(f"Failed to serialize ReportContext to JSON: {e}")
+
+        js_content = f"window.BUGTRACE_REPORT_DATA = {json_content};"
+
         with open(dest_path, 'w', encoding='utf-8') as f:
-            f.write(f"window.BUGTRACE_REPORT_DATA = {json_content};")
+            f.write(js_content)
+
+        # Validate file was written correctly
+        dest = Path(dest_path)
+        if not dest.exists() or dest.stat().st_size < 50:
+            raise RuntimeError(
+                f"engagement_data.js not written correctly "
+                f"(size={dest.stat().st_size if dest.exists() else 0})"
+            )
 
     def _copy_viewer_template(self, output_path: str):
         """Copy static viewer template to output path."""

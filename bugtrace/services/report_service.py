@@ -166,6 +166,9 @@ class ReportService:
 
         Returns:
             Path to generated HTML file
+
+        Raises:
+            RuntimeError: If engagement_data.js cannot be generated (JSON serialization or I/O error)
         """
         # Create scan-specific report directory
         report_dir = settings.REPORT_DIR / f"scan_{scan_id}"
@@ -173,11 +176,27 @@ class ReportService:
 
         output_path = report_dir / "report.html"
 
-        # First, write engagement_data.js
+        # First, write engagement_data.js with validation
         data_js_path = report_dir / "engagement_data.js"
-        json_content = context.model_dump_json(indent=4)
+
+        try:
+            json_content = context.model_dump_json(indent=4)
+        except Exception as e:
+            logger.error(f"Failed to serialize ReportContext to JSON for scan {scan_id}: {e}")
+            raise RuntimeError(f"engagement_data.js generation failed: JSON serialization error: {e}")
+
+        # Validate JSON content before writing
+        if not json_content or len(json_content) < 50:
+            logger.error(f"Invalid JSON content generated for scan {scan_id} (length={len(json_content) if json_content else 0})")
+            raise RuntimeError("engagement_data.js generation failed: invalid JSON content")
+
         with open(data_js_path, 'w', encoding='utf-8') as f:
             f.write(f"window.BUGTRACE_REPORT_DATA = {json_content};")
+
+        # Validate file was written correctly
+        if not data_js_path.exists() or data_js_path.stat().st_size < 100:
+            logger.error(f"engagement_data.js not written correctly for scan {scan_id}")
+            raise RuntimeError("engagement_data.js generation failed: file not written correctly")
 
         # Generate HTML (copies report_viewer.html template)
         self.html_generator.generate(context, str(output_path))

@@ -3,14 +3,19 @@ import httpx
 from typing import Optional, Tuple
 from bugtrace.utils.logger import logger
 from .models import MutableRequest
+from .global_rate_limiter import global_rate_limiter
 
 class RequestController:
     """
     Controlador de peticiones HTTP con mecanismos de seguridad (Circuit Breaker, Throttling).
     Inspirado en Shift Agents v2 Request Controller.
+
+    Uses GlobalRateLimiter to coordinate requests across all ManipulatorOrchestrator instances
+    (XSSSkill, CSTISkill running in parallel).
     """
-    def __init__(self, rate_limit: float = 0.5, max_consecutive_errors: int = 5):
-        self.rate_limit = rate_limit
+    def __init__(self, rate_limit: float = 0.5, max_consecutive_errors: int = 5, use_global_limiter: bool = True):
+        self.rate_limit = rate_limit  # Fallback if global limiter disabled
+        self.use_global_limiter = use_global_limiter
         self.max_consecutive_errors = max_consecutive_errors
         self.error_count = 0
         self.circuit_open = False
@@ -25,7 +30,11 @@ class RequestController:
             logger.warning("RequestController: Circuit breaker is OPEN. Rejecting request.")
             return 0, "CIRCUIT_OPEN", 0.0
 
-        await asyncio.sleep(self.rate_limit)
+        # Use global rate limiter if enabled (coordinates across XSS/CSTI)
+        if self.use_global_limiter:
+            await global_rate_limiter.acquire()
+        else:
+            await asyncio.sleep(self.rate_limit)
 
         try:
             # Prepare arguments

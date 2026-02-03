@@ -48,8 +48,8 @@ class MemoryManager:
                 # Set a timeout for the download if possible or handle the error
                 import os
                 os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1' # Optional speedup
-                self.model = SentenceTransformer('all-MiniLM-L6-v2') 
-                logger.info("Memory: Embedding model loaded (all-MiniLM-L6-v2)")
+                self.model = SentenceTransformer('BAAI/bge-small-en-v1.5') 
+                logger.info("Memory: Embedding model loaded (BAAI/bge-small-en-v1.5)")
             except Exception as e:
                 logger.warning(f"Failed to load embedding model (likely network timeout): {e}. Running in semantic-blind mode.")
                 self.model = None
