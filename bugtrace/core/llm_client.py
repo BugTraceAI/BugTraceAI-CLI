@@ -14,8 +14,28 @@ from bugtrace.core.ui import dashboard
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.config import settings
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+# Removed: phase_semaphores - no global LLM semaphore needed
+# Each agent runs independently with retry/backoff handling rate limits
 
 logger = get_logger("core.llm_client")
+
+
+# ========== Circuit Breaker Constants ==========
+class LLMHealthState:
+    """Health states for LLM API circuit breaker."""
+    HEALTHY = "HEALTHY"      # Normal operation
+    DEGRADED = "DEGRADED"    # Slow down requests (API unstable)
+    CRITICAL = "CRITICAL"    # Circuit OPEN - return fallbacks
+
+# Circuit breaker configuration
+CB_FAILURE_THRESHOLD = 3       # Consecutive failures to open circuit
+CB_COOLDOWN_SECONDS = 60       # Time before attempting recovery (half-open)
+CB_DEGRADED_DELAY = 2.0        # Delay between requests in DEGRADED state
+CB_SUCCESS_THRESHOLD = 2       # Successes needed to recover from DEGRADED
+
+# LLM Request Timeouts (seconds)
+LLM_TOTAL_TIMEOUT = 90         # Total request timeout
+LLM_CONNECT_TIMEOUT = 10       # Connection establishment timeout
 
 
 def sanitize_text(text: str) -> str:
@@ -180,8 +200,11 @@ class LLMClient:
         if not self.api_key:
             logger.warning("OPENROUTER_API_KEY is not set. LLM features will be disabled.")
 
-        # Concurrency Control (Sequential vs Parallel)
-        self.semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_REQUESTS)
+        # No global semaphore - each agent runs independently
+        # Rate limiting handled by:
+        # 1. tenacity retry with exponential backoff
+        # 2. Model shifting on 429 errors
+        # 3. Circuit breaker for cascading failures
 
         # TASK-130: Token usage tracking
         self.token_tracker = TokenUsageTracker()
@@ -192,6 +215,150 @@ class LLMClient:
 
         # TASK-133: Model performance metrics
         self.model_metrics: Dict[str, ModelMetrics] = {}
+
+        # Circuit Breaker State Tracking
+        self.health_state = LLMHealthState.HEALTHY
+        self.consecutive_errors = 0
+        self.consecutive_successes = 0
+        self.last_failure_time: float = 0
+        self.circuit_open_until: float = 0
+
+    # ========== Circuit Breaker Methods ==========
+
+    def _check_circuit_breaker(self) -> tuple[bool, Optional[str]]:
+        """Check circuit breaker state before making API call.
+
+        Returns:
+            Tuple of (should_proceed, reason_if_blocked)
+            - (True, None): Proceed with API call
+            - (False, "CIRCUIT_OPEN"): Circuit is open, use fallback
+            - (True, "HALF_OPEN"): Circuit is half-open, probe request allowed
+        """
+        if self.health_state == LLMHealthState.CRITICAL:
+            if time.time() < self.circuit_open_until:
+                remaining = int(self.circuit_open_until - time.time())
+                logger.warning(f"[Circuit Breaker] OPEN - {remaining}s remaining until probe")
+                return (False, "CIRCUIT_OPEN")
+            else:
+                # Half-open: allow probe request
+                logger.info("[Circuit Breaker] HALF-OPEN - Probing API...")
+                return (True, "HALF_OPEN")
+
+        return (True, None)
+
+    async def _apply_degraded_throttling(self):
+        """Apply throttling when in DEGRADED state."""
+        if self.health_state == LLMHealthState.DEGRADED:
+            logger.debug(f"[Circuit Breaker] DEGRADED state - throttling {CB_DEGRADED_DELAY}s")
+            await asyncio.sleep(CB_DEGRADED_DELAY)
+
+    def _record_circuit_failure(self, error: Exception):
+        """Record failure and transition state machine if threshold reached."""
+        self.consecutive_errors += 1
+        self.consecutive_successes = 0
+        self.last_failure_time = time.time()
+
+        logger.error(
+            f"[Circuit Breaker] Error detected ({self.consecutive_errors}/{CB_FAILURE_THRESHOLD}): {error}"
+        )
+
+        # State transitions based on consecutive errors
+        if self.consecutive_errors >= CB_FAILURE_THRESHOLD:
+            if self.health_state != LLMHealthState.CRITICAL:
+                self.health_state = LLMHealthState.CRITICAL
+                self.circuit_open_until = time.time() + CB_COOLDOWN_SECONDS
+                dashboard.log(
+                    f"[LLM] 🔴 API Unstable. Circuit Breaker OPEN for {CB_COOLDOWN_SECONDS}s.",
+                    "ERROR"
+                )
+                logger.warning(
+                    f"[Circuit Breaker] Transitioned to CRITICAL - circuit open until "
+                    f"{time.strftime('%H:%M:%S', time.localtime(self.circuit_open_until))}"
+                )
+        elif self.consecutive_errors >= 2 and self.health_state == LLMHealthState.HEALTHY:
+            # Transition to DEGRADED after 2 consecutive errors
+            self.health_state = LLMHealthState.DEGRADED
+            dashboard.log("[LLM] ⚠️ API Degraded. Throttling requests.", "WARN")
+            logger.warning("[Circuit Breaker] Transitioned to DEGRADED")
+
+    def _record_circuit_success(self):
+        """Record success and potentially recover from degraded states."""
+        previous_state = self.health_state
+        self.consecutive_successes += 1
+        self.consecutive_errors = 0
+
+        # Recovery logic
+        if self.health_state == LLMHealthState.CRITICAL:
+            # Single success in half-open transitions to DEGRADED
+            self.health_state = LLMHealthState.DEGRADED
+            dashboard.log("[LLM] ⚠️ API Recovering. Moving to DEGRADED.", "WARN")
+            logger.info("[Circuit Breaker] Transitioned from CRITICAL to DEGRADED (probe success)")
+
+        elif self.health_state == LLMHealthState.DEGRADED:
+            if self.consecutive_successes >= CB_SUCCESS_THRESHOLD:
+                self.health_state = LLMHealthState.HEALTHY
+                self.consecutive_successes = 0
+                dashboard.log("[LLM] 🟢 API Recovered. Resuming normal operations.", "SUCCESS")
+                logger.info("[Circuit Breaker] Transitioned to HEALTHY (full recovery)")
+
+        if previous_state != self.health_state:
+            logger.info(f"[Circuit Breaker] State transition: {previous_state} → {self.health_state}")
+
+    def _get_fallback_response(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Generate safe fallback responses when circuit is open.
+
+        Uses prompt keywords to determine appropriate fallback that won't break
+        downstream JSON parsing or logic.
+        """
+        prompt_lower = prompt.lower()
+        system_lower = (system_prompt or "").lower()
+        combined = prompt_lower + " " + system_lower
+
+        # Deduplication tasks - return empty findings to not filter anything
+        if "deduplication" in combined or "dedupe" in combined or "duplicate" in combined:
+            logger.debug("[Fallback] Deduplication task - returning empty findings")
+            return '{"findings": [], "deduplicated": []}'
+
+        # Validation/skeptic tasks - FAIL OPEN (assume real to not lose vulnerabilities)
+        if any(kw in combined for kw in ["skeptic", "false positive", "validate", "confirm", "verify"]):
+            logger.debug("[Fallback] Validation task - FAIL OPEN (CONFIRMED)")
+            return "CONFIRMED"
+
+        # Payload generation tasks
+        if "payload" in combined or "generate" in combined and "xss" in combined:
+            logger.debug("[Fallback] Payload generation - returning generic payloads")
+            return '{"payloads": ["<script>alert(1)</script>", "{{7*7}}", "${7*7}"]}'
+
+        # Analysis/classification tasks
+        if "analyze" in combined or "classify" in combined:
+            logger.debug("[Fallback] Analysis task - returning uncertain response")
+            return '{"result": "uncertain", "confidence": 0.5, "reason": "LLM unavailable"}'
+
+        # Risk assessment - return medium risk (conservative)
+        if "risk" in combined or "severity" in combined:
+            logger.debug("[Fallback] Risk assessment - returning medium")
+            return '{"severity": "medium", "confidence": 0.5}'
+
+        # Default: empty JSON object (safest)
+        logger.debug("[Fallback] Unknown task type - returning empty JSON")
+        return "{}"
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get current circuit breaker health status for monitoring."""
+        status = {
+            "state": self.health_state,
+            "consecutive_errors": self.consecutive_errors,
+            "consecutive_successes": self.consecutive_successes,
+        }
+
+        if self.health_state == LLMHealthState.CRITICAL:
+            remaining = max(0, self.circuit_open_until - time.time())
+            status["circuit_open_remaining_seconds"] = int(remaining)
+
+        if self.last_failure_time > 0:
+            status["last_failure_ago_seconds"] = int(time.time() - self.last_failure_time)
+
+        return status
 
     async def verify_connectivity(self) -> bool:
         """
@@ -405,28 +572,75 @@ class LLMClient:
         max_tokens: int = 1500
     ) -> Optional[str]:
         """
-        Generates text using Model Shifting.
+        Generates text using Model Shifting with Circuit Breaker resilience.
+
+        Circuit Breaker States:
+        - HEALTHY: Normal operation
+        - DEGRADED: Throttled requests (API unstable)
+        - CRITICAL: Circuit OPEN - returns fallback responses
+
         If a model fails or is filtered, it 'shifts' to the next one in the list.
         """
-        async with self.semaphore:
-            if not self.api_key:
-                logger.warning(f"LLM Client: No API Key found for {module_name}. Skipping generation.")
-                await self._audit_log(module_name, "NONE", prompt, "SKIPPED: Missing API Key")
-                return None
+        # No global semaphore - each agent runs independently
+        # Rate limiting handled by retry with exponential backoff (tenacity)
+        if not self.api_key:
+            logger.warning(f"LLM Client: No API Key found for {module_name}. Skipping generation.")
+            await self._audit_log(module_name, "NONE", prompt, "SKIPPED: Missing API Key")
+            return None
 
-            models_to_try = [model_override] if model_override else self.models
-            headers = self._build_headers(module_name)
-            messages = self._build_messages(prompt, system_prompt)
+        # ========== Circuit Breaker Check ==========
+        should_proceed, cb_status = self._check_circuit_breaker()
 
+        if not should_proceed:
+            # Circuit is OPEN - return fallback response
+            fallback = self._get_fallback_response(prompt, system_prompt)
+            await self._audit_log(
+                module_name, "CIRCUIT_BREAKER",
+                prompt, f"FALLBACK: {fallback}"
+            )
+            return fallback
+
+        # Apply throttling if in DEGRADED state
+        await self._apply_degraded_throttling()
+
+        # ========== Normal Generation with Model Shifting ==========
+        models_to_try = [model_override] if model_override else self.models
+        headers = self._build_headers(module_name)
+        messages = self._build_messages(prompt, system_prompt)
+
+        try:
             result = await self._try_generate_with_models(
                 models_to_try, headers, messages, module_name, prompt,
                 temperature, max_tokens, model_override, system_prompt
             )
 
-            if not result:
-                logger.critical(f"LLM Client: All models exhausted for module {module_name}. Check connectivity or API Key.")
+            if result:
+                # Success - record for circuit breaker
+                self._record_circuit_success()
+                return result
+            else:
+                # All models failed
+                self._record_circuit_failure(Exception("All models exhausted"))
+                logger.critical(
+                    f"LLM Client: All models exhausted for module {module_name}. "
+                    f"Circuit state: {self.health_state}"
+                )
 
-            return result
+                # Return fallback instead of None to prevent crashes
+                if self.health_state == LLMHealthState.CRITICAL:
+                    return self._get_fallback_response(prompt, system_prompt)
+
+                return None
+
+        except Exception as e:
+            self._record_circuit_failure(e)
+            logger.error(f"LLM Generate exception: {e}", exc_info=True)
+
+            # If circuit just opened, return fallback
+            if self.health_state == LLMHealthState.CRITICAL:
+                return self._get_fallback_response(prompt, system_prompt)
+
+            raise  # Let tenacity retry handle it
 
     async def _try_generate_with_models(
         self,
@@ -465,20 +679,40 @@ class LLMClient:
         model_override: Optional[str],
         system_prompt: Optional[str]
     ) -> Optional[str]:
-        """Attempt generation with a single model."""
+        """Attempt generation with a single model.
+
+        Uses explicit timeouts (90s total, 10s connect) to prevent hanging.
+        """
         payload = self._build_request_payload(current_model, messages, temperature, max_tokens)
         start_time = time.time()
+
+        # Explicit timeout configuration for resilience
+        timeout = aiohttp.ClientTimeout(
+            total=LLM_TOTAL_TIMEOUT,
+            connect=LLM_CONNECT_TIMEOUT
+        )
 
         # Use orchestrator with LLM destination for proper timeout and lifecycle tracking
         try:
             async with orchestrator.session(DestinationType.LLM) as session:
-                async with session.post(self.base_url, headers=headers, json=payload) as resp:
+                async with session.post(
+                    self.base_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout
+                ) as resp:
                     latency_ms = (time.time() - start_time) * 1000
                     return await self._handle_api_response(
                         resp, current_model, module_name, prompt,
                         latency_ms, model_override, system_prompt,
                         temperature, max_tokens
                     )
+        except asyncio.TimeoutError:
+            latency_ms = (time.time() - start_time) * 1000
+            self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+            await self._audit_log(module_name, current_model, prompt, f"TIMEOUT after {latency_ms:.0f}ms")
+            logger.warning(f"LLM Shift Timeout with {current_model} after {latency_ms:.0f}ms")
+            return None
         except Exception as e:
             latency_ms = (time.time() - start_time) * 1000
             self._record_model_call(current_model, success=False, latency_ms=latency_ms)
@@ -595,24 +829,24 @@ class LLMClient:
         """Generate text using ConversationThread for persistent context."""
         from bugtrace.core.conversation_thread import ConversationThread
 
-        async with self.semaphore:
-            if not self.api_key:
-                logger.warning(f"LLM Client: No API Key for {module_name}")
-                return None
+        # No global semaphore - each agent runs independently
+        if not self.api_key:
+            logger.warning(f"LLM Client: No API Key for {module_name}")
+            return None
 
-            thread.add_message("user", prompt)
-            messages = thread.get_messages(format_for_api=True)
-            models_to_try = [model_override] if model_override else self.models
+        thread.add_message("user", prompt)
+        messages = thread.get_messages(format_for_api=True)
+        models_to_try = [model_override] if model_override else self.models
 
-            result = await self._try_thread_models(
-                models_to_try, self._build_headers(module_name), messages,
-                temperature, max_tokens, module_name, thread, prompt
-            )
+        result = await self._try_thread_models(
+            models_to_try, self._build_headers(module_name), messages,
+            temperature, max_tokens, module_name, thread, prompt
+        )
 
-            if not result:
-                logger.critical(f"LLM Client: All models exhausted for threaded generation in {module_name}")
+        if not result:
+            logger.critical(f"LLM Client: All models exhausted for threaded generation in {module_name}")
 
-            return result
+        return result
 
     async def update_balance(self):
         """Polls OpenRouter for current credit balance."""
@@ -748,23 +982,45 @@ class LLMClient:
         return "NONE"
 
     async def _audit_log(self, module: str, model: str, prompt: str, response: str):
-        """Saves LLM transactions to a dedicated audit file asynchronously.
+        """Saves LLM transactions using XML-like format with Base64 for payload integrity.
 
         TASK-128: Sanitizes prompts and responses to remove sensitive data.
+        
+        Format (v3.1):
+        <LLM_CALL>
+          <TIMESTAMP>...</TIMESTAMP>
+          <MODULE>...</MODULE>
+          <MODEL>...</MODEL>
+          <PROMPT_B64>base64_encoded</PROMPT_B64>
+          <RESPONSE_B64>base64_encoded</RESPONSE_B64>
+        </LLM_CALL>
         """
+        import base64
+        
         try:
             log_dir = settings.LOG_DIR
             log_dir.mkdir(parents=True, exist_ok=True)
-            audit_file = log_dir / "llm_audit.jsonl"
-            entry = {
-                "timestamp": datetime.now().isoformat(),
-                "module": module,
-                "model": model,
-                "prompt": sanitize_text(prompt),
-                "response": sanitize_text(response)
-            }
-            async with aiofiles.open(audit_file, "a") as f:
-                await f.write(json.dumps(entry) + "\n")
+            audit_file = log_dir / "llm_audit.log"
+            
+            # Sanitize and then Base64 encode to preserve any special chars
+            sanitized_prompt = sanitize_text(prompt)
+            sanitized_response = sanitize_text(response)
+            
+            prompt_b64 = base64.b64encode(sanitized_prompt.encode('utf-8')).decode('ascii')
+            response_b64 = base64.b64encode(sanitized_response.encode('utf-8')).decode('ascii')
+            
+            entry = (
+                f"<LLM_CALL>\n"
+                f"  <TIMESTAMP>{datetime.now().isoformat()}</TIMESTAMP>\n"
+                f"  <MODULE>{module}</MODULE>\n"
+                f"  <MODEL>{model}</MODEL>\n"
+                f"  <PROMPT_B64>{prompt_b64}</PROMPT_B64>\n"
+                f"  <RESPONSE_B64>{response_b64}</RESPONSE_B64>\n"
+                f"</LLM_CALL>\n"
+            )
+            
+            async with aiofiles.open(audit_file, "a", encoding="utf-8") as f:
+                await f.write(entry)
         except Exception as e:
             # Fallback to printing if logging fails
             print(f"FAILED TO AUDIT: {e}")
@@ -785,8 +1041,8 @@ class LLMClient:
 
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_data}"}}]}]
 
-        async with self.semaphore:
-            return await self._call_vision_api(messages, model_override, module_name, temperature)
+        # No global semaphore - each agent runs independently
+        return await self._call_vision_api(messages, model_override, module_name, temperature)
 
     async def _call_vision_api(
         self,
@@ -1023,25 +1279,25 @@ class LLMClient:
         on_chunk: Optional[callable] = None
     ):
         """Generate with streaming response, yields chunks as they arrive."""
-        async with self.semaphore:
-            if not self.api_key:
-                logger.warning(f"LLM Client: No API Key for streaming {module_name}")
-                return
+        # No global semaphore - each agent runs independently
+        if not self.api_key:
+            logger.warning(f"LLM Client: No API Key for streaming {module_name}")
+            return
 
-            model = model_override or (self.models[0] if self.models else None)
-            if not model:
-                logger.error("No model available for streaming")
-                return
+        model = model_override or (self.models[0] if self.models else None)
+        if not model:
+            logger.error("No model available for streaming")
+            return
 
-            headers = self._build_headers(module_name)
-            messages = self._build_messages(prompt, system_prompt)
-            payload = self._build_stream_payload(model, messages, temperature, max_tokens)
+        headers = self._build_headers(module_name)
+        messages = self._build_messages(prompt, system_prompt)
+        payload = self._build_stream_payload(model, messages, temperature, max_tokens)
 
-            async for chunk, full_response in self._execute_stream_request(
-                headers, payload, on_chunk, module_name, model, prompt
-            ):
-                if chunk:
-                    yield chunk
+        async for chunk, full_response in self._execute_stream_request(
+            headers, payload, on_chunk, module_name, model, prompt
+        ):
+            if chunk:
+                yield chunk
 
     def _build_stream_payload(
         self,
