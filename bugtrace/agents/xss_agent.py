@@ -1649,33 +1649,146 @@ Each payload should target a different context or use a different breakout techn
                     dashboard.log(f"[{self.name}] ⚡ Early exit: Skipping {remaining} params (optimization)", "INFO")
                 break
 
-    async def _loop_test_dom_xss(self):
-        """Phase 3.5: DOM XSS Headless scan."""
+    async def _loop_test_dom_xss(self, screenshots_dir: Path = None):
+        """
+        Phase 3.5: DOM XSS Headless scan with VISUAL VALIDATION.
+
+        Flow:
+        1. detect_dom_xss() finds DOM XSS candidates
+        2. For each candidate, validate visually with screenshot + Vision AI
+        3. Only CONFIRMED if Vision sees execution proof
+        """
         dashboard.log(f"[{self.name}] 🎭 Starting DOM XSS Headless Scan...", "INFO")
         logger.info(f"[{self.name}] Phase 3.5: DOM XSS Headless Scan")
+
         try:
             dom_findings = await detect_dom_xss(self.url)
+
+            if not dom_findings:
+                dashboard.log(f"[{self.name}] No DOM XSS candidates found", "INFO")
+                return
+
+            dashboard.log(
+                f"[{self.name}] 🔍 Found {len(dom_findings)} DOM XSS candidates, validating visually...",
+                "INFO"
+            )
+
+            confirmed_count = 0
             for df in dom_findings:
-                # Convert to XSSFinding
-                self.findings.append(XSSFinding(
+                # Visual validation: screenshot + Vision AI
+                evidence = await self._validate_dom_xss_visually(
                     url=df["url"],
-                    parameter=df["source"],
                     payload=df["payload"],
-                    context="dom_xss",
-                    validation_method="headless_playwright",
-                    evidence={"sink": df["sink"], "evidence": df["evidence"]},
-                    confidence=1.0,
-                    status="VALIDATED_CONFIRMED",
-                    validated=True,
-                    reflection_context=df["source"],
-                    successful_payloads=[df["payload"]]
-                ))
-            if dom_findings:
-                dashboard.log(f"[{self.name}] 🎯 DOM XSS CONFIRMED ({len(dom_findings)} hits)!", "SUCCESS")
-                logger.info(f"[{self.name}] DOM XSS Headless Scan found {len(dom_findings)} vulnerabilities")
+                    sink=df["sink"],
+                    source=df["source"],
+                    screenshots_dir=screenshots_dir
+                )
+
+                if evidence and evidence.get("vision_confirmed"):
+                    # CONFIRMED: Vision AI saw execution proof
+                    confirmed_count += 1
+                    self.findings.append(XSSFinding(
+                        url=df["url"],
+                        parameter=df["source"],
+                        payload=df["payload"],
+                        context="dom_xss",
+                        validation_method="dom_xss_vision_confirmed",
+                        evidence=evidence,
+                        confidence=0.99,  # High confidence with visual proof
+                        status="VALIDATED_CONFIRMED",
+                        validated=True,
+                        reflection_context=df["source"],
+                        successful_payloads=[df["payload"]]
+                    ))
+                    dashboard.log(
+                        f"[{self.name}] ✅ DOM XSS CONFIRMED via Vision: {df['sink']}",
+                        "SUCCESS"
+                    )
+                else:
+                    # Not visually confirmed - log as candidate only
+                    logger.warning(
+                        f"[{self.name}] DOM XSS candidate not visually confirmed: "
+                        f"sink={df['sink']}, payload={df['payload'][:50]}..."
+                    )
+
+            if confirmed_count > 0:
+                dashboard.log(
+                    f"[{self.name}] 🎯 DOM XSS: {confirmed_count}/{len(dom_findings)} visually confirmed!",
+                    "SUCCESS"
+                )
+            else:
+                dashboard.log(
+                    f"[{self.name}] ⚠️ DOM XSS: {len(dom_findings)} candidates, 0 visually confirmed",
+                    "WARN"
+                )
+
         except Exception as e:
             logger.error(f"[{self.name}] DOM XSS Headless Scan failed: {e}", exc_info=True)
             dashboard.log(f"[{self.name}] ⚠️ DOM XSS Scan skipped: Headless error", "WARN")
+
+    async def _validate_dom_xss_visually(
+        self,
+        url: str,
+        payload: str,
+        sink: str,
+        source: str,
+        screenshots_dir: Path = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Validate DOM XSS candidate with screenshot + Vision AI.
+
+        This is the BULLETPROOF validation:
+        1. Navigate to URL (payload already in URL from detector)
+        2. Capture screenshot
+        3. Vision AI confirms: "Do you see alert/XSS execution?"
+
+        Returns:
+            Evidence dict with vision_confirmed=True if validated, None otherwise
+        """
+        try:
+            # Use verifier with screenshot capture
+            screenshot_path = None
+            if screenshots_dir:
+                screenshots_dir = Path(screenshots_dir)
+                screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+            result = await self.verifier.verify_xss(
+                url=url,
+                screenshot_dir=str(screenshots_dir) if screenshots_dir else None,
+                timeout=10.0,
+                max_level=3
+            )
+
+            evidence = {
+                "sink": sink,
+                "source": source,
+                "detector_found": True,
+                "playwright_tested": True
+            }
+
+            if result and result.screenshot_path:
+                evidence["screenshot_path"] = result.screenshot_path
+
+                # Vision AI validation
+                await self._run_vision_validation(
+                    screenshot_path=result.screenshot_path,
+                    attack_url=url,
+                    payload=payload,
+                    evidence=evidence
+                )
+
+            if result and result.success:
+                evidence["playwright_confirmed"] = True
+                # If Playwright confirmed but no Vision, still consider it
+                # but with lower confidence
+                if not evidence.get("vision_confirmed"):
+                    evidence["validation_note"] = "Playwright confirmed, Vision not available"
+
+            return evidence if (evidence.get("vision_confirmed") or evidence.get("playwright_confirmed")) else None
+
+        except Exception as e:
+            logger.error(f"[{self.name}] DOM XSS visual validation failed: {e}")
+            return None
 
     async def _loop_test_additional_vectors(self, interactsh_domain: str, screenshots_dir: Path):
         """Phase 4: Additional attack vectors (POST, Headers)."""
@@ -2399,8 +2512,8 @@ Each payload should target a different context or use a different breakout techn
             # Phase 3: Test parameters
             await self._loop_test_params(interactsh_domain, screenshots_dir)
 
-            # Phase 3.5: DOM XSS
-            await self._loop_test_dom_xss()
+            # Phase 3.5: DOM XSS with visual validation
+            await self._loop_test_dom_xss(screenshots_dir)
 
             # Phase 4: Additional vectors
             await self._loop_test_additional_vectors(interactsh_domain, screenshots_dir)
