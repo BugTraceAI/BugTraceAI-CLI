@@ -498,18 +498,18 @@ class TestClassificationExtended:
     # Header Injection Mapping Tests
     # -------------------------------------------------------------------------
 
-    @pytest.mark.parametrize("header_type", [
-        "header injection",
-        "Header Injection",
-        "CRLF injection",
-        "crlf injection",
-        "HTTP Response Splitting",
-        "http response splitting",
+    @pytest.mark.parametrize("header_type,expected", [
+        ("header injection", "header_injection"),
+        ("Header Injection", "header_injection"),
+        ("CRLF injection", "xss"),
+        ("crlf injection", "xss"),
+        ("HTTP Response Splitting", "xss"),
+        ("http response splitting", "xss"),
     ])
-    def test_classify_header_injection_maps_to_xss(self, agent, header_type):
-        """CRLF/header injection types map to 'xss' specialist."""
+    def test_classify_header_injection_maps_to_xss(self, agent, header_type, expected):
+        """CRLF/header injection types map to correct specialist."""
         result = agent._classify_finding({"type": header_type})
-        assert result == "xss", f"'{header_type}' should map to 'xss', got '{result}'"
+        assert result == expected, f"'{header_type}' should map to '{expected}', got '{result}'"
 
 
 class TestPriorityExtended:

@@ -124,16 +124,27 @@ class TestCanConfirmFromHttpResponse:
         """Create XSSAgent instance for testing."""
         return XSSAgent(url="https://example.com")
 
-    def test_confirms_script_block(self, agent):
-        """Should confirm XSS when payload is in script block."""
-        html = '<script>alert("CONFIRMPAYLOAD");</script>'
+    def test_confirms_html_tag_injection(self, agent):
+        """Should confirm XSS when payload creates a new HTML tag with JS execution."""
+        # Payload that injects a new tag with event handler
+        html = '<div><img src=x onerror=alert(1)></div>'
         evidence = {}
-        result = agent._can_confirm_from_http_response("CONFIRMPAYLOAD", html, evidence)
+        result = agent._can_confirm_from_http_response("<img src=x onerror=alert(1)>", html, evidence)
 
         assert result is True
         assert evidence["http_confirmed"] is True
-        assert evidence["execution_context"] == "script_block"
+        assert evidence["execution_context"] == "html_tag"
         assert evidence["validation_method"] == "http_response_analysis"
+
+    def test_rejects_payload_in_js_string_literal(self, agent):
+        """Payload inside JS string literal is NOT executable (just data)."""
+        # Payload reflected inside quotes in JS - not exploitable
+        html = '<script>var x = "CONFIRMPAYLOAD";</script>'
+        evidence = {}
+        result = agent._can_confirm_from_http_response("CONFIRMPAYLOAD", html, evidence)
+
+        # Should NOT confirm - payload is data, not code
+        assert result is False
 
     def test_confirms_event_handler(self, agent):
         """Should confirm XSS when payload is in event handler."""
@@ -153,14 +164,16 @@ class TestCanConfirmFromHttpResponse:
         assert result is True
         assert evidence["execution_context"] == "javascript_uri"
 
-    def test_confirms_template_expression(self, agent):
-        """Should confirm XSS when payload is in template expression."""
+    def test_template_expression_needs_browser(self, agent):
+        """Template expressions need browser evaluation, not HTTP confirmation."""
+        # Template expressions like {{payload}} need Angular/Vue to evaluate
+        # HTTP analysis cannot confirm execution - needs browser
         html = '<div>{{TEMPLATEPAYLOAD}}</div>'
         evidence = {}
         result = agent._can_confirm_from_http_response("TEMPLATEPAYLOAD", html, evidence)
 
-        assert result is True
-        assert evidence["execution_context"] == "template_expression"
+        # Should NOT confirm from HTTP - requires browser to evaluate template
+        assert result is False
 
     def test_rejects_body_reflection(self, agent):
         """Should NOT confirm when payload is just in body text."""
@@ -169,7 +182,8 @@ class TestCanConfirmFromHttpResponse:
         result = agent._can_confirm_from_http_response("TEXTPAYLOAD", html, evidence)
 
         assert result is False
-        assert "http_confirmed" not in evidence
+        # http_confirmed is set to False on rejection
+        assert evidence.get("http_confirmed") is False
 
     def test_rejects_attribute_reflection(self, agent):
         """Should NOT confirm when payload is in non-event attribute."""
@@ -189,11 +203,14 @@ class TestCanConfirmFromHttpResponse:
 
     def test_evidence_populated_on_success(self, agent):
         """Evidence dict should have all required fields on success."""
-        html = '<script>var x = "EVIDENCEPAYLOAD";</script>'
+        # Use a payload that actually creates executable context (HTML tag injection)
+        html = '<div><svg onload=alert(1)></div>'
         evidence = {}
-        agent._can_confirm_from_http_response("EVIDENCEPAYLOAD", html, evidence)
+        result = agent._can_confirm_from_http_response("<svg onload=alert(1)>", html, evidence)
 
+        assert result is True
         assert "http_confirmed" in evidence
+        assert evidence["http_confirmed"] is True
         assert "execution_context" in evidence
         assert "validation_method" in evidence
 
@@ -373,13 +390,14 @@ class TestValidateIntegration:
 
     def test_http_confirmation_sets_evidence(self, agent):
         """HTTP confirmation should populate evidence dict correctly."""
-        html = '<script>var x = "TESTPAYLOAD";</script>'
+        # Use a truly executable payload (HTML tag injection)
+        html = '<div><img src=x onerror=alert(1)></div>'
         evidence = {}
-        result = agent._can_confirm_from_http_response("TESTPAYLOAD", html, evidence)
+        result = agent._can_confirm_from_http_response("<img src=x onerror=alert(1)>", html, evidence)
 
         assert result is True
         assert evidence["http_confirmed"] is True
-        assert evidence["execution_context"] == "script_block"
+        assert evidence["execution_context"] == "html_tag"
         assert evidence["validation_method"] == "http_response_analysis"
 
     def test_browser_gate_works_correctly(self, agent):
