@@ -23,6 +23,8 @@
 
 ***
 
+> 🏆 **The First Agentic Framework Intelligently Designed for Bug Bounty Hunting**
+
 BugTraceAI-CLI is an autonomous offensive security framework that combines LLM-driven analysis with deterministic exploitation tools. Unlike passive analysis tools, BugTraceAI-CLI actively exploits vulnerabilities using real payloads, SQLMap integration, and browser-based validation to deliver confirmed, actionable findings.
 
 The core philosophy is **"Think like a pentester, execute like a machine, validate like an auditor"** - using AI for intelligent hypothesis generation, but relying on real tools for exploitation and validation.
@@ -54,9 +56,10 @@ BugTraceAI-CLI implements a 5-phase pipeline that mirrors a professional penetra
 - 🔍 **Parameter Extraction**: Automatic identification of injectable parameters
 
 ### Phase 2: Analysis (DASTySAST)
-- 🧠 **Multi-Persona Analysis**: 5 different AI "personas" analyze each URL (bug bounty hunter, code auditor, pentester, etc.)
-- ✅ **Consensus Voting**: Requires 4/5 agreement to reduce false positives
-- 🔎 **Skeptical Review**: Claude Haiku performs final filtering before exploitation
+- 🧠 **Multi-Persona Analysis**: 6 different AI "personas" analyze each URL (bug bounty hunter, code auditor, pentester, etc.)
+- ✅ **Consensus Voting**: Requires 4/5 agreement from analysis personas to reduce false positives
+- 🔎 **Skeptical Review**: The 6th "Skeptical" persona (Claude Haiku) performs final filtering
+- 🛡️ **Parallel Execution**: All personas analyze simultaneously for speed
 
 ### Phase 3: Intelligent Consolidation
 - 🎯 **ThinkingConsolidationAgent**: Central brain that routes findings to specialists
@@ -76,6 +79,8 @@ Real tools, real payloads, real results:
 | 📄 **XXEAgent** | XML External Entity | DTD injection + OOB exfiltration |
 | 🔓 **IDORAgent** | Insecure Direct Object Reference | ID manipulation testing |
 | 📁 **LFIAgent** | Local File Inclusion | Path traversal with filter evasion |
+| 🧩 **ProtoAgent** | Prototype Pollution | Browser-based property verification |
+| 🔌 **ApiAgent** | API Security | Broken Object Level Authorization (BOLA) testing |
 
 ### Phase 5: Validation
 - 🖥️ **Chrome DevTools Protocol**: Low-level browser verification for XSS
@@ -92,20 +97,22 @@ Real tools, real payloads, real results:
 BugTraceAI-CLI uses a multi-layered approach to maximize accuracy while minimizing false positives.
 
 ### Multi-Persona Analysis
-Instead of a single AI scan, each URL is analyzed by 5 different "personas":
-- **Bug Bounty Hunter**: Focuses on exploitable, reward-worthy issues
-- **Code Auditor**: Deep analysis of code patterns and logic flaws
-- **Pentester**: Attack-surface mapping and exploitation paths
-- **Security Researcher**: Novel attack vectors and edge cases
-- **DevSecOps Engineer**: Infrastructure and configuration issues
+Instead of a single AI scan, each URL is analyzed by 6 different "personas" providing diverse perspectives:
+
+1. **Bug Bounty Hunter**: Focuses on high-impact, reward-worthy issues (RCE, SQLi, SSRF)
+2. **Code Auditor**: analyzing code patterns, input validation, and logic flaws
+3. **Pentester**: Standard attack-surface mapping and OWASP Top 10 exploitation
+4. **Security Researcher**: Novel attack vectors, race conditions, and edge cases
+5. **Red Team Operator**: Advanced attack chains, privilege escalation, and lateral movement
+6. **Skeptical Reviewer**: A separate "critic" agent that aggressively filters false positives
 
 ### Consensus + Skeptical Review
 ```
-5 Personas analyze URL
+5 Analysis Personas run in parallel
         ↓
-Consensus voting (4/5 required)
+Consensus voting (Agreement analysis)
         ↓
-Claude Haiku skeptical review (score >= 5/10)
+6th Persona "Skeptical Agent" Review (Claude Haiku)
         ↓
 Passed to specialist agents
 ```
@@ -119,17 +126,17 @@ The key differentiator: **AI hypothesizes, tools validate**.
 
 This eliminates the "hallucination problem" of pure-AI scanners.
 
-## 🏗️ Architecture
+## 🏗️ V5 Reactor Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      BUGTRACE PIPELINE                          │
+│                      BUGTRACE REACTOR                           │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐     │
 │  │ Discovery│ → │ Analysis │ → │ Thinking │ → │Specialist│     │
 │  │ GoSpider │   │ DASTySAST│   │ Consolid.│   │  Agents  │     │
-│  │ Nuclei   │   │ 5 Personas   │ Dedup    │   │ SQLMap   │     │
+│  │ Nuclei   │   │ 6 Personas   │ Dedup    │   │ SQLMap   │     │
 │  └──────────┘   │ Consensus│   │ Priority │   │ Playwright    │
 │                 └──────────┘   └──────────┘   └────┬─────┘     │
 │                                                     │           │
@@ -165,6 +172,7 @@ Each phase runs with independent concurrency:
 
 - **Language**: Python 3.10+
 - **AI Provider**: OpenRouter (Gemini, Claude, DeepSeek, Qwen)
+- **Local AI**: BAAI/bge-small-en-v1.5 (SOTA Embeddings & Semantic Search)
 - **Browser Automation**: Playwright (exploitation), Chrome CDP (validation)
 - **SQL Injection**: SQLMap via Docker
 - **Crawling**: GoSpider via Docker

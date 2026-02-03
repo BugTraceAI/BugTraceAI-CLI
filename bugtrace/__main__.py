@@ -71,6 +71,7 @@ def main_callback(ctx: typer.Context):
 @app.command(name="scan")
 def scan(
     target: str = typer.Argument(..., help="The target URL to scan (Hunter phase)"),
+    url_list_file: Optional[str] = typer.Option(None, help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
     clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
@@ -83,7 +84,7 @@ def scan(
     param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
 ):
     """Run the Discovery (Hunter) phase only."""
-    _run_pipeline(target, phase="hunter", safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    _run_pipeline(target, phase="hunter", url_list_file=url_list_file, safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
 
 @app.command(name="audit")
 def audit(
@@ -96,6 +97,7 @@ def audit(
 @app.command(name="full")
 def full_scan(
     target: str = typer.Argument(..., help="The target URL for full engagement"),
+    url_list_file: Optional[str] = typer.Option(None, help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
     clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
@@ -109,7 +111,7 @@ def full_scan(
     param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
 ):
     """Run Hunter followed by Auditor (The complete professional workflow)."""
-    _run_pipeline(target, phase="all", safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    _run_pipeline(target, phase="all", url_list_file=url_list_file, safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
 
 @app.command(name="serve")
 def serve(
@@ -195,10 +197,80 @@ def agents():
     console.print(table)
     console.print("\n[dim]Run with: bugtrace scan <url> or bugtrace full <url>[/dim]")
 
-def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
+def _load_url_list(file_path: str, target: str) -> list:
+    """
+    Load URLs from file, one per line.
+    Filters URLs to only include those from the target domain.
+    Ignores empty lines and comments (#).
+
+    Args:
+        file_path: Path to file containing URLs
+        target: Base target URL for domain filtering
+
+    Returns:
+        List of URLs from the same domain as target
+    """
+    from pathlib import Path
+    from urllib.parse import urlparse
+
+    if not Path(file_path).exists():
+        raise FileNotFoundError(f"URL list file not found: {file_path}")
+
+    # Extract base domain from target
+    target_parsed = urlparse(target)
+    target_domain = target_parsed.netloc
+
+    urls = []
+    filtered_count = 0
+
+    with open(file_path, 'r') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+
+            # Skip empty lines and comments
+            if not line or line.startswith('#'):
+                continue
+
+            # Validate URL format
+            try:
+                parsed = urlparse(line)
+                if not parsed.scheme or not parsed.netloc:
+                    console.print(f"[yellow]Warning: Line {line_num} - Invalid URL format: {line}[/yellow]")
+                    continue
+
+                # Filter by domain
+                if parsed.netloc == target_domain:
+                    urls.append(line)
+                else:
+                    filtered_count += 1
+                    console.print(f"[dim]Skipping URL from different domain: {line}[/dim]")
+
+            except Exception as e:
+                console.print(f"[yellow]Warning: Line {line_num} - Could not parse URL: {line} ({e})[/yellow]")
+                continue
+
+    if not urls:
+        raise ValueError(f"No valid URLs found in {file_path} matching domain {target_domain}")
+
+    console.print(f"[green]✅ Loaded {len(urls)} URLs from {file_path}[/green]")
+    if filtered_count > 0:
+        console.print(f"[yellow]⚠️  Filtered {filtered_count} URLs from different domains[/yellow]")
+
+    return urls
+
+def _run_pipeline(target, phase="all", url_list_file=None, safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
     """Internal helper to run the pipeline phases."""
     if safe_mode is not None:
         settings.SAFE_MODE = safe_mode
+
+    # Load URL list if provided
+    url_list = None
+    if url_list_file:
+        try:
+            url_list = _load_url_list(url_list_file, target)
+        except Exception as e:
+            console.print(f"[bold red]Error loading URL list:[/bold red] {e}")
+            raise typer.Exit(code=1)
 
     # Check for focused mode
     if xss or sqli or lfi or jwt or idor or ssrf:
@@ -214,7 +286,7 @@ def _run_pipeline(target, phase="all", safe_mode=None, resume=False, clean=False
 
     # Execute phases
     try:
-        asyncio.run(_execute_phases(target, phase, resume, clean, scan_id, continuous))
+        asyncio.run(_execute_phases(target, phase, resume, clean, scan_id, continuous, url_list))
     except KeyboardInterrupt:
         console.print("\n[yellow]Engagement aborted by user.[/yellow]")
     except Exception as e:
@@ -256,7 +328,7 @@ def _display_framework_info(target: str):
     console.print(f"[bold cyan]Architecture:[/bold cyan] Sequential Pipeline (V2 Architecture)")
 
 
-async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, scan_id: int, continuous: bool):
+async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, scan_id: int, continuous: bool, url_list: Optional[list] = None):
     """Execute scan phases with dashboard UI."""
     from bugtrace.core.database import get_db_manager
     from bugtrace.core.ui import dashboard
@@ -281,20 +353,25 @@ async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, sc
     # Start stop monitor thread
     stop_thread = _start_stop_monitor_thread(dashboard)
 
-    with Live(dashboard, refresh_per_second=4, screen=True):
-        dashboard.active = True
-        dashboard.set_status("Running", "Initializing pipeline...")
+    try:
+        with Live(dashboard, refresh_per_second=4, screen=True):
+            dashboard.active = True
+            dashboard.set_status("Running", "Initializing pipeline...")
 
-        # Execute Hunter phase
-        orchestrator = None
-        if phase in ["hunter", "all"]:
-            orchestrator = await _run_hunter_phase(target, db, resume, common_output_dir)
+            # Execute Hunter phase
+            orchestrator = None
+            if phase in ["hunter", "all"]:
+                orchestrator = await _run_hunter_phase(target, db, resume, common_output_dir, url_list)
 
-        # Execute Auditor phase
-        if phase in ["manager", "all"]:
-            await _run_auditor_phase(target, db, scan_id, orchestrator, common_output_dir, continuous)
+            # Execute Auditor phase
+            if phase in ["manager", "all"]:
+                await _run_auditor_phase(target, db, scan_id, orchestrator, common_output_dir, continuous)
 
+            dashboard.active = False
+    finally:
+        # ALWAYS ensure keyboard listener restores terminal settings
         dashboard.active = False
+        dashboard.stop_keyboard_listener()
 
 
 def _setup_output_directory(target: str) -> Path:
@@ -340,7 +417,7 @@ def _perform_emergency_shutdown():
         os._exit(1)
 
 
-async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Path):
+async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Path, url_list: Optional[list] = None):
     """Run Hunter (Discovery) phase."""
     # Check for active scan and auto-resume
     resume = await _check_and_resume_scan(target, db, resume)
@@ -353,9 +430,16 @@ async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Pa
         max_depth=settings.MAX_DEPTH,
         max_urls=settings.MAX_URLS,
         use_vertical_agents=True,
-        output_dir=common_output_dir
+        output_dir=common_output_dir,
+        url_list=url_list
     )
-    console.print(f"\n[bold green]🏹 Launching Hunter Phase (Scan ID: {orchestrator.scan_id})[/bold green]")
+
+    # Display mode info
+    if url_list:
+        console.print(f"\n[bold green]🏹 Launching Hunter Phase (Scan ID: {orchestrator.scan_id}) - URL List Mode ({len(url_list)} URLs)[/bold green]")
+    else:
+        console.print(f"\n[bold green]🏹 Launching Hunter Phase (Scan ID: {orchestrator.scan_id})[/bold green]")
+
     await orchestrator.start()
 
     # Phase transition cleanup
@@ -484,14 +568,20 @@ def _run_focused_agent_with_dashboard(target: str, params, report_dir: Path, xss
     dashboard.reset()
     dashboard.start_keyboard_listener()
 
-    with Live(dashboard, refresh_per_second=4, screen=True):
-        dashboard.active = True
-        dashboard.set_status("Running", "Initializing focused agent...")
-        result = asyncio.run(_execute_focused_agent(target, params, report_dir, xss, sqli, jwt, lfi, idor, ssrf))
-        dashboard.active = False
+    result = None
+    try:
+        with Live(dashboard, refresh_per_second=4, screen=True):
+            dashboard.active = True
+            dashboard.set_status("Running", "Initializing focused agent...")
+            result = asyncio.run(_execute_focused_agent(target, params, report_dir, xss, sqli, jwt, lfi, idor, ssrf))
+            dashboard.active = False
 
-        if dashboard.stop_requested:
-            _handle_emergency_stop()
+            if dashboard.stop_requested:
+                _handle_emergency_stop()
+    finally:
+        # ALWAYS ensure keyboard listener restores terminal settings
+        dashboard.active = False
+        dashboard.stop_keyboard_listener()
 
     return result
 

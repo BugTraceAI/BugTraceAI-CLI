@@ -84,3 +84,5 @@ alembic.ini
 
 # Internal testing/training tools (dojos, benchmarks)
 testing/
+# Auto-learned breakouts (generated at runtime)
+bugtrace/payloads/learned_breakouts.json
