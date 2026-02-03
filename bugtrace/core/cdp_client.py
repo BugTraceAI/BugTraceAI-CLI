@@ -40,6 +40,7 @@ class CDPResult:
     console_logs: List[Dict] = field(default_factory=list)
     screenshot_path: Optional[str] = None
     marker_found: bool = False
+    alert_message: Optional[str] = None
 
 
 class CDPClient:
@@ -554,9 +555,8 @@ class CDPClient:
                 logger.error(f"Navigation error: {result['error']}")
                 return False
 
-            # Wait for page load
-            await self._send("Page.loadEventFired")
-            await asyncio.sleep(1.0)
+            # Wait for page load (simple sleep since we can't await events via _send)
+            await asyncio.sleep(2.0)
 
             return True
         except Exception as e:
@@ -631,21 +631,26 @@ class CDPClient:
         """Check if XSS was executed (not just reflected) in DOM."""
         return await self.execute_js('''
             (() => {
-                const marker = "BUGTRACE-XSS-CONFIRMED";
+                const markers = ["BUGTRACE-XSS-CONFIRMED", "HACKED BY BUGTRACEAI"];
                 const bodyText = document.body.innerText || "";
-                const hasVisibleMarker = bodyText.includes(marker);
+                
+                // Check visible text for any marker
+                const hasVisibleMarker = markers.some(m => bodyText.includes(m));
 
                 const styledElements = document.querySelectorAll('[style*="color"], [style*="background"]');
                 const hasStyledMarker = Array.from(styledElements).some(el =>
-                    el.textContent && el.textContent.includes(marker)
+                    el.textContent && markers.some(m => el.textContent.includes(m))
                 );
 
-                const poeElements = document.querySelectorAll('[id^="BTPOE_"]');
+                // Check for both legacy POE ID and new XSSAgent bt-pwn ID
+                const poeElements = document.querySelectorAll('[id^="BTPOE_"], [id="bt-pwn"]');
                 const hasPoeMarker = poeElements.length > 0;
 
                 const scriptCreatedDivs = document.querySelectorAll('div[id], span[id]');
                 const hasScriptCreatedElement = Array.from(scriptCreatedDivs).some(el => {
-                    return el.id.startsWith('BTPOE_') || (el.textContent && el.textContent.includes(marker));
+                    const idMatch = el.id.startsWith('BTPOE_') || el.id === 'bt-pwn';
+                    const textMatch = el.textContent && markers.some(m => el.textContent.includes(m));
+                    return idMatch || textMatch;
                 });
 
                 return hasStyledMarker || hasPoeMarker || hasScriptCreatedElement;
@@ -791,7 +796,8 @@ class CDPClient:
             },
             console_logs=self._console_logs.copy(),
             screenshot_path=screenshot_path,
-            marker_found=check_results["marker_found"]
+            marker_found=check_results.get("marker_found", False),
+            alert_message=self._last_alert_message
         )
 
     async def get_console_logs(self) -> List[Dict]:

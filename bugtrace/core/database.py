@@ -544,16 +544,66 @@ class DatabaseManager:
             proof_screenshot_path=finding_data.get("screenshot_path") or finding_data.get("screenshot")
         )
 
+    def _is_global_parameter(self, param: str) -> bool:
+        """
+        Check if parameter is global (affects all endpoints, not URL-specific).
+
+        Global parameters include cookies, headers, and auth tokens that persist
+        across all requests to a domain.
+        """
+        param_lower = (param or "").lower()
+        global_indicators = ["cookie", "header", "authorization", "bearer", "token", "session"]
+        return any(indicator in param_lower for indicator in global_indicators)
+
+    def _normalize_parameter_for_lookup(self, param: str) -> str:
+        """Normalize parameter for database lookup (handles variations)."""
+        param_lower = (param or "").lower().strip()
+
+        # Cookie: extract just the cookie name
+        if "cookie" in param_lower:
+            clean = param_lower.replace("cookie:", "").replace("cookie", "").strip()
+            clean = clean.split()[0] if clean else ""
+            return f"cookie:{clean}" if clean else param_lower
+
+        return param_lower
+
     def _find_existing_finding(self, session, scan_id: int, vuln_type, finding_data: Dict, target_url: str):
-        """Check if finding already exists for this scan."""
-        return session.exec(
-            select(FindingTable).where(
-                FindingTable.scan_id == scan_id,
-                FindingTable.type == vuln_type,
-                FindingTable.attack_url == finding_data.get("url", target_url),
-                FindingTable.vuln_parameter == finding_data.get("parameter", finding_data.get("param", ""))
-            )
-        ).first()
+        """
+        Check if finding already exists for this scan.
+
+        For global parameters (cookies, headers), ignores the URL since the
+        vulnerability affects all endpoints equally.
+        """
+        param = finding_data.get("parameter", finding_data.get("param", ""))
+        param_normalized = self._normalize_parameter_for_lookup(param)
+
+        if self._is_global_parameter(param):
+            # Global parameter: match by (scan_id, type, param) - ignore URL
+            # Use LIKE to handle parameter variations
+            results = session.exec(
+                select(FindingTable).where(
+                    FindingTable.scan_id == scan_id,
+                    FindingTable.type == vuln_type
+                )
+            ).all()
+
+            # Check if any existing finding has a matching normalized parameter
+            for existing in results:
+                existing_param_norm = self._normalize_parameter_for_lookup(existing.vuln_parameter)
+                if existing_param_norm == param_normalized:
+                    return existing
+
+            return None
+        else:
+            # URL-specific parameter: full match required
+            return session.exec(
+                select(FindingTable).where(
+                    FindingTable.scan_id == scan_id,
+                    FindingTable.type == vuln_type,
+                    FindingTable.attack_url == finding_data.get("url", target_url),
+                    FindingTable.vuln_parameter == param
+                )
+            ).first()
 
     def save_scan_result(self, target_url: str, findings: List[Dict], scan_id: Optional[int] = None) -> int:
         """Save scan results to database."""

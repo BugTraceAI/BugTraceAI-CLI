@@ -29,10 +29,13 @@ class EventType(str, Enum):
     """
     Standard event types for agent coordination.
 
-    Discovery Phase:
-    - URL_ANALYZED: SASTDASTAgent completed URL analysis
+    Reconnaissance Phase:
+    - URL_ANALYZED: GoSpider/AssetDiscoveryAgent completed recon
 
-    Evaluation Phase:
+    Discovery Phase:
+    - URL_ANALYZED: SASTDASTAgent completed DAST probing
+
+    Strategy Phase:
     - WORK_QUEUED_XSS: ThinkingAgent queued work for XSS specialist
     - WORK_QUEUED_SQLI: ThinkingAgent queued work for SQLi specialist
     - WORK_QUEUED_CSTI: ThinkingAgent queued work for CSTI specialist
@@ -58,10 +61,13 @@ class EventType(str, Enum):
     - AGENT_STARTED: Agent started execution
     - AGENT_STOPPED: Agent stopped execution
     """
+    # Reconnaissance
+    URL_CRAWLED = "url_crawled"
+    
     # Discovery
     URL_ANALYZED = "url_analyzed"
 
-    # Evaluation (work distribution)
+    # Strategy (work distribution)
     WORK_QUEUED_XSS = "work_queued_xss"
     WORK_QUEUED_SQLI = "work_queued_sqli"
     WORK_QUEUED_CSTI = "work_queued_csti"
@@ -82,9 +88,10 @@ class EventType(str, Enum):
     FINDING_VALIDATED = "finding_validated"
     FINDING_REJECTED = "finding_rejected"
 
-    # Phase Completion Events (Pipeline Orchestration)
+    # Phase Completion Events (6-Phase Pipeline Orchestration)
+    PHASE_COMPLETE_RECONNAISSANCE = "phase_complete_reconnaissance"
     PHASE_COMPLETE_DISCOVERY = "phase_complete_discovery"
-    PHASE_COMPLETE_EVALUATION = "phase_complete_evaluation"
+    PHASE_COMPLETE_STRATEGY = "phase_complete_strategy"
     PHASE_COMPLETE_EXPLOITATION = "phase_complete_exploitation"
     PHASE_COMPLETE_VALIDATION = "phase_complete_validation"
     PHASE_COMPLETE_REPORTING = "phase_complete_reporting"

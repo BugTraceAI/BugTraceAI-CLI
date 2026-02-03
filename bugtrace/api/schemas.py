@@ -11,6 +11,8 @@ Version: 2.0.0
 from typing import Optional, List, Any, Dict
 from pydantic import BaseModel, Field
 
+from bugtrace.schemas.db_models import ScanStatus, FindingStatus
+
 
 # Scan Request/Response Models
 
@@ -39,7 +41,7 @@ class ScanStatusResponse(BaseModel):
     """
     scan_id: int
     target: str
-    status: str  # initializing, running, completed, stopped, failed
+    status: ScanStatus  # Type-safe enum: PENDING, RUNNING, COMPLETED, STOPPED, FAILED
     progress: int  # 0-100
     uptime_seconds: Optional[float] = None  # None if not running
     findings_count: int
@@ -60,7 +62,7 @@ class FindingItem(BaseModel):
     url: str
     parameter: Optional[str] = None
     validated: bool
-    status: str
+    status: FindingStatus  # Type-safe enum for validation status
     confidence: Optional[float] = None
 
 
@@ -83,7 +85,7 @@ class ScanSummary(BaseModel):
     """
     scan_id: int
     target: str
-    status: str
+    status: ScanStatus  # Type-safe enum
     progress: int
     timestamp: str  # ISO format
     origin: str = "cli"  # "cli" or "web"

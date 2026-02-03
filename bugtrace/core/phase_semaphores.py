@@ -23,7 +23,8 @@ class ScanPhase(str, Enum):
     ANALYSIS = "analysis"
     EXPLOITATION = "exploitation"
     VALIDATION = "validation"
-    LLM_GLOBAL = "llm_global"  # Backward compatibility
+    REPORTING = "reporting"
+    LLM_GLOBAL = "llm_global"  # DEPRECATED v3.1 - kept for backwards compatibility only
 
 
 @dataclass
@@ -70,7 +71,12 @@ class PhaseSemaphoreManager:
             ScanPhase.EXPLOITATION: asyncio.Semaphore(settings.MAX_CONCURRENT_SPECIALISTS),
             # HARDCODED: CDP only supports 1 concurrent session (crashes with more)
             ScanPhase.VALIDATION: asyncio.Semaphore(1),  # DO NOT CHANGE - CDP limitation
-            ScanPhase.LLM_GLOBAL: asyncio.Semaphore(settings.MAX_CONCURRENT_REQUESTS),
+            ScanPhase.REPORTING: asyncio.Semaphore(1),   # Sequential reporting
+            # DEPRECATED (v3.1): LLM_GLOBAL semaphore no longer used.
+            # Each agent makes LLM calls independently - no global blocking.
+            # Rate limiting handled by tenacity retry + model shifting.
+            # Kept for backwards compatibility but set to high value (no blocking).
+            ScanPhase.LLM_GLOBAL: asyncio.Semaphore(999),
         }
 
         # Initialize stats
@@ -82,7 +88,8 @@ class PhaseSemaphoreManager:
             f"Discovery={settings.MAX_CONCURRENT_DISCOVERY}, "
             f"Analysis={settings.MAX_CONCURRENT_ANALYSIS}, "
             f"Specialists={settings.MAX_CONCURRENT_SPECIALISTS}, "
-            f"Validation=1 (CDP hardcoded)"
+            f"Validation=1 (CDP hardcoded), "
+            f"Reporting=1"
         )
 
     def get_semaphore(self, phase: ScanPhase) -> asyncio.Semaphore:
@@ -179,6 +186,24 @@ def get_validation_semaphore() -> asyncio.Semaphore:
     """Get the validation phase semaphore."""
     return phase_semaphores.get_semaphore(ScanPhase.VALIDATION)
 
+def get_reporting_semaphore() -> asyncio.Semaphore:
+    """Get the reporting phase semaphore."""
+    return phase_semaphores.get_semaphore(ScanPhase.REPORTING)
+
+def get_llm_global_semaphore() -> asyncio.Semaphore:
+    """DEPRECATED (v3.1): Global LLM semaphore is no longer used.
+
+    Each agent now makes LLM calls independently without global blocking.
+    Rate limiting is handled by:
+    - tenacity retry with exponential backoff
+    - Model shifting on 429 errors
+    - Circuit breaker for cascading failures
+
+    This function is kept for backwards compatibility but returns a
+    semaphore with value 999 (effectively no blocking).
+    """
+    return phase_semaphores.get_semaphore(ScanPhase.LLM_GLOBAL)
+
 
 __all__ = [
     "ScanPhase",
@@ -188,4 +213,6 @@ __all__ = [
     "get_analysis_semaphore",
     "get_exploitation_semaphore",
     "get_validation_semaphore",
+    "get_reporting_semaphore",
+    "get_llm_global_semaphore",
 ]

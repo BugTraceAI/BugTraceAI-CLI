@@ -14,7 +14,6 @@ Version: 2.0.0
 """
 
 import os
-import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from typing import Dict, Any
@@ -24,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from bugtrace.core.config import settings
+from bugtrace.core.database import get_db_manager
 from bugtrace.api.deps import ScanServiceDep, ReportServiceDep, EventBusDep, get_scan_service
 from bugtrace.api.exceptions import register_exception_handlers
 from bugtrace.services.event_bus import service_event_bus
@@ -277,14 +277,13 @@ async def readiness_check() -> Dict[str, Any]:
     Use /health for liveness probes (is the process alive?).
     Use /ready for readiness probes (can it handle requests?).
     """
-    # Check database connectivity
+    # Check database connectivity using DatabaseManager (not direct sqlite3)
     database_ok = False
     try:
-        conn = sqlite3.connect("bugtrace.db")
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1")
-        cursor.close()
-        conn.close()
+        db = get_db_manager()
+        with db.get_session() as session:
+            from sqlalchemy import text
+            session.exec(text("SELECT 1"))
         database_ok = True
     except Exception as e:
         logger.warning(f"Database readiness check failed: {e}")
@@ -314,11 +313,13 @@ from bugtrace.api.routes.scans import router as scans_router
 from bugtrace.api.routes.reports import router as reports_router
 from bugtrace.api.routes.config import router as config_router
 from bugtrace.api.routes.metrics import router as metrics_router
+from bugtrace.api.routes.websocket import router as websocket_router
 
 app.include_router(scans_router, prefix="/api", tags=["scans"])
 app.include_router(reports_router, prefix="/api", tags=["reports"])
 app.include_router(config_router, prefix="/api", tags=["config"])
 app.include_router(metrics_router, prefix="/api", tags=["metrics"])
+app.include_router(websocket_router, prefix="/api", tags=["websocket"])
 
 
 # WebSocket endpoint for real-time scan event streaming

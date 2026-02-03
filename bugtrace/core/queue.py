@@ -9,6 +9,8 @@ Version: 1.0.0
 
 import asyncio
 import time
+import json
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from bugtrace.utils.logger import get_logger
@@ -176,6 +178,112 @@ class SpecialistQueue:
 
         logger.info(f"Queue '{name}' created: max_depth={self.max_depth}, rate_limit={self.rate_limit}/s")
 
+        # File-based mode state
+        self._file_mode = False
+        self.file_path: Optional[Path] = None
+        self._tail_task: Optional[asyncio.Task] = None
+        self._check_file_event = asyncio.Event()
+
+    def enable_file_mode(self, file_path: Path):
+        """Enable file-based mode: tail file and disable manual enqueue."""
+        if self._file_mode:
+            return
+        self._file_mode = True
+        self.file_path = file_path
+        logger.info(f"Queue '{self.name}' enabled file mode: {file_path}")
+        
+        # Start background tailing task
+        loop = asyncio.get_event_loop()
+        self._tail_task = loop.create_task(self._tail_file_loop())
+
+    async def _tail_file_loop(self):
+        """Continuously read JSON Lines queue items from file and populate the queue.
+
+        v3.2 Format (JSON Lines - one JSON object per line):
+            {"timestamp": 123.456, "specialist": "xss", "scan_context": "scan_xyz", "finding": {...}}
+
+        This replaces the legacy XML format used in v3.1.
+        """
+        cursor = 0
+
+        while True:
+            try:
+                # Wait for signal (enqueue) or timeout (poll)
+                try:
+                    await asyncio.wait_for(self._check_file_event.wait(), timeout=0.5)
+                    self._check_file_event.clear()
+                except asyncio.TimeoutError:
+                    pass
+
+                if not self.file_path.exists():
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # Read new content from file (blocking IO in thread)
+                content, new_cursor = await asyncio.to_thread(self._read_content_safe, self.file_path, cursor)
+
+                if not content:
+                    continue
+
+                cursor = new_cursor
+
+                # Parse JSON Lines format (v3.2)
+                # Each line is a complete JSON object:
+                #   {"timestamp": 123.456, "specialist": "xss", "scan_context": "ctx", "finding": {...}}
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        entry = json.loads(line)
+
+                        # Extract fields from JSON Lines format
+                        ts = entry.get("timestamp", time.monotonic())
+                        ctx = entry.get("scan_context", "unknown")
+                        finding_data = entry.get("finding", {})
+
+                        # Build payload structure that specialists expect
+                        # Specialists expect: {"finding": {...}, "scan_context": "..."}
+                        payload = {
+                            "finding": finding_data,
+                            "scan_context": ctx
+                        }
+
+                        item = QueueItem(
+                            payload=payload,
+                            scan_context=ctx,
+                            enqueued_at=ts
+                        )
+
+                        # Put into internal async queue (buffer)
+                        await self._queue.put(item)
+                        self._stats.record_enqueue()
+                        logger.debug(f"Queue '{self.name}' parsed JSON Lines item: {finding_data.get('type', 'unknown')}")
+
+                    except json.JSONDecodeError as e:
+                        # Skip invalid JSON lines (could be partial writes)
+                        logger.debug(f"Queue '{self.name}' skipping invalid JSON line: {e}")
+                    except Exception as e:
+                        logger.warning(f"Queue '{self.name}' failed to parse queue item: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Queue '{self.name}' tail loop error: {e}")
+                await asyncio.sleep(1)
+
+    def _read_content_safe(self, path, offset):
+        """Helper to read content from offset."""
+        with open(path, "r", encoding="utf-8") as f:
+            f.seek(offset)
+            content = f.read()
+            return content, f.tell()
+
+    def _read_lines_safe(self, path, offset):
+        """DEPRECATED: Use _read_content_safe for XML parsing."""
+        return self._read_content_safe(path, offset)
+
     async def enqueue(self, item: dict, scan_context: str) -> bool:
         """
         Add item to queue with backpressure check.
@@ -189,9 +297,21 @@ class SpecialistQueue:
         """
         # Check backpressure first
         if self.is_full():
+            # In File Mode, we don't block enqueue because the producer writes to disk.
+            # We return True to satisfy the caller (ThinkingAgent) that the item is "safe".
+            if self._file_mode:
+                return True
+                
             self._stats.record_rejected()
             logger.warning(f"Queue '{self.name}' is full ({self.depth()}/{self.max_depth}), backpressure triggered")
             return False
+
+        # In File Mode, enqueue is a no-op for the caller because 
+        # the queue is fed by the file tailer.
+        if self._file_mode:
+            # Signal the tailer to read the file immediately
+            self._check_file_event.set()
+            return True
 
         # Apply rate limiting (token bucket)
         if self.rate_limit > 0:
@@ -233,6 +353,18 @@ class SpecialistQueue:
 
     def depth(self) -> int:
         """Get current queue depth."""
+        # In file mode, check the file size instead of memory queue
+        # This prevents race conditions where the file has data but tailer hasn't read it yet
+        if self._file_mode and self.file_path and self.file_path.exists():
+            try:
+                # Count non-empty lines in file
+                with open(self.file_path, 'r') as f:
+                    count = sum(1 for line in f if line.strip())
+                return count
+            except Exception as e:
+                logger.warning(f"Queue '{self.name}' failed to read file depth: {e}")
+                return self._queue.qsize()
+
         return self._queue.qsize()
 
     def is_full(self) -> bool:
@@ -285,7 +417,64 @@ class QueueManager:
     def __init__(self):
         self._queues: Dict[str, SpecialistQueue] = {}
         self._lock = asyncio.Lock()
+        self._status_log_task: Optional[asyncio.Task] = None
         logger.info("QueueManager initialized")
+
+    def start_status_logging(self, interval: float = 10.0):
+        """Start periodic status logging task."""
+        if self._status_log_task is None or self._status_log_task.done():
+            try:
+                loop = asyncio.get_event_loop()
+                self._status_log_task = loop.create_task(self._log_status_periodically(interval))
+                logger.debug("QueueManager status logging started")
+            except RuntimeError:
+                pass  # No event loop running yet
+
+    def stop_status_logging(self):
+        """Stop periodic status logging task."""
+        if self._status_log_task and not self._status_log_task.done():
+            self._status_log_task.cancel()
+            self._status_log_task = None
+
+    async def _log_status_periodically(self, interval: float = 10.0):
+        """
+        Periodically log queue status with detailed breakdown.
+
+        Logs format: "Queue status: 15 pending (SQLi: 5, XSS: 8, CSTI: 2)"
+        Only logs when there are pending items to avoid log noise.
+        """
+        while True:
+            try:
+                await asyncio.sleep(interval)
+
+                # Collect queue depths
+                details = []
+                total_pending = 0
+
+                for name, queue in self._queues.items():
+                    depth = queue.depth()
+                    if depth > 0:
+                        # Capitalize first letter for display
+                        display_name = name.upper() if len(name) <= 4 else name.capitalize()
+                        details.append(f"{display_name}: {depth}")
+                        total_pending += depth
+
+                # Only log if there are pending items
+                if total_pending > 0:
+                    detail_str = ", ".join(details)
+                    logger.info(f"Queue status: {total_pending} pending ({detail_str})")
+
+                    # Also update dashboard if available
+                    try:
+                        from bugtrace.core.ui import dashboard
+                        dashboard.log(f"Queues: {total_pending} pending ({detail_str})", "INFO")
+                    except Exception:
+                        pass
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Queue status logging error: {e}")
 
     def get_queue(self, specialist: str) -> SpecialistQueue:
         """Get or create queue for specialist."""
@@ -301,6 +490,20 @@ class QueueManager:
         """Clear all queues (for testing)."""
         self._queues.clear()
         logger.info("QueueManager reset")
+
+    def initialize_file_queues(self, queue_dir: Path):
+        """
+        Initialize file-based mode for all known specialist queues using the given directory.
+
+        Args:
+            queue_dir: Directory containing {specialist}.json files (v3.2 JSON Lines format)
+        """
+        from pathlib import Path
+        for specialist in SPECIALIST_QUEUES:
+            queue = self.get_queue(specialist)
+            file_path = queue_dir / f"{specialist}.json"
+            queue.enable_file_mode(file_path)
+        logger.info(f"Initialized file queues in {queue_dir}")
 
     def get_all_stats(self) -> Dict[str, Dict[str, Any]]:
         """

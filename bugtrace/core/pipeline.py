@@ -1,16 +1,17 @@
 """
-Pipeline Phase State Machine - 5-Phase Execution Model
+Pipeline Phase State Machine - 6-Phase Execution Model
 
 This module provides the foundational infrastructure for the pipeline orchestration
 system (ORCH-01). It defines the phases of vulnerability scanning, transition rules,
 and state tracking for the TeamOrchestrator.
 
-The 5-phase execution model:
-1. DISCOVERY  - SASTDASTAgent analyzing URLs, emitting url_analyzed events
-2. EVALUATION - ThinkingConsolidationAgent deduplicating and classifying findings
-3. EXPLOITATION - Specialist agents (XSS, SQLi, etc.) testing payloads
-4. VALIDATION - AgenticValidator processing PENDING_VALIDATION findings via CDP
-5. REPORTING  - ReportingAgent generating deliverables
+The 6-phase execution model:
+1. RECONNAISSANCE - Asset discovery (GoSpider, tech stack detection)
+2. DISCOVERY  - DAST probing (DASTySASTAgent analyzing URLs)
+3. STRATEGY - ThinkingConsolidationAgent deduplicating and classifying findings
+4. EXPLOITATION - Specialist agents (XSS, SQLi, etc.) testing payloads
+5. VALIDATION - AgenticValidator processing PENDING_VALIDATION findings via CDP
+6. REPORTING  - ReportingAgent generating deliverables
 
 Additional states:
 - IDLE     - Pipeline not started
@@ -19,7 +20,7 @@ Additional states:
 - PAUSED   - User-requested pause
 
 Transition Rules:
-- Normal flow: IDLE -> DISCOVERY -> EVALUATION -> EXPLOITATION -> VALIDATION -> REPORTING -> COMPLETE
+- Normal flow: IDLE -> RECONNAISSANCE -> DISCOVERY -> STRATEGY -> EXPLOITATION -> VALIDATION -> REPORTING -> COMPLETE
 - Any phase can transition to PAUSED or ERROR
 - PAUSED can resume to any active phase
 - COMPLETE and ERROR can only transition to IDLE (restart/reset)
@@ -58,7 +59,7 @@ __all__ = [
 
 class PipelinePhase(str, Enum):
     """
-    Pipeline phases for 5-phase execution model.
+    Pipeline phases for 6-phase execution model.
 
     Inherits from str for JSON serialization compatibility.
     Each phase corresponds to a stage in vulnerability scanning.
@@ -66,12 +67,13 @@ class PipelinePhase(str, Enum):
     # Not started
     IDLE = "idle"
 
-    # Active phases (5-phase model)
-    DISCOVERY = "discovery"       # SASTDASTAgent analyzing URLs
-    EVALUATION = "evaluation"     # ThinkingConsolidationAgent deduplicating, classifying
-    EXPLOITATION = "exploitation" # Specialist agents testing payloads
-    VALIDATION = "validation"     # AgenticValidator processing PENDING_VALIDATION
-    REPORTING = "reporting"       # ReportingAgent generating deliverables
+    # Active phases (6-phase model)
+    RECONNAISSANCE = "reconnaissance" # Asset discovery (GoSpider, tech detection)
+    DISCOVERY = "discovery"           # DAST probing (DASTySASTAgent)
+    STRATEGY = "strategy"             # ThinkingConsolidationAgent deduplicating, classifying
+    EXPLOITATION = "exploitation"     # Specialist agents testing payloads
+    VALIDATION = "validation"         # AgenticValidator processing PENDING_VALIDATION
+    REPORTING = "reporting"           # ReportingAgent generating deliverables
 
     # Terminal states
     COMPLETE = "complete"  # Pipeline finished
@@ -107,16 +109,21 @@ class PipelineTransition:
 
 # Valid transitions from each phase
 VALID_TRANSITIONS: Dict[PipelinePhase, List[PipelinePhase]] = {
-    # IDLE can only start discovery
-    PipelinePhase.IDLE: [PipelinePhase.DISCOVERY],
+    # IDLE can only start reconnaissance
+    PipelinePhase.IDLE: [PipelinePhase.RECONNAISSANCE],
 
     # Active phases follow linear progression with pause/error exits
-    PipelinePhase.DISCOVERY: [
-        PipelinePhase.EVALUATION,
+    PipelinePhase.RECONNAISSANCE: [
+        PipelinePhase.DISCOVERY,
         PipelinePhase.PAUSED,
         PipelinePhase.ERROR
     ],
-    PipelinePhase.EVALUATION: [
+    PipelinePhase.DISCOVERY: [
+        PipelinePhase.STRATEGY,
+        PipelinePhase.PAUSED,
+        PipelinePhase.ERROR
+    ],
+    PipelinePhase.STRATEGY: [
         PipelinePhase.EXPLOITATION,
         PipelinePhase.PAUSED,
         PipelinePhase.ERROR
@@ -138,8 +145,9 @@ VALID_TRANSITIONS: Dict[PipelinePhase, List[PipelinePhase]] = {
 
     # PAUSED can resume to any active phase
     PipelinePhase.PAUSED: [
+        PipelinePhase.RECONNAISSANCE,
         PipelinePhase.DISCOVERY,
-        PipelinePhase.EVALUATION,
+        PipelinePhase.STRATEGY,
         PipelinePhase.EXPLOITATION,
         PipelinePhase.VALIDATION,
         PipelinePhase.REPORTING
@@ -357,6 +365,7 @@ class PipelineLifecycle:
         Drain all specialist queues.
 
         Waits until all registered queues are empty or timeout expires.
+        Now includes worker health check to detect dead workers early.
 
         Args:
             timeout: Max seconds to wait (defaults to PIPELINE_DRAIN_TIMEOUT)
@@ -371,6 +380,7 @@ class PipelineLifecycle:
 
         result: Dict[str, int] = {}
         start_time = time.monotonic()
+        stall_check_counter = 0  # Check worker health every N iterations
 
         queue_names = queue_manager.list_queues()
         if not queue_names:
@@ -383,6 +393,7 @@ class PipelineLifecycle:
             queue = queue_manager.get_queue(queue_name)
             initial_depth = queue.depth()
             result[queue_name] = 0
+            last_depth = initial_depth
 
             while queue.depth() > 0:
                 elapsed = time.monotonic() - start_time
@@ -392,6 +403,38 @@ class PipelineLifecycle:
                         f"{queue.depth()} items remaining"
                     )
                     break
+
+                # Worker health check: every 10 iterations (~1 second)
+                stall_check_counter += 1
+                if stall_check_counter >= 10:
+                    stall_check_counter = 0
+                    current_depth = queue.depth()
+
+                    # Count active workers
+                    workers_active = 0
+                    for pool in self._worker_pools.values():
+                        try:
+                            stats = pool.get_stats()
+                            if stats.get("running"):
+                                workers_active += stats.get("worker_count", 0)
+                        except Exception:
+                            pass  # Pool may be stopping
+
+                    # CRITICAL: Queue has items but no workers to process them
+                    if current_depth > 0 and workers_active == 0:
+                        logger.error(
+                            f"[Pipeline] STALL DETECTED: {queue_name} has {current_depth} items "
+                            f"but 0 active workers. Aborting drain to prevent infinite wait."
+                        )
+                        break
+
+                    # Check if queue is stalled (same depth after 1 second with workers running)
+                    if current_depth == last_depth and workers_active > 0:
+                        logger.warning(
+                            f"[Pipeline] Queue '{queue_name}' appears stalled at depth {current_depth}"
+                        )
+
+                    last_depth = current_depth
 
                 await asyncio.sleep(0.1)  # Check every 100ms
 
@@ -682,8 +725,9 @@ class PipelineLifecycle:
         from bugtrace.core.event_bus import EventType
 
         event_map = {
+            PipelinePhase.RECONNAISSANCE: EventType.PHASE_COMPLETE_RECONNAISSANCE,
             PipelinePhase.DISCOVERY: EventType.PHASE_COMPLETE_DISCOVERY,
-            PipelinePhase.EVALUATION: EventType.PHASE_COMPLETE_EVALUATION,
+            PipelinePhase.STRATEGY: EventType.PHASE_COMPLETE_STRATEGY,
             PipelinePhase.EXPLOITATION: EventType.PHASE_COMPLETE_EXPLOITATION,
             PipelinePhase.VALIDATION: EventType.PHASE_COMPLETE_VALIDATION,
             PipelinePhase.REPORTING: EventType.PHASE_COMPLETE_REPORTING,
@@ -714,7 +758,7 @@ class PipelineOrchestrator:
 
     Completion Detection:
     - DISCOVERY: All URLs analyzed (url_count == processed_count)
-    - EVALUATION: ThinkingAgent buffer empty + queues receiving work
+    - STRATEGY: ThinkingAgent buffer empty + queues receiving work
     - EXPLOITATION: All specialist queues empty + no active workers
     - VALIDATION: AgenticValidator queue empty + validation complete
     - REPORTING: Report generation complete event received
@@ -754,14 +798,14 @@ class PipelineOrchestrator:
 
         self.subscribe_to_events()
 
-        # Transition to DISCOVERY
-        self.state.transition(PipelinePhase.DISCOVERY, "Pipeline started")
+        # Transition to RECONNAISSANCE
+        self.state.transition(PipelinePhase.RECONNAISSANCE, "Pipeline started")
 
         # Emit pipeline started event
         await self.event_bus.emit(EventType.PIPELINE_STARTED, {
             "scan_context": self.scan_id,
             "scan_id": self.scan_id,
-            "phase": PipelinePhase.DISCOVERY.value
+            "phase": PipelinePhase.RECONNAISSANCE.value
         })
 
         logger.info(f"Pipeline orchestrator started for scan {self.scan_id}")
@@ -811,8 +855,9 @@ class PipelineOrchestrator:
 
         # Map event types to handlers
         event_handlers = [
+            (EventType.PHASE_COMPLETE_RECONNAISSANCE, self._handle_reconnaissance_complete),
             (EventType.PHASE_COMPLETE_DISCOVERY, self._handle_discovery_complete),
-            (EventType.PHASE_COMPLETE_EVALUATION, self._handle_evaluation_complete),
+            (EventType.PHASE_COMPLETE_STRATEGY, self._handle_strategy_complete),
             (EventType.PHASE_COMPLETE_EXPLOITATION, self._handle_exploitation_complete),
             (EventType.PHASE_COMPLETE_VALIDATION, self._handle_validation_complete),
             (EventType.PHASE_COMPLETE_REPORTING, self._handle_reporting_complete),
@@ -837,6 +882,27 @@ class PipelineOrchestrator:
         self._subscribed = False
         logger.debug("Unsubscribed from all phase completion events")
 
+    async def _handle_reconnaissance_complete(self, data: Dict[str, Any]) -> None:
+        """Handle reconnaissance phase completion event."""
+        # Ignore events from other scans
+        if data.get("scan_context") != self.scan_id:
+            return
+
+        # Only process if in RECONNAISSANCE phase
+        if self.state.current_phase != PipelinePhase.RECONNAISSANCE:
+            logger.debug(f"Ignoring reconnaissance complete (current phase: {self.state.current_phase})")
+            return
+
+        metrics = {
+            "assets_found": data.get("assets_found", 0),
+            "urls_found": data.get("urls_found", 0)
+        }
+        await self._advance_phase(
+            PipelinePhase.DISCOVERY,
+            "Reconnaissance complete - assets discovered",
+            metrics
+        )
+
     async def _handle_discovery_complete(self, data: Dict[str, Any]) -> None:
         """Handle discovery phase completion event."""
         # Ignore events from other scans
@@ -853,27 +919,27 @@ class PipelineOrchestrator:
             "findings_count": data.get("findings_count", 0)
         }
         await self._advance_phase(
-            PipelinePhase.EVALUATION,
+            PipelinePhase.STRATEGY,
             "Discovery complete - all URLs analyzed",
             metrics
         )
 
-    async def _handle_evaluation_complete(self, data: Dict[str, Any]) -> None:
-        """Handle evaluation phase completion event."""
+    async def _handle_strategy_complete(self, data: Dict[str, Any]) -> None:
+        """Handle strategy phase completion event."""
         if data.get("scan_context") != self.scan_id:
             return
 
-        if self.state.current_phase != PipelinePhase.EVALUATION:
-            logger.debug(f"Ignoring evaluation complete (current phase: {self.state.current_phase})")
+        if self.state.current_phase != PipelinePhase.STRATEGY:
+            logger.debug(f"Ignoring strategy complete (current phase: {self.state.current_phase})")
             return
 
         metrics = {
-            "deduplicated_count": data.get("deduplicated_count", 0),
-            "queued_count": data.get("queued_count", 0)
+            "findings_processed": data.get("findings_processed", 0),
+            "findings_distributed": data.get("findings_distributed", 0)
         }
         await self._advance_phase(
             PipelinePhase.EXPLOITATION,
-            "Evaluation complete - work distributed to specialists",
+            "Strategy complete - findings deduplicated and distributed",
             metrics
         )
 
@@ -966,7 +1032,6 @@ class PipelineOrchestrator:
 
             # Emit appropriate event for the new phase
             event_map = {
-                PipelinePhase.EVALUATION: None,  # No specific event needed
                 PipelinePhase.EXPLOITATION: None,
                 PipelinePhase.VALIDATION: None,
                 PipelinePhase.REPORTING: None,

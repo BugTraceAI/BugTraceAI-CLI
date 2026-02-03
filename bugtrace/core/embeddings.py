@@ -30,13 +30,13 @@ class EmbeddingManager:
     _instance: Optional["EmbeddingManager"] = None
     _model: Optional[SentenceTransformer] = None
     
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
         """
         Initialize embedding manager.
         
         Args:
             model_name: Sentence-transformers model to use
-                       'all-MiniLM-L6-v2' is fast and good (384 dimensions)
+                       'BAAI/bge-small-en-v1.5' is fast and SOTA (384 dimensions)
         """
         self.model_name = model_name
         self._load_model()

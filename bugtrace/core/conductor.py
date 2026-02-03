@@ -420,247 +420,50 @@ class ConductorV2:
 
         return False, None
     
-    async def _crawl_target(self, target_url: str) -> List[str]:
-        """Usa GoSpider para descubrir endpoints antes de atacar."""
-        logger.info(f"[Conductor] Starting GoSpider crawl on {target_url}")
-
-        urls = await external_tools.run_gospider(target_url, depth=2)
-
-        # Filtrar URLs con parametros (las interesantes para SQLi/XSS)
-        parameterized = [u for u in urls if '?' in u or '=' in u]
-
-        logger.info(f"[Conductor] GoSpider found {len(urls)} URLs, {len(parameterized)} with parameters")
-
-        if parameterized:
-            self.share_context("discovered_urls", parameterized)
-        else:
-             self.share_context("discovered_urls", [target_url])
-
-        # Normalize and Dedup
-        unique_endpoints = set()
-        normalized_endpoints = []
+    async def audit_batch(self, findings: List[Dict]) -> List[Dict]:
+        """
+        Phase 5: Validation (Auditor Role).
         
-        candidates = parameterized if parameterized else [target_url]
-        for url in candidates:
-             # Basic normalization: strip trailing slash
-             norm = url.rstrip('/')
-             if norm not in unique_endpoints:
-                 unique_endpoints.add(norm)
-                 normalized_endpoints.append(url) # Keep original for now, or norm? Use norm for dedup key.
-                 
-        start_msg = f"[Conductor] Deduplicated endpoints to scan: {len(normalized_endpoints)}"
-        logger.info(start_msg)
-        for ep in normalized_endpoints:
-            logger.info(f"[Conductor] >> To Scan: {ep}")
-
-        return normalized_endpoints
-
-    async def _fingerprint_target(self, target_url: str) -> Dict[str, Any]:
-        """Usa Nuclei para identificar tecnologias y vulns conocidas."""
-        logger.info(f"[Conductor] Running Nuclei fingerprint on {target_url}")
-
-        findings = await external_tools.run_nuclei(target_url)
-
-        # Extraer info relevante
-        technologies = []
-        known_vulns = []
-
-        for f in findings:
-            template_id = f.get("template-id", "")
-            severity = f.get("info", {}).get("severity", "")
-
-            if "tech-detect" in template_id or "fingerprint" in template_id:
-                technologies.append(template_id)
-            elif severity in ["critical", "high"]:
-                known_vulns.append(f)
-
-        logger.info(f"[Conductor] Nuclei: {len(technologies)} techs, {len(known_vulns)} known vulns")
-
-        return {
-            "technologies": technologies,
-            "known_vulns": known_vulns,
-            "raw_findings": findings
-        }
-
-    def _parse_endpoint_params(self, endpoint: str) -> Tuple[Optional[str], str]:
-        """Parse URL parameters and return first param with its value."""
-        from urllib.parse import urlparse, parse_qs
-
-        parsed = urlparse(endpoint)
-        params = parse_qs(parsed.query)
-        first_param = list(params.keys())[0] if params else None
-        first_value = params[first_param][0] if first_param and params[first_param] else "1"
-
-        return first_param, first_value
-
-    async def _launch_xss_agent(self, endpoint: str, first_param: Optional[str]) -> List[Dict]:
-        """Launch XSS Agent and return findings."""
-        try:
-            from bugtrace.agents.xss_agent import XSSAgent
-            logger.info(f"[Conductor] Launching XSS Agent on {endpoint}")
-            xss_agent = XSSAgent(url=endpoint, params=[first_param] if first_param else [])
-            xss_result = await xss_agent.run_loop()
-            if xss_result.get("vulnerable"):
-                logger.info(f"[Conductor] XSS Agent found {len(xss_result.get('findings', []))} issues")
-                return xss_result.get("findings", [])
-        except Exception as e:
-            logger.error(f"[Conductor] XSS Agent failed: {e}", exc_info=True)
-        return []
-
-    async def _launch_sqli_agent(self, endpoint: str, first_param: Optional[str]) -> List[Dict]:
-        """Launch SQLi Agent and return findings."""
-        if not first_param:
+        Review a batch of findings from the Exploitation Phase (Phase 4).
+        Applies strict anti-hallucination rules and evidence verification.
+        
+        Args:
+            findings: List of raw findings from Specialist Agents.
+            
+        Returns:
+            List of VALIDATED findings that passed the audit.
+        """
+        if not findings:
+            logger.info("[Conductor] Audit batch is empty.")
             return []
-        try:
-            from bugtrace.agents.sqli_agent import SQLiAgent
-            logger.info(f"[Conductor] Launching SQLi Agent on {endpoint}")
-            sqli_agent = SQLiAgent(url=endpoint, param=first_param)
-            sqli_result = await sqli_agent.run_loop()
-            if sqli_result.get("vulnerable"):
-                logger.info(f"[Conductor] SQLi Agent found {len(sqli_result.get('findings', []))} issues")
-                return sqli_result.get("findings", [])
-        except Exception as e:
-            logger.error(f"[Conductor] SQLi Agent failed: {e}", exc_info=True)
-        return []
+            
+        logger.info(f"[Conductor] Auditing batch of {len(findings)} findings...")
+        
+        validated_findings = []
+        rejected_count = 0
+        
+        for finding in findings:
+            # 1. Structural Validation
+            is_valid_format, fmt_error = self._validate_payload_format(finding)
+            if not is_valid_format:
+                logger.warning(f"[Conductor] REJECTED (Format): {fmt_error}")
+                rejected_count += 1
+                continue
 
-    async def _launch_ssrf_agent(self, endpoint: str, first_param: Optional[str]) -> List[Dict]:
-        """Launch SSRF Agent and return findings."""
-        if not first_param:
-            return []
-        try:
-            from bugtrace.agents.ssrf_agent import SSRFAgent
-            logger.info(f"[Conductor] Launching SSRF Agent on {endpoint}")
-            ssrf_agent = SSRFAgent(url=endpoint, param=first_param)
-            ssrf_result = await ssrf_agent.run_loop()
-            if ssrf_result.get("vulnerable"):
-                logger.info(f"[Conductor] SSRF Agent found {len(ssrf_result.get('findings', []))} issues")
-                return ssrf_result.get("findings", [])
-        except Exception as e:
-            logger.error(f"[Conductor] SSRF Agent failed: {e}", exc_info=True)
-        return []
-
-    async def _launch_idor_agent(self, endpoint: str, first_param: Optional[str], first_value: str) -> List[Dict]:
-        """Launch IDOR Agent and return findings."""
-        if not first_param or not first_value.isdigit():
-            return []
-        try:
-            from bugtrace.agents.idor_agent import IDORAgent
-            logger.info(f"[Conductor] Launching IDOR Agent on {endpoint}")
-            idor_params = [{"parameter": first_param, "original_value": first_value}]
-            idor_agent = IDORAgent(url=endpoint, params=idor_params)
-            idor_result = await idor_agent.run_loop()
-            findings = idor_result.get("findings", [])
-            if findings:
-                logger.info(f"[Conductor] IDOR Agent found {len(findings)} issues")
-            return findings
-        except Exception as e:
-            logger.error(f"[Conductor] IDOR Agent failed: {e}", exc_info=True)
-        return []
-
-    async def _launch_optional_agents(self, endpoint: str) -> List[Dict]:
-        """Launch XXE, JWT, and File Upload agents."""
-        from bugtrace.core.event_bus import event_bus
-        all_findings = []
-
-        # XXE Agent
-        try:
-            from bugtrace.agents.xxe_agent import XXEAgent
-            logger.info(f"[Conductor] Launching XXE Agent on {endpoint}")
-            xxe_agent = XXEAgent(url=endpoint)
-            xxe_result = await xxe_agent.run_loop()
-            if xxe_result.get("vulnerable"):
-                all_findings.extend(xxe_result.get("findings", []))
-                logger.info(f"[Conductor] XXE Agent found {len(xxe_result.get('findings', []))} issues")
-        except Exception as e:
-            logger.error(f"[Conductor] XXE Agent failed: {e}", exc_info=True)
-
-        # JWT Agent
-        try:
-            from bugtrace.agents.jwt_agent import JWTAgent
-            logger.info(f"[Conductor] Launching JWT Agent on {endpoint}")
-            jwt_agent = JWTAgent(event_bus=event_bus)
-            jwt_result = await jwt_agent.check_url(url=endpoint)
-            if jwt_result.get("vulnerable"):
-                all_findings.extend(jwt_result.get("findings", []))
-                logger.info(f"[Conductor] JWT Agent found {len(jwt_result.get('findings', []))} issues")
-        except Exception as e:
-            logger.error(f"[Conductor] JWT Agent failed: {e}", exc_info=True)
-
-        # File Upload Agent
-        try:
-            from bugtrace.agents.fileupload_agent import FileUploadAgent
-            logger.info(f"[Conductor] Launching File Upload Agent on {endpoint}")
-            fileupload_agent = FileUploadAgent(url=endpoint)
-            fileupload_result = await fileupload_agent.run_loop()
-            if fileupload_result.get("vulnerable"):
-                all_findings.extend(fileupload_result.get("findings", []))
-                logger.info(f"[Conductor] File Upload Agent found {len(fileupload_result.get('findings', []))} issues")
-        except Exception as e:
-            logger.error(f"[Conductor] File Upload Agent failed: {e}", exc_info=True)
-
-        return all_findings
-
-    def _validate_and_store_findings(self, all_findings: List[Dict]) -> List[Dict]:
-        """Validate payload format and store findings in shared context."""
-        if not all_findings:
-            return []
-
-        valid_findings = []
-        for f in all_findings:
-            is_valid, error_msg = self._validate_payload_format(f)
-            if is_valid:
-                valid_findings.append(f)
+            # 2. Logic/Evidence Validation
+            is_valid_logic, logic_error = self.validate_finding(finding)
+            if is_valid_logic:
+                validated_findings.append(finding)
+                # Share confirmed finding in context
+                self.share_context("confirmed_vulns", finding)
             else:
-                logger.warning(f"[Conductor] {error_msg}")
+                logger.warning(f"[Conductor] REJECTED (Logic): {logic_error} | Finding: {finding.get('type')} at {finding.get('parameter')}")
+                rejected_count += 1
+                
+        logger.info(f"[Conductor] Audit Complete: {len(validated_findings)} Passed, {rejected_count} Rejected.")
+        return validated_findings
 
-        if valid_findings:
-            existing = self.get_shared_context("agent_findings") or []
-            existing.extend(valid_findings)
-            self.share_context("agent_findings", existing)
-            logger.info(f"[Conductor] Total findings so far: {len(existing)}")
 
-        return valid_findings
-
-    async def _launch_agents(self, endpoint: str):
-        """Dispatches the specialist agents to a specific endpoint."""
-        logger.info(f"[Conductor] Launching specialist agents on {endpoint}")
-
-        first_param, first_value = self._parse_endpoint_params(endpoint)
-
-        # Launch mandatory agents
-        all_findings = []
-        all_findings.extend(await self._launch_xss_agent(endpoint, first_param))
-        all_findings.extend(await self._launch_sqli_agent(endpoint, first_param))
-        all_findings.extend(await self._launch_ssrf_agent(endpoint, first_param))
-        all_findings.extend(await self._launch_idor_agent(endpoint, first_param, first_value))
-
-        # Launch optional agents
-        all_findings.extend(await self._launch_optional_agents(endpoint))
-
-        # Validate and store findings
-        return self._validate_and_store_findings(all_findings)
-
-    async def run(self, target: str):
-        """Main entry point for the Conductor-led scan."""
-        logger.info(f"[Conductor] Starting orchestrated scan for {target}")
-
-        # 1. Fingerprint
-        fingerprint = await self._fingerprint_target(target)
-
-        # 2. Si Nuclei ya encontro vulns criticas, reportarlas directamente
-        if fingerprint["known_vulns"]:
-            logger.info(f"[Conductor] Nuclei found {len(fingerprint['known_vulns'])} known vulnerabilities!")
-            # Note: We'll add them to shared context for later reporting
-            self.share_context("confirmed_vulns", fingerprint["known_vulns"])
-
-        # 3. Crawl
-        endpoints = await self._crawl_target(target)
-
-        # 4. Lanzar agentes
-        for endpoint in endpoints:
-            await self._launch_agents(endpoint)
-
-        logger.info(f"[Conductor] Orchestrated scan complete for {target}")
 
     def get_full_system_prompt(self, agent_type: str = "general") -> str:
         """
@@ -771,6 +574,90 @@ class ConductorV2:
         if self.shared_context.get("tested_params"):
             summary.append(f"Tested params: {len(self.shared_context['tested_params'])}")
         return " | ".join(summary) if summary else "No shared context yet"
+
+    # =========================================================
+    # INTEGRITY VERIFICATION: Cross-phase coherence checks
+    # =========================================================
+
+    def verify_integrity(self, phase: str, expected: Dict, actual: Dict) -> bool:
+        """
+        Verify coherence between pipeline phases.
+
+        Detects data loss, hallucinations, and pipeline anomalies by comparing
+        expected inputs vs actual outputs at phase boundaries.
+
+        Args:
+            phase: 'discovery', 'strategy', 'exploitation'
+            expected: Expected data (e.g., {'urls_count': 5})
+            actual: Actual data found (e.g., {'dast_reports_count': 4, 'errors': 1})
+
+        Returns:
+            True if integrity check passes, False otherwise
+        """
+        logger.info(f"[Conductor] Verifying integrity for Phase: {phase}")
+
+        if phase == "discovery":
+            # Rule: If N URLs entered, N reports should exist (or errors logged)
+            urls_in = expected.get('urls_count', 0)
+            reports_out = actual.get('dast_reports_count', 0)
+            errors = actual.get('errors', 0)
+
+            accounted = reports_out + errors
+            if accounted < urls_in:
+                missing = urls_in - accounted
+                logger.error(
+                    f"[Conductor] INTEGRITY FAIL (Discovery): "
+                    f"Missing {missing} DAST reports. "
+                    f"In: {urls_in}, Reports: {reports_out}, Errors: {errors}"
+                )
+                self.stats["integrity_failures"] = self.stats.get("integrity_failures", 0) + 1
+                return False
+
+        elif phase == "strategy":
+            # Rule: If raw findings exist, WET queue should have items (unless all filtered)
+            raw_findings = expected.get('raw_findings_count', 0)
+            wet_items = actual.get('wet_queue_count', 0)
+
+            # 100% filtration is suspicious but not always wrong
+            if raw_findings > 0 and wet_items == 0:
+                logger.warning(
+                    f"[Conductor] INTEGRITY WARN (Strategy): "
+                    f"100% filtration rate. Raw: {raw_findings}, WET: {wet_items}. "
+                    f"Is ThinkingAgent working correctly?"
+                )
+                # Warning only, not failure - some scans legitimately have no exploitable findings
+
+            # Sanity check: WET items should never exceed raw findings
+            if wet_items > raw_findings:
+                logger.error(
+                    f"[Conductor] INTEGRITY FAIL (Strategy): "
+                    f"WET items ({wet_items}) > raw findings ({raw_findings}). "
+                    f"ThinkingAgent may be duplicating data!"
+                )
+                self.stats["integrity_failures"] = self.stats.get("integrity_failures", 0) + 1
+                return False
+
+        elif phase == "exploitation":
+            # Rule: DRY items must be <= WET items (can't create findings from nothing)
+            wet_in = expected.get('wet_processed', 0)
+            dry_out = actual.get('dry_generated', 0)
+
+            if dry_out > wet_in:
+                logger.error(
+                    f"[Conductor] INTEGRITY FAIL (Exploitation): "
+                    f"Hallucination detected! DRY items ({dry_out}) > WET inputs ({wet_in}). "
+                    f"Specialists are inventing data!"
+                )
+                self.stats["integrity_failures"] = self.stats.get("integrity_failures", 0) + 1
+                return False
+
+        else:
+            logger.warning(f"[Conductor] Unknown phase for integrity check: {phase}")
+            return True
+
+        logger.info(f"[Conductor] Integrity Check PASSED for {phase}")
+        self.stats["integrity_passes"] = self.stats.get("integrity_passes", 0) + 1
+        return True
 
 
 # Singleton instance

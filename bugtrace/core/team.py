@@ -78,7 +78,6 @@ class TeamOrchestrator:
 
     def __init__(self, target: str, resume: bool = False, max_depth: int = 2, max_urls: int = 15, use_vertical_agents: bool = False, output_dir: Optional[Path] = None, scan_id: Optional[int] = None, url_list: Optional[List[str]] = None):
         self.target = target
-        self.output_dir = output_dir
         self.resume = resume
         self.max_depth = max_depth
         self.max_urls = max_urls
@@ -89,6 +88,22 @@ class TeamOrchestrator:
 
         # Scan context for event correlation (V3 pipeline)
         self.scan_context = f"scan_{id(self)}_{int(__import__('time').time())}"
+
+        # Create UNIFIED report directory early (v3.1 - fixes data fragmentation)
+        # All specialists will write to this single directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        domain = urlparse(target).netloc.replace(":", "_")
+        if output_dir:
+            self.report_dir = Path(output_dir)
+        else:
+            self.report_dir = settings.REPORT_DIR / f"{domain}_{timestamp}"
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+        (self.report_dir / "specialists").mkdir(exist_ok=True)
+        (self.report_dir / "logs").mkdir(exist_ok=True)
+        logger.info(f"Unified Report Directory: {self.report_dir}")
+
+        # Legacy compatibility
+        self.output_dir = self.report_dir
 
         # Initialize specialist agents
         self._init_specialist_agents()
@@ -135,9 +150,11 @@ class TeamOrchestrator:
         from bugtrace.agents.xxe_agent import XXEAgent
         from bugtrace.agents.openredirect_agent import OpenRedirectAgent
         from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
+        from bugtrace.agents.header_injection_agent import HeaderInjectionAgent
 
         # Initialize specialist agents with minimal parameters
         # url parameter required but will be overridden by queue work items
+        # report_dir is set post-init for unified output (v3.1)
         self.sqli_worker_agent = SQLiAgent(url="", event_bus=self.event_bus)
         self.xss_worker_agent = XSSAgent(url="", event_bus=self.event_bus)
         self.csti_worker_agent = CSTIAgent(url="", event_bus=self.event_bus)
@@ -148,6 +165,18 @@ class TeamOrchestrator:
         self.xxe_worker_agent = XXEAgent(url="", event_bus=self.event_bus)
         self.open_redirect_worker_agent = OpenRedirectAgent(url="", event_bus=self.event_bus)
         self.prototype_pollution_worker_agent = PrototypePollutionAgent(url="", event_bus=self.event_bus)
+        self.header_injection_worker_agent = HeaderInjectionAgent(url="", event_bus=self.event_bus)
+
+        # Inject unified report_dir into all specialists (v3.1 - fixes data fragmentation)
+        for agent in [
+            self.sqli_worker_agent, self.xss_worker_agent, self.csti_worker_agent,
+            self.lfi_worker_agent, self.idor_worker_agent, self.rce_worker_agent,
+            self.ssrf_worker_agent, self.xxe_worker_agent, self.open_redirect_worker_agent,
+            self.prototype_pollution_worker_agent, self.header_injection_worker_agent,
+            self.jwt_agent  # Also inject into JWT agent
+        ]:
+            agent.report_dir = self.report_dir
+        logger.info(f"Injected unified report_dir into 12 specialist agents")
 
         # Use specialist dispatcher to check queues and start necessary specialists
         from bugtrace.core.specialist_dispatcher import dispatch_specialists
@@ -167,6 +196,7 @@ class TeamOrchestrator:
             "jwt": self.jwt_agent,
             "openredirect": self.open_redirect_worker_agent,
             "prototype_pollution": self.prototype_pollution_worker_agent,
+            "header_injection": self.header_injection_worker_agent,
         }
 
         # Dispatch specialists with concurrency control (dispatcher handles queue checks and specialist startup)
@@ -511,14 +541,11 @@ class TeamOrchestrator:
             dashboard.log(f"❌ Report generation failed: {e}", "ERROR")
 
     def _create_report_directory(self) -> Path:
-        """Create and return report directory."""
-        parsed = urlparse(self.target)
-        domain = parsed.netloc.replace(":", "_") or "local"
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_dir = settings.REPORT_DIR / f"{domain}_{timestamp}"
-        report_dir.mkdir(parents=True, exist_ok=True)
-        (report_dir / "logs").mkdir(exist_ok=True)
-        return report_dir
+        """Return unified report directory (created in __init__)."""
+        # v3.1: Use unified report_dir created in __init__ instead of creating new one
+        # This ensures specialists and ReportingAgent write to the same directory
+        (self.report_dir / "logs").mkdir(exist_ok=True)
+        return self.report_dir
 
     def _create_url_folders(self, report_dir: Path, urls_scanned: list) -> dict:
         """Create folders for each scanned URL."""
@@ -1179,19 +1206,10 @@ class TeamOrchestrator:
         return set()
 
     def _setup_scan_directory(self, start_time: datetime) -> tuple:
-        """Setup scan folder with organized structure."""
-        timestamp = start_time.strftime("%Y%m%d_%H%M%S")
-        domain = urlparse(self.target).netloc or "unknown"
-        if ":" in domain:
-            domain = domain.split(":")[0]
-
-        if self.output_dir:
-            scan_dir = self.output_dir
-        else:
-            scan_dir = settings.REPORT_DIR / f"{domain}_{timestamp}"
-
+        """Setup scan folder with organized structure using unified report_dir."""
+        # v3.1: Use unified report_dir created in __init__
+        scan_dir = self.report_dir
         self.scan_dir = scan_dir
-        scan_dir.mkdir(parents=True, exist_ok=True)
 
         recon_dir = scan_dir / "recon"
         analysis_dir = scan_dir / "analysis"
@@ -1716,6 +1734,9 @@ class TeamOrchestrator:
         # Update ThinkingConsolidationAgent with correct scan_dir
         self.thinking_agent.scan_dir = scan_dir
 
+        # V3.2: Set scan_dir in state_manager for file-based findings
+        self.state_manager.set_scan_dir(scan_dir)
+
         # ========== PHASE 1: DISCOVERY ==========
         # GoSpider crawls target, discovers URLs
         await self._phase_1_reconnaissance(dashboard, recon_dir)
@@ -1746,6 +1767,18 @@ class TeamOrchestrator:
         # Run batch DAST - this is the actual DISCOVERY work
         self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir)
 
+        # ========== INTEGRITY CHECKPOINT 1: Discovery ==========
+        dastysast_dir = self.scan_dir / "dastysast"
+        urls_count = len(self.urls_to_scan)
+        reports_generated = len(list(dastysast_dir.glob("*.json"))) if dastysast_dir.exists() else 0
+        errors_count = urls_count - len(self.vulnerabilities_by_url)
+
+        if not conductor.verify_integrity("discovery",
+            {'urls_count': urls_count},
+            {'dast_reports_count': reports_generated, 'errors': errors_count}):
+            dashboard.log("❌ Integrity mismatch: Discovery phase", "CRITICAL")
+            logger.error(f"[Pipeline] Integrity check FAILED for Discovery. URLs: {urls_count}, Reports: {reports_generated}")
+
         # Signal DISCOVERY complete AFTER batch DAST finishes
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.DISCOVERY,
@@ -1769,6 +1802,16 @@ class TeamOrchestrator:
         findings_count = await self._phase_3_strategy(dashboard, analysis_json_dir)
 
         logger.info("ThinkingConsolidationAgent finished - queues ready for specialists")
+
+        # ========== INTEGRITY CHECKPOINT 2: Strategy ==========
+        raw_findings_count = batch_metrics.findings_before_dedup
+        wet_queue_count = findings_count  # Items distributed to specialist queues
+
+        if not conductor.verify_integrity("strategy",
+            {'raw_findings_count': raw_findings_count},
+            {'wet_queue_count': wet_queue_count}):
+            dashboard.log("❌ Integrity mismatch: Strategy phase", "WARN")
+            logger.warning(f"[Pipeline] Integrity check FAILED for Strategy. Raw: {raw_findings_count}, WET: {wet_queue_count}")
 
         # Signal STRATEGY complete
         await self._lifecycle.signal_phase_complete(
@@ -1797,6 +1840,16 @@ class TeamOrchestrator:
             findings_distributed=queue_results.get('items_distributed', 0),
             by_specialist=queue_results.get('by_specialist', {})
         )
+
+        # ========== INTEGRITY CHECKPOINT 3: Exploitation (WET → DRY) ==========
+        wet_processed = batch_metrics.wet_processed
+        dry_generated = batch_metrics.dry_generated
+
+        if not conductor.verify_integrity("exploitation",
+            {'wet_processed': wet_processed},
+            {'dry_generated': dry_generated}):
+            dashboard.log("❌ Integrity mismatch: Exploitation phase (possible hallucination)", "CRITICAL")
+            logger.error(f"[Pipeline] Integrity check FAILED for Exploitation. WET: {wet_processed}, DRY: {dry_generated}")
 
         dashboard.log(
             f"Specialist execution complete: {queue_results.get('items_distributed', 0)} items processed",
@@ -1904,9 +1957,16 @@ class TeamOrchestrator:
             # Update dashboard with queue stats in real-time
             dashboard.set_progress_metrics(queue_stats=queue_stats, scan_id=self.scan_id)
 
-            # Log progress every 10 seconds
+            # Log progress every 10 seconds with detailed breakdown
             if (time.monotonic() - last_log_time) >= 10.0:
-                dashboard.log(f"Queue status: {total_pending} items pending", "INFO")
+                # Build breakdown of non-empty queues
+                non_empty = [f"{s.upper()}:{queue_stats[s]['depth']}"
+                            for s in queue_stats if queue_stats[s]['depth'] > 0]
+                if non_empty:
+                    breakdown = ", ".join(non_empty)
+                    dashboard.log(f"Queues pending: {breakdown} ({total_pending} total)", "INFO")
+                else:
+                    dashboard.log(f"Queues: {total_pending} items pending", "INFO")
                 last_log_time = time.monotonic()
 
             if total_pending == 0:
@@ -2201,16 +2261,16 @@ class TeamOrchestrator:
     async def _generate_specialist_reports(self, scan_dir: Path) -> None:
         """
         Generate specialist reports for Phase 4 auditing and traceability.
-        
-        Creates the following structure:
+
+        Creates the following structure (v3.2):
         specialists/
-        ├── queues/              # What each specialist received (queue input)
-        │   ├── xss.jsonl
-        │   ├── sqli.jsonl
+        ├── wet/                 # Raw findings input (queue input)
+        │   ├── xss.json
+        │   ├── sqli.json
         │   └── ...
-        ├── warmup/              # Pre-analysis dedup summary per specialist
-        │   ├── xss_warmup.json
-        │   ├── sqli_warmup.json
+        ├── dry/                 # Deduped findings (processed)
+        │   ├── xss_dry.json
+        │   ├── sqli_dry.json
         │   └── ...
         └── results/             # Exploitation results per specialist
             ├── xss_results.json
@@ -2219,13 +2279,13 @@ class TeamOrchestrator:
         """
         specialists_dir = scan_dir / "specialists"
         specialists_dir.mkdir(exist_ok=True)
-        
-        queues_dir = specialists_dir / "queues"
-        warmup_dir = specialists_dir / "warmup"
+
+        wet_dir = specialists_dir / "wet"
+        dry_dir = specialists_dir / "dry"
         results_dir = specialists_dir / "results"
-        
-        queues_dir.mkdir(exist_ok=True)
-        warmup_dir.mkdir(exist_ok=True)
+
+        wet_dir.mkdir(exist_ok=True)
+        dry_dir.mkdir(exist_ok=True)
         results_dir.mkdir(exist_ok=True)
         
         specialist_names = [
@@ -2238,17 +2298,19 @@ class TeamOrchestrator:
         
         for specialist in specialist_names:
             try:
+                # Skip specialists without WET input (no work was distributed)
+                wet_file = wet_dir / f"{specialist}.json"
+                if not wet_file.exists():
+                    logger.debug(f"[Specialist Reports] Skipping {specialist} - no WET input")
+                    continue
+
                 queue = queue_manager.get_queue(specialist)
-                
-                # 1. Queue input (copy existing .queue file if available)
-                # NOTE: v3.1 uses .queue extension with XML-like format and Base64 payloads
-                source_queue_file = self.scan_dir / "queues" / f"{specialist}.queue"
-                if source_queue_file.exists():
-                    import shutil
-                    shutil.copy(source_queue_file, queues_dir / f"{specialist}.queue")
-                
-                # 2. Warmup summary - what the specialist analyzed before attacking
-                warmup_data = {
+
+                # 1. Wet files already exist in specialists/wet/ (created by thinking agent)
+                # No need to copy - they're already in the right place
+
+                # 2. Dry summary - deduped/processed findings per specialist
+                dry_data = {
                     "specialist": specialist,
                     "scan_id": self.scan_id,
                     "target": self.target,
@@ -2260,57 +2322,26 @@ class TeamOrchestrator:
                     "work_items_received": getattr(queue, 'total_enqueued', 0),
                     "status": "COMPLETE" if queue.depth() == 0 else "TIMEOUT_PENDING"
                 }
-                
-                warmup_file = warmup_dir / f"{specialist}_warmup.json"
-                with open(warmup_file, "w", encoding="utf-8") as f:
-                    json.dump(warmup_data, f, indent=2, default=str)
-                
-                # 3. Results - findings confirmed by this specialist
-                # Get findings from state manager filtered by specialist type
-                all_findings = self.state_manager.get_findings()
-                specialist_findings = []
-                
-                # Map specialist name to finding types
-                type_mapping = {
-                    "xss": ["XSS", "Cross-Site Scripting", "DOM XSS", "Reflected XSS", "Stored XSS"],
-                    "sqli": ["SQLI", "SQL Injection", "SQLi"],
-                    "csti": ["CSTI", "Client-Side Template Injection", "SSTI", "Template Injection"],
-                    "lfi": ["LFI", "Local File Inclusion", "Path Traversal"],
-                    "idor": ["IDOR", "Insecure Direct Object Reference"],
-                    "rce": ["RCE", "Remote Code Execution", "Command Injection"],
-                    "ssrf": ["SSRF", "Server-Side Request Forgery"],
-                    "xxe": ["XXE", "XML External Entity"],
-                    "jwt": ["JWT", "JWT Bypass", "JWT Vulnerability"],
-                    "openredirect": ["Open Redirect", "URL Redirect"],
-                    "prototype_pollution": ["Prototype Pollution"],
-                }
-                
-                valid_types = type_mapping.get(specialist, [])
-                for finding in all_findings:
-                    finding_type = str(finding.get("type", "")).upper()
-                    if any(vt.upper() in finding_type for vt in valid_types):
-                        specialist_findings.append(finding)
-                
-                results_data = {
-                    "specialist": specialist,
-                    "scan_id": self.scan_id,
-                    "target": self.target,
-                    "findings_count": len(specialist_findings),
-                    "findings": specialist_findings,
-                    "summary": {
-                        "confirmed": sum(1 for f in specialist_findings if f.get("validated")),
-                        "pending_validation": sum(1 for f in specialist_findings if not f.get("validated")),
-                    }
-                }
-                
-                results_file = results_dir / f"{specialist}_results.json"
-                with open(results_file, "w", encoding="utf-8") as f:
-                    json.dump(results_data, f, indent=2, default=str)
+
+                dry_file = dry_dir / f"{specialist}_dry.json"
+                with open(dry_file, "w", encoding="utf-8") as f:
+                    json.dump(dry_data, f, indent=2, default=str)
+
+                # v3.2: Results files are now generated by specialist agents directly
+                # in specialists/results/{specialist}_results.json
+                # No need to generate here - avoids duplication
                     
             except Exception as e:
                 logger.warning(f"[Specialist Reports] Failed to generate report for {specialist}: {e}")
-        
-        logger.info(f"Generated specialist reports in {specialists_dir}")
+
+        # Count actual reports generated (only for specialists with WET input)
+        wet_count = len(list(wet_dir.glob("*.json")))
+        dry_count = len(list(dry_dir.glob("*_dry.json")))
+        results_count = len(list(results_dir.glob("*_results.json")))
+        logger.info(
+            f"[Specialist Reports] Generated reports in {specialists_dir}: "
+            f"WET={wet_count}, DRY={dry_count}, RESULTS={results_count}"
+        )
 
     async def _decide_specialist(self, vuln: dict) -> str:
         """Uses LLM to classify vulnerability and select best specialist agent."""
@@ -2422,6 +2453,116 @@ class TeamOrchestrator:
         if "HEADER" in v_type: return "HEADER_INJECTION"
         return "IGNORE"
 
+    def _is_finding_type_consistent(self, finding: Dict, specialist: str) -> bool:
+        """
+        Validate that finding payload matches its claimed type.
+
+        v3.2: Prevents misclassified findings (e.g., XXE payload labeled as XSS)
+        from appearing in wrong specialist results.
+
+        Args:
+            finding: Finding dictionary with type, payload, etc.
+            specialist: Target specialist name (e.g., "xss", "xxe")
+
+        Returns:
+            True if consistent, False if payload contradicts claimed type
+        """
+        payload = str(finding.get("payload", "") or finding.get("exploitation_strategy", "") or "").lower()
+        param = str(finding.get("parameter", "")).lower()
+
+        # If no payload, allow (might be legitimate)
+        if not payload:
+            return True
+
+        # XXE signatures in payload
+        xxe_indicators = ["<!doctype", "<!entity", "<?xml", "system", "external entity"]
+        has_xxe = any(ind in payload for ind in xxe_indicators)
+
+        # XSS signatures in payload
+        xss_indicators = ["<script", "javascript:", "onerror", "onload", "alert(", "confirm("]
+        has_xss = any(ind in payload for ind in xss_indicators)
+
+        # SQL signatures
+        sql_indicators = ["' or", "union select", "1=1", "sleep(", "benchmark("]
+        has_sql = any(ind in payload for ind in sql_indicators)
+
+        # Validate consistency
+        if specialist == "xss":
+            # Reject if payload is clearly XXE or SQL
+            if has_xxe and not has_xss:
+                logger.debug(f"[TypeConsistency] Rejecting XSS finding with XXE payload: {payload[:50]}")
+                return False
+            if has_sql and not has_xss:
+                logger.debug(f"[TypeConsistency] Rejecting XSS finding with SQL payload: {payload[:50]}")
+                return False
+
+        if specialist == "xxe":
+            # Allow if has XXE indicators
+            if has_xss and not has_xxe:
+                logger.debug(f"[TypeConsistency] Rejecting XXE finding with XSS payload: {payload[:50]}")
+                return False
+
+        if specialist == "sqli":
+            # Reject if payload is clearly XXE or XSS
+            if has_xxe and not has_sql:
+                logger.debug(f"[TypeConsistency] Rejecting SQLI finding with XXE payload: {payload[:50]}")
+                return False
+
+        return True
+
+    def _load_findings_from_wet(self, wet_dir: Path, specialist: str) -> List[Dict]:
+        """
+        Load findings from wet/{specialist}.json file.
+
+        v3.2: Files are the SOURCE OF TRUTH, not the database.
+        The wet/ files contain findings with correct types as written by ThinkingAgent.
+
+        Args:
+            wet_dir: Path to specialists/wet/ directory
+            specialist: Specialist name (e.g., "xss", "sqli")
+
+        Returns:
+            List of findings for this specialist
+        """
+        wet_file = wet_dir / f"{specialist}.json"
+        if not wet_file.exists():
+            logger.debug(f"[LoadWet] No wet file for {specialist}: {wet_file}")
+            return []
+
+        findings = []
+        try:
+            # JSON Lines format: one JSON object per line
+            with open(wet_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        finding = entry.get("finding", {})
+                        if finding:
+                            # Normalize finding for results format
+                            normalized = {
+                                "type": finding.get("type", specialist.upper()),
+                                "url": finding.get("url", ""),
+                                "parameter": finding.get("parameter", ""),
+                                "payload": finding.get("payload", ""),
+                                "evidence": finding.get("evidence") or finding.get("description", ""),
+                                "severity": finding.get("severity", "High"),
+                                "status": finding.get("status", "PENDING_VALIDATION"),
+                                "screenshot": finding.get("screenshot"),
+                            }
+                            findings.append(normalized)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"[LoadWet] Invalid JSON line in {wet_file}: {e}")
+                        continue
+
+            logger.info(f"[LoadWet] Loaded {len(findings)} findings from {wet_file.name}")
+
+        except Exception as e:
+            logger.error(f"[LoadWet] Failed to read {wet_file}: {e}")
+
+        return findings
 
     async def _global_review(self, findings: list, scan_dir: Path, dashboard):
         """Phase 3: Analyzes cross-URL patterns and vulnerability chaining."""

@@ -34,8 +34,14 @@ class BatchMetrics:
     findings_distributed: int = 0
     findings_exploited: int = 0
 
+    # WET→DRY tracking (integrity verification)
+    wet_processed: int = 0  # Total WET items consumed by specialists
+    dry_generated: int = 0  # Total DRY items produced after dedup
+
     # Per-specialist
     by_specialist: Dict[str, int] = field(default_factory=dict)
+    wet_by_specialist: Dict[str, int] = field(default_factory=dict)
+    dry_by_specialist: Dict[str, int] = field(default_factory=dict)
 
     def start_scan(self):
         """Mark scan start."""
@@ -60,6 +66,23 @@ class BatchMetrics:
         self.queue_drain_end_time = time.monotonic()
         self.findings_distributed = findings_distributed
         self.by_specialist = by_specialist
+
+    def record_specialist_wet_dry(self, specialist: str, wet_count: int, dry_count: int):
+        """
+        Record WET→DRY processing for a specialist.
+
+        Called by specialists after Phase A (dedup) completes.
+
+        Args:
+            specialist: Specialist name (e.g., 'xss', 'sqli')
+            wet_count: Number of WET items consumed
+            dry_count: Number of DRY items produced after dedup
+        """
+        self.wet_processed += wet_count
+        self.dry_generated += dry_count
+        self.wet_by_specialist[specialist] = self.wet_by_specialist.get(specialist, 0) + wet_count
+        self.dry_by_specialist[specialist] = self.dry_by_specialist.get(specialist, 0) + dry_count
+        logger.debug(f"[BatchMetrics] {specialist}: WET={wet_count} → DRY={dry_count}")
 
     def end_scan(self, findings_exploited: int):
         """Mark scan end."""
@@ -122,12 +145,20 @@ class BatchMetrics:
         logger.info(f"Findings distributed: {self.findings_distributed}")
         logger.info(f"Dedup effectiveness: {self.dedup_effectiveness:.1f}%")
         logger.info("-" * 60)
+        logger.info(f"WET processed: {self.wet_processed}")
+        logger.info(f"DRY generated: {self.dry_generated}")
+        if self.wet_processed > 0:
+            specialist_dedup = ((self.wet_processed - self.dry_generated) / self.wet_processed) * 100
+            logger.info(f"Specialist dedup rate: {specialist_dedup:.1f}%")
+        logger.info("-" * 60)
         logger.info(f"Estimated sequential time: {self.estimated_sequential_time:.1f}s")
         logger.info(f"TIME SAVED: {self.time_saved_percent:.1f}%")
         logger.info("=" * 60)
 
         for specialist, count in sorted(self.by_specialist.items()):
-            logger.info(f"  {specialist}: {count} findings")
+            wet = self.wet_by_specialist.get(specialist, 0)
+            dry = self.dry_by_specialist.get(specialist, 0)
+            logger.info(f"  {specialist}: {count} distributed, WET={wet} → DRY={dry}")
 
 
 # Global singleton

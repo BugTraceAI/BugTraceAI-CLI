@@ -28,6 +28,9 @@ from bugtrace.api.schemas import (
     StopScanResponse,
     DeleteScanResponse,
 )
+from bugtrace.core.ui import dashboard
+from bugtrace.core.batch_metrics import batch_metrics
+from bugtrace.core.queue import queue_manager
 from bugtrace.services.scan_context import ScanOptions
 from bugtrace.utils.logger import get_logger
 
@@ -301,4 +304,95 @@ async def delete_scan(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=error_msg,
+        )
+
+
+@router.get("/scans/{scan_id}/detailed-metrics")
+async def get_detailed_metrics(
+    scan_id: int,
+    scan_service: ScanServiceDep,
+):
+    """
+    Get detailed real-time metrics for a scan.
+
+    Provides rich progress information including:
+    - URL discovery/analysis progress with percentages
+    - Deduplication effectiveness
+    - Queue depths per specialist
+    - Processing throughput
+    - Current phase and agent activity
+
+    Args:
+        scan_id: Scan ID to get metrics for
+        scan_service: Injected ScanService
+
+    Returns:
+        Detailed metrics dict with all progress information
+
+    Raises:
+        404: Scan not found
+    """
+    try:
+        # Get basic scan status
+        status_dict = await scan_service.get_scan_status(scan_id)
+
+        # Get dashboard metrics (if scan is active)
+        progress_metrics = {
+            "urls_discovered": dashboard.urls_discovered,
+            "urls_analyzed": dashboard.urls_analyzed,
+            "urls_total": dashboard.urls_total,
+            "findings_before_dedup": dashboard.findings_before_dedup,
+            "findings_after_dedup": dashboard.findings_after_dedup,
+            "findings_distributed": dashboard.findings_distributed,
+            "dedup_effectiveness": dashboard.dedup_effectiveness,
+        }
+
+        # Get queue stats for all specialists
+        queue_stats = {}
+        for specialist in ["xss", "sqli", "csti", "lfi", "idor", "rce", "ssrf", "xxe", "jwt", "openredirect", "prototype_pollution"]:
+            try:
+                queue = queue_manager.get_queue(specialist)
+                queue_stats[specialist] = {
+                    "depth": queue.depth() if hasattr(queue, 'depth') else 0,
+                    "total_enqueued": queue.total_enqueued if hasattr(queue, 'total_enqueued') else 0,
+                    "total_dequeued": queue.total_dequeued if hasattr(queue, 'total_dequeued') else 0,
+                    "avg_latency_ms": queue.avg_latency_ms if hasattr(queue, 'avg_latency_ms') else 0,
+                }
+            except Exception:
+                queue_stats[specialist] = {
+                    "depth": 0,
+                    "total_enqueued": 0,
+                    "total_dequeued": 0,
+                    "avg_latency_ms": 0,
+                }
+
+        # Get batch metrics
+        batch_stats = {
+            "urls_discovered": batch_metrics.urls_discovered,
+            "urls_analyzed": batch_metrics.urls_analyzed,
+            "findings_before_dedup": batch_metrics.findings_before_dedup,
+            "findings_after_dedup": batch_metrics.findings_after_dedup,
+            "findings_distributed": batch_metrics.findings_distributed,
+            "time_saved_percent": batch_metrics.time_saved_percent,
+            "dedup_effectiveness": batch_metrics.dedup_effectiveness,
+        }
+
+        # Combine all metrics
+        return {
+            "scan_id": scan_id,
+            "status": status_dict["status"],
+            "phase": status_dict.get("phase", "unknown"),
+            "active_agent": status_dict.get("active_agent", ""),
+            "progress": progress_metrics,
+            "queues": queue_stats,
+            "batch_metrics": batch_stats,
+            "uptime_seconds": status_dict.get("uptime_seconds", 0),
+            "findings_count": status_dict.get("findings_count", 0),
+        }
+
+    except ValueError as e:
+        logger.error(f"Scan {scan_id} not found: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Scan {scan_id} not found",
         )

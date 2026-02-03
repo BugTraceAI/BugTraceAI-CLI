@@ -477,6 +477,20 @@ class Settings(BaseSettings):
         if "RCE_SELF_VALIDATE" in section:
             self.RCE_SELF_VALIDATE = section.getboolean("RCE_SELF_VALIDATE")
 
+    def _load_paths_config(self, config):
+        """Load PATHS section config for LOG_DIR and REPORT_DIR.
+
+        This ensures paths defined in bugtraceaicli.conf are properly loaded.
+        Without this, LOG_DIR and REPORT_DIR from [PATHS] section are ignored.
+        """
+        if "PATHS" not in config:
+            return
+        section = config["PATHS"]
+        if "LOG_DIR" in section:
+            self.LOG_DIR_PATH = section["LOG_DIR"].strip()
+        if "REPORT_DIR" in section:
+            self.REPORT_DIR_PATH = section["REPORT_DIR"].strip()
+
     def _load_analysis_and_misc_config(self, config):
         """Load ANALYSIS, BROWSER, ADVANCED, REPORT, OPTIMIZATION sections."""
         if "ANALYSIS" in config:
@@ -528,6 +542,8 @@ class Settings(BaseSettings):
             return
 
         config.read(conf_path)
+        # Load paths FIRST - other sections may depend on LOG_DIR/REPORT_DIR
+        self._load_paths_config(config)
         self._load_crawler_config(config)
         self._load_scan_config(config)
         self._load_parallelization_config(config)
