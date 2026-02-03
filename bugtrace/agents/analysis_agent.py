@@ -314,10 +314,6 @@ class DASTySASTAgent(BaseAgent):
             for approach in core_approaches
         ]
 
-        # Add Header Injection Check
-        from bugtrace.tools.exploitation.header_injection import header_detector
-        tasks.append(self._check_header_injection(header_detector))
-
         # Add SQLi Probe Check (active testing for error-based SQLi)
         tasks.append(self._check_sqli_probes())
 
@@ -515,33 +511,6 @@ class DASTySASTAgent(BaseAgent):
         if llm_severity and llm_severity.capitalize() in ["Critical", "High", "Medium", "Low", "Information"]:
             return llm_severity.capitalize()
         return "High"
-
-
-    async def _check_header_injection(self, detector) -> Dict:
-        """Wrapper to run header injection check and format as analysis result."""
-        try:
-            result = await detector.check(self.url)
-            if result:
-                message, screenshot = result
-                return {
-                    "vulnerabilities": [{
-                        "type": "Header Injection",
-                        "vulnerability": "HTTP Response Splitting / CRLF Injection",
-                        "parameter": "URL/Query",
-                        "confidence": 1.0, # Verified by detector
-                        "reasoning": message,
-                        "severity": "High",
-                        "evidence": message,
-                        "screenshot_path": screenshot,
-                        "validated": True,
-                        "description": f"HTTP Header Injection (CRLF) vulnerability detected. Attacker can inject arbitrary headers into HTTP responses. Evidence: {message[:200] if message else 'N/A'}",
-                        "reproduction": f"curl -I '{self.url}%0d%0aX-Injected:%20true' | grep -i x-injected"
-                    }]
-                }
-            return {"vulnerabilities": []}
-        except Exception as e:
-            logger.error(f"Header injection check failed: {e}", exc_info=True)
-            return {"vulnerabilities": []}
 
     async def _check_sqli_probes(self) -> Dict:
         """

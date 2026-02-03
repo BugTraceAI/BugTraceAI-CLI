@@ -20,9 +20,12 @@ from bugtrace.reporting.standards import (
     normalize_severity,
 )
 
+# v3.2.0: Import TechContextMixin for context-aware detection
+from bugtrace.agents.mixins.tech_context import TechContextMixin
+
 logger = get_logger("agents.ssrf")
 
-class SSRFAgent(BaseAgent):
+class SSRFAgent(BaseAgent, TechContextMixin):
     """
     Specialist Agent for Server-Side Request Forgery (SSRF).
     Target: Parameters containing URLs or likely to trigger outbound requests.
@@ -52,6 +55,10 @@ class SSRFAgent(BaseAgent):
 
         # WET → DRY transformation (Two-phase processing)
         self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
+
+        # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
+        self._tech_stack_context: Dict = {}
+        self._ssrf_prime_directive: str = ""
         
     async def _test_with_go_fuzzer(self, param: str) -> list:
         """Test parameter with Go SSRF fuzzer."""
@@ -327,9 +334,46 @@ class SSRFAgent(BaseAgent):
     async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
         from bugtrace.core.llm_client import llm_client
         import json
+
+        # v3.2: Extract tech stack info for prompt
+        tech_stack = getattr(self, '_tech_stack_context', {}) or {}
+        lang = tech_stack.get('lang', 'generic')
+        server = tech_stack.get('server', 'generic')
+
+        # Get SSRF-specific context prompts
+        ssrf_prime_directive = getattr(self, '_ssrf_prime_directive', '')
+        ssrf_dedup_context = self.generate_ssrf_dedup_context(tech_stack) if tech_stack else ''
+
+        # Detect cloud providers for prompt
+        infrastructure = tech_stack.get("raw_profile", {}).get("infrastructure", [])
+        cloud_providers = self._detect_cloud_provider(infrastructure)
+
+        prompt = f"""You are analyzing {len(wet_findings)} potential SSRF findings.
+
+{ssrf_prime_directive}
+
+{ssrf_dedup_context}
+
+## TARGET CONTEXT
+- Language: {lang}
+- Server: {server}
+- Cloud Providers: {', '.join(cloud_providers) if cloud_providers else 'None detected'}
+
+WET FINDINGS (may contain duplicates):
+{json.dumps(wet_findings, indent=2)}
+
+Return ONLY unique findings in JSON format:
+{{"findings": [...]}}"""
+
+        system_prompt = f"""You are an expert SSRF deduplication analyst.
+
+{ssrf_prime_directive}
+
+Focus on parameter+target deduplication. Same internal target via different bypasses = DUPLICATE."""
+
         response = await llm_client.generate(
-            prompt=f"Deduplicate {len(wet_findings)} SSRF findings. Same URL+param=DUPLICATE. Return JSON: {{\"findings\":[...]}}. WET: {json.dumps(wet_findings, indent=2)}",
-            system_prompt="Expert SSRF deduplication analyst.",
+            prompt=prompt,
+            system_prompt=system_prompt,
             module_name="SSRF_DEDUP",
             temperature=0.2
         )
@@ -377,9 +421,11 @@ class SSRFAgent(BaseAgent):
         import json, aiofiles
         from datetime import datetime
         from bugtrace.core.config import settings
-        scan_dir = settings.BASE_DIR / "reports" / self._scan_context.split("/")[-1]
-        (scan_dir / "specialists").mkdir(parents=True, exist_ok=True)
-        report_path = scan_dir / "specialists" / "ssrf_report.json"
+        # v3.2: Write to specialists/results/ for unified wet→dry→results flow
+        scan_dir = getattr(self, 'report_dir', None) or (settings.BASE_DIR / "reports" / self._scan_context.split("/")[-1])
+        results_dir = scan_dir / "specialists" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        report_path = results_dir / "ssrf_results.json"
         async with aiofiles.open(report_path, 'w') as f:
             await f.write(json.dumps({
                 "agent": self.name,
@@ -394,16 +440,51 @@ class SSRFAgent(BaseAgent):
 
     async def start_queue_consumer(self, scan_context: str) -> None:
         """TWO-PHASE queue consumer (WET → DRY). NO infinite loop."""
+        from bugtrace.agents.specialist_utils import (
+            report_specialist_start,
+            report_specialist_progress,
+            report_specialist_done,
+            report_specialist_wet_dry,
+        )
+
         self._queue_mode = True
         self._scan_context = scan_context
+
+        # v3.2: Load context-aware tech stack for intelligent deduplication
+        await self._load_ssrf_tech_context()
+
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+
+        # Get initial queue depth for telemetry
+        queue = queue_manager.get_queue("ssrf")
+        initial_depth = queue.depth()
+        report_specialist_start(self.name, queue_depth=initial_depth)
+
         dry_list = await self.analyze_and_dedup_queue()
+
+        # Report WET→DRY metrics for integrity verification
+        report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            report_specialist_done(self.name, processed=0, vulns=0)
             return
+
         results = await self.exploit_dry_list()
+
+        # Count confirmed vulnerabilities
+        vulns_count = len([r for r in results if r]) if results else 0
+        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
+
+        # Report completion with final stats
+        report_specialist_done(
+            self.name,
+            processed=len(dry_list),
+            vulns=vulns_count
+        )
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
     async def _process_queue_item(self, item: dict) -> Optional[Dict]:
@@ -537,3 +618,36 @@ class SSRFAgent(BaseAgent):
             "queue_mode": True,
             "worker_stats": self._worker_pool.get_stats(),
         }
+
+    # =========================================================================
+    # TECH CONTEXT LOADING (v3.2)
+    # =========================================================================
+
+    async def _load_ssrf_tech_context(self) -> None:
+        """
+        Load technology stack context from recon data (v3.2).
+
+        Uses TechContextMixin methods to load and generate context-aware
+        prompts for SSRF-specific deduplication (cloud provider detection).
+        """
+        # Determine report directory
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1] if self._scan_context else ""
+            scan_dir = settings.BASE_DIR / "reports" / scan_id if scan_id else None
+
+        if not scan_dir or not Path(scan_dir).exists():
+            logger.debug(f"[{self.name}] No report directory found, using generic tech context")
+            self._tech_stack_context = {"db": "generic", "server": "generic", "lang": "generic"}
+            self._ssrf_prime_directive = ""
+            return
+
+        # Use TechContextMixin methods
+        self._tech_stack_context = self.load_tech_stack(Path(scan_dir))
+        self._ssrf_prime_directive = self.generate_ssrf_context_prompt(self._tech_stack_context)
+
+        lang = self._tech_stack_context.get("lang", "generic")
+        infrastructure = self._tech_stack_context.get("raw_profile", {}).get("infrastructure", [])
+        cloud_providers = self._detect_cloud_provider(infrastructure)
+
+        logger.info(f"[{self.name}] SSRF tech context loaded: lang={lang}, cloud={', '.join(cloud_providers) if cloud_providers else 'none'}")

@@ -73,6 +73,7 @@ FAILURE indicators:
 Respond in JSON format:
 
 ```json
+```
 {
     "success": true/false,
     "confidence": 0.0-1.0,
@@ -81,6 +82,28 @@ Respond in JSON format:
     "recommendation": "next steps"
 }
 ```
+
+## CSTI/SSTI Validation Prompt
+
+You are a security expert analyzing a screenshot for Template Injection validation.
+
+CONTEXT:
+- We injected a template payload like `{{7*7}}` or `{{111111+111111}}`
+- We expect the server or client-side engine to evaluate this math
+- Seeing "49" or "222222" is proof of vulnerability
+
+SUCCESS indicators:
+1. The number "49" is visible where the payload was injected (if payload was 7*7)
+2. The number "111111" etc. if other math was used
+3. Text like "Config", "Smarty", "Java" if object printing was used
+4. "uid=..." or system command output (rare for visual)
+
+FAILURE indicators:
+1. The literal text `{{7*7}}` is displayed (means it was NOT evaluated)
+2. Normal page content
+3. "Invalid input" error
+
+Respond in JSON (same format).
 
 ## General Validation Prompt
 

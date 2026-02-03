@@ -357,41 +357,50 @@ class ThinkingConsolidationAgent(BaseAgent):
         logger.info(f"[{self.name}] Initialized in {self._mode} mode")
 
     def _get_queues_dir(self):
-        """Helper to find and ensure queues directory, initializes file queues if needed."""
+        """Helper to find and ensure specialists/wet directory, initializes file queues if needed.
+
+        Structure (v3.2):
+            specialists/
+            ├── wet/           # Raw findings input (this dir)
+            │   └── {specialist}.json
+            ├── dry/           # Deduped findings (created by team.py)
+            └── results/       # Exploitation results
+        """
         if self._queues_dir_cached:
             return self._queues_dir_cached
 
-        # Use scan_dir from TeamOrchestrator if available
+        # Use scan_dir from TeamOrchestrator (REQUIRED in v3.2+)
         if self.scan_dir:
             found_dir = self.scan_dir
         else:
-            # Fallback: search for scan directory
+            # FAIL FAST: scan_dir should always be set by TeamOrchestrator
+            # If we get here, something is wrong with the pipeline initialization
+            logger.error(
+                f"[{self.name}] CRITICAL: scan_dir not set! "
+                f"ThinkingConsolidationAgent requires scan_dir from TeamOrchestrator. "
+                f"scan_context={self.scan_context}"
+            )
+            # Emergency fallback: use REPORT_DIR directly with scan_context
+            # This preserves basic functionality but logs the issue
             report_dir = settings.REPORT_DIR
-            found_dir = None
+            found_dir = report_dir / f"emergency_{self.scan_context or 'unknown'}"
+            found_dir.mkdir(parents=True, exist_ok=True)
+            logger.warning(f"[{self.name}] Using emergency fallback dir: {found_dir}")
 
-            # Locate scan directory
-            if report_dir.exists():
-                for p in report_dir.iterdir():
-                    if p.is_dir() and self.scan_context in p.name:
-                        found_dir = p
-                        break
+        # v3.2: specialists/wet/ instead of queues/
+        specialists_dir = found_dir / "specialists"
+        specialists_dir.mkdir(exist_ok=True)
+        wet_dir = specialists_dir / "wet"
+        wet_dir.mkdir(exist_ok=True)
 
-            if not found_dir:
-                # Fallback
-                found_dir = report_dir / f"{settings.APP_NAME}_scan_{self.scan_context}"
-                found_dir.mkdir(parents=True, exist_ok=True)
-
-        queues_dir = found_dir / "queues"
-        queues_dir.mkdir(exist_ok=True)
-
-        self._queues_dir_cached = queues_dir
+        self._queues_dir_cached = wet_dir
 
         # Initialize SpecialistQueues for file tailing
         if not self._queues_initialized:
-            queue_manager.initialize_file_queues(queues_dir)
+            queue_manager.initialize_file_queues(wet_dir)
             self._queues_initialized = True
 
-        return queues_dir
+        return wet_dir
 
     def _setup_event_subscriptions(self):
         """Subscribe to url_analyzed events from Discovery phase.
@@ -579,62 +588,42 @@ class ThinkingConsolidationAgent(BaseAgent):
     async def _persist_queue_item(self, specialist: str, finding: Dict[str, Any]) -> None:
         """
         Persist finding to a file-based queue for durability and auditing.
-        Also appends to the concatenated findings log.
 
-        File structure (v3.1 - XML-like with Base64 encoded JSON for payload integrity):
-        - reports/{scan_id}/queues/{specialist}.queue
-        - reports/{scan_id}/concatenated_findings.queue
-        
-        Format:
-        <QUEUE_ITEM>
-          <TIMESTAMP>1706882445.123</TIMESTAMP>
-          <SPECIALIST>xss</SPECIALIST>
-          <SCAN_CONTEXT>ginandjuice_12345</SCAN_CONTEXT>
-          <FINDING_B64>eyJ0eXBlIjogIlhTUyIsICJwYXlsb2FkIjogIjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD4ifQ==</FINDING_B64>
-        </QUEUE_ITEM>
-        
-        Why Base64? Security payloads often contain characters that break JSON Lines:
-        - Newlines in payloads
-        - Unicode control characters
-        - Nested quotes and escape sequences
-        Base64 guarantees 100% fidelity.
+        File structure (v3.2 - JSON Lines format):
+        - reports/{scan_id}/specialists/wet/{specialist}.json
+
+        Format (JSON Lines - one JSON object per line):
+        {"timestamp": 1706882445.123, "specialist": "xss", "scan_context": "...", "finding": {...}}
+
+        v3.2 changes:
+        - Moved from queues/ to specialists/wet/
+        - Changed extension from .queue to .json
+        - Simplified format from XML-like to JSON Lines
+        - Removed redundant concatenated_findings file
         """
-        import base64
-        
         try:
-            # Determine scan report directory
-            # We construct this dynamically based on scan_context
-            # Reuse cached directory logic which ensures file queues are initialized
-            queues_dir = self._get_queues_dir()
-            found_dir = queues_dir.parent
-            
-            # Prepare data - encode finding as Base64 JSON
-            finding_json = json.dumps(finding, ensure_ascii=False, separators=(',', ':'))
-            finding_b64 = base64.b64encode(finding_json.encode('utf-8')).decode('ascii')
-            
-            # Build XML-like queue entry (one block per item)
-            queue_entry = (
-                f"<QUEUE_ITEM>\n"
-                f"  <TIMESTAMP>{time.time()}</TIMESTAMP>\n"
-                f"  <SPECIALIST>{specialist}</SPECIALIST>\n"
-                f"  <SCAN_CONTEXT>{self.scan_context}</SCAN_CONTEXT>\n"
-                f"  <FINDING_B64>{finding_b64}</FINDING_B64>\n"
-                f"</QUEUE_ITEM>\n"
-            )
+            # Determine scan report directory (now specialists/wet/)
+            wet_dir = self._get_queues_dir()
 
-            # 1. Append to specialist queue file
-            queue_file = queues_dir / f"{specialist}.queue"
-            async with asyncio.Lock(): # Simple lock for file safety
-                with open(queue_file, "a", encoding="utf-8") as f:
-                    f.write(queue_entry)
+            # v3.2: Encode complex payloads as base64 for safe JSON storage
+            from bugtrace.core.payload_format import encode_finding_payloads
+            encoded_finding = encode_finding_payloads(finding)
 
-            # 2. Append to concatenated findings file
-            concat_file = found_dir / "concatenated_findings.queue"
+            # Prepare data as JSON Lines entry
+            queue_entry = {
+                "timestamp": time.time(),
+                "specialist": specialist,
+                "scan_context": self.scan_context,
+                "finding": encoded_finding
+            }
+
+            # Append to specialist queue file (JSON Lines format)
+            queue_file = wet_dir / f"{specialist}.json"
             async with asyncio.Lock():
-                 with open(concat_file, "a", encoding="utf-8") as f:
-                     f.write(queue_entry)
+                with open(queue_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(queue_entry, ensure_ascii=False, separators=(',', ':')) + "\n")
 
-            # 3. Persist to SQLite Database (if scan_id available)
+            # Persist to SQLite Database (if scan_id available)
             if self.scan_id:
                 try:
                     from bugtrace.core.database import get_db_manager

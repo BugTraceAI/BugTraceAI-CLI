@@ -23,7 +23,10 @@ from bugtrace.reporting.standards import (
     normalize_severity,
 )
 
-class JWTAgent(BaseAgent):
+# v3.2.0: Import TechContextMixin for context-aware detection
+from bugtrace.agents.mixins.tech_context import TechContextMixin
+
+class JWTAgent(BaseAgent, TechContextMixin):
     """
     JWTAgent - Expert in JWT analysis and exploitation.
     Follows the V4 Specialist pattern.
@@ -46,6 +49,10 @@ class JWTAgent(BaseAgent):
 
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
+
+        # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
+        self._tech_stack_context: Dict = {}
+        self._jwt_prime_directive: str = ""
         
     def _setup_event_subscriptions(self):
         """Subscribe to token discovery events."""
@@ -868,11 +875,10 @@ class JWTAgent(BaseAgent):
         drain_start = time.monotonic()
 
         while stable_empty_count < 10 and (time.monotonic() - drain_start) < 300.0:
-            item = queue.get_nowait() if hasattr(queue, 'get_nowait') else None
+            item = await queue.dequeue(timeout=0.5)  # Use dequeue(), not get_nowait()
 
             if item is None:
                 stable_empty_count += 1
-                await asyncio.sleep(0.5)
                 continue
 
             stable_empty_count = 0
@@ -902,18 +908,26 @@ class JWTAgent(BaseAgent):
         Use LLM to intelligently deduplicate JWT findings.
         Falls back to fingerprint-based dedup if LLM fails.
         """
+        # v3.2: Extract tech stack info for prompt
+        tech_stack = getattr(self, '_tech_stack_context', {}) or {}
+        lang = tech_stack.get('lang', 'generic')
+
+        # Get JWT-specific context prompts
+        jwt_prime_directive = getattr(self, '_jwt_prime_directive', '')
+        jwt_dedup_context = self.generate_jwt_dedup_context(tech_stack) if tech_stack else ''
+
+        # Infer JWT library for context
+        jwt_lib = self._infer_jwt_library(lang)
+
         prompt = f"""You are analyzing {len(wet_findings)} potential JWT vulnerability findings.
 
-DEDUPLICATION RULES FOR JWT:
-1. Same netloc (domain) + vuln_type = DUPLICATE (global per domain)
-2. Different netloc = DIFFERENT vulnerabilities
-3. Different vuln_type = DIFFERENT vulnerabilities (none_alg ≠ weak_secret ≠ kid_injection ≠ key_confusion)
-4. JWT vulnerabilities are token-specific, NOT URL-specific (ignore paths/params)
+{jwt_prime_directive}
 
-EXAMPLES:
-- example.com (none_alg) + example.com (none_alg) = DUPLICATE ✓
-- example.com (none_alg) + example.com (weak_secret) = DIFFERENT ✗
-- example.com (none_alg) + other.com (none_alg) = DIFFERENT ✗
+{jwt_dedup_context}
+
+## TARGET CONTEXT
+- Language: {lang}
+- Likely JWT Library: {jwt_lib}
 
 WET FINDINGS (may contain duplicates):
 {json.dumps(wet_findings, indent=2)}
@@ -926,7 +940,11 @@ Return ONLY unique findings in JSON format:
   ]
 }}"""
 
-        system_prompt = """You are an expert JWT deduplication analyst. Your job is to identify and remove duplicate JWT vulnerabilities while preserving unique token-based attacks. Focus on domain-level deduplication."""
+        system_prompt = f"""You are an expert JWT deduplication analyst.
+
+{jwt_prime_directive}
+
+Your job is to identify and remove duplicate JWT vulnerabilities while preserving unique token-based attacks. Focus on domain-level deduplication."""
 
         try:
             response = await llm_client.generate(
@@ -1050,11 +1068,14 @@ Return ONLY unique findings in JSON format:
         """
         import aiofiles
 
-        # Use absolute path from settings.BASE_DIR
-        scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
-        scan_dir = settings.BASE_DIR / "reports" / scan_id
-        specialists_dir = scan_dir / "specialists"
-        specialists_dir.mkdir(parents=True, exist_ok=True)
+        # v3.1: Use unified report_dir if injected, else fallback to scan_context
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
+            scan_dir = settings.BASE_DIR / "reports" / scan_id
+        # v3.2: Write to specialists/results/ for unified wet→dry→results flow
+        results_dir = scan_dir / "specialists" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
 
         report = {
             "agent": f"{self.name}",
@@ -1076,7 +1097,7 @@ Return ONLY unique findings in JSON format:
             }
         }
 
-        report_path = specialists_dir / "jwt_report.json"
+        report_path = results_dir / "jwt_results.json"
 
         async with aiofiles.open(report_path, "w") as f:
             await f.write(json.dumps(report, indent=2))
@@ -1097,26 +1118,55 @@ Return ONLY unique findings in JSON format:
         Args:
             scan_context: Scan identifier for event correlation
         """
+        from bugtrace.agents.specialist_utils import (
+            report_specialist_start,
+            report_specialist_done,
+            report_specialist_wet_dry,
+        )
+
         self._queue_mode = True
         self._scan_context = scan_context
 
+        # v3.2: Load context-aware tech stack for intelligent deduplication
+        await self._load_jwt_tech_context()
+
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+
+        # Get initial queue depth for telemetry
+        queue = queue_manager.get_queue("jwt")
+        initial_depth = queue.depth()
+        report_specialist_start(self.name, queue_depth=initial_depth)
 
         # PHASE A: Analyze and deduplicate
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
         dry_list = await self.analyze_and_dedup_queue()
 
+        # Report WET→DRY metrics for integrity verification
+        report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            report_specialist_done(self.name, processed=0, vulns=0)
             return  # Terminate agent
 
         # PHASE B: Exploit DRY findings
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
+        # Count confirmed vulnerabilities
+        vulns_count = len([r for r in results if r]) if results else 0
+        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+
         # REPORTING: Generate specialist report
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
+
+        # Report completion with final stats
+        report_specialist_done(
+            self.name,
+            processed=len(dry_list),
+            vulns=vulns_count
+        )
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
@@ -1285,6 +1335,36 @@ Return ONLY unique findings in JSON format:
 
         # Default: Specialist trust
         return ValidationStatus.VALIDATED_CONFIRMED.value
+
+    # =========================================================================
+    # TECH CONTEXT LOADING (v3.2)
+    # =========================================================================
+
+    async def _load_jwt_tech_context(self) -> None:
+        """
+        Load technology stack context from recon data (v3.2).
+
+        Uses TechContextMixin methods to load and generate context-aware
+        prompts for JWT-specific deduplication (JWT library detection).
+        """
+        # Determine report directory
+        scan_id = self._scan_context.split("/")[-1] if self._scan_context else ""
+        scan_dir = settings.BASE_DIR / "reports" / scan_id if scan_id else None
+
+        if not scan_dir or not Path(scan_dir).exists():
+            logger.debug(f"[{self.name}] No report directory found, using generic tech context")
+            self._tech_stack_context = {"db": "generic", "server": "generic", "lang": "generic"}
+            self._jwt_prime_directive = ""
+            return
+
+        # Use TechContextMixin methods
+        self._tech_stack_context = self.load_tech_stack(Path(scan_dir))
+        self._jwt_prime_directive = self.generate_jwt_context_prompt(self._tech_stack_context)
+
+        lang = self._tech_stack_context.get("lang", "generic")
+        jwt_lib = self._infer_jwt_library(lang)
+
+        logger.info(f"[{self.name}] JWT tech context loaded: lang={lang}, jwt_lib={jwt_lib}")
 
 
 async def run_jwt_analysis(token: str, url: str) -> Dict:

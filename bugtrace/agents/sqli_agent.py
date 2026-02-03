@@ -45,6 +45,9 @@ from bugtrace.core.validation_status import ValidationStatus, requires_cdp_valid
 # v2.1.0: Import specialist utilities for payload loading from JSON (if needed)
 from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_full_finding_data
 
+# v3.2.0: Import TechContextMixin for context-aware SQLi detection
+from bugtrace.agents.mixins.tech_context import TechContextMixin
+
 
 # =============================================================================
 # DATABASE FINGERPRINTS
@@ -258,7 +261,7 @@ class SQLiConfidenceTier:
 # SQLI AGENT V3
 # =============================================================================
 
-class SQLiAgent(BaseAgent):
+class SQLiAgent(BaseAgent, TechContextMixin):
     """
     Intelligent SQL Injection Specialist v3.
 
@@ -274,11 +277,13 @@ class SQLiAgent(BaseAgent):
     - Prepared statement early exit
     - Complete SQLMap reproduction commands
     - LLM exploitation explanation
+    - Context-aware technology stack integration (v3.2)
     """
 
     def __init__(self, url: str = None, param: str = None, event_bus: Any = None,
                  cookies: List[Dict] = None, headers: Dict[str, str] = None,
-                 post_data: str = None, observation_points: List[str] = None):
+                 post_data: str = None, observation_points: List[str] = None,
+                 report_dir: Path = None):
         super().__init__("SQLiAgent", "SQL Injection Specialist v3", event_bus=event_bus, agent_id="sqli_agent")
         self.url = url
         self.param = param
@@ -286,6 +291,7 @@ class SQLiAgent(BaseAgent):
         self.headers = headers or {}
         self.post_data = post_data
         self.observation_points = observation_points or []  # For second-order SQLi
+        self.report_dir = report_dir  # v3.2: For context-aware tech stack loading
 
         self._tested_params = set()
         self._detected_db_type: Optional[str] = None
@@ -315,6 +321,10 @@ class SQLiAgent(BaseAgent):
 
         # WET → DRY transformation (Two-phase processing)
         self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
+
+        # v3.2: Context-aware tech stack (loaded in start_queue_consumer)
+        self._tech_stack_context: Dict = {}
+        self._prime_directive: str = ""
 
     def _finding_to_dict(self, finding: SQLiFinding) -> Dict:
         """Convert SQLiFinding object to dictionary for report."""
@@ -2095,12 +2105,14 @@ Write the exploitation explanation section for the report."""
             logger.info(f"[{self.name}] Phase A: No findings in WET list")
             return []
 
-        # 3. Load global context (simplified - no filesystem deps)
+        # 3. Load global context with tech stack from recon (v3.2)
+        tech_stack = self._tech_stack_context or {"db": "generic", "server": "generic", "lang": "generic"}
         context = {
             "target_url": self.url or "unknown",
             "wet_count": len(wet_findings),
-            "tech_stack": "unknown",  # TODO: Load from scan metadata
-            "urls_scanned": [],  # TODO: Load from scan metadata
+            "tech_stack": tech_stack,
+            "tech_context_prompt": self.generate_dedup_context(tech_stack) if tech_stack.get("db") != "generic" else "",
+            "prime_directive": self._prime_directive or "",
         }
 
         # 4. Call LLM for global analysis
@@ -2119,48 +2131,67 @@ Write the exploitation explanation section for the report."""
         context: Dict
     ) -> List[Dict]:
         """
-        Call LLM to analyze WET list and generate DRY list.
+        Call LLM to analyze WET list and generate DRY list (v3.2: Context-Aware).
 
         Uses: llm_client from bugtrace.core.llm_client with SQLi expert prompt.
+        Incorporates tech stack context for intelligent database-specific filtering.
         """
         from bugtrace.core.llm_client import llm_client
 
-        # Build system prompt with SQLi expert rules
+        # Extract tech stack info for prompt
+        tech_stack = context.get('tech_stack', {})
+        db_type = tech_stack.get('db', 'generic') if isinstance(tech_stack, dict) else 'generic'
+        server = tech_stack.get('server', 'generic') if isinstance(tech_stack, dict) else 'generic'
+        lang = tech_stack.get('lang', 'generic') if isinstance(tech_stack, dict) else 'generic'
+
+        # Build tech context section
+        tech_context_section = context.get('tech_context_prompt', '')
+        prime_directive = context.get('prime_directive', '')
+
+        # Build system prompt with SQLi expert rules + tech context (v3.2)
         system_prompt = f"""You are an expert SQL Injection security analyst.
 
-Context:
-- Target: {context['target_url']}
-- Tech Stack: {context.get('tech_stack', 'unknown')}
-- URLs Scanned: {len(context.get('urls_scanned', []))}
+{prime_directive}
 
-WET List ({context['wet_count']} findings):
+{tech_context_section}
+
+## TARGET CONTEXT
+- Target: {context['target_url']}
+- Detected Database: {db_type}
+- Detected Server: {server}
+- Detected Language: {lang}
+
+## WET LIST ({context['wet_count']} potential findings):
 {json.dumps(wet_findings, indent=2)}
 
-Task:
-1. Analyze each finding for real exploitability
-2. Identify attack paths worth testing
+## TASK
+1. Analyze each finding for real exploitability based on the detected tech stack
+2. Identify attack paths worth testing - prioritize {db_type}-compatible techniques
 3. Apply expert deduplication rules:
-   - Cookie-based SQLi: GLOBAL (same cookie on different URLs = DUPLICATE)
-   - Header-based SQLi: GLOBAL (same header on different URLs = DUPLICATE)
-   - URL param SQLi: PER-ENDPOINT (same param on different URLs = DIFFERENT)
-   - POST param SQLi: PER-ENDPOINT (same param on different endpoints = DIFFERENT)
-4. Return DRY list in JSON format
+   - Cookie-based SQLi: GLOBAL scope (same cookie on different URLs = DUPLICATE)
+   - Header-based SQLi: GLOBAL scope (same header on different URLs = DUPLICATE)
+   - URL param SQLi: PER-ENDPOINT scope (same param on different URLs = DIFFERENT)
+   - POST param SQLi: PER-ENDPOINT scope (same param on different endpoints = DIFFERENT)
+4. Filter OUT findings incompatible with {db_type} (if known)
+5. Return DRY list in JSON format
 
-Examples:
-- Cookie: TrackingId @ /blog/post?id=3 = Cookie: TrackingId @ /catalog?id=1 (DUPLICATE)
-- URL param 'id' @ /blog/post?id=3 ≠ URL param 'id' @ /catalog?id=1 (DIFFERENT endpoints)
+## EXAMPLES
+- Cookie: TrackingId @ /blog/post?id=3 = Cookie: TrackingId @ /catalog?id=1 (DUPLICATE - same injection point)
+- URL param 'id' @ /blog/post?id=3 ≠ URL param 'id' @ /catalog?id=1 (DIFFERENT - separate endpoints)
 
-Output format (JSON only, no markdown):
+## OUTPUT FORMAT (JSON only, no markdown):
 {{
   "dry_findings": [
     {{
       "url": "...",
       "parameter": "...",
-      "rationale": "why this is unique and exploitable",
-      "attack_priority": 1-5
+      "rationale": "why this is unique and exploitable for {db_type}",
+      "attack_priority": 1-5,
+      "recommended_technique": "error_based|union|boolean|time_based|oob"
     }}
   ],
-  "duplicates_removed": 10,
+  "duplicates_removed": <count>,
+  "tech_filtered": <count of findings filtered due to incompatible db>,
   "reasoning": "Brief explanation of deduplication strategy"
 }}"""
 
@@ -2293,12 +2324,14 @@ Output format (JSON only, no markdown):
         from datetime import datetime
         from bugtrace.core.config import settings
 
-        # Create specialists directory (use absolute path)
-        # _scan_context format: "scan_130008889105184_1770059687"
-        scan_id = self._scan_context.split("/")[-1]  # Extract scan ID from context
-        scan_dir = settings.BASE_DIR / "reports" / scan_id
-        specialists_dir = scan_dir / "specialists"
-        specialists_dir.mkdir(parents=True, exist_ok=True)
+        # v3.1: Use unified report_dir if injected, else fallback to scan_context
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1]
+            scan_dir = settings.BASE_DIR / "reports" / scan_id
+        # v3.2: Write to specialists/results/ for unified wet→dry→results flow
+        results_dir = scan_dir / "specialists" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
 
         # Build report
         report = {
@@ -2322,7 +2355,7 @@ Output format (JSON only, no markdown):
         }
 
         # Save report
-        report_path = specialists_dir / "sqli_report.json"
+        report_path = results_dir / "sqli_results.json"
         with open(report_path, 'w') as f:
             json.dump(report, f, indent=2)
 
@@ -2349,17 +2382,36 @@ Output format (JSON only, no markdown):
         - Phase A: Read ALL WET files, LLM deduplication → DRY list
         - Phase B: Attack DRY list only → Generate specialist report
         """
+        from bugtrace.agents.specialist_utils import (
+            report_specialist_start,
+            report_specialist_progress,
+            report_specialist_done,
+            report_specialist_wet_dry,
+        )
+
         self._queue_mode = True
         self._scan_context = scan_context
 
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
 
+        # v3.2: Load context-aware tech stack for intelligent deduplication
+        await self._load_tech_context()
+
+        # Get initial queue depth for telemetry
+        queue = queue_manager.get_queue("sqli")
+        initial_depth = queue.depth()
+        report_specialist_start(self.name, queue_depth=initial_depth)
+
         # PHASE A: ANALYSIS & DEDUPLICATION
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
         dry_list = await self.analyze_and_dedup_queue()
 
+        # Report WET→DRY metrics for integrity verification
+        report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            report_specialist_done(self.name, processed=0, vulns=0)
             return
 
         logger.info(f"[{self.name}] DRY list: {len(dry_list)} unique findings to attack")
@@ -2368,8 +2420,55 @@ Output format (JSON only, no markdown):
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
+        # Count confirmed vulnerabilities
+        vulns_count = len([r for r in results if r]) if results else 0
+
+        # Report completion with final stats
+        report_specialist_done(
+            self.name,
+            processed=len(dry_list),
+            vulns=vulns_count
+        )
+
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
         logger.info(f"[{self.name}] Specialist report saved to: {self._scan_context}/specialists/sqli_report.json")
+
+    async def _load_tech_context(self) -> None:
+        """
+        Load technology stack context from recon data (v3.2).
+
+        Uses TechContextMixin to:
+        1. Load tech_profile.json from report directory
+        2. Normalize into db/server/lang context
+        3. Generate prime directive for LLM prompts
+
+        This context helps focus SQLi payloads on the detected database type.
+        """
+        # Resolve report directory
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            # Fallback: construct from scan_context
+            scan_id = self._scan_context.split("/")[-1] if self._scan_context else ""
+            scan_dir = settings.BASE_DIR / "reports" / scan_id if scan_id else None
+
+        if not scan_dir or not Path(scan_dir).exists():
+            logger.debug(f"[{self.name}] No report directory found, using generic tech context")
+            self._tech_stack_context = {"db": "generic", "server": "generic", "lang": "generic"}
+            self._prime_directive = ""
+            return
+
+        # Use TechContextMixin methods
+        self._tech_stack_context = self.load_tech_stack(Path(scan_dir))
+        self._prime_directive = self.generate_context_prompt(self._tech_stack_context)
+
+        db_type = self._tech_stack_context.get("db", "generic")
+        logger.info(f"[{self.name}] Tech context loaded: db={db_type}, "
+                   f"server={self._tech_stack_context.get('server', 'generic')}, "
+                   f"lang={self._tech_stack_context.get('lang', 'generic')}")
+
+        # Update detected database type for payload selection
+        if db_type != "generic":
+            self._detected_db_type = db_type
 
     async def _process_queue_item(self, item: dict) -> Optional[SQLiFinding]:
         """

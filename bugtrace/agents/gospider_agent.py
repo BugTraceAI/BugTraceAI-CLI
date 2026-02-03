@@ -73,7 +73,12 @@ class GoSpiderAgent(BaseAgent):
         
     async def _discover_urls(self) -> List[str]:
         """Run GoSpider and fallback discovery if needed."""
-        gospider_urls = await external_tools.run_gospider(self.target, depth=self.max_depth)
+        # Pass max_urls to support early exit (optimization)
+        gospider_urls = await external_tools.run_gospider(
+            self.target, 
+            depth=self.max_depth,
+            max_urls=self.max_urls
+        )
 
         # If GoSpider only returns 1 URL (the target itself), trigger fallback
         if len(gospider_urls) <= 1:
@@ -105,7 +110,13 @@ class GoSpiderAgent(BaseAgent):
         # Ensure target is always included and at the top
         if self.target in final_urls:
             final_urls.remove(self.target)
-        final_urls.insert(0, self.target)
+            final_urls.insert(0, self.target)
+        else:
+            # Target was not in top N, force insert it at top
+            final_urls.insert(0, self.target)
+            # Resizing to respect max_urls if we exceeded it
+            if len(final_urls) > self.max_urls:
+                final_urls.pop()  # Remove lowest priority URL
 
         return final_urls
 

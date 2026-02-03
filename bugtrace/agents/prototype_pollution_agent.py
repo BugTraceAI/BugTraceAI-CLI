@@ -27,10 +27,13 @@ from bugtrace.agents.prototype_pollution_payloads import (
     RCE_GADGETS, PAYLOAD_TIERS, TIER_SEVERITY, get_payloads_for_tier
 )
 
+# v3.2.0: Import TechContextMixin for context-aware detection
+from bugtrace.agents.mixins.tech_context import TechContextMixin
+
 logger = get_logger("agents.prototype_pollution")
 
 
-class PrototypePollutionAgent(BaseAgent):
+class PrototypePollutionAgent(BaseAgent, TechContextMixin):
     """
     Specialist Agent for Prototype Pollution vulnerabilities (CWE-1321).
     Target: Node.js APIs and frontend JavaScript with vulnerable merge/extend operations.
@@ -63,6 +66,10 @@ class PrototypePollutionAgent(BaseAgent):
 
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
+
+        # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
+        self._tech_stack_context: Dict = {}
+        self._prototype_pollution_prime_directive: str = ""
 
     async def run_loop(self) -> Dict:
         """Main execution loop for Prototype Pollution testing."""
@@ -678,11 +685,10 @@ class PrototypePollutionAgent(BaseAgent):
         drain_start = time.monotonic()
 
         while stable_empty_count < 10 and (time.monotonic() - drain_start) < 300.0:
-            item = queue.get_nowait() if hasattr(queue, 'get_nowait') else None
+            item = await queue.dequeue(timeout=0.5)  # Use dequeue(), not get_nowait()
 
             if item is None:
                 stable_empty_count += 1
-                await asyncio.sleep(0.5)
                 continue
 
             stable_empty_count = 0
@@ -714,7 +720,16 @@ class PrototypePollutionAgent(BaseAgent):
         """
         from bugtrace.core.llm_client import llm_client
 
+        # v3.2.0: Get tech context for context-aware deduplication
+        tech_stack = getattr(self, '_tech_stack_context', {}) or {}
+        prototype_pollution_prime_directive = getattr(self, '_prototype_pollution_prime_directive', '')
+        prototype_pollution_dedup_context = self.generate_prototype_pollution_dedup_context(tech_stack)
+
         prompt = f"""You are analyzing {len(wet_findings)} potential Prototype Pollution findings.
+
+{prototype_pollution_prime_directive}
+
+{prototype_pollution_dedup_context}
 
 DEDUPLICATION RULES FOR PROTOTYPE POLLUTION:
 1. Same endpoint + parameter = DUPLICATE (keep only one)
@@ -862,11 +877,14 @@ Return ONLY unique findings in JSON format:
         """
         import aiofiles
 
-        # Use absolute path from settings.BASE_DIR
-        scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
-        scan_dir = settings.BASE_DIR / "reports" / scan_id
-        specialists_dir = scan_dir / "specialists"
-        specialists_dir.mkdir(parents=True, exist_ok=True)
+        # v3.1: Use unified report_dir if injected, else fallback to scan_context
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
+            scan_dir = settings.BASE_DIR / "reports" / scan_id
+        # v3.2: Write to specialists/results/ for unified wet→dry→results flow
+        results_dir = scan_dir / "specialists" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
 
         report = {
             "agent": f"{self.name}",
@@ -888,7 +906,7 @@ Return ONLY unique findings in JSON format:
             }
         }
 
-        report_path = specialists_dir / "prototype_pollution_report.json"
+        report_path = results_dir / "prototype_pollution_results.json"
 
         async with aiofiles.open(report_path, "w") as f:
             await f.write(json.dumps(report, indent=2))
@@ -909,26 +927,55 @@ Return ONLY unique findings in JSON format:
         Args:
             scan_context: Scan identifier for event correlation
         """
+        from bugtrace.agents.specialist_utils import (
+            report_specialist_start,
+            report_specialist_done,
+            report_specialist_wet_dry,
+        )
+
         self._queue_mode = True
         self._scan_context = scan_context
 
+        # v3.2.0: Load tech context for context-aware detection
+        await self._load_prototype_pollution_tech_context()
+
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+
+        # Get initial queue depth for telemetry
+        queue = queue_manager.get_queue("prototype_pollution")
+        initial_depth = queue.depth()
+        report_specialist_start(self.name, queue_depth=initial_depth)
 
         # PHASE A: Analyze and deduplicate
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
         dry_list = await self.analyze_and_dedup_queue()
 
+        # Report WET→DRY metrics for integrity verification
+        report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            report_specialist_done(self.name, processed=0, vulns=0)
             return  # Terminate agent
 
         # PHASE B: Exploit DRY findings
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
+        # Count confirmed vulnerabilities
+        vulns_count = len([r for r in results if r]) if results else 0
+        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+
         # REPORTING: Generate specialist report
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
+
+        # Report completion with final stats
+        report_specialist_done(
+            self.name,
+            processed=len(dry_list),
+            vulns=vulns_count
+        )
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
@@ -1035,6 +1082,31 @@ Return ONLY unique findings in JSON format:
     async def _on_work_queued(self, data: dict) -> None:
         """Handle work_queued_prototype_pollution notification (logging only)."""
         logger.debug(f"[{self.name}] Work queued: {data.get('finding', {}).get('url', 'unknown')}")
+
+    async def _load_prototype_pollution_tech_context(self) -> None:
+        """
+        v3.2.0: Load tech stack context for context-aware Prototype Pollution detection.
+
+        Uses TechContextMixin to:
+        1. Load tech stack from recon data
+        2. Generate prime directive for LLM-powered deduplication
+        """
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1] if self._scan_context else ""
+            scan_dir = settings.BASE_DIR / "reports" / scan_id if scan_id else None
+
+        if scan_dir:
+            tech_stack = self.load_tech_stack(Path(scan_dir))
+            self._tech_stack_context = tech_stack
+            self._prototype_pollution_prime_directive = self.generate_prototype_pollution_context_prompt(tech_stack)
+
+            if tech_stack:
+                logger.info(f"[{self.name}] Tech context loaded: {list(tech_stack.keys())}")
+            else:
+                logger.debug(f"[{self.name}] No tech stack data available")
+        else:
+            logger.debug(f"[{self.name}] No scan_dir available for tech context")
 
     async def stop_queue_consumer(self) -> None:
         """Stop queue consumer mode gracefully."""

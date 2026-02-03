@@ -108,8 +108,8 @@ class Worker:
 
         if self._task is not None:
             try:
-                # Wait for task to complete with timeout
-                await asyncio.wait_for(self._task, timeout=5.0)
+                # Wait for task to complete with timeout (increased for long tasks like SQLMap)
+                await asyncio.wait_for(self._task, timeout=60.0)
             except asyncio.TimeoutError:
                 logger.warning(f"Worker {self.worker_id} stop timed out, cancelling")
                 self._task.cancel()

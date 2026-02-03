@@ -21,6 +21,9 @@ from bugtrace.core.validation_status import ValidationStatus, requires_cdp_valid
 # v2.1.0: Import specialist utilities for payload loading from JSON (if needed)
 from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_full_finding_data
 
+# v3.2.0: Import TechContextMixin for context-aware CSTI detection
+from bugtrace.agents.mixins.tech_context import TechContextMixin
+
 @dataclass
 class CSTIFinding:
     """
@@ -319,16 +322,17 @@ HIGH_PRIORITY_PARAMS = [
     "category", "filter", "sort", "lang", "locale", "theme",
 ]
 
-class CSTIAgent(BaseAgent):
+class CSTIAgent(BaseAgent, TechContextMixin):
     """
     CSTI Agent V2 - Intelligent Template Injection Specialist.
-    
+
     Feature Set:
     - Binomial Arithmetic Proof (7*7=49)
     - WAF Detection & Q-Learning Bypass (UCB1)
     - Template Engine Fingerprinting
     - Targeted & Polyglot Payloads
     - Blind SSTI Detection via Interactsh (OOB)
+    - Context-aware technology stack integration (v3.2)
     """
     
     def __init__(self, url: str, params: List[Dict] = None, report_dir: Path = None, event_bus=None):
@@ -362,6 +366,10 @@ class CSTIAgent(BaseAgent):
 
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
+
+        # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
+        self._tech_stack_context: Dict = {}
+        self._csti_prime_directive: str = ""
 
     async def _detect_waf_async(self) -> Tuple[str, float]:
         """Detect WAF using framework's intelligent fingerprinter."""
@@ -1625,11 +1633,10 @@ Response format (XML):
         drain_start = time.monotonic()
 
         while stable_empty_count < 10 and (time.monotonic() - drain_start) < 300.0:
-            item = queue.get_nowait() if hasattr(queue, 'get_nowait') else None
+            item = await queue.dequeue(timeout=0.5)  # Use dequeue(), not get_nowait()
 
             if item is None:
                 stable_empty_count += 1
-                await asyncio.sleep(0.5)
                 continue
 
             stable_empty_count = 0
@@ -1656,40 +1663,70 @@ Response format (XML):
 
     async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
         """
-        Use LLM to intelligently deduplicate CSTI findings.
+        Use LLM to intelligently deduplicate CSTI findings (v3.2: Context-Aware).
         Falls back to fingerprint-based dedup if LLM fails.
         """
         from bugtrace.core.llm_client import llm_client
         import json
 
-        prompt = f"""You are analyzing {len(wet_findings)} potential CSTI (Client/Server-Side Template Injection) findings.
+        # Extract tech stack info for prompt (v3.2)
+        tech_stack = getattr(self, '_tech_stack_context', {}) or {}
+        lang = tech_stack.get('lang', 'generic')
+        frameworks = tech_stack.get('frameworks', [])
+        waf = tech_stack.get('waf')
 
-DEDUPLICATION RULES FOR CSTI:
-1. Same URL + parameter + template_engine = DUPLICATE (keep only one)
-2. Different template engines = DIFFERENT vulnerabilities (Jinja2 ≠ Mako ≠ Twig ≠ ERB)
-3. Client-side vs server-side = DIFFERENT vulnerabilities (Angular ≠ Jinja2)
-4. Same parameter in different endpoints = DIFFERENT
-5. Same endpoint with different parameters = DIFFERENT
+        # Get CSTI-specific context prompts
+        csti_prime_directive = getattr(self, '_csti_prime_directive', '')
+        csti_dedup_context = self.generate_csti_dedup_context(tech_stack) if tech_stack else ''
 
-EXAMPLES:
-- /page?name=X (Jinja2) + /page?name=Y (Jinja2) = DUPLICATE ✓
-- /page?name=X (Jinja2) + /page?name=Y (Mako) = DIFFERENT ✗
-- /page?name=X (Angular/client) + /page?name=Y (Jinja2/server) = DIFFERENT ✗
-- /page?name=X + /other?name=Y = DIFFERENT ✗
-- /page?name=X + /page?email=Y = DIFFERENT ✗
+        # Detect engines for context
+        raw_profile = tech_stack.get("raw_profile", {})
+        tech_tags = [t.lower() for t in raw_profile.get("tech_tags", [])]
+        detected_engines = self._detect_template_engines(frameworks, tech_tags, lang)
 
-WET FINDINGS (may contain duplicates):
+        # Build enhanced system prompt with tech context (v3.2)
+        system_prompt = f"""You are an expert CSTI/SSTI deduplication analyst with deep knowledge of template engines.
+
+{csti_prime_directive}
+
+{csti_dedup_context}
+
+## TARGET CONTEXT
+- Backend Language: {lang}
+- Detected Engines: {', '.join(detected_engines) if detected_engines else 'Unknown'}
+- WAF: {waf or 'None detected'}
+- Frameworks: {', '.join(frameworks[:3]) if frameworks else 'Unknown'}
+
+Your job is to identify and remove duplicate template injection findings while preserving unique vulnerabilities.
+Different template engines represent different attack surfaces - NEVER merge findings with different engines."""
+
+        prompt = f"""Analyze {len(wet_findings)} potential CSTI/SSTI findings.
+
+## WET FINDINGS (may contain duplicates):
 {json.dumps(wet_findings, indent=2)}
 
-Return ONLY unique findings in JSON format:
+## TASK
+1. Apply engine-based deduplication rules
+2. Distinguish CSTI (client-side: Angular, Vue) from SSTI (server-side: Jinja2, Twig)
+3. Prioritize findings for detected engines: {detected_engines or ['generic']}
+4. Remove true duplicates (same URL + param + engine)
+
+## OUTPUT FORMAT (JSON only, no markdown):
 {{
   "findings": [
-    {{"url": "...", "parameter": "...", "template_engine": "...", ...}},
-    ...
-  ]
+    {{
+      "url": "...",
+      "parameter": "...",
+      "template_engine": "jinja2|twig|angular|vue|freemarker|erb|unknown",
+      "injection_type": "SSTI|CSTI",
+      "rationale": "why unique",
+      "attack_priority": 1-5,
+      "recommended_payload": "specific payload for this engine"
+    }}
+  ],
+  "duplicates_removed": <count>,
+  "reasoning": "Brief deduplication strategy"
 }}"""
-
-        system_prompt = """You are an expert CSTI deduplication analyst. Your job is to identify and remove duplicate template injection findings while preserving unique vulnerabilities. Different template engines represent different attack surfaces."""
 
         try:
             response = await llm_client.generate(
@@ -1704,6 +1741,7 @@ Return ONLY unique findings in JSON format:
             dry_list = result.get("findings", [])
 
             if dry_list:
+                logger.info(f"[{self.name}] LLM deduplication: {result.get('reasoning', 'No reasoning')}")
                 logger.info(f"[{self.name}] LLM deduplication successful: {len(wet_findings)} → {len(dry_list)}")
                 return dry_list
             else:
@@ -1822,11 +1860,14 @@ Return ONLY unique findings in JSON format:
         import aiofiles
         from bugtrace.core.config import settings
 
-        # Use absolute path from settings.BASE_DIR
-        scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
-        scan_dir = settings.BASE_DIR / "reports" / scan_id
-        specialists_dir = scan_dir / "specialists"
-        specialists_dir.mkdir(parents=True, exist_ok=True)
+        # v3.1: Use unified report_dir if injected, else fallback to scan_context
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
+            scan_dir = settings.BASE_DIR / "reports" / scan_id
+        # v3.2: Write to specialists/results/ for unified wet→dry→results flow
+        results_dir = scan_dir / "specialists" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
 
         report = {
             "agent": f"{self.name}",
@@ -1848,7 +1889,7 @@ Return ONLY unique findings in JSON format:
             }
         }
 
-        report_path = specialists_dir / "csti_report.json"
+        report_path = results_dir / "csti_results.json"
 
         async with aiofiles.open(report_path, "w") as f:
             await f.write(json.dumps(report, indent=2))
@@ -1869,26 +1910,57 @@ Return ONLY unique findings in JSON format:
         Args:
             scan_context: Scan identifier for event correlation
         """
+        from bugtrace.agents.specialist_utils import (
+            report_specialist_start,
+            report_specialist_progress,
+            report_specialist_done,
+            report_specialist_wet_dry,
+        )
+        from bugtrace.core.queue import queue_manager
+
         self._queue_mode = True
         self._scan_context = scan_context
 
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
 
+        # v3.2: Load context-aware tech stack for intelligent deduplication
+        await self._load_csti_tech_context()
+
+        # Get initial queue depth for telemetry
+        queue = queue_manager.get_queue("csti")
+        initial_depth = queue.depth()
+        report_specialist_start(self.name, queue_depth=initial_depth)
+
         # PHASE A: Analyze and deduplicate
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
         dry_list = await self.analyze_and_dedup_queue()
 
+        # Report WET→DRY metrics for integrity verification
+        report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            report_specialist_done(self.name, processed=0, vulns=0)
             return  # Terminate agent
 
         # PHASE B: Exploit DRY findings
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
+        # Count confirmed vulnerabilities
+        vulns_count = len([r for r in results if r]) if results else 0
+        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+
         # REPORTING: Generate specialist report
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
+
+        # Report completion with final stats
+        report_specialist_done(
+            self.name,
+            processed=len(dry_list),
+            vulns=vulns_count
+        )
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
@@ -1908,6 +1980,46 @@ Return ONLY unique findings in JSON format:
 
         self._queue_mode = False
         logger.info(f"[{self.name}] Queue consumer stopped")
+
+    async def _load_csti_tech_context(self) -> None:
+        """
+        Load technology stack context from recon data (v3.2).
+
+        Uses TechContextMixin to:
+        1. Load tech_profile.json from report directory
+        2. Detect likely template engines from framework/language
+        3. Generate CSTI-specific prime directive for LLM prompts
+
+        This context helps focus CSTI payloads on the detected template engines.
+        """
+        # Resolve report directory
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            # Fallback: construct from scan_context
+            scan_id = self._scan_context.split("/")[-1] if self._scan_context else ""
+            scan_dir = settings.BASE_DIR / "reports" / scan_id if scan_id else None
+
+        if not scan_dir or not Path(scan_dir).exists():
+            logger.debug(f"[{self.name}] No report directory found, using generic tech context")
+            self._tech_stack_context = {"db": "generic", "server": "generic", "lang": "generic"}
+            self._csti_prime_directive = ""
+            return
+
+        # Use TechContextMixin methods
+        self._tech_stack_context = self.load_tech_stack(Path(scan_dir))
+        self._csti_prime_directive = self.generate_csti_context_prompt(self._tech_stack_context)
+
+        lang = self._tech_stack_context.get("lang", "generic")
+        frameworks = self._tech_stack_context.get("frameworks", [])
+        waf = self._tech_stack_context.get("waf")
+
+        # Detect engines for logging
+        raw_profile = self._tech_stack_context.get("raw_profile", {})
+        tech_tags = [t.lower() for t in raw_profile.get("tech_tags", [])]
+        detected_engines = self._detect_template_engines(frameworks, tech_tags, lang)
+
+        logger.info(f"[{self.name}] CSTI tech context loaded: lang={lang}, "
+                   f"engines={detected_engines or ['unknown']}, waf={waf or 'none'}")
 
     async def _on_work_queued(self, data: dict) -> None:
         """Handle work_queued_csti notification (logging only)."""

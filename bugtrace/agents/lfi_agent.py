@@ -17,9 +17,12 @@ from bugtrace.reporting.standards import (
 )
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 
+# v3.2.0: Import TechContextMixin for context-aware detection
+from bugtrace.agents.mixins.tech_context import TechContextMixin
+
 logger = logging.getLogger(__name__)
 
-class LFIAgent(BaseAgent):
+class LFIAgent(BaseAgent, TechContextMixin):
     """
     Specialist Agent for Local File Inclusion (LFI) and Path Traversal.
     """
@@ -48,6 +51,10 @@ class LFIAgent(BaseAgent):
 
         # WET → DRY transformation (Two-phase processing)
         self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
+
+        # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
+        self._tech_stack_context: Dict = {}
+        self._lfi_prime_directive: str = ""
         
     def _determine_validation_status(self, response_text: str, payload: str) -> str:
         """
@@ -300,11 +307,30 @@ class LFIAgent(BaseAgent):
         from bugtrace.core.llm_client import llm_client
         import json
 
+        # v3.2: Extract tech stack info for prompt
+        tech_stack = getattr(self, '_tech_stack_context', {}) or {}
+        lang = tech_stack.get('lang', 'generic')
+        server = tech_stack.get('server', 'generic')
+        waf = tech_stack.get('waf')
+
+        # Get LFI-specific context prompts
+        lfi_prime_directive = getattr(self, '_lfi_prime_directive', '')
+        lfi_dedup_context = self.generate_lfi_dedup_context(tech_stack) if tech_stack else ''
+
+        # Infer OS for context
+        os_type = self._infer_os_from_stack(tech_stack)
+
         prompt = f"""You are analyzing {len(wet_findings)} potential LFI findings.
 
-DEDUPLICATION RULES FOR LFI:
-- Same URL + parameter = DUPLICATE
-- Different parameter = DIFFERENT
+{lfi_prime_directive}
+
+{lfi_dedup_context}
+
+## TARGET CONTEXT
+- Language: {lang}
+- Server: {server}
+- Likely OS: {os_type}
+- WAF: {waf or 'None'}
 
 WET LIST:
 {json.dumps(wet_findings, indent=2)}
@@ -313,9 +339,15 @@ Return JSON array of UNIQUE findings only:
 {{"findings": [...]}}
 """
 
+        system_prompt = f"""You are an expert security analyst specializing in LFI deduplication.
+
+{lfi_prime_directive}
+
+Focus on parameter+file deduplication. Same file via different traversal depths = DUPLICATE."""
+
         response = await llm_client.generate(
             prompt=prompt,
-            system_prompt="You are an expert security analyst specializing in LFI deduplication.",
+            system_prompt=system_prompt,
             module_name="LFI_DEDUP",
             temperature=0.2
         )
@@ -408,10 +440,14 @@ Return JSON array of UNIQUE findings only:
         from datetime import datetime
         from bugtrace.core.config import settings
 
-        scan_id = self._scan_context.split("/")[-1]
-        scan_dir = settings.BASE_DIR / "reports" / scan_id
-        specialists_dir = scan_dir / "specialists"
-        specialists_dir.mkdir(parents=True, exist_ok=True)
+        # v3.1: Use unified report_dir if injected, else fallback to scan_context
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1]
+            scan_dir = settings.BASE_DIR / "reports" / scan_id
+        # v3.2: Write to specialists/results/ for unified wet→dry→results flow
+        results_dir = scan_dir / "specialists" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
 
         report = {
             "agent": f"{self.name}",
@@ -430,7 +466,7 @@ Return JSON array of UNIQUE findings only:
             "findings": findings
         }
 
-        report_path = specialists_dir / "lfi_report.json"
+        report_path = results_dir / "lfi_results.json"
         async with aiofiles.open(report_path, 'w') as f:
             await f.write(json.dumps(report, indent=2))
 
@@ -440,26 +476,56 @@ Return JSON array of UNIQUE findings only:
 
     async def start_queue_consumer(self, scan_context: str) -> None:
         """TWO-PHASE queue consumer (WET → DRY). NO infinite loop."""
+        from bugtrace.agents.specialist_utils import (
+            report_specialist_start,
+            report_specialist_done,
+            report_specialist_wet_dry,
+        )
+        from bugtrace.core.queue import queue_manager
+
         self._queue_mode = True
         self._scan_context = scan_context
 
+        # v3.2: Load context-aware tech stack for intelligent deduplication
+        await self._load_lfi_tech_context()
+
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+
+        # Get initial queue depth for telemetry
+        queue = queue_manager.get_queue("lfi")
+        initial_depth = queue.depth()
+        report_specialist_start(self.name, queue_depth=initial_depth)
 
         # PHASE A
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
         dry_list = await self.analyze_and_dedup_queue()
 
+        # Report WET→DRY metrics for integrity verification
+        report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            report_specialist_done(self.name, processed=0, vulns=0)
             return
 
         # PHASE B
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
+        # Count confirmed vulnerabilities
+        vulns_count = len([r for r in results if r]) if results else 0
+        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+
         # REPORTING
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
+
+        # Report completion with final stats
+        report_specialist_done(
+            self.name,
+            processed=len(dry_list),
+            vulns=vulns_count
+        )
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
@@ -625,3 +691,37 @@ Return JSON array of UNIQUE findings only:
             "queue_mode": True,
             "worker_stats": self._worker_pool.get_stats(),
         }
+
+    # =========================================================================
+    # TECH CONTEXT LOADING (v3.2)
+    # =========================================================================
+
+    async def _load_lfi_tech_context(self) -> None:
+        """
+        Load technology stack context from recon data (v3.2).
+
+        Uses TechContextMixin methods to load and generate context-aware
+        prompts for LFI-specific deduplication (OS and language detection).
+        """
+        # Determine report directory
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1] if self._scan_context else ""
+            scan_dir = settings.BASE_DIR / "reports" / scan_id if scan_id else None
+
+        if not scan_dir or not Path(scan_dir).exists():
+            logger.debug(f"[{self.name}] No report directory found, using generic tech context")
+            self._tech_stack_context = {"db": "generic", "server": "generic", "lang": "generic"}
+            self._lfi_prime_directive = ""
+            return
+
+        # Use TechContextMixin methods
+        self._tech_stack_context = self.load_tech_stack(Path(scan_dir))
+        self._lfi_prime_directive = self.generate_lfi_context_prompt(self._tech_stack_context)
+
+        lang = self._tech_stack_context.get("lang", "generic")
+        server = self._tech_stack_context.get("server", "generic")
+        os_type = self._infer_os_from_stack(self._tech_stack_context)
+        waf = self._tech_stack_context.get("waf")
+
+        logger.info(f"[{self.name}] LFI tech context loaded: lang={lang}, server={server}, os={os_type}, waf={waf or 'none'}")

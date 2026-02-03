@@ -37,6 +37,8 @@ from bugtrace.core.llm_client import llm_client
 from bugtrace.core.event_bus import EventType, event_bus as global_event_bus
 from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.core.validation_metrics import validation_metrics
+# Import specialist utilities for full payload loading (v2.1.0+)
+from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_full_finding_data
 # NOTE: ValidationFeedback imports removed - feedback loop eliminated for simplicity
 # AgenticValidator is now a linear CDP specialist (no loopback to specialist agents)
 
@@ -109,7 +111,7 @@ class VerifierPool:
             return
         self._semaphore = asyncio.Semaphore(self.pool_size)
         self._verifiers = [
-            XSSVerifier(headless=settings.HEADLESS_BROWSER, prefer_cdp=False)
+            XSSVerifier(headless=settings.HEADLESS_BROWSER, prefer_cdp=True)
             for _ in range(self.pool_size)
         ]
         self._initialized = True
@@ -144,11 +146,21 @@ class AgenticValidator(BaseAgent):
     - Browser session reuse via VerifierPool
     - Smart filtering of pre-validated and low-severity findings
 
+    v2.1.0+ PAYLOAD HANDLING:
+    - Automatically loads FULL payloads from JSON reports when truncated (>200 chars)
+    - Uses specialist_utils.load_full_finding_data() for complete payload recovery
+    - Ensures accurate CDP validation even for complex/long payloads
+    - Logs payload loading operations for debugging and traceability
+
     Unlike the basic ValidatorAgent which just checks for alert(), this agent:
     - Takes screenshots and sends them to a vision LLM
     - Asks the LLM to reason about what it sees
     - Can adapt its testing strategy based on the response
     - Provides detailed evidence with confidence scores
+
+    IMPORTANT: This agent REQUIRES findings to have _report_files metadata
+    to load full payloads from JSON. Phase 3 STRATEGY ensures this metadata
+    is present in all findings.
     """
 
     # Configuration
@@ -156,7 +168,7 @@ class AgenticValidator(BaseAgent):
     MAX_CONCURRENT_VALIDATIONS = 3  # Fallback if phase_semaphores not available
     SKIP_VISION_ON_CDP_CONFIRM = True  # Early exit optimization
     ENABLE_CACHE = True  # Result caching
-    FAST_VALIDATION_TIMEOUT = 30.0  # Reduced from default
+    FAST_VALIDATION_TIMEOUT = 20.0  # Reduced from default (30s) to avoid conflicts
     MAX_TOTAL_VALIDATION_TIME = 600.0  # 10 minutes global timeout (was 300s - too aggressive)
     MAX_FEEDBACK_DEPTH = 2  # Maximum recursion depth for feedback loop
 
@@ -193,7 +205,12 @@ class AgenticValidator(BaseAgent):
             "skipped_confirmed": 0,    # VALIDATED_CONFIRMED (skipped)
             "queued_for_cdp": 0,       # PENDING_VALIDATION (processed)
             "cdp_rejected": 0,         # CDP rejected as FP
+            "cdp_skipped_duplicate": 0, # Structural deduplication hits
         }
+
+        # Phase 21: Structural deduplication tracking
+        self._structural_keys: Set[str] = set()
+        self._structural_lock = asyncio.Lock()
 
         # NOTE: Feedback loop removed - AgenticValidator is now a linear CDP specialist
         # No loopback to XSSAgent/CSTIAgent - validation is single-attempt
@@ -217,6 +234,7 @@ class AgenticValidator(BaseAgent):
         prompts = {
             "xss": self._get_xss_prompt(),
             "sqli": self._get_sqli_prompt(),
+            "csti": self._get_csti_prompt(),
             "general": self._get_general_prompt()
         }
 
@@ -296,6 +314,30 @@ Respond in JSON format:
     "recommendation": "next steps"
 }"""
 
+    def _get_csti_prompt(self) -> str:
+        """Get CSTI/SSTI validation prompt template."""
+        return """You are a security expert analyzing a screenshot for Template Injection validation.
+
+CONTEXT:
+- We injected a template payload like `{{7*7}}` or `{{111111+111111}}`
+- We expect the server or client-side engine (Angular, Vue, Jinja2) to evaluate this math
+- Seeing "49" or "222222" is proof of vulnerability
+
+SUCCESS indicators (HIGH CONFIDENCE):
+1. The number "49" is visible where the payload was injected (arithmetic evaluation)
+2. The number "111111" etc. if other math was used
+3. Text like "Config", "Smarty", "class 'os'" if object printing was used
+4. "uid=..." or system command output (rare for visual)
+5. Angular bindings visible (e.g., `ng-bind` attributes not rendered correctly, or successful interpolation)
+
+FAILURE indicators:
+1. The literal text `{{7*7}}` is displayed (means it was reflected but NOT evaluated)
+2. Normal page content without numbers
+3. "Invalid input" error
+4. WAF Block Page
+
+Respond in JSON (same format)."""
+
     def _get_general_prompt(self) -> str:
         """Get general vulnerability validation prompt template."""
         return """You are a security expert analyzing a screenshot for vulnerability validation.
@@ -332,9 +374,12 @@ Respond in JSON format:
             prompts["xss"] = re.sub(r'^xss validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
             return
 
-        # Guard: SQLi validation prompt
-        if part_lower.startswith("sqli validation prompt"):
             prompts["sqli"] = re.sub(r'^sqli validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
+            return
+
+        # Guard: CSTI validation prompt
+        if part_lower.startswith("csti/ssti validation prompt"):
+            prompts["csti"] = re.sub(r'^csti/ssti validation prompt\s*', '', part, flags=re.IGNORECASE).strip()
             return
 
         # Guard: General validation prompt
@@ -377,9 +422,25 @@ Respond in JSON format:
             logger.debug(f"[{self.name}] Skipping {specialist} finding (status={status})")
             return
 
+        # OPTIMIZATION: Structural Deduplication
+        # If we already have a pending or validated finding for this (type, path, param), skip it
+        url = finding.get("url", "")
+        param = finding.get("parameter", "")
+        vuln_type = finding.get("type", specialist).upper()
+        
+        struct_key = self._generate_structural_key(vuln_type, url, param)
+        
+        async with self._structural_lock:
+            if struct_key in self._structural_keys:
+                self._stats["cdp_skipped_duplicate"] += 1
+                logger.info(f"[{self.name}] 🛡️ STRUCTURAL DEDUPLICATION: Skiping redundant {vuln_type} on {param} (path already validates/validating)")
+                return
+            
+            self._structural_keys.add(struct_key)
+
         # Queue for CDP validation
         self._stats["queued_for_cdp"] = self._stats.get("queued_for_cdp", 0) + 1
-        logger.info(f"[{self.name}] Queuing {specialist} finding for CDP validation")
+        logger.info(f"[{self.name}] Queuing {specialist} finding for CDP validation ({vuln_type} on {param})")
 
         await self._pending_queue.put({
             "specialist": specialist,
@@ -422,11 +483,38 @@ Respond in JSON format:
                 logger.info(f"[{self.name}] Queue processor cancelled")
                 break
             except Exception as e:
-                logger.error(f"[{self.name}] Queue processing error: {e}")
+                logger.error(f"[{self.name}] Error in queue processor: {e}", exc_info=True)
+                if self._pending_queue.qsize() > 0:
+                     self._pending_queue.task_done()
+
+    def _generate_structural_key(self, vuln_type: str, url: str, parameter: str) -> str:
+        """
+        Generate a structural key for deduplication.
+        Format: VULN_TYPE:HOST:PATH:PARAMETER
+
+        For global injection points (Cookies, Headers), ignores PATH.
+        """
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(url)
+            path = parsed.path or "/"
+            host = parsed.netloc
+            param_lower = parameter.lower()
+
+            # Global Injection Points: Cookie, Header, User-Agent, Referer
+            # These are typically host-wide, not path-specific.
+            if any(p in param_lower for p in ["cookie", "header", "user-agent", "referer", "bearer", "authorization"]):
+                path = "*GLOBAL*"
+
+            return f"{vuln_type.upper()}:{host}:{path}:{param_lower}"
+        except Exception:
+            return f"{vuln_type.upper()}:unknown:unknown:{parameter.lower()}"
 
     async def _validate_and_emit(self, item: Dict[str, Any]) -> None:
         """
         Validate a finding via CDP and emit result event.
+
+        v2.1.0+: Ensures full payload is loaded from JSON before validation.
 
         Emits:
         - EventType.FINDING_VALIDATED if CDP confirms
@@ -436,17 +524,30 @@ Respond in JSON format:
         finding = item.get("finding", {})
         scan_context = item.get("scan_context", "")
 
+        # CRITICAL: Load full payload from JSON if truncated (v2.1.0+)
+        # The finding dict from queue may have truncated payload (200 chars)
+        # We need the complete payload for accurate CDP validation
+        finding_with_full_payload = self._ensure_full_payload(finding)
+
         # Build finding dict for validation
         finding_for_validation = {
-            "url": finding.get("url", ""),
-            "payload": finding.get("payload", ""),
-            "parameter": finding.get("parameter", ""),
-            "type": finding.get("type", specialist.upper()),
-            "evidence": finding.get("evidence", {}),
+            "url": finding_with_full_payload.get("url", ""),
+            "payload": finding_with_full_payload.get("payload", ""),
+            "parameter": finding_with_full_payload.get("parameter", ""),
+            "type": finding_with_full_payload.get("type", specialist.upper()),
+            "evidence": finding_with_full_payload.get("evidence", {}),
+            # Preserve _report_files metadata for downstream use
+            "_report_files": finding_with_full_payload.get("_report_files", {}),
         }
 
         # Perform CDP validation
-        result = await self.validate_finding_agentically(finding_for_validation)
+        # OPTIMIZATION: Check for static XSS reflection first to skip browser overhead
+        static_result = await self._validate_static_xss(finding_for_validation)
+        if static_result:
+             logger.info(f"[{self.name}] ⚡ Static XSS validated (CSP Safe + Reflected). Skipping browser.")
+             result = static_result
+        else:
+             result = await self.validate_finding_agentically(finding_for_validation)
 
         # Determine event type based on result
         if result.get("validated", False):
@@ -506,17 +607,89 @@ Respond in JSON format:
             
         return finding
     
-    def _agentic_prepare_context(self, finding: Dict[str, Any]) -> Tuple[str, Optional[str], str]:
-        """Prepare validation context from finding."""
+    def _ensure_full_payload(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Ensure finding has full payload loaded from JSON report.
+
+        v2.1.0+: Payloads in events are truncated to 200 chars for performance.
+        This method loads the complete payload from the JSON report file if available.
+
+        Args:
+            finding: Finding dict (may have truncated payload)
+
+        Returns:
+            Finding dict with full payload loaded, or original if unavailable
+
+        Note:
+            This is CRITICAL for AgenticValidator because CDP validation needs
+            the complete payload to accurately reproduce vulnerabilities.
+            Truncated payloads (>200 chars) will cause validation failures.
+        """
+        original_payload = finding.get("payload", "")
+        original_len = len(original_payload)
+
+        # Fast path: payload is short, no truncation
+        if original_len < 199:
+            logger.debug(f"[AgenticValidator] Payload length {original_len} < 199, no JSON load needed")
+            return finding
+
+        # Check if we have JSON report metadata
+        if not finding.get("_report_files"):
+            logger.warning(
+                f"[AgenticValidator] Payload is {original_len} chars (likely truncated) "
+                f"but no _report_files metadata found. Validation may fail for complex payloads."
+            )
+            return finding
+
+        # Load full finding data from JSON (includes payload, reasoning, fp_reason, etc.)
+        try:
+            full_finding = load_full_finding_data(finding)
+            full_payload = full_finding.get("payload", "")
+            full_len = len(full_payload)
+
+            if full_len > original_len:
+                logger.info(
+                    f"[AgenticValidator] ✅ Loaded FULL payload from JSON: "
+                    f"{full_len} chars (was {original_len} chars truncated)"
+                )
+                return full_finding
+            else:
+                logger.debug(f"[AgenticValidator] Payload unchanged after JSON load ({full_len} chars)")
+                return finding
+
+        except Exception as e:
+            logger.error(
+                f"[AgenticValidator] Failed to load full payload from JSON: {e}. "
+                f"Using truncated payload ({original_len} chars). Validation may be inaccurate.",
+                exc_info=True
+            )
+            return finding
+
+    def _agentic_prepare_context(self, finding: Dict[str, Any]) -> Tuple[str, Optional[str], str, Optional[str]]:
+        """
+        Prepare validation context from finding.
+
+        v2.1.0+: Automatically loads full payload from JSON if truncated.
+
+        Args:
+            finding: Finding dict (will be loaded from JSON if payload is truncated)
+
+        Returns:
+            Tuple of (url, payload, vuln_type, param)
+        """
+        # CRITICAL: Ensure we have the full payload before validation
+        finding = self._ensure_full_payload(finding)
+
         url = finding.get("url")
         payload = finding.get("payload")
+        param = finding.get("parameter") or finding.get("param")
         vuln_type = self._detect_vuln_type(finding)
 
         # Select best verification URL from specialist methods if available
         if finding.get("verification_methods"):
             url, payload = self._select_best_verification_method(finding, url)
 
-        return url, payload, vuln_type
+        return url, payload, vuln_type, param
 
     def _select_best_verification_method(self, finding: Dict, url: str) -> Tuple[str, Optional[str]]:
         """Select best verification method from specialist options."""
@@ -529,17 +702,21 @@ Respond in JSON format:
         return url, finding.get("payload")
 
     async def _agentic_execute_validation(
-        self, url: str, payload: Optional[str], vuln_type: str
-    ) -> Tuple[Optional[str], List[str], bool]:
+        self, url: str, payload: Optional[str], vuln_type: str, param: Optional[str] = None
+    ) -> Tuple[Optional[str], List[str], bool, Optional[str]]:
         """Execute payload with timeout and return results."""
         try:
-            return await asyncio.wait_for(
-                self._execute_payload_optimized(url, payload, vuln_type),
+            path, logs, confirmed, alert_msg = await asyncio.wait_for(
+                self._execute_payload_optimized(url, payload, vuln_type, param),
                 timeout=self.FAST_VALIDATION_TIMEOUT
             )
+            return path, logs, confirmed, alert_msg
         except asyncio.TimeoutError:
             logger.warning(f"Validation timeout for {url[:50]}...")
-            return None, ["TIMEOUT"], False
+            return None, ["TIMEOUT"], False, None
+        except Exception as e:
+            logger.error(f"Validation error: {e}", exc_info=True)
+            return None, [], False, None
 
     def _agentic_build_cdp_result(
         self, logs: List[str], url: str, payload: Optional[str], start_time: float
@@ -602,41 +779,64 @@ Respond in JSON format:
 
     async def _agentic_process_validation_result(
         self, screenshot_path: Optional[str], logs: List[str], basic_triggered: bool,
-        finding: Dict, url: str, payload: Optional[str], start_time: float
+        finding: Dict, url: str, payload: Optional[str], start_time: float,
+        alert_message: Optional[str] = None
     ) -> Dict[str, Any]:
         """Process validation result and build final response."""
-        # Handle timeout
-        if screenshot_path is None and logs == ["TIMEOUT"]:
-            return {
-                "validated": False,
-                "reasoning": f"Validation timed out after {self.FAST_VALIDATION_TIMEOUT}s",
-                "screenshot_path": None,
-                "logs": ["TIMEOUT"]
-            }
+        # Step 1: Impact-Aware Alert Validation
+        impact_analysis = None
+        if alert_message:
+            impact_analysis = self._validate_alert_impact(alert_message, url)
+            logger.info(f"Impact Analysis: {impact_analysis}")
 
-        # Early exit on CDP confirmation
+        # Step 2: Triggered event (L4 CDP confirmed)
         if basic_triggered:
-            return self._agentic_build_cdp_result(logs, url, payload, start_time)
+            result = self._agentic_build_cdp_result(logs, url, payload, start_time)
+            if impact_analysis:
+                result["impact"] = impact_analysis["impact"]
+                result["reasoning"] += f" | {impact_analysis['reason']}"
+            return result
 
-        # Visual analysis
+        # Step 3: Vision fallback (L1-L4 silent)
         if screenshot_path and Path(screenshot_path).exists():
-            result = await self._agentic_analyze_with_vision(finding, screenshot_path, logs)
-        else:
-            result = {
-                "validated": False,
-                "status": "VALIDATED_FALSE_POSITIVE",
-                "reasoning": "Audit failed: Could not capture screenshot.",
-                "screenshot_path": None,
-                "logs": logs
-            }
+            return await self._agentic_analyze_with_vision(finding, screenshot_path, logs)
 
-        # Cache and update stats
-        if self.ENABLE_CACHE:
-            self._cache.set(url, payload, result)
-        elapsed = (time.time() - start_time) * 1000
-        self._update_stats(elapsed)
+        # Step 4: Rejection
+        return {
+            "validated": False,
+            "status": "VALIDATED_FALSE_POSITIVE",
+            "reasoning": "No execution evidence found in CDP logs or visual capture."
+        }
 
-        return result
+    def _validate_alert_impact(self, alert_message: str, target_url: str) -> Dict[str, str]:
+        """
+        Validate the impact of an alert() call.
+        Aligns with BugTraceAI V5 Impact Scoring.
+        """
+        from urllib.parse import urlparse
+        parsed_url = urlparse(target_url)
+        target_domain = parsed_url.netloc
+
+        # 1. Target Domain Match (HIGH IMPACT)
+        if alert_message == target_domain or alert_message in target_url:
+             return {"impact": "HIGH", "reason": "Execution on TARGET domain confirmed (Impact: Session/CSRF)"}
+
+        # 2. Localhost/Internal (MEDIUM IMPACT)
+        if "localhost" in alert_message or "127.0.0.1" in alert_message:
+             return {"impact": "MEDIUM", "reason": "Execution confirmed but limited to local/loopback environment"}
+
+        # 3. Sandbox Rejection (LOW IMPACT / ESCALATION)
+        # e.g. *.googleusercontent.com or sandboxed iframes
+        sandbox_indicators = [".googleusercontent.com", "sandbox", "null", "undefined"]
+        for indicator in sandbox_indicators:
+            if indicator in alert_message.lower():
+                return {"impact": "LOW", "reason": f"Execution restricted to sandboxed environment ({indicator})"}
+
+        # 4. Generic Alert (alert(1))
+        if alert_message == "1" or alert_message == "undefined":
+             return {"impact": "MEDIUM", "reason": "Execution confirmed with generic marker (Identity of domain unconfirmed)"}
+
+        return {"impact": "MEDIUM", "reason": f"Execution confirmed with message: {alert_message}"}
 
     async def validate_finding_agentically(
         self,
@@ -646,6 +846,26 @@ Respond in JSON format:
         """
         V3 Reproduction Flow (Auditor Role) - OPTIMIZED.
         Validates findings using CDP events and vision analysis.
+
+        v2.1.0+: Automatically loads full payload from JSON report if truncated.
+        This ensures accurate validation even for complex payloads >200 characters.
+
+        Args:
+            finding: Finding dict with vulnerability data (may have truncated payload)
+            _recursion_depth: Internal recursion tracker (max depth = MAX_FEEDBACK_DEPTH)
+
+        Returns:
+            Validation result dict with fields:
+            - validated: bool - True if vulnerability confirmed
+            - status: str - VALIDATED_CONFIRMED, VALIDATED_FALSE_POSITIVE, etc.
+            - reasoning: str - Explanation of validation result
+            - screenshot_path: str - Path to screenshot (if captured)
+            - logs: List[str] - Browser console logs
+            - confidence: float - Confidence score (0.0-1.0)
+
+        Note:
+            The finding dict is automatically enhanced with full payload data
+            via _ensure_full_payload() before validation begins.
         """
         # Check for cancellation
         if self._cancellation_token.get("cancelled", False):
@@ -657,7 +877,7 @@ Respond in JSON format:
             return {"validated": False, "reasoning": "Max feedback retries exceeded"}
 
         start_time = time.time()
-        url, payload, vuln_type = self._agentic_prepare_context(finding)
+        url, payload, vuln_type, param = self._agentic_prepare_context(finding)
 
         if not url:
             return {"validated": False, "reasoning": "Missing target URL"}
@@ -668,15 +888,20 @@ Respond in JSON format:
             return cached
 
         self.think(f"Auditing {vuln_type} on {url}")
-
+        self._stats["queued_for_cdp"] = self._stats.get("queued_for_cdp", 0) + 1
         # Execute validation with semaphore
+        # 1. Execute payload (L4 CDP)
+        start_time = time.time()
         async with self._validation_semaphore:
-            screenshot_path, logs, basic_triggered = await self._agentic_execute_validation(
-                url, payload, vuln_type
-            )
+            # Execute
+            screenshot_path, logs, triggered, alert_msg = await self._agentic_execute_validation(url, payload, vuln_type, param)
+            
+            # Analyze logs for confirmation
+            confirmed = triggered or self._check_logs_for_execution(logs, vuln_type) or (alert_msg is not None)
 
+            # 2. Process results
             return await self._agentic_process_validation_result(
-                screenshot_path, logs, basic_triggered, finding, url, payload, start_time
+                screenshot_path, logs, confirmed, finding, url, payload, start_time, alert_msg
             )
 
     def _update_stats(self, elapsed_ms: float):
@@ -684,6 +909,27 @@ Respond in JSON format:
         self._stats["total_validated"] += 1
         self._stats["total_time_ms"] += elapsed_ms
         self._stats["avg_time_ms"] = self._stats["total_time_ms"] / self._stats["total_validated"]
+
+    def _check_logs_for_execution(self, logs: List[str], vuln_type: str) -> bool:
+        """Check browser logs for successful exploitation indicators."""
+        if not logs:
+            return False
+            
+        success_markers = {
+            "xss": ["alert", "prompt", "confirm", "XSS", "HACKED", "fetch"],
+            "sqli": ["SQL syntax", "mysql_", "ORA-"],
+            "lfi": ["root:x:0:0", "daemon:x:1:1"], 
+            "csti": ["49", "7777777"] # Common math results
+        }
+        
+        markers = success_markers.get(vuln_type.lower(), [])
+        
+        for log in logs:
+            if any(marker in str(log) for marker in markers):
+                return True
+                
+        return False
+
 
     def get_stats(self) -> Dict[str, Any]:
         """Get validation statistics including CDP load percentage."""
@@ -703,26 +949,29 @@ Respond in JSON format:
         self,
         url: str,
         payload: Optional[str],
-        vuln_type: str
+        vuln_type: str,
+        param: Optional[str] = None
     ) -> Tuple[str, List[str], bool]:
         """
         OPTIMIZED payload execution using pooled verifiers.
         """
-        if vuln_type == "xss":
+        if vuln_type in ["xss", "csti"]:
             # Use pooled verifier instead of creating new one each time
             verifier = await _verifier_pool.get_verifier()
             try:
-                target_url = self._construct_payload_url(url, payload)
+                target_url = self._construct_payload_url(url, payload, param)
                 result = await verifier.verify_xss(
                     target_url,
                     screenshot_dir=str(settings.LOG_DIR),
-                    timeout=self.FAST_VALIDATION_TIMEOUT - 5  # Leave margin
+                    timeout=self.FAST_VALIDATION_TIMEOUT - 5,  # Leave margin
+                    max_level=4  # Explicitly allow L4 CDP
                 )
-                return result.screenshot_path, result.console_logs or [], result.success
+                return result.screenshot_path, result.console_logs or [], result.success, result.alert_message
             finally:
                 _verifier_pool.release()
         else:
-            return await self._generic_capture(url, payload)
+            path, logs, triggered = await self._generic_capture(url, payload, param)
+            return path, logs, triggered, None
 
     # NOTE: _has_specialist_authority removed - filtering now happens at ValidationEngine level
 
@@ -765,22 +1014,23 @@ Respond in JSON format:
         self, 
         url: str, 
         payload: Optional[str],
-        vuln_type: str
+        vuln_type: str,
+        param: Optional[str] = None
     ) -> Tuple[str, List[str], bool]:
         """
         Execute the payload in browser and capture result.
         Returns (screenshot_path, logs, basic_triggered)
         """
-        if vuln_type == "xss":
+        if vuln_type in ["xss", "csti"]:
             # Use Playwright for current environment stability
-            verifier = XSSVerifier(headless=settings.HEADLESS_BROWSER, prefer_cdp=False)
-            target_url = self._construct_payload_url(url, payload)
+            verifier = XSSVerifier(headless=settings.HEADLESS_BROWSER, prefer_cdp=True)
+            target_url = self._construct_payload_url(url, payload, param)
             
             result = await verifier.verify_xss(target_url, screenshot_dir=str(settings.LOG_DIR))
             return result.screenshot_path, result.console_logs, result.success
         else:
             # Generic page capture for other types
-            return await self._generic_capture(url, payload)
+            return await self._generic_capture(url, payload, param)
     
     def _check_sql_errors(self, content: str) -> Optional[str]:
         """Check page content for SQL error indicators. Returns error name if found."""
@@ -802,7 +1052,8 @@ Respond in JSON format:
     async def _generic_capture(
         self,
         url: str,
-        payload: Optional[str]
+        payload: Optional[str],
+        param: Optional[str] = None
     ) -> Tuple[str, List[str], bool]:
         """
         Generic page capture for non-XSS validations.
@@ -810,7 +1061,7 @@ Respond in JSON format:
         logs = []
         screenshot_path = ""
 
-        target_url = self._construct_payload_url(url, payload) if payload else url
+        target_url = self._construct_payload_url(url, payload, param) if payload else url
 
         async with browser_manager.get_page() as page:
             try:
@@ -833,7 +1084,8 @@ Respond in JSON format:
 
         return screenshot_path, logs, False
     
-    def _construct_payload_url(self, url: str, payload: Optional[str]) -> str:
+
+    def _construct_payload_url(self, url: str, payload: Optional[str], param: Optional[str] = None) -> str:
         """Construct URL with payload injected."""
         if not payload or payload in url:
             return url
@@ -842,14 +1094,23 @@ Respond in JSON format:
         from urllib.parse import urlencode, parse_qs
         
         parsed = urlparse.urlparse(url)
-        if parsed.query:
-            qs = parse_qs(parsed.query)
+        qs = parse_qs(parsed.query)
+
+        if param:
+            # 1. Targeted Injection: Inject ONLY into the specific parameter
+            # Logic: If param exists, replace it. If not, APPEND it.
+            qs[param] = [payload]
+        elif parsed.query:
+            # 2. Spray Mode (Legacy): Inject into ALL parameters (Blind)
             for k in qs:
                 qs[k] = payload
-            new_query = urlencode(qs, doseq=True)
-            return urlparse.urlunparse(parsed._replace(query=new_query))
         else:
-            return f"{url}?q={payload}"
+            # 3. No targets available? Return original URL to avoid errors
+            # (Though technically we could append ?payload=...)
+            return url
+            
+        new_query = urlencode(qs, doseq=True)
+        return urlparse.urlunparse(parsed._replace(query=new_query))
     
     def _detect_vuln_type(self, finding: Dict[str, Any]) -> str:
         """Detect vulnerability type from finding data."""
@@ -860,6 +1121,8 @@ Respond in JSON format:
             return "xss"
         elif "SQL" in title or "SQLI" in vuln_type:
             return "sqli"
+        elif "CSTI" in title or "CSTI" in vuln_type or "TEMPLATE" in title or "SSTI" in vuln_type:
+            return "csti"
         else:
             return "general"
     

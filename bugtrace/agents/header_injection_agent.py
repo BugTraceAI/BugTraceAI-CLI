@@ -13,6 +13,7 @@ Burp Scanner finds these as "HTTP Response Header Injection" which allows:
 
 import asyncio
 import aiohttp
+import json
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -27,10 +28,13 @@ from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
 from bugtrace.core.event_bus import EventType
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 
+# v3.2.0: Import TechContextMixin for context-aware detection
+from bugtrace.agents.mixins.tech_context import TechContextMixin
+
 logger = get_logger("agents.header_injection")
 
 
-class HeaderInjectionAgent(BaseAgent):
+class HeaderInjectionAgent(BaseAgent, TechContextMixin):
     """
     HTTP Response Header Injection (CRLF) Specialist Agent.
 
@@ -71,6 +75,9 @@ class HeaderInjectionAgent(BaseAgent):
         "<html>injected",
     ]
 
+    # Config path for header injection scope filtering
+    SCOPE_CONFIG_PATH = Path(__file__).parent.parent / "data" / "header_injection_scope.json"
+
     def __init__(
         self,
         url: str,
@@ -107,6 +114,10 @@ class HeaderInjectionAgent(BaseAgent):
         self._worker_pool: Optional[WorkerPool] = None
         self._scan_context: str = ""
 
+        # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
+        self._tech_stack_context: Dict = {}
+        self._header_injection_prime_directive: str = ""
+
     async def run_loop(self):
         """Standard run loop."""
         return await self.run()
@@ -126,6 +137,11 @@ class HeaderInjectionAgent(BaseAgent):
         dashboard.log(f"[{self.name}] 🔍 Starting Header Injection scan on {self.url}", "INFO")
 
         try:
+            # Smart Scope Filter - skip if URL not in scope
+            if not self._should_test():
+                dashboard.log(f"[{self.name}] Skipping - URL not in scope", "INFO")
+                return {"findings": [], "status": JobStatus.COMPLETED, "stats": self._stats}
+
             # Get parameters to test
             params_to_test = self._get_parameters_to_test()
 
@@ -171,6 +187,54 @@ class HeaderInjectionAgent(BaseAgent):
 
         logger.info(f"[{self.name}] Parameters to test: {params_to_test}")
         return params_to_test
+
+    def _should_test(self) -> bool:
+        """
+        Determines if Header Injection should be tested on this URL
+        based on configurable scope rules from header_injection_scope.json.
+
+        Logic:
+        1. If url.path is / or empty -> TRUE
+        2. If url.path contains any string from patterns.paths -> TRUE
+        3. If any GET parameter matches patterns.params -> TRUE
+        4. Default: FALSE (log as "Skipped")
+        """
+        try:
+            with open(self.SCOPE_CONFIG_PATH, 'r') as f:
+                scope = json.load(f)
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to load scope config: {e}, defaulting to test")
+            return True  # Fail-safe: test if config unavailable
+
+        config = scope.get("config", {})
+        patterns = scope.get("patterns", {})
+        path_patterns = patterns.get("paths", [])
+        param_patterns = patterns.get("params", [])
+
+        parsed = urlparse(self.url)
+        path = parsed.path.lower()
+        query_params = parse_qs(parsed.query)
+
+        # Check 1: Root or empty path
+        if config.get("always_test_root", True) and (path == "/" or path == ""):
+            logger.info(f"[{self.name}] URL in scope: root path")
+            return True
+
+        # Check 2: Path contains sensitive patterns
+        for pattern in path_patterns:
+            if pattern.lower() in path:
+                logger.info(f"[{self.name}] URL in scope: path contains '{pattern}'")
+                return True
+
+        # Check 3: Query parameters match sensitive patterns
+        for param in query_params.keys():
+            if param.lower() in [p.lower() for p in param_patterns]:
+                logger.info(f"[{self.name}] URL in scope: param '{param}' is redirect-related")
+                return True
+
+        # Default: Not in scope
+        logger.debug(f"[{self.name}] Skipping Header Injection on {self.url} (Not in scope)")
+        return False
 
     async def _test_parameter(self, session: aiohttp.ClientSession, param: str):
         """Test a single parameter for CRLF injection."""
@@ -331,11 +395,10 @@ class HeaderInjectionAgent(BaseAgent):
         drain_start = time.monotonic()
 
         while stable_empty_count < 10 and (time.monotonic() - drain_start) < 300.0:
-            item = queue.get_nowait() if hasattr(queue, 'get_nowait') else None
+            item = await queue.dequeue(timeout=0.5)  # Use dequeue(), not get_nowait()
 
             if item is None:
                 stable_empty_count += 1
-                await asyncio.sleep(0.5)
                 continue
 
             stable_empty_count = 0
@@ -368,13 +431,26 @@ class HeaderInjectionAgent(BaseAgent):
         import json
         from bugtrace.core.llm_client import llm_client
 
+        # v3.2: Extract tech stack info for prompt
+        tech_stack = getattr(self, '_tech_stack_context', {}) or {}
+        server = tech_stack.get('server', 'generic')
+        cdn = tech_stack.get('cdn')
+        waf = tech_stack.get('waf')
+
+        # Get Header Injection-specific context prompts
+        header_injection_prime_directive = getattr(self, '_header_injection_prime_directive', '')
+        header_injection_dedup_context = self.generate_header_injection_dedup_context(tech_stack) if tech_stack else ''
+
         prompt = f"""You are analyzing {len(wet_findings)} potential HTTP Header Injection (CRLF) findings.
 
-DEDUPLICATION RULES FOR HEADER INJECTION:
-1. Same header name = DUPLICATE (global across all URLs)
-2. Different header names = DIFFERENT vulnerabilities
-3. URL-agnostic: Header injection affects the same header globally
-4. Parameter-agnostic: Only the injected header name matters
+{header_injection_prime_directive}
+
+{header_injection_dedup_context}
+
+## TARGET CONTEXT
+- Server: {server}
+- CDN: {cdn or 'None'}
+- WAF: {waf or 'None'}
 
 EXAMPLES:
 - /page?param=X (X-Injected) + /other?param=Y (X-Injected) = DUPLICATE ✓
@@ -392,7 +468,11 @@ Return ONLY unique findings in JSON format:
   ]
 }}"""
 
-        system_prompt = """You are an expert CRLF/Header Injection deduplication analyst. Your job is to identify and remove duplicate findings while preserving unique injected header names. Focus on header name-only deduplication."""
+        system_prompt = f"""You are an expert CRLF/Header Injection deduplication analyst.
+
+{header_injection_prime_directive}
+
+Your job is to identify and remove duplicate findings while preserving unique injected header names. Focus on header name-only deduplication."""
 
         try:
             response = await llm_client.generate(
@@ -517,11 +597,14 @@ Return ONLY unique findings in JSON format:
         import json
         import aiofiles
 
-        # Use absolute path from settings.BASE_DIR
-        scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
-        scan_dir = settings.BASE_DIR / "reports" / scan_id
-        specialists_dir = scan_dir / "specialists"
-        specialists_dir.mkdir(parents=True, exist_ok=True)
+        # v3.1: Use unified report_dir if injected, else fallback to scan_context
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
+            scan_dir = settings.BASE_DIR / "reports" / scan_id
+        # v3.2: Write to specialists/results/ for unified wet→dry→results flow
+        results_dir = scan_dir / "specialists" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
 
         report = {
             "agent": f"{self.name}",
@@ -543,7 +626,7 @@ Return ONLY unique findings in JSON format:
             }
         }
 
-        report_path = specialists_dir / "header_injection_report.json"
+        report_path = results_dir / "header_injection_results.json"
 
         async with aiofiles.open(report_path, "w") as f:
             await f.write(json.dumps(report, indent=2))
@@ -564,26 +647,56 @@ Return ONLY unique findings in JSON format:
         Args:
             scan_context: Scan identifier for event correlation
         """
+        from bugtrace.agents.specialist_utils import (
+            report_specialist_start,
+            report_specialist_done,
+            report_specialist_wet_dry,
+        )
+        from bugtrace.core.queue import queue_manager
+
         self._queue_mode = True
         self._scan_context = scan_context
 
+        # v3.2: Load context-aware tech stack for intelligent deduplication
+        await self._load_header_injection_tech_context()
+
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+
+        # Get initial queue depth for telemetry
+        queue = queue_manager.get_queue("header_injection")
+        initial_depth = queue.depth()
+        report_specialist_start(self.name, queue_depth=initial_depth)
 
         # PHASE A: Analyze and deduplicate
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
         dry_list = await self.analyze_and_dedup_queue()
 
+        # Report WET→DRY metrics for integrity verification
+        report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            report_specialist_done(self.name, processed=0, vulns=0)
             return  # Terminate agent
 
         # PHASE B: Exploit DRY findings
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
+        # Count confirmed vulnerabilities
+        vulns_count = len([r for r in results if r]) if results else 0
+        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+
         # REPORTING: Generate specialist report
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
+
+        # Report completion with final stats
+        report_specialist_done(
+            self.name,
+            processed=len(dry_list),
+            vulns=vulns_count
+        )
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
@@ -714,3 +827,36 @@ Return ONLY unique findings in JSON format:
             "queue_mode": True,
             "worker_stats": self._worker_pool.get_stats(),
         }
+
+    # =========================================================================
+    # TECH CONTEXT LOADING (v3.2)
+    # =========================================================================
+
+    async def _load_header_injection_tech_context(self) -> None:
+        """
+        Load technology stack context from recon data (v3.2).
+
+        Uses TechContextMixin methods to load and generate context-aware
+        prompts for Header Injection-specific deduplication.
+        """
+        # Determine report directory
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1] if self._scan_context else ""
+            scan_dir = settings.BASE_DIR / "reports" / scan_id if scan_id else None
+
+        if not scan_dir or not Path(scan_dir).exists():
+            logger.debug(f"[{self.name}] No report directory found, using generic tech context")
+            self._tech_stack_context = {"db": "generic", "server": "generic", "lang": "generic"}
+            self._header_injection_prime_directive = ""
+            return
+
+        # Use TechContextMixin methods
+        self._tech_stack_context = self.load_tech_stack(Path(scan_dir))
+        self._header_injection_prime_directive = self.generate_header_injection_context_prompt(self._tech_stack_context)
+
+        server = self._tech_stack_context.get("server", "generic")
+        cdn = self._tech_stack_context.get("cdn")
+        waf = self._tech_stack_context.get("waf")
+
+        logger.info(f"[{self.name}] Header Injection tech context loaded: server={server}, cdn={cdn or 'none'}, waf={waf or 'none'}")

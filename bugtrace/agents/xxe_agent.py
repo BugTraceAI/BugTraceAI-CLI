@@ -15,9 +15,12 @@ from bugtrace.reporting.standards import (
 )
 from bugtrace.utils.logger import get_logger
 
+# v3.2.0: Import TechContextMixin for context-aware detection
+from bugtrace.agents.mixins.tech_context import TechContextMixin
+
 logger = get_logger(__name__)
 
-class XXEAgent(BaseAgent):
+class XXEAgent(BaseAgent, TechContextMixin):
     """
     Specialist Agent for XML External Entity (XXE).
     Target: Endpoints consuming XML.
@@ -43,6 +46,10 @@ class XXEAgent(BaseAgent):
 
         # WET → DRY transformation (Two-phase processing)
         self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
+
+        # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
+        self._tech_stack_context: Dict = {}
+        self._xxe_prime_directive: str = ""
 
     def _determine_validation_status(self, payload: str, evidence: str = "success") -> str:
         """
@@ -341,12 +348,28 @@ class XXEAgent(BaseAgent):
         from bugtrace.core.llm_client import llm_client
         import json
 
+        # v3.2: Extract tech stack info for prompt
+        tech_stack = getattr(self, '_tech_stack_context', {}) or {}
+        lang = tech_stack.get('lang', 'generic')
+        server = tech_stack.get('server', 'generic')
+
+        # Get XXE-specific context prompts
+        xxe_prime_directive = getattr(self, '_xxe_prime_directive', '')
+        xxe_dedup_context = self.generate_xxe_dedup_context(tech_stack) if tech_stack else ''
+
+        # Infer XML parser for context
+        xml_parser = self._infer_xml_parser(lang)
+
         prompt = f"""You are analyzing {len(wet_findings)} potential XXE findings.
 
-DEDUPLICATION RULES FOR XXE:
-- Same endpoint = DUPLICATE (regardless of query params)
-- Example: /api/product?id=1 and /api/product?id=2 = DUPLICATE (keep 1)
-- XXE is endpoint-based, not parameter-specific
+{xxe_prime_directive}
+
+{xxe_dedup_context}
+
+## TARGET CONTEXT
+- Language: {lang}
+- Server: {server}
+- Likely XML Parser: {xml_parser}
 
 WET LIST:
 {json.dumps(wet_findings, indent=2)}
@@ -355,9 +378,15 @@ Return JSON array of UNIQUE findings only:
 {{"findings": [...]}}
 """
 
+        system_prompt = f"""You are an expert security analyst specializing in XXE deduplication.
+
+{xxe_prime_directive}
+
+Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerability."""
+
         response = await llm_client.generate(
             prompt=prompt,
-            system_prompt="You are an expert security analyst specializing in XXE deduplication.",
+            system_prompt=system_prompt,
             module_name="XXE_DEDUP",
             temperature=0.2  # Low temperature for consistent dedup
         )
@@ -474,7 +503,7 @@ Return JSON array of UNIQUE findings only:
         Steps:
         1. Summarize findings (validated vs pending)
         2. Technical analysis per finding
-        3. Save to: reports/scan_{id}/specialists/xxe_report.json
+        3. Save to: reports/<domain>_<timestamp>/specialists/xxe_report.json
 
         Returns:
             Path to generated report
@@ -484,11 +513,14 @@ Return JSON array of UNIQUE findings only:
         from datetime import datetime
         from bugtrace.core.config import settings
 
-        # Create specialists directory (use absolute path)
-        scan_id = self._scan_context.split("/")[-1]  # Extract scan ID
-        scan_dir = settings.BASE_DIR / "reports" / scan_id
-        specialists_dir = scan_dir / "specialists"
-        specialists_dir.mkdir(parents=True, exist_ok=True)
+        # v3.1: Use unified report_dir if injected, else fallback to scan_context
+        scan_dir = getattr(self, 'report_dir', None)
+        if not scan_dir:
+            scan_id = self._scan_context.split("/")[-1]
+            scan_dir = settings.BASE_DIR / "reports" / scan_id
+        # v3.2: Write to specialists/results/ for unified wet→dry→results flow
+        results_dir = scan_dir / "specialists" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
 
         # Build report
         report = {
@@ -510,7 +542,7 @@ Return JSON array of UNIQUE findings only:
         }
 
         # Write report
-        report_path = specialists_dir / "xxe_report.json"
+        report_path = results_dir / "xxe_results.json"
         async with aiofiles.open(report_path, 'w') as f:
             await f.write(json.dumps(report, indent=2))
 
@@ -527,26 +559,55 @@ Return JSON array of UNIQUE findings only:
 
         NO infinite loop - processes once and terminates.
         """
+        from bugtrace.agents.specialist_utils import (
+            report_specialist_start,
+            report_specialist_done,
+            report_specialist_wet_dry,
+        )
+
         self._queue_mode = True
         self._scan_context = scan_context
 
+        # v3.2: Load context-aware tech stack for intelligent deduplication
+        await self._load_xxe_tech_context()
+
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+
+        # Get initial queue depth for telemetry
+        queue = queue_manager.get_queue("xxe")
+        initial_depth = queue.depth()
+        report_specialist_start(self.name, queue_depth=initial_depth)
 
         # PHASE A: ANALYSIS & DEDUPLICATION
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
         dry_list = await self.analyze_and_dedup_queue()
 
+        # Report WET→DRY metrics for integrity verification
+        report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            report_specialist_done(self.name, processed=0, vulns=0)
             return  # ✅ Terminate (no loop)
 
         # PHASE B: EXPLOITATION
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
+        # Count confirmed vulnerabilities
+        vulns_count = len([r for r in results if r]) if results else 0
+        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+
         # REPORTING
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
+
+        # Report completion with final stats
+        report_specialist_done(
+            self.name,
+            processed=len(dry_list),
+            vulns=vulns_count
+        )
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
         # Method ends - agent terminates ✅
@@ -686,3 +747,35 @@ Return JSON array of UNIQUE findings only:
             "queue_mode": True,
             "worker_stats": self._worker_pool.get_stats(),
         }
+
+    # =========================================================================
+    # TECH CONTEXT LOADING (v3.2)
+    # =========================================================================
+
+    async def _load_xxe_tech_context(self) -> None:
+        """
+        Load technology stack context from recon data (v3.2).
+
+        Uses TechContextMixin methods to load and generate context-aware
+        prompts for XXE-specific deduplication (XML parser detection).
+        """
+        from pathlib import Path
+
+        # Determine report directory
+        scan_id = self._scan_context.split("/")[-1] if self._scan_context else ""
+        scan_dir = settings.BASE_DIR / "reports" / scan_id if scan_id else None
+
+        if not scan_dir or not Path(scan_dir).exists():
+            logger.debug(f"[{self.name}] No report directory found, using generic tech context")
+            self._tech_stack_context = {"db": "generic", "server": "generic", "lang": "generic"}
+            self._xxe_prime_directive = ""
+            return
+
+        # Use TechContextMixin methods
+        self._tech_stack_context = self.load_tech_stack(Path(scan_dir))
+        self._xxe_prime_directive = self.generate_xxe_context_prompt(self._tech_stack_context)
+
+        lang = self._tech_stack_context.get("lang", "generic")
+        xml_parser = self._infer_xml_parser(lang)
+
+        logger.info(f"[{self.name}] XXE tech context loaded: lang={lang}, parser={xml_parser}")
