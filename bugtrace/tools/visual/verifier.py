@@ -29,6 +29,7 @@ class VerificationResult:
     screenshot_path: Optional[str] = None
     console_logs: List[Dict] = None
     details: Dict[str, Any] = None
+    alert_message: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -45,7 +46,7 @@ class XSSVerifier:
     """
     
     # XSS MARKER
-    XSS_MARKER = "BUGTRACE-XSS-CONFIRMED"
+    XSS_MARKER = "HACKED BY BUGTRACEAI"
     
     def __init__(self, headless: bool = True, prefer_cdp: bool = False):
         self.headless = headless
@@ -78,29 +79,36 @@ class XSSVerifier:
         url: str,
         screenshot_dir: Optional[str] = None,
         timeout: float = 15.0,
-        expected_marker: Optional[str] = None
+        expected_marker: Optional[str] = None,
+        max_level: int = 4
     ) -> VerificationResult:
         """
-        Verify XSS at URL using best available method.
+        Verify XSS at URL using best available method up to max_level.
         
         Args:
             url: URL with XSS payload to verify
             screenshot_dir: Directory to save evidence screenshots
             timeout: Time to wait for XSS execution
+            max_level: Maximum level to try (3=Playwright, 4=CDP)
             
         Returns:
             VerificationResult with outcome and evidence
         """
-        # Try CDP first if preferred and available
-        if self.prefer_cdp and await self._check_cdp_available():
-            result = await self._verify_with_cdp(url, screenshot_dir, timeout, expected_marker)
-            if result.success or result.error is None:
+        # Level 3: Try Playwright first (Lighter, handles most cases)
+        if max_level >= 3:
+            result = await self._verify_with_playwright(url, screenshot_dir, timeout, expected_marker)
+            if result.success:
                 return result
-            # If CDP failed, fall through to Playwright
-            logger.warning("CDP verification failed, trying Playwright...")
+
+        # Level 4: If Playwright failed or was inconclusive, try CDP as a specialized fallback
+        if max_level >= 4 and self.prefer_cdp and await self._check_cdp_available():
+            logger.info("Playwright inconclusive (L3), attempting deep validation via CDP (L4)...")
+            cdp_result = await self._verify_with_cdp(url, screenshot_dir, timeout, expected_marker)
+            if cdp_result.success:
+                return cdp_result
         
-        # Fallback to Playwright
-        return await self._verify_with_playwright(url, screenshot_dir, timeout, expected_marker)
+        # If we only wanted L3 and it failed, or L3 and L4 both failed
+        return result if max_level >= 3 else VerificationResult(success=False, method="none", error="Level limit reached")
     
     async def _verify_with_cdp(
         self,
@@ -133,7 +141,7 @@ class XSSVerifier:
                 cdp.validate_xss(
                     url=url,
                     xss_marker=self.XSS_MARKER,
-                    timeout=timeout,
+                    timeout=min(timeout, 5.0), # Cap execution wait at 5s to leave room for setup
                     screenshot_dir=screenshot_dir,
                     expected_marker=expected_marker
                 ),
@@ -153,6 +161,7 @@ class XSSVerifier:
             screenshot_path=result.screenshot_path,
             console_logs=result.console_logs,
             details=result.data,
+            alert_message=result.alert_message,
             error=result.error
         )
     
@@ -211,7 +220,8 @@ class XSSVerifier:
 
         result = self._build_verification_result(
             xss_confirmed, screenshot_path, console_logs,
-            dialog_detected[0], evaluation_data, impact_data
+            dialog_detected[0], dialog_detected[1] if len(dialog_detected) > 1 else None,
+            evaluation_data, impact_data
         )
 
         return {
@@ -220,13 +230,14 @@ class XSSVerifier:
         }
 
     def _build_verification_result(self, xss_confirmed, screenshot_path, console_logs,
-                                   dialog_detected, evaluation_data, impact_data) -> VerificationResult:
+                                   dialog_detected, dialog_message, evaluation_data, impact_data) -> VerificationResult:
         """Build final verification result."""
         return VerificationResult(
             success=xss_confirmed,
             method="playwright",
             screenshot_path=screenshot_path,
             console_logs=console_logs,
+            alert_message=dialog_message,
             details={
                 "dialog_detected": dialog_detected,
                 "marker_found": evaluation_data.get("marker_found", False),
@@ -250,11 +261,12 @@ class XSSVerifier:
             "source": "playwright"
         }))
 
-        dialog_detected = [False]  # Use list for mutability in closure
+        dialog_detected = [False, None]  # Use list for mutability in closure: [triggered, message]
         async def handle_dialog(dialog):
             dialog_detected[0] = True
+            dialog_detected[1] = dialog.message
             await dialog.dismiss()
-
+ 
         page.on("dialog", handle_dialog)
         return dialog_detected
 
