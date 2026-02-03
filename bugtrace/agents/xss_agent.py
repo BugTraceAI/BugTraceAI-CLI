@@ -2273,19 +2273,13 @@ Each payload should target a different context or use a different breakout techn
                     "screenshot": getattr(result, 'screenshot_path', None)
                 }
 
-            # Also check for DOM XSS patterns
-            dom_results = await detect_dom_xss(test_url)
-            if dom_results:
-                # detect_dom_xss returns a list of findings
-                for dom_finding in dom_results:
-                    if dom_finding.get("validated"):
-                        return {
-                            "confirmed": True,
-                            "method": "dom_xss_detector",
-                            "sink": dom_finding.get("sink"),
-                            "source": dom_finding.get("source"),
-                            "evidence": dom_finding.get("evidence")
-                        }
+            # NOTE: DOM XSS detection removed from payload validation
+            # detect_dom_xss finds DOM XSS that exist INDEPENDENTLY of the payload
+            # we're testing. Mixing them causes FALSE POSITIVES where we report
+            # a payload as working when actually a different DOM XSS exists.
+            #
+            # DOM XSS scanning should be done separately in _run_dom_xss_scan()
+            # which creates its own findings with the correct payload.
 
             return None
 
