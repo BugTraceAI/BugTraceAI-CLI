@@ -153,9 +153,10 @@ class DASTySASTAgent(BaseAgent):
             logger.warning(f"[{self.name}] Failed to fetch HTML content: {e}")
 
         # ADDED (2026-02-01): Run active reconnaissance probes
+        # FIX (2026-02-04): Now passes HTML to extract form parameters, not just URL params
         if settings.ACTIVE_RECON_PROBES:
             try:
-                probes = await self._run_reflection_probes()
+                probes = await self._run_reflection_probes(context.get("html_content", ""))
                 context["reflection_probes"] = probes
                 logger.info(f"[{self.name}] Active recon: {len(probes)} parameters probed")
             except Exception as e:
@@ -163,12 +164,16 @@ class DASTySASTAgent(BaseAgent):
 
         return context
 
-    async def _run_reflection_probes(self) -> List[Dict]:
+    async def _run_reflection_probes(self, html_content: str = "") -> List[Dict]:
         """
         ADDED (2026-02-01): Active reconnaissance probes.
+        FIX (2026-02-04): Now extracts parameters from HTML forms, not just URL.
 
-        Sends an Omni-Probe to each URL parameter and analyzes HOW it reflects.
+        Sends an Omni-Probe to each parameter and analyzes HOW it reflects.
         This provides CONCRETE evidence for the LLM instead of speculation.
+
+        Args:
+            html_content: HTML content to extract form parameters from.
 
         Returns:
             List of probe results with reflection context analysis.
@@ -180,17 +185,30 @@ class DASTySASTAgent(BaseAgent):
         marker = settings.OMNI_PROBE_MARKER
 
         parsed = urlparse(self.url)
-        params = parse_qs(parsed.query)
+        url_params = parse_qs(parsed.query)
 
-        if not params:
+        # FIX (2026-02-04): Extract parameters from HTML forms
+        # This finds params like "searchTerm" that aren't in the URL
+        html_params = self._extract_html_params(html_content) if html_content else []
+
+        # Combine URL params + HTML params (URL params take priority)
+        all_param_names = set(url_params.keys())
+        for html_param in html_params:
+            if html_param not in all_param_names:
+                all_param_names.add(html_param)
+                url_params[html_param] = [""]  # Empty default value for HTML-only params
+
+        if not all_param_names:
             return probes
+
+        logger.info(f"[{self.name}] Probing {len(all_param_names)} params: {list(all_param_names)}")
 
         # Use orchestrator for lifecycle-tracked connections
         async with orchestrator.session(DestinationType.TARGET) as session:
-            for param_name in params:
+            for param_name in all_param_names:
                 try:
                     # Build probe URL with marker
-                    test_params = {k: v[0] if v else "" for k, v in params.items()}
+                    test_params = {k: v[0] if v else "" for k, v in url_params.items()}
                     test_params[param_name] = marker
                     probe_url = urlunparse((
                         parsed.scheme, parsed.netloc, parsed.path,
@@ -219,6 +237,70 @@ class DASTySASTAgent(BaseAgent):
                     })
 
         return probes
+
+    def _extract_html_params(self, html: str) -> List[str]:
+        """
+        ADDED (2026-02-04): Extract parameter names from HTML forms.
+
+        This finds parameters like "searchTerm" that exist in forms but
+        aren't in the current URL. Critical for discovering hidden attack surfaces.
+
+        Args:
+            html: HTML content to parse.
+
+        Returns:
+            List of parameter names found in forms.
+        """
+        from bs4 import BeautifulSoup
+
+        params = []
+        if not html:
+            return params
+
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+
+            # Extract from all forms
+            for form in soup.find_all('form'):
+                # Get form method - we want GET forms for URL params
+                method = form.get('method', 'GET').upper()
+
+                # Extract all input elements
+                inputs = form.find_all(['input', 'textarea', 'select'])
+                for inp in inputs:
+                    name = inp.get('name')
+                    inp_type = inp.get('type', 'text').lower()
+
+                    # Skip if no name
+                    if not name:
+                        continue
+
+                    # Skip CSRF tokens and submit buttons
+                    if inp_type in ('submit', 'button', 'image', 'reset'):
+                        continue
+                    if name.lower() in ('csrf', 'token', '_token', 'csrfmiddlewaretoken', '__requestverificationtoken'):
+                        continue
+
+                    # Include both visible and hidden inputs (hidden can be vulnerable too!)
+                    params.append(name)
+                    logger.debug(f"[{self.name}] Found form param: {name} (type={inp_type}, method={method})")
+
+            # Deduplicate while preserving order
+            seen = set()
+            unique_params = []
+            for p in params:
+                if p not in seen:
+                    seen.add(p)
+                    unique_params.append(p)
+
+            if unique_params:
+                logger.info(f"[{self.name}] Extracted {len(unique_params)} params from HTML forms: {unique_params}")
+
+            return unique_params
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to extract HTML params: {e}")
+            return []
 
     def _analyze_reflection(self, param: str, marker: str, html: str, status: int) -> Dict:
         """
