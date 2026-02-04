@@ -299,6 +299,9 @@ class Settings(BaseSettings):
     CDP_PORT: int = 9222  # Chrome remote debugging port
     CDP_TIMEOUT: float = 5.0  # Time to wait for XSS execution (seconds)
 
+    # --- JWT Agent Rate Limiting ---
+    JWT_RATE_LIMIT_DELAY: float = 0.5  # Seconds to wait between JWT attack requests (prevents WAF triggers)
+
     # --- Queue Configuration (Phase 16: v2.3) ---
     QUEUE_PERSISTENCE_MODE: str = "memory"  # "memory" or "redis"
     QUEUE_DEFAULT_MAX_DEPTH: int = 1000  # Max items per queue
@@ -857,6 +860,31 @@ class Settings(BaseSettings):
     IDOR_LLM_PREDICTION_COUNT: int = 20  # Number of IDs to generate via LLM
     IDOR_PREDICTION_PRIORITY: str = "llm_first"  # "llm_first" | "fuzzing_first" | "parallel"
     IDOR_ENABLE_LLM_VALIDATION: bool = True  # Use LLM to validate MEDIUM severity findings
+
+    # --- IDOR Deep Exploitation Configuration ---
+    IDOR_ENABLE_DEEP_EXPLOITATION: bool = True
+    """Enable deep exploitation analysis for CRITICAL/HIGH IDOR findings."""
+
+    IDOR_EXPLOITER_MODE: str = "full"
+    """Exploitation mode: 'full' (phases 1-6), 'quick' (phases 1-3), 'safe' (phase 1 only)."""
+
+    IDOR_EXPLOITER_ENABLE_WRITE_TESTS: bool = False
+    """⚠️ DANGEROUS: Allow PUT/PATCH tests (can modify server data)."""
+
+    IDOR_EXPLOITER_ENABLE_DELETE_TESTS: bool = False
+    """⚠️ DANGEROUS: Allow DELETE tests (can delete server data)."""
+
+    IDOR_EXPLOITER_MAX_HORIZONTAL_ENUM: int = 50
+    """Maximum number of IDs to enumerate in horizontal escalation."""
+
+    IDOR_EXPLOITER_SEVERITY_THRESHOLD: str = "HIGH"
+    """Only exploit findings >= this severity. Options: CRITICAL, HIGH, MEDIUM."""
+
+    IDOR_EXPLOITER_RATE_LIMIT: float = 0.5
+    """Seconds between requests during exploitation (avoid WAF)."""
+
+    IDOR_EXPLOITER_TIMEOUT: float = 10.0
+    """HTTP request timeout during exploitation phases."""
 
 
 # Singleton Instance
