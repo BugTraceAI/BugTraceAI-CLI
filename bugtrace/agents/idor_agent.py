@@ -169,6 +169,244 @@ class IDORAgent(BaseAgent, TechContextMixin):
 
         return "unknown", []
 
+    async def _llm_predict_ids(self, original_value: str, url: str, param: str) -> List[str]:
+        """
+        Use LLM to predict likely IDOR target IDs based on context.
+
+        Returns:
+            List of predicted ID strings to test
+        """
+        from bugtrace.core.llm_client import llm_client
+        import json
+
+        # Extract context from URL
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        path = parsed.path
+
+        # Determine likely app type from domain/path
+        app_context = self._infer_app_context(domain, path)
+
+        prompt = f"""You are analyzing an IDOR vulnerability target.
+
+**Current Context:**
+- Domain: {domain}
+- Path: {path}
+- Parameter: {param}
+- Baseline ID: {original_value}
+- Inferred Type: {app_context}
+
+**Task:** Generate {settings.IDOR_LLM_PREDICTION_COUNT} likely ID values that could reveal unauthorized data through IDOR.
+
+**Consider:**
+1. Common test/admin accounts (admin, root, test, demo, guest)
+2. Sequential patterns (+1, -1, ×10, ×100, /2)
+3. Edge cases (0, 1, -1, 999, 1000, 9999, 99999)
+4. Common typos and variations of the baseline
+5. Well-known default IDs for this app type
+6. Obvious enumeration targets (first user, last user, system accounts)
+
+**Important:**
+- Focus on IDs that are LIKELY to exist in a real application
+- Prioritize special/privileged accounts over random IDs
+- Include both smaller and larger IDs than baseline
+- Match the format of the baseline (if numeric, stay numeric)
+
+Return ONLY a JSON object with an "ids" array:
+{{"ids": ["id1", "id2", "id3", ...]}}"""
+
+        try:
+            response = await llm_client.generate(
+                prompt=prompt,
+                module_name="IDOR_ID_PREDICTION",
+                temperature=0.3,  # Low temperature for consistent, logical predictions
+                max_tokens=500
+            )
+
+            if not response:
+                logger.warning(f"[{self.name}] LLM prediction returned empty response")
+                return []
+
+            # Parse JSON response
+            result = json.loads(response)
+            predicted_ids = result.get("ids", [])
+
+            # Validate and filter predictions
+            valid_ids = [str(id).strip() for id in predicted_ids if id]
+
+            logger.info(f"[{self.name}] LLM predicted {len(valid_ids)} candidate IDs for {param}={original_value}")
+            return valid_ids[:settings.IDOR_LLM_PREDICTION_COUNT]
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[{self.name}] LLM returned invalid JSON: {e}")
+            logger.debug(f"Raw response: {response[:200]}")
+            return []
+        except Exception as e:
+            logger.error(f"[{self.name}] LLM prediction failed: {e}")
+            return []
+
+    def _infer_app_context(self, domain: str, path: str) -> str:
+        """Infer application type from domain/path for better LLM context."""
+        domain_lower = domain.lower()
+        path_lower = path.lower()
+
+        # E-commerce
+        if any(kw in domain_lower for kw in ['shop', 'store', 'commerce', 'cart']):
+            return "e-commerce"
+        if any(kw in path_lower for kw in ['product', 'order', 'cart', 'checkout']):
+            return "e-commerce"
+
+        # Social/Blog
+        if any(kw in domain_lower for kw in ['social', 'blog', 'forum', 'community']):
+            return "social platform"
+        if any(kw in path_lower for kw in ['post', 'article', 'comment', 'user', 'profile']):
+            return "social platform"
+
+        # SaaS/API
+        if 'api' in domain_lower or 'api' in path_lower:
+            return "API/SaaS"
+
+        # Admin/Dashboard
+        if any(kw in path_lower for kw in ['admin', 'dashboard', 'panel']):
+            return "admin panel"
+
+        return "web application"
+
+    async def _test_custom_ids_python(
+        self,
+        candidate_ids: List[str],
+        param: str,
+        original_value: str
+    ) -> Optional[Dict]:
+        """
+        Test custom IDs using Python (without Go fuzzer).
+        Performs semantic differential analysis similar to Go fuzzer.
+
+        Returns:
+            Finding dict if IDOR detected, None otherwise
+        """
+        from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+
+        logger.info(f"[{self.name}] Testing {len(candidate_ids)} predicted IDs with Python analyzer")
+
+        # Fetch baseline first
+        baseline_url = self._inject(original_value, param, original_value)
+        async with orchestrator.session(DestinationType.TARGET) as session:
+            try:
+                async with session.get(baseline_url, timeout=5) as resp:
+                    baseline_status = resp.status
+                    baseline_body = await resp.text()
+                    baseline_length = len(baseline_body)
+            except Exception as e:
+                logger.warning(f"[{self.name}] Failed to fetch baseline: {e}")
+                return None
+
+        # Test each candidate ID
+        for test_id in candidate_ids:
+            test_url = self._inject(str(test_id), param, original_value)
+
+            try:
+                async with orchestrator.session(DestinationType.TARGET) as session:
+                    async with session.get(test_url, timeout=5) as resp:
+                        test_status = resp.status
+                        test_body = await resp.text()
+                        test_length = len(test_body)
+
+                # Semantic analysis (simplified from Go fuzzer)
+                is_idor, severity, indicators = self._analyze_differential(
+                    baseline_status, baseline_body, baseline_length,
+                    test_status, test_body, test_length,
+                    test_id
+                )
+
+                if is_idor:
+                    logger.info(f"[{self.name}] 🚨 LLM-predicted IDOR HIT: ID {test_id} ({severity})")
+                    dashboard.log(f"[{self.name}] 🎯 LLM Prediction Success! ID {test_id}", "SUCCESS")
+
+                    return self._create_idor_finding({
+                        "id": test_id,
+                        "status_code": test_status,
+                        "severity": severity,
+                        "diff_type": indicators,
+                        "contains_sensitive": "user_data" in indicators.lower()
+                    }, param, original_value)
+
+            except Exception as e:
+                logger.debug(f"[{self.name}] Error testing ID {test_id}: {e}")
+                continue
+
+        logger.info(f"[{self.name}] No IDOR found in {len(candidate_ids)} LLM-predicted IDs")
+        return None
+
+    def _analyze_differential(
+        self,
+        baseline_status: int,
+        baseline_body: str,
+        baseline_length: int,
+        test_status: int,
+        test_body: str,
+        test_length: int,
+        test_id: str
+    ) -> tuple[bool, str, str]:
+        """
+        Simplified semantic analysis (Python port of Go fuzzer logic).
+
+        Returns:
+            (is_idor: bool, severity: str, indicators: str)
+        """
+        import re
+
+        indicators = []
+
+        # 1. Permission bypass (CRITICAL)
+        if baseline_status in [401, 403] and test_status == 200:
+            return True, "CRITICAL", "permission_bypass"
+
+        # 2. Status code change to success
+        if baseline_status >= 400 and test_status == 200:
+            indicators.append("status_change")
+
+        # 3. Significant length difference (>30%)
+        if baseline_length > 0:
+            diff_ratio = abs(test_length - baseline_length) / baseline_length
+            if diff_ratio > 0.3:
+                indicators.append("length_change")
+
+        # 4. User-specific data patterns (simplified)
+        user_patterns = [
+            r'"user_id":\s*"?(\d+)"?',
+            r'"email":\s*"([^"]+@[^"]+)"',
+            r'"username":\s*"([^"]+)"',
+            r'/users/(\d+)',
+        ]
+
+        baseline_users = set()
+        test_users = set()
+
+        for pattern in user_patterns:
+            baseline_users.update(re.findall(pattern, baseline_body))
+            test_users.update(re.findall(pattern, test_body))
+
+        if test_users and test_users != baseline_users:
+            indicators.append("user_data_leakage")
+            return True, "CRITICAL", ",".join(indicators)
+
+        # 5. Sensitive data markers
+        sensitive_markers = ['password', 'token', 'secret', 'api_key', 'ssn', 'credit_card']
+        test_has_sensitive = any(marker in test_body.lower() for marker in sensitive_markers)
+        baseline_has_sensitive = any(marker in baseline_body.lower() for marker in sensitive_markers)
+
+        if test_has_sensitive and not baseline_has_sensitive:
+            indicators.append("sensitive_data_exposure")
+
+        # Decision logic
+        if len(indicators) >= 2:
+            return True, "HIGH", ",".join(indicators)
+        elif len(indicators) == 1:
+            return True, "MEDIUM", indicators[0]
+
+        return False, "LOW", ""
+
     async def _test_idor_param(self, item: dict):
         """Test a single parameter for IDOR vulnerability."""
         param = item.get("parameter")
@@ -186,32 +424,52 @@ class IDORAgent(BaseAgent, TechContextMixin):
             logger.info(f"[{self.name}] Skipping {param} - already tested")
             return None
 
-        # Smart ID detection (if enabled)
-        id_range = settings.IDOR_ID_RANGE
-        custom_ids = []
+        # ===== PHASE 1: LLM-Powered Prediction (if enabled) =====
+        if settings.IDOR_ENABLE_LLM_PREDICTION and original_value:
+            dashboard.log(f"[{self.name}] 🧠 Using LLM to predict likely IDOR targets...", "INFO")
 
+            # Get LLM predictions
+            llm_predicted_ids = await self._llm_predict_ids(original_value, self.url, param)
+
+            if llm_predicted_ids:
+                logger.info(f"[{self.name}] Testing {len(llm_predicted_ids)} LLM-predicted IDs FIRST")
+
+                # Test LLM predictions with Python analyzer
+                llm_finding = await self._test_custom_ids_python(llm_predicted_ids, param, original_value)
+
+                if llm_finding:
+                    self._tested_params.add(key)
+                    dashboard.log(f"[{self.name}] ✅ LLM prediction successful - IDOR found!", "SUCCESS")
+                    return llm_finding
+
+                logger.info(f"[{self.name}] LLM predictions didn't yield IDOR, falling back to fuzzing")
+
+        # ===== PHASE 2: Smart ID Detection (format-based) =====
+        custom_ids = []
         if settings.IDOR_SMART_ID_DETECTION and original_value:
             id_format, detected_ids = self._detect_id_format(original_value)
             if detected_ids:
                 logger.info(f"[{self.name}] Detected ID format: {id_format}, testing {len(detected_ids)} similar IDs")
                 custom_ids = detected_ids
 
-        # Custom IDs from config (highest priority)
+        # ===== PHASE 3: Custom IDs from config (highest priority for manual testing) =====
         if settings.IDOR_CUSTOM_IDS:
             config_ids = [id.strip() for id in settings.IDOR_CUSTOM_IDS.split(",") if id.strip()]
             if config_ids:
                 logger.info(f"[{self.name}] Using {len(config_ids)} custom IDs from config")
                 custom_ids = config_ids
 
-        # Use custom IDs if available, otherwise numeric range
+        # Test custom IDs if available
         if custom_ids:
-            # Test custom IDs one by one (Go fuzzer doesn't support custom ID lists yet)
-            # TODO: Extend Go fuzzer to accept custom ID list
-            dashboard.log(f"[{self.name}] 🚀 Testing {len(custom_ids)} custom IDs on '{param}'...", "INFO")
-            # For now, fall back to numeric range
-            logger.warning(f"[{self.name}] Custom ID testing not yet supported in Go fuzzer, using numeric range")
+            logger.info(f"[{self.name}] Testing {len(custom_ids)} custom/detected IDs with Python analyzer")
+            custom_finding = await self._test_custom_ids_python(custom_ids, param, original_value)
 
-        # High-Performance Go IDOR Fuzzer
+            if custom_finding:
+                self._tested_params.add(key)
+                return custom_finding
+
+        # ===== PHASE 4: High-Performance Go IDOR Fuzzer (numeric range fallback) =====
+        id_range = settings.IDOR_ID_RANGE
         dashboard.log(f"[{self.name}] 🚀 Launching Go IDOR Fuzzer on '{param}' (Range {id_range})...", "INFO")
         go_result = await external_tools.run_go_idor_fuzzer(self.url, param, id_range=id_range, baseline_id=original_value)
 

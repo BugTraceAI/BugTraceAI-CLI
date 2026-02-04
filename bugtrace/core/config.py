@@ -853,6 +853,9 @@ class Settings(BaseSettings):
     IDOR_QUEUE_MAX_WAIT: float = 300.0  # Max seconds to wait for queue items
     IDOR_ENABLE_COOKIE_TAMPERING: bool = False  # Enable horizontal privilege escalation tests
     IDOR_SMART_ID_DETECTION: bool = True  # Auto-detect ID format and generate similar IDs
+    IDOR_ENABLE_LLM_PREDICTION: bool = True  # Use LLM to predict likely IDOR target IDs
+    IDOR_LLM_PREDICTION_COUNT: int = 20  # Number of IDs to generate via LLM
+    IDOR_PREDICTION_PRIORITY: str = "llm_first"  # "llm_first" | "fuzzing_first" | "parallel"
 
 
 # Singleton Instance
