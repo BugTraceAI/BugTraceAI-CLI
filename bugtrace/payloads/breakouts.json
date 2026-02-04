@@ -12,6 +12,10 @@
     {"prefix": "</script><", "description": "Close script tag", "category": "xss", "priority": 1, "success_count": 0, "enabled": true},
     {"prefix": "';", "description": "Single quote + semicolon", "category": "xss,sqli", "priority": 1, "success_count": 0, "enabled": true},
     {"prefix": "\";", "description": "Double quote + semicolon", "category": "xss,sqli", "priority": 1, "success_count": 0, "enabled": true},
+    {"prefix": "\\'", "description": "Backslash-escaped single quote (JS string breakout)", "category": "xss", "priority": 1, "success_count": 1, "enabled": true},
+    {"prefix": "\\\"", "description": "Backslash-escaped double quote (JS string breakout)", "category": "xss", "priority": 1, "success_count": 0, "enabled": true},
+    {"prefix": "\\';", "description": "Backslash single quote + semicolon (ginandjuice killer)", "category": "xss", "priority": 1, "success_count": 1, "enabled": true},
+    {"prefix": "\\\";", "description": "Backslash double quote + semicolon", "category": "xss", "priority": 1, "success_count": 0, "enabled": true},
 
     {"prefix": ">", "description": "Close tag", "category": "xss", "priority": 2, "success_count": 0, "enabled": true},
     {"prefix": "<", "description": "Start tag", "category": "xss", "priority": 2, "success_count": 0, "enabled": true},
