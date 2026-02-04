@@ -61,12 +61,17 @@ class IDORAgent(BaseAgent, TechContextMixin):
         
     def _determine_validation_status(self, evidence_type: str, confidence: str) -> str:
         """
+        IDOR validation is purely HTTP-based (semantic differential analysis).
+        No CDP/browser validation needed - specialist agent has full authority.
+
         TIER 1 (VALIDATED_CONFIRMED):
-            - HIGH confidence differential with sensitive data markers
+            - HIGH confidence differential analysis (CRITICAL or HIGH severity)
+            - Robust semantic indicators: permission_bypass, user_data_leakage,
+              or 2+ differential indicators (status_change + length_change + sensitive_data)
 
         TIER 2 (PENDING_VALIDATION):
-            - MEDIUM/LOW confidence differential analysis
-            - Needs human/CDP verification
+            - MEDIUM confidence (single weak indicator like length_change only)
+            - Requires human review to rule out dynamic content
 
         Note: Cookie tampering (horizontal privilege escalation) can be enabled
         via settings.IDOR_ENABLE_COOKIE_TAMPERING for future implementation.
@@ -75,10 +80,14 @@ class IDORAgent(BaseAgent, TechContextMixin):
             return "VALIDATED_CONFIRMED"
 
         return "PENDING_VALIDATION"
-        
+
     def _create_idor_finding(self, hit: Dict, param: str, original_value: str) -> Dict:
         """Create IDOR finding from fuzzer hit."""
-        confidence_level = "HIGH" if hit["severity"] == "CRITICAL" else "MEDIUM"
+        # Auto-confirm CRITICAL and HIGH severity (robust semantic analysis)
+        # CRITICAL: permission_bypass, user_data_leakage
+        # HIGH: 2+ differential indicators (status_change + length_change + sensitive_data)
+        # MEDIUM: single weak indicator → needs human review
+        confidence_level = "HIGH" if hit["severity"] in ["CRITICAL", "HIGH"] else "MEDIUM"
         return {
             "type": "IDOR",
             "url": self.url,
