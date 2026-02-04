@@ -58,7 +58,59 @@ class IDORAgent(BaseAgent, TechContextMixin):
         # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._idor_prime_directive: str = ""
-        
+
+    # =========================================================================
+    # FINDING VALIDATION: IDOR-specific validation (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> Tuple[bool, str]:
+        """
+        IDOR-specific validation before emitting finding.
+
+        Validates:
+        1. Basic requirements (type, url) via parent
+        2. Has differential evidence (status change, content change)
+        3. Involves ID parameter manipulation
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # Extract from nested structure if needed
+        nested = finding.get("finding", {})
+        evidence = finding.get("evidence", nested.get("evidence", {}))
+        status = finding.get("status", nested.get("status", ""))
+
+        # IDOR-specific: Must have differential evidence or confirmed status
+        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+            has_differential = evidence.get("differential_analysis") if isinstance(evidence, dict) else False
+            has_status_change = evidence.get("status_change") if isinstance(evidence, dict) else False
+            has_data_leak = evidence.get("user_data_leakage") if isinstance(evidence, dict) else False
+            if not (has_differential or has_status_change or has_data_leak):
+                return False, "IDOR requires proof: differential analysis, status change, or data leakage"
+
+        # IDOR-specific: Should have tested_value or modified ID
+        tested_value = finding.get("tested_value", nested.get("tested_value", ""))
+        payload = finding.get("payload", nested.get("payload", ""))
+        if not tested_value and not payload:
+            return False, "IDOR requires tested_value or payload showing ID manipulation"
+
+        return True, ""
+
+    def _emit_idor_finding(self, finding_dict: Dict, scan_context: str = None) -> Optional[Dict]:
+        """
+        Helper to emit IDOR finding using BaseAgent.emit_finding() with validation.
+        """
+        if "type" not in finding_dict:
+            finding_dict["type"] = "IDOR"
+
+        if scan_context:
+            finding_dict["scan_context"] = scan_context
+
+        finding_dict["agent"] = self.name
+        return self.emit_finding(finding_dict)
+
     def _determine_validation_status(self, evidence_type: str, confidence: str) -> str:
         """
         IDOR validation is purely HTTP-based (semantic differential analysis).
@@ -541,6 +593,97 @@ Return ONLY a JSON object:
             logger.error(f"[{self.name}] LLM validation failed: {e}")
             return (True, "MEDIUM")  # Fallback: conservatively keep as MEDIUM
 
+    # =========================================================================
+    # DEEP EXPLOITATION: Optional Phase 4b - Advanced IDOR Analysis
+    # =========================================================================
+
+    async def _exploit_deep(self, finding: Dict) -> Dict:
+        """
+        Deep exploitation analysis (6 phases).
+
+        Enhances basic IDOR finding with comprehensive exploitation evidence.
+        Called from exploit_dry_list() for CRITICAL/HIGH severity findings.
+
+        Args:
+            finding: Basic IDOR finding from _create_idor_finding()
+
+        Returns:
+            Enhanced finding with exploitation data in finding["exploitation"]
+        """
+        logger.info(f"[{self.name}] ===== Phase 4b: Deep Exploitation Analysis =====")
+
+        # Extract context
+        url = finding["url"]
+        param = finding["parameter"]
+        payload = finding["payload"]
+        original_value = finding.get("original_value")
+
+        exploitation_log = []
+
+        # Phase 1: Re-test
+        logger.info(f"[{self.name}] Phase 1/6: Re-testing...")
+        phase1 = await self._phase1_retest(url, param, payload, original_value)
+        exploitation_log.append({"phase": "retest", **phase1})
+
+        if not phase1.get("confirmed"):
+            logger.warning(f"[{self.name}] ⚠️ Re-test failed")
+            finding["exploitation_failed"] = "retest_failed"
+            return finding
+
+        # Phase 2: HTTP Methods
+        logger.info(f"[{self.name}] Phase 2/6: Testing HTTP methods...")
+        phase2 = await self._phase2_http_methods(url, param, payload)
+        exploitation_log.append({"phase": "http_methods", **phase2})
+
+        # Phase 3: Impact Analysis
+        logger.info(f"[{self.name}] Phase 3/6: Analyzing impact...")
+        phase3 = self._phase3_impact_analysis(phase1, phase2)
+        exploitation_log.append({"phase": "impact", **phase3})
+
+        # Phase 4-5: Escalation (only if mode=full)
+        phase4 = None
+        phase5 = None
+        if settings.IDOR_EXPLOITER_MODE == "full":
+            logger.info(f"[{self.name}] Phase 4/6: Horizontal escalation...")
+            phase4 = await self._phase4_horizontal_escalation(url, param, payload, original_value)
+            exploitation_log.append({"phase": "horizontal", **phase4})
+
+            logger.info(f"[{self.name}] Phase 5/6: Vertical escalation...")
+            phase5 = await self._phase5_vertical_escalation(url, param)
+            exploitation_log.append({"phase": "vertical", **phase5})
+
+        # Phase 6: LLM Report
+        logger.info(f"[{self.name}] Phase 6/6: Generating LLM report...")
+        phase6_report = await self._phase6_llm_report(finding, {
+            "retest": phase1,
+            "http_methods": phase2,
+            "impact": phase3,
+            "horizontal": phase4,
+            "vertical": phase5,
+        })
+
+        # Enhance finding
+        finding["exploitation"] = {
+            "retest": phase1,
+            "http_methods": phase2,
+            "impact": phase3,
+            "horizontal": phase4,
+            "vertical": phase5,
+            "llm_report": phase6_report,
+            "timeline": exploitation_log,
+        }
+
+        # Severity upgrade if delete capability
+        if phase3.get("delete_capability"):
+            original_severity = finding["severity"]
+            finding["severity"] = "CRITICAL"
+            logger.warning(f"[{self.name}] ⬆️ Severity: {original_severity} → CRITICAL")
+
+        finding["deep_exploitation_completed"] = True
+        logger.info(f"[{self.name}] ✅ Deep exploitation complete")
+
+        return finding
+
     async def _test_idor_param(self, item: dict):
         """Test a single parameter for IDOR vulnerability."""
         param = item.get("parameter")
@@ -821,22 +964,20 @@ Focus on endpoint+resource deduplication. Same resource type = DUPLICATE."""
                     if fingerprint not in self._emitted_findings:
                         self._emitted_findings.add(fingerprint)
 
-                        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+                        if settings.WORKER_POOL_EMIT_EVENTS:
                             status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
-
-                            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                            self._emit_idor_finding({
                                 "specialist": "idor",
-                                "finding": {
-                                    "type": "IDOR",
-                                    "url": result.get("url"),
-                                    "parameter": result.get("parameter"),
-                                    "payload": result.get("payload"),
-                                    "severity": result.get("severity"),
-                                },
+                                "type": "IDOR",
+                                "url": result.get("url"),
+                                "parameter": result.get("parameter"),
+                                "payload": result.get("payload"),
+                                "tested_value": result.get("tested_value", result.get("payload")),
+                                "severity": result.get("severity"),
                                 "status": status,
+                                "evidence": result.get("evidence", {"differential_analysis": True}),
                                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
-                                "scan_context": self._scan_context,
-                            })
+                            }, scan_context=self._scan_context)
 
                         logger.info(f"[{self.name}] ✅ Emitted unique IDOR finding: {url}?{parameter}")
                     else:
@@ -1027,20 +1168,19 @@ Focus on endpoint+resource deduplication. Same resource type = DUPLICATE."""
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        # Emit vulnerability_detected event
-        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+        # Emit vulnerability_detected event with validation
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            self._emit_idor_finding({
                 "specialist": "idor",
-                "finding": {
-                    "type": "IDOR",
-                    "url": result.get("url"),
-                    "parameter": result.get("parameter"),
-                    "payload": result.get("payload"),
-                },
+                "type": "IDOR",
+                "url": result.get("url"),
+                "parameter": result.get("parameter"),
+                "payload": result.get("payload"),
+                "tested_value": result.get("tested_value", result.get("payload")),
                 "status": status,
+                "evidence": result.get("evidence", {"differential_analysis": True}),
                 "validation_requires_cdp": needs_cdp,
-                "scan_context": self._scan_context,
-            })
+            }, scan_context=self._scan_context)
 
         logger.info(f"[{self.name}] Confirmed IDOR: {result.get('url')}?{result.get('parameter')}")
 
