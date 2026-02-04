@@ -856,6 +856,135 @@ Return ONLY a JSON object:
             "impact_description": impact_description,
         }
 
+    async def _phase4_horizontal_escalation(
+        self, url: str, param: str, payload: str, original_value: str
+    ) -> Dict:
+        """Phase 4: Enumerate other accessible IDs."""
+        from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+        import asyncio
+
+        max_enum = settings.IDOR_EXPLOITER_MAX_HORIZONTAL_ENUM
+
+        # Detect ID format (reuse existing method)
+        id_format, _ = self._detect_id_format(payload)
+
+        # Generate test IDs
+        test_ids = self._generate_horizontal_test_ids(payload, id_format, max_enum)
+
+        # Test IDs concurrently
+        accessible_ids = []
+        special_accounts = []
+
+        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent
+
+        async def test_id(test_id: str):
+            async with semaphore:
+                try:
+                    test_url = self._inject(test_id, param, original_value)
+                    async with orchestrator.session(DestinationType.TARGET) as session:
+                        async with session.get(test_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
+                            if resp.status == 200:
+                                body = await resp.text()
+                                is_special = self._is_special_account(body)
+                                return (test_id, True, is_special)
+                    return (test_id, False, False)
+                except:
+                    return (test_id, False, False)
+
+        tasks = [test_id(tid) for tid in test_ids]
+        results = await asyncio.gather(*tasks)
+
+        for test_id, accessible, is_special in results:
+            if accessible:
+                accessible_ids.append(test_id)
+                if is_special:
+                    special_accounts.append(test_id)
+
+        total_accessible = len(accessible_ids)
+        severity_multiplier = 1.0 + min(total_accessible / 100, 1.0)
+
+        logger.info(f"[{self.name}] Found {total_accessible} accessible IDs")
+
+        return {
+            "enumerated_ids": accessible_ids[:20],  # First 20
+            "total_accessible": total_accessible,
+            "id_pattern": id_format,
+            "special_accounts": special_accounts,
+            "severity_multiplier": severity_multiplier,
+        }
+
+    def _generate_horizontal_test_ids(self, base_id: str, id_format: str, max_count: int) -> list:
+        """Generate test IDs for enumeration."""
+        test_ids = []
+
+        if id_format == "numeric":
+            base_int = int(base_id)
+            for offset in range(-10, max_count):
+                if offset != 0:
+                    test_ids.append(str(base_int + offset))
+        elif id_format == "uuid":
+            import uuid
+            test_ids = [str(uuid.uuid4()) for _ in range(min(max_count, 20))]
+        else:
+            test_ids = ["1", "2", "100", "admin", "root", "test"]
+
+        return test_ids[:max_count]
+
+    def _is_special_account(self, response_body: str) -> bool:
+        """Check if response indicates special/privileged account."""
+        special_markers = ["admin", "administrator", "root", "system", "superuser"]
+        return any(marker in response_body.lower() for marker in special_markers)
+
+    async def _phase5_vertical_escalation(self, url: str, param: str) -> Dict:
+        """Phase 5: Check for admin/privileged access."""
+        from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+
+        admin_candidates = ["0", "1", "-1", "admin", "root", "administrator", "superuser", "system"]
+
+        admin_ids = []
+        privilege_indicators = []
+
+        for admin_id in admin_candidates:
+            try:
+                test_url = self._inject(admin_id, param, admin_id)
+                async with orchestrator.session(DestinationType.TARGET) as session:
+                    async with session.get(test_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
+                        if resp.status == 200:
+                            body = await resp.text()
+                            indicators = self._detect_privilege_indicators(body)
+
+                            if indicators:
+                                admin_ids.append(admin_id)
+                                privilege_indicators.extend(indicators)
+                                logger.warning(f"[{self.name}] 🚨 Admin access via ID: {admin_id}")
+
+            except:
+                continue
+
+        return {
+            "admin_accessible": len(admin_ids) > 0,
+            "admin_ids": admin_ids,
+            "privilege_indicators": list(set(privilege_indicators)),
+            "vertical_confirmed": len(privilege_indicators) > 0,
+        }
+
+    def _detect_privilege_indicators(self, response_body: str) -> list:
+        """Detect privilege indicators in response."""
+        indicators = []
+        body_lower = response_body.lower()
+
+        privilege_keywords = {
+            "admin_panel": ["admin panel", "dashboard", "control panel"],
+            "user_management": ["delete user", "edit user", "manage users"],
+            "system_config": ["system settings", "configuration", "server config"],
+        }
+
+        for indicator_type, keywords in privilege_keywords.items():
+            if any(kw in body_lower for kw in keywords):
+                indicators.append(indicator_type)
+
+        return indicators
+
     async def _test_idor_param(self, item: dict):
         """Test a single parameter for IDOR vulnerability."""
         param = item.get("parameter")
