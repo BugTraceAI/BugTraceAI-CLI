@@ -985,6 +985,136 @@ Return ONLY a JSON object:
 
         return indicators
 
+    async def _phase6_llm_report(self, finding: Dict, phases: Dict) -> str:
+        """Phase 6: Generate professional exploitation report using LLM."""
+        from bugtrace.core.llm_client import llm_client
+        from datetime import datetime
+        import json
+
+        report_context = {
+            "url": finding["url"],
+            "parameter": finding["parameter"],
+            "payload": finding["payload"],
+            "original_value": finding.get("original_value"),
+            "severity": finding["severity"],
+            "retest": phases.get("retest", {}),
+            "http_methods": phases.get("http_methods", {}),
+            "impact": phases.get("impact", {}),
+            "horizontal": phases.get("horizontal"),
+            "vertical": phases.get("vertical"),
+        }
+
+        prompt = f"""You are a professional security researcher writing an IDOR exploitation report.
+
+**Exploitation Context:**
+```json
+{json.dumps(report_context, indent=2)}
+```
+
+**Task:** Generate a comprehensive IDOR exploitation report in Markdown format.
+
+**Report Structure:**
+
+# IDOR Exploitation Report
+
+## Executive Summary
+[1-2 paragraphs explaining business impact]
+
+## Vulnerability Details
+- **Type:** Insecure Direct Object Reference (IDOR)
+- **Severity:** {finding["severity"]}
+- **CWE:** CWE-639
+- **CVSS Score:** [Estimate based on impact]
+
+## Technical Analysis
+
+### 1. Re-test Confirmation
+[Explain re-test results]
+
+### 2. HTTP Methods Analysis
+[Which methods are vulnerable?]
+
+### 3. Impact Assessment
+- **Read Access:** [Yes/No + details]
+- **Write Access:** [Yes/No + details]
+- **Delete Access:** [Yes/No + details]
+- **Impact Score:** [0-10]
+
+### 4. Horizontal Escalation
+[How many users can be accessed?]
+
+### 5. Vertical Escalation
+[Can admin accounts be accessed?]
+
+## Proof of Concept
+
+```bash
+# Baseline (authorized)
+curl '{finding["url"]}' -H 'Cookie: session=...'
+
+# IDOR exploit (unauthorized)
+curl '{finding["url"].replace(finding.get("original_value", ""), finding["payload"])}' -H 'Cookie: session=...'
+```
+
+## Business Impact
+[Real-world consequences]
+
+## Remediation
+
+### Immediate Actions
+1. [First step]
+2. [Second step]
+
+### Long-term Fixes
+1. Implement proper authorization checks
+2. Use indirect references (tokens instead of sequential IDs)
+3. Add access control logging
+
+## References
+- OWASP: https://owasp.org/www-community/attacks/Insecure_Direct_Object_References
+- CWE-639: https://cwe.mitre.org/data/definitions/639.html
+
+---
+**Report Generated:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+**Tool:** BugTraceAI IDORAgent Deep Exploitation
+"""
+
+        try:
+            report = await llm_client.generate(
+                prompt=prompt,
+                module_name="IDOR_EXPLOITATION_REPORT",
+                temperature=0.3,
+                max_tokens=2000
+            )
+
+            if not report:
+                logger.warning(f"[{self.name}] LLM returned empty report")
+                return self._generate_fallback_report(finding, phases)
+
+            return report
+
+        except Exception as e:
+            logger.error(f"[{self.name}] LLM report generation failed: {e}")
+            return self._generate_fallback_report(finding, phases)
+
+    def _generate_fallback_report(self, finding: Dict, phases: Dict) -> str:
+        """Generate basic report if LLM fails."""
+        from datetime import datetime
+
+        return f"""# IDOR Exploitation Report (Automated)
+
+## Vulnerability Details
+- **URL:** {finding['url']}
+- **Parameter:** {finding['parameter']}
+- **Exploit ID:** {finding['payload']}
+- **Severity:** {finding['severity']}
+
+## Impact Summary
+{phases.get('impact', {}).get('impact_description', 'Unknown impact')}
+
+**Report Generated:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+"""
+
     async def _test_idor_param(self, item: dict):
         """Test a single parameter for IDOR vulnerability."""
         param = item.get("parameter")
