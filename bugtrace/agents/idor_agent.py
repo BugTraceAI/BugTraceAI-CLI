@@ -71,7 +71,8 @@ class IDORAgent(BaseAgent, TechContextMixin):
 
         TIER 2 (PENDING_VALIDATION):
             - MEDIUM confidence (single weak indicator like length_change only)
-            - Requires human review to rule out dynamic content
+            - If IDOR_ENABLE_LLM_VALIDATION=True: LLM validates before reaching here
+            - If LLM disabled or fails: Requires human review to rule out dynamic content
 
         Note: Cookie tampering (horizontal privilege escalation) can be enabled
         via settings.IDOR_ENABLE_COOKIE_TAMPERING for future implementation.
@@ -329,6 +330,25 @@ Return ONLY a JSON object with an "ids" array:
                 )
 
                 if is_idor:
+                    # LLM validation for MEDIUM severity (if enabled)
+                    if severity == "MEDIUM" and settings.IDOR_ENABLE_LLM_VALIDATION:
+                        logger.info(f"[{self.name}] 🧠 MEDIUM severity detected, using LLM for validation...")
+                        is_valid_idor, validated_severity = await self._llm_validate_medium_severity(
+                            baseline_body, test_body,
+                            baseline_status, test_status,
+                            baseline_length, test_length,
+                            indicators, test_id
+                        )
+
+                        if not is_valid_idor:
+                            logger.info(f"[{self.name}] ❌ LLM marked as FALSE POSITIVE: {indicators}")
+                            continue  # Skip this ID, not a real IDOR
+
+                        # Upgrade severity if LLM upgraded it
+                        if validated_severity != severity:
+                            logger.info(f"[{self.name}] ⬆️ LLM upgraded severity: {severity} → {validated_severity}")
+                            severity = validated_severity
+
                     logger.info(f"[{self.name}] 🚨 LLM-predicted IDOR HIT: ID {test_id} ({severity})")
                     dashboard.log(f"[{self.name}] 🎯 LLM Prediction Success! ID {test_id}", "SUCCESS")
 
@@ -415,6 +435,111 @@ Return ONLY a JSON object with an "ids" array:
             return True, "MEDIUM", indicators[0]
 
         return False, "LOW", ""
+
+    async def _llm_validate_medium_severity(
+        self,
+        baseline_body: str,
+        test_body: str,
+        baseline_status: int,
+        test_status: int,
+        baseline_length: int,
+        test_length: int,
+        indicators: str,
+        test_id: str
+    ) -> tuple[bool, str]:
+        """
+        Use LLM to analyze MEDIUM severity findings and determine if they're real IDORs.
+
+        MEDIUM severity = single weak indicator (e.g., length_change only).
+        Could be: 1) Real IDOR, or 2) Dynamic content (Product A vs Product B in catalog).
+
+        Returns:
+            (is_valid_idor: bool, upgraded_severity: str)
+        """
+        from bugtrace.core.llm_client import llm_client
+        import json
+        import re
+
+        # Extract key patterns from responses (first 2K chars to avoid token limits)
+        baseline_snippet = baseline_body[:2000]
+        test_snippet = test_body[:2000]
+
+        baseline_keys = re.findall(r'"(\w+)":', baseline_snippet)
+        test_keys = re.findall(r'"(\w+)":', test_snippet)
+
+        # Calculate key similarity
+        baseline_key_set = set(baseline_keys)
+        test_key_set = set(test_keys)
+        common_keys = baseline_key_set & test_key_set
+        key_similarity = len(common_keys) / max(len(baseline_key_set), len(test_key_set), 1)
+
+        prompt = f"""You are analyzing a potential IDOR vulnerability with MEDIUM confidence.
+
+**Context:**
+- Test ID: {test_id}
+- Indicators: {indicators}
+- Baseline Status: {baseline_status}, Test Status: {test_status}
+- Baseline Length: {baseline_length}, Test Length: {test_length}
+- Key Similarity: {key_similarity:.2%}
+
+**Response Structure Analysis:**
+- Baseline keys (first 20): {baseline_keys[:20]}
+- Test keys (first 20): {test_keys[:20]}
+
+**Task:** Determine if this is a REAL IDOR or just dynamic content.
+
+**Real IDOR indicators:**
+1. Different user identifiers (email, username, user_id changed)
+2. Access to different resource TYPE (e.g., admin panel vs user profile)
+3. New sensitive fields appeared (password, token, api_key, ssn)
+4. Structural change suggests privilege escalation
+5. Different permission levels visible
+
+**False Positive indicators:**
+1. Same structure, different content (e.g., Product A vs Product B)
+2. Keys/fields are >90% identical (key_similarity > 0.9)
+3. Typical catalog/list pagination (items differ, structure same)
+4. Timestamp or session-specific data only
+5. Dynamic content like recommendations, ads, featured items
+
+**Decision Rules:**
+- If key_similarity >90% AND no user identifier changes → FALSE POSITIVE
+- If new sensitive fields OR user identifier changes → REAL IDOR (upgrade to HIGH)
+- If access to different resource type → REAL IDOR (upgrade to HIGH)
+- If only length/content differs but structure identical → FALSE POSITIVE
+
+Return ONLY a JSON object:
+{{"is_idor": true/false, "severity": "HIGH"|"MEDIUM"|"LOW", "reasoning": "brief 1-sentence explanation"}}"""
+
+        try:
+            response = await llm_client.generate(
+                prompt=prompt,
+                module_name="IDOR_MEDIUM_VALIDATION",
+                temperature=0.2,  # Low temp for consistent, logical decisions
+                max_tokens=300
+            )
+
+            if not response:
+                logger.warning(f"[{self.name}] LLM validation returned empty response")
+                return (True, "MEDIUM")  # Fallback: keep as MEDIUM
+
+            result = json.loads(response)
+            is_idor = result.get("is_idor", False)
+            severity = result.get("severity", "MEDIUM")
+            reasoning = result.get("reasoning", "No reasoning provided")
+
+            logger.info(f"[{self.name}] LLM MEDIUM validation for ID {test_id}: is_idor={is_idor}, severity={severity}")
+            logger.debug(f"[{self.name}] LLM reasoning: {reasoning}")
+
+            return (is_idor, severity)
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[{self.name}] LLM returned invalid JSON: {e}")
+            logger.debug(f"Raw response: {response[:200]}")
+            return (True, "MEDIUM")  # Fallback: conservatively keep as MEDIUM
+        except Exception as e:
+            logger.error(f"[{self.name}] LLM validation failed: {e}")
+            return (True, "MEDIUM")  # Fallback: conservatively keep as MEDIUM
 
     async def _test_idor_param(self, item: dict):
         """Test a single parameter for IDOR vulnerability."""

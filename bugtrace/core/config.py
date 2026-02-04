@@ -856,6 +856,7 @@ class Settings(BaseSettings):
     IDOR_ENABLE_LLM_PREDICTION: bool = True  # Use LLM to predict likely IDOR target IDs
     IDOR_LLM_PREDICTION_COUNT: int = 20  # Number of IDs to generate via LLM
     IDOR_PREDICTION_PRIORITY: str = "llm_first"  # "llm_first" | "fuzzing_first" | "parallel"
+    IDOR_ENABLE_LLM_VALIDATION: bool = True  # Use LLM to validate MEDIUM severity findings
 
 
 # Singleton Instance
