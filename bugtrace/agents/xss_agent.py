@@ -2666,7 +2666,8 @@ Return ONLY the payloads, one per line, no explanations."""
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] 🚀 Starting LLM-driven XSS analysis on {self.url}", "INFO")
 
-        screenshots_dir = self.report_dir / "screenshots"
+        # Use captures/ directly - no need for intermediate screenshots/ folder
+        screenshots_dir = self.report_dir / "captures"
         screenshots_dir.mkdir(parents=True, exist_ok=True)
 
         try:
