@@ -110,7 +110,7 @@ class BugTraceApp(App):
     def _auto_start_scan(self) -> None:
         """Auto-start scan after screens are mounted."""
         if self.target and not self.scan_worker:
-            self.run_scan(self.target)
+            self.scan_worker = self.run_scan(self.target)
 
     async def on_shutdown_request(self) -> None:
         """Handle shutdown request gracefully.
@@ -183,14 +183,22 @@ class BugTraceApp(App):
             self.notify("Scan already in progress.", severity="warning")
             return
 
-        self.run_scan(self.target)
+        self.scan_worker = self.run_scan(self.target)
 
     def action_quit(self) -> None:
-        """Quit the application cleanly."""
+        """Quit the application cleanly.
+
+        If a scan is running, cancels it before exiting.
+        Note: Confirmation dialog will be added in Phase 3.
+        """
         # Cancel any running scan
         if self.scan_worker and self.scan_worker.state == WorkerState.RUNNING:
+            self.notify("Cancelling scan...", severity="warning")
             self.scan_worker.cancel()
-        self.exit()
+            # Small delay to allow cancellation to propagate
+            self.set_timer(0.5, self.exit)
+        else:
+            self.exit()
 
     def action_toggle_dark(self) -> None:
         """Toggle dark mode on/off."""
