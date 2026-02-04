@@ -1273,6 +1273,30 @@ class TeamOrchestrator:
 
             # Run GoSpider for URL discovery
             urls_to_scan = await self._run_gospider(recon_dir)
+
+            # Run AuthDiscoveryAgent for JWT/cookie discovery
+            from bugtrace.agents.auth_discovery_agent import AuthDiscoveryAgent
+            auth_discovery_dir = recon_dir / "auth_discovery"
+            auth_discovery_dir.mkdir(exist_ok=True)
+
+            auth_agent = AuthDiscoveryAgent(
+                target=self.target,
+                report_dir=auth_discovery_dir,
+                urls_to_scan=urls_to_scan
+            )
+            auth_results = await auth_agent.run()
+
+            logger.info(
+                f"[AuthDiscovery] Found {len(auth_results['jwts'])} JWTs, "
+                f"{len(auth_results['cookies'])} cookies"
+            )
+            dashboard.log(
+                f"🔑 Discovered {len(auth_results['jwts'])} JWTs and "
+                f"{len(auth_results['cookies'])} session cookies",
+                "INFO"
+            )
+
+            # Legacy token scanning (kept for backward compatibility)
             await self._scan_for_tokens(urls_to_scan)
         except Exception as e:
             logger.error(f"Reconnaissance crash: {e}", exc_info=True)
@@ -1384,9 +1408,8 @@ class TeamOrchestrator:
                 return
 
             for f in res["findings"]:
-                if not self._validate_finding_format(f):
-                    continue
-
+                # NOTE: Validation removed (2026-02-04)
+                # Specialists now self-validate via BaseAgent.emit_finding()
                 key = self._generate_finding_key(f)
                 if key in seen_keys:
                     continue
@@ -1394,13 +1417,6 @@ class TeamOrchestrator:
                 self._add_new_finding(f, key, seen_keys, all_validated_findings, dashboard)
 
         return process_result
-
-    def _validate_finding_format(self, finding: dict) -> bool:
-        """Validate finding payload format."""
-        is_valid, error_msg = conductor._validate_payload_format(finding)
-        if not is_valid:
-            logger.warning(f"[TeamOrchestrator] {error_msg}")
-        return is_valid
 
     def _generate_finding_key(self, finding: dict) -> str:
         """Generate unique key for finding deduplication."""
@@ -1439,6 +1455,10 @@ class TeamOrchestrator:
                 idor_params, current_qs, process_result
             )
 
+        # FIX (2026-02-04): Tech-based auto-dispatch for CSTI
+        # If Angular/Vue detected, always dispatch CSTIAgent even without explicit CSTI finding
+        self._auto_dispatch_csti_if_needed(specialist_dispatches, params_map, current_qs, dashboard)
+
         return {
             "specialist_dispatches": specialist_dispatches,
             "params_map": params_map,
@@ -1446,6 +1466,39 @@ class TeamOrchestrator:
             "parsed_url": parsed_url,
             "current_qs": current_qs
         }
+
+    def _auto_dispatch_csti_if_needed(self, specialist_dispatches: set, params_map: dict, current_qs: dict, dashboard):
+        """
+        Auto-dispatch CSTIAgent if Angular/Vue is detected in tech_profile.
+
+        FIX (2026-02-04): CSTIAgent wasn't running because DASTySAST LLM classified
+        Angular template injection as "XSS" instead of "CSTI". Now we auto-dispatch
+        CSTIAgent whenever Angular or Vue is detected, regardless of finding types.
+        """
+        if "CSTI_AGENT" in specialist_dispatches:
+            return  # Already dispatched
+
+        # Check tech_profile for Angular/Vue frameworks
+        frameworks = getattr(self, 'tech_profile', {}).get('frameworks', [])
+        frameworks_lower = [f.lower() for f in frameworks]
+
+        csti_frameworks = ['angular', 'angularjs', 'vue', 'vuejs', 'vue.js']
+        detected_csti_framework = None
+
+        for fw in csti_frameworks:
+            if any(fw in f for f in frameworks_lower):
+                detected_csti_framework = fw
+                break
+
+        if detected_csti_framework:
+            specialist_dispatches.add("CSTI_AGENT")
+            dashboard.log(f"🔧 Auto-dispatch: CSTI_AGENT (detected {detected_csti_framework} in tech_profile)", "INFO")
+
+            # Add all URL params to CSTI_AGENT for probing
+            if "CSTI_AGENT" not in params_map:
+                params_map["CSTI_AGENT"] = set()
+            for param in current_qs.keys():
+                params_map["CSTI_AGENT"].add(param)
 
     async def _process_vulnerability(
         self,
@@ -2070,10 +2123,14 @@ class TeamOrchestrator:
 
     async def _phase_3_strategy(self, dashboard, analysis_json_dir: Path) -> int:
         """
-        Execute Phase 3: STRATEGY - Batch processing of DAST findings.
+        Execute Phase 3: STRATEGY - Batch processing of DAST and AuthDiscovery findings.
 
-        Reads all JSON files from analysis_dir, passes to ThinkingAgent
-        for deduplication, classification, prioritization, and queue distribution.
+        Reads:
+        1. DAST findings from analysis_json_dir (numbered JSON files)
+        2. AuthDiscovery findings from recon/auth_discovery/ (JWTs, cookies)
+
+        Passes to ThinkingAgent for deduplication, classification, prioritization,
+        and queue distribution.
 
         Args:
             dashboard: UI dashboard
@@ -2091,11 +2148,10 @@ class TeamOrchestrator:
 
         if not json_files:
             logger.warning(f"No JSON files found in {analysis_json_dir}")
-            return 0
 
-        dashboard.log(f"Found {len(json_files)} JSON files to process", "INFO")
+        dashboard.log(f"Found {len(json_files)} DAST JSON files to process", "INFO")
 
-        # Load all findings from JSON files
+        # Load all findings from DAST JSON files
         all_findings = []
         for json_file in json_files:
             try:
@@ -2121,7 +2177,18 @@ class TeamOrchestrator:
                 logger.error(f"Failed to read {json_file}: {e}")
                 continue
 
-        logger.info(f"Loaded {len(all_findings)} total findings from {len(json_files)} files")
+        logger.info(f"Loaded {len(all_findings)} DAST findings from {len(json_files)} files")
+
+        # NEW: Load AuthDiscovery findings from recon/auth_discovery/
+        auth_discovery_dir = self.scan_dir / "recon" / "auth_discovery"
+        if auth_discovery_dir.exists():
+            auth_findings = await self._load_auth_discovery_findings(auth_discovery_dir)
+            if auth_findings:
+                all_findings.extend(auth_findings)
+                logger.info(f"Loaded {len(auth_findings)} AuthDiscovery findings")
+                dashboard.log(f"🔑 Loaded {len(auth_findings)} authentication artifacts", "INFO")
+
+        logger.info(f"Total {len(all_findings)} findings ready for processing")
         dashboard.log(f"Processing {len(all_findings)} findings...", "INFO")
 
         # Pass to ThinkingAgent for batch processing
@@ -2161,6 +2228,89 @@ class TeamOrchestrator:
             )
 
         return processed_count
+
+    async def _load_auth_discovery_findings(self, auth_discovery_dir: Path) -> List[Dict]:
+        """
+        Load authentication artifacts from AuthDiscoveryAgent and convert to findings.
+
+        Reads:
+        - jwts_discovered.json → JWT_DISCOVERED findings
+        - cookies_discovered.json → SESSION_COOKIE_DISCOVERED findings
+
+        Returns:
+            List of findings ready for ThinkingAgent processing
+        """
+        import json
+        findings = []
+
+        # Load JWTs
+        jwt_file = auth_discovery_dir / "jwts_discovered.json"
+        if jwt_file.exists():
+            try:
+                with open(jwt_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                jwts = data.get("jwts", [])
+                logger.info(f"[AuthDiscovery] Loading {len(jwts)} JWTs from {jwt_file.name}")
+
+                for jwt_info in jwts:
+                    finding = {
+                        "type": "JWT_DISCOVERED",
+                        "url": jwt_info.get("url", ""),
+                        "token": jwt_info.get("token", ""),
+                        "source": jwt_info.get("source", ""),
+                        "parameter": jwt_info.get("storage_key", jwt_info.get("cookie_name", "N/A")),
+                        "context": jwt_info.get("context", "unknown"),
+                        "severity": "INFO",
+                        "agent": "AuthDiscoveryAgent",
+                        "timestamp": data.get("timestamp", ""),
+                        "metadata": jwt_info.get("metadata", {}),
+                        "_source_file": str(jwt_file),
+                        "_scan_context": self.scan_context,
+                        "_report_files": {
+                            "json": str(jwt_file),
+                            "markdown": str(auth_discovery_dir / "auth_discovery.md")
+                        }
+                    }
+                    findings.append(finding)
+
+            except Exception as e:
+                logger.error(f"Failed to load {jwt_file}: {e}")
+
+        # Load session cookies
+        cookie_file = auth_discovery_dir / "cookies_discovered.json"
+        if cookie_file.exists():
+            try:
+                with open(cookie_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+
+                cookies = data.get("cookies", [])
+                logger.info(f"[AuthDiscovery] Loading {len(cookies)} cookies from {cookie_file.name}")
+
+                for cookie_info in cookies:
+                    finding = {
+                        "type": "SESSION_COOKIE_DISCOVERED",
+                        "url": cookie_info.get("url", ""),
+                        "cookie_name": cookie_info.get("name", ""),
+                        "cookie_value": cookie_info.get("value", ""),
+                        "source": "cookie_jar",
+                        "severity": "INFO",
+                        "agent": "AuthDiscoveryAgent",
+                        "timestamp": data.get("timestamp", ""),
+                        "metadata": cookie_info.get("metadata", {}),
+                        "_source_file": str(cookie_file),
+                        "_scan_context": self.scan_context,
+                        "_report_files": {
+                            "json": str(cookie_file),
+                            "markdown": str(auth_discovery_dir / "auth_discovery.md")
+                        }
+                    }
+                    findings.append(finding)
+
+            except Exception as e:
+                logger.error(f"Failed to load {cookie_file}: {e}")
+
+        return findings
 
     async def _phase_2_analysis(self, dashboard, analysis_dir):
         """Execute Phase 2: Batch DAST Analysis + Queue-based Specialist Execution.

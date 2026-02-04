@@ -149,8 +149,19 @@ class DASTySASTAgent(BaseAgent):
                     context["html_content"] = html_full
 
                 logger.info(f"[{self.name}] Fetched HTML content ({len(context['html_content'])} chars) for analysis.")
+
+                # FIX (2026-02-04): Detect frontend frameworks from HTML
+                # This ensures CSTI detection even when Nuclei misses Angular/Vue
+                self._detect_frontend_frameworks_from_html(html_full)
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to fetch HTML content: {e}")
+
+        # ADDED (2026-02-04): Detect JWTs and cookies in HTML/JavaScript
+        # If found, emit findings for ThinkingAgent to route to JWT/IDOR queues
+        try:
+            await self._detect_auth_artifacts(context.get("html_content", ""))
+        except Exception as e:
+            logger.warning(f"[{self.name}] Auth artifact detection failed: {e}")
 
         # ADDED (2026-02-01): Run active reconnaissance probes
         # FIX (2026-02-04): Now passes HTML to extract form parameters, not just URL params
@@ -301,6 +312,140 @@ class DASTySASTAgent(BaseAgent):
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to extract HTML params: {e}")
             return []
+
+    async def _detect_auth_artifacts(self, html_content: str):
+        """
+        ADDED (2026-02-04): Detect JWTs and session cookies during DAST analysis.
+
+        Scans HTML content for:
+        - JWTs (using regex pattern)
+        - Session cookies (common patterns)
+
+        Emits findings for ThinkingAgent to route to specialist queues.
+
+        Args:
+            html_content: HTML content to scan
+        """
+        import re
+        from datetime import datetime
+
+        if not html_content:
+            return
+
+        # JWT regex pattern (same as AuthDiscoveryAgent)
+        jwt_pattern = r'eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]*'
+        jwt_matches = re.findall(jwt_pattern, html_content)
+
+        # Deduplicate JWTs
+        unique_jwts = list(set(jwt_matches))
+
+        for token in unique_jwts:
+            # Decode JWT for metadata
+            try:
+                import base64
+                import json
+
+                parts = token.split('.')
+                if len(parts) >= 2:
+                    # Decode header
+                    header_json = base64.urlsafe_b64decode(parts[0] + '==').decode('utf-8')
+                    header = json.loads(header_json)
+
+                    # Decode payload (preview only - don't expose sensitive data)
+                    payload_json = base64.urlsafe_b64decode(parts[1] + '==').decode('utf-8')
+                    payload = json.loads(payload_json)
+
+                    # Emit JWT finding
+                    finding = {
+                        "type": "JWT_DISCOVERED",
+                        "url": self.url,
+                        "token": token,
+                        "source": "html_content",
+                        "parameter": "embedded_in_html",
+                        "context": "html_script",
+                        "severity": "INFO",
+                        "agent": self.name,
+                        "timestamp": datetime.now().isoformat(),
+                        "metadata": {
+                            "header": header,
+                            "payload_preview": {k: v for k, v in list(payload.items())[:5]},  # First 5 claims only
+                            "signature_present": len(parts) == 3
+                        }
+                    }
+
+                    # Emit to event bus for ThinkingAgent routing
+                    self.emit_finding(finding)
+                    logger.info(f"[{self.name}] 🔑 Detected JWT in HTML (alg={header.get('alg', 'unknown')})")
+
+            except Exception as e:
+                logger.debug(f"[{self.name}] Failed to decode JWT: {e}")
+
+        # TODO: Add session cookie detection from Set-Cookie headers
+        # This would require capturing response headers during browser navigation
+        # For now, AuthDiscoveryAgent handles cookie discovery
+
+        if unique_jwts:
+            dashboard.log(f"[{self.name}] Found {len(unique_jwts)} JWT(s) in HTML", "INFO")
+
+    def _detect_frontend_frameworks_from_html(self, html: str):
+        """
+        ADDED (2026-02-04): Detect frontend frameworks from HTML content.
+
+        This ensures CSTIAgent gets dispatched even when Nuclei misses Angular/Vue.
+        Updates self.tech_profile in-place with detected frameworks.
+
+        Detection methods:
+        - ng-app, ng-controller, ng-model: AngularJS
+        - data-ng-*, x-ng-*: AngularJS alternative syntax
+        - v-bind, v-model, v-if: Vue.js
+        - angular.js, angularjs in script src: AngularJS
+        """
+        if not html:
+            return
+
+        detected = []
+        html_lower = html.lower()
+
+        # AngularJS detection
+        angular_indicators = [
+            'ng-app', 'ng-controller', 'ng-model', 'ng-bind', 'ng-repeat',
+            'data-ng-app', 'data-ng-controller', 'x-ng-app',
+            '{{', '}}',  # Angular template syntax
+        ]
+        if any(indicator in html_lower for indicator in angular_indicators):
+            # Double-check for {{}} pattern (could be other template engines)
+            if 'ng-app' in html_lower or 'ng-controller' in html_lower or 'angular' in html_lower:
+                detected.append('AngularJS')
+                logger.info(f"[{self.name}] 🔍 Detected AngularJS from HTML (ng-app/ng-controller/angular)")
+            elif '{{' in html and '}}' in html:
+                # Check if it's in a script context that looks like Angular
+                if 'ng-' in html_lower or 'angular' in html_lower:
+                    detected.append('AngularJS')
+                    logger.info(f"[{self.name}] 🔍 Detected AngularJS from HTML (ng-* + {{}}))")
+
+        # Vue.js detection
+        vue_indicators = [
+            'v-bind', 'v-model', 'v-if', 'v-for', 'v-on:', '@click', ':href',
+            'vue.js', 'vue.min.js', 'vue@', 'vuejs'
+        ]
+        if any(indicator in html_lower for indicator in vue_indicators):
+            detected.append('Vue.js')
+            logger.info(f"[{self.name}] 🔍 Detected Vue.js from HTML")
+
+        # React detection (less relevant for CSTI but good to know)
+        react_indicators = ['data-reactroot', 'data-reactid', '__react', 'react-dom']
+        if any(indicator in html_lower for indicator in react_indicators):
+            detected.append('React')
+            logger.info(f"[{self.name}] 🔍 Detected React from HTML")
+
+        # Update tech_profile with detected frameworks
+        if detected:
+            existing = self.tech_profile.get('frameworks', [])
+            for fw in detected:
+                if fw not in existing:
+                    existing.append(fw)
+            self.tech_profile['frameworks'] = existing
+            logger.info(f"[{self.name}] Updated tech_profile.frameworks: {self.tech_profile['frameworks']}")
 
     def _analyze_reflection(self, param: str, marker: str, html: str, status: int) -> Dict:
         """
