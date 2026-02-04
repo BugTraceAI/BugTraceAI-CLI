@@ -684,6 +684,178 @@ Return ONLY a JSON object:
 
         return finding
 
+    async def _phase1_retest(self, url: str, param: str, payload: str, original_value: str) -> Dict:
+        """Phase 1: Re-test vulnerability confirmation."""
+        from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+        from datetime import datetime
+
+        try:
+            # Fetch baseline
+            baseline_url = self._inject(original_value, param, original_value)
+            async with orchestrator.session(DestinationType.TARGET) as session:
+                async with session.get(baseline_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
+                    baseline_status = resp.status
+                    baseline_body = await resp.text()
+                    baseline_length = len(baseline_body)
+
+            # Fetch exploit
+            exploit_url = self._inject(payload, param, original_value)
+            async with orchestrator.session(DestinationType.TARGET) as session:
+                async with session.get(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
+                    exploit_status = resp.status
+                    exploit_body = await resp.text()
+                    exploit_length = len(exploit_body)
+
+            # Analyze
+            confirmed = (
+                exploit_status == 200 and
+                baseline_status in [200, 401, 403] and
+                exploit_body != baseline_body
+            )
+
+            diff_summary = self._analyze_response_diff(baseline_body, exploit_body)
+
+            return {
+                "confirmed": confirmed,
+                "baseline_status": baseline_status,
+                "exploit_status": exploit_status,
+                "baseline_length": baseline_length,
+                "exploit_length": exploit_length,
+                "response_diff": diff_summary,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Phase 1 failed: {e}")
+            return {"confirmed": False, "error": str(e), "timestamp": datetime.now().isoformat()}
+
+    def _analyze_response_diff(self, baseline: str, exploit: str) -> str:
+        """Helper: Analyze response differences."""
+        import re
+
+        baseline_users = set(re.findall(r'"user_id":\s*"?(\d+)"?', baseline))
+        exploit_users = set(re.findall(r'"user_id":\s*"?(\d+)"?', exploit))
+
+        baseline_emails = set(re.findall(r'"email":\s*"([^"]+@[^"]+)"', baseline))
+        exploit_emails = set(re.findall(r'"email":\s*"([^"]+@[^"]+)"', exploit))
+
+        diffs = []
+        if baseline_users != exploit_users:
+            diffs.append(f"user_id: {baseline_users} → {exploit_users}")
+        if baseline_emails != exploit_emails:
+            diffs.append(f"email: {baseline_emails} → {exploit_emails}")
+
+        return "; ".join(diffs) if diffs else "Different content"
+
+    async def _phase2_http_methods(self, url: str, param: str, payload: str) -> Dict:
+        """Phase 2: Test different HTTP methods."""
+        from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+        import asyncio
+
+        methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+        results = {}
+        vulnerable_methods = []
+
+        exploit_url = self._inject(payload, param, payload)
+
+        for method in methods:
+            # Skip destructive tests if disabled
+            if method in ["PUT", "PATCH"] and not settings.IDOR_EXPLOITER_ENABLE_WRITE_TESTS:
+                results[method] = {"skipped": True, "reason": "write_tests_disabled"}
+                continue
+            if method == "DELETE" and not settings.IDOR_EXPLOITER_ENABLE_DELETE_TESTS:
+                results[method] = {"skipped": True, "reason": "delete_tests_disabled"}
+                continue
+
+            # Rate limiting
+            await asyncio.sleep(settings.IDOR_EXPLOITER_RATE_LIMIT)
+
+            try:
+                async with orchestrator.session(DestinationType.TARGET) as session:
+                    if method == "GET":
+                        response = await session.get(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT)
+                    elif method == "POST":
+                        response = await session.post(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT)
+                    elif method == "PUT":
+                        response = await session.put(exploit_url, json={}, timeout=settings.IDOR_EXPLOITER_TIMEOUT)
+                    elif method == "PATCH":
+                        response = await session.patch(exploit_url, json={}, timeout=settings.IDOR_EXPLOITER_TIMEOUT)
+                    elif method == "DELETE":
+                        response = await session.delete(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT)
+
+                    status = response.status
+                    accessible = status in [200, 201, 204]
+
+                    results[method] = {
+                        "status": status,
+                        "accessible": accessible,
+                    }
+
+                    if accessible:
+                        vulnerable_methods.append(method)
+                        logger.warning(f"[{self.name}] ⚠️ Method {method} accessible!")
+
+            except Exception as e:
+                logger.debug(f"[{self.name}] Method {method} failed: {e}")
+                results[method] = {"error": str(e), "accessible": False}
+
+        # Severity upgrade
+        severity_upgrade = None
+        if "DELETE" in vulnerable_methods:
+            severity_upgrade = "CRITICAL - DELETE accessible"
+        elif any(m in vulnerable_methods for m in ["PUT", "PATCH"]):
+            severity_upgrade = "HIGH - Write methods accessible"
+
+        return {
+            "methods_tested": methods,
+            "vulnerable_methods": results,
+            "accessible_methods": vulnerable_methods,
+            "severity_upgrade": severity_upgrade,
+        }
+
+    def _phase3_impact_analysis(self, phase1: Dict, phase2: Dict) -> Dict:
+        """Phase 3: Analyze impact."""
+
+        # Read capability
+        read_capability = phase1.get("confirmed", False)
+
+        # Write capability
+        write_capability = any(
+            method in phase2.get("accessible_methods", [])
+            for method in ["PUT", "PATCH", "POST"]
+        )
+
+        # Delete capability
+        delete_capability = "DELETE" in phase2.get("accessible_methods", [])
+
+        # Calculate impact score (0-10)
+        impact_score = 0.0
+        if read_capability:
+            impact_score += 4.0
+        if write_capability:
+            impact_score += 3.0
+        if delete_capability:
+            impact_score += 3.0
+
+        # Description
+        capabilities = []
+        if read_capability:
+            capabilities.append("read unauthorized data")
+        if write_capability:
+            capabilities.append("modify data")
+        if delete_capability:
+            capabilities.append("delete data")
+
+        impact_description = f"Attacker can: {', '.join(capabilities)}"
+
+        return {
+            "read_capability": read_capability,
+            "write_capability": write_capability,
+            "delete_capability": delete_capability,
+            "impact_score": impact_score,
+            "impact_description": impact_description,
+        }
+
     async def _test_idor_param(self, item: dict):
         """Test a single parameter for IDOR vulnerability."""
         param = item.get("parameter")
