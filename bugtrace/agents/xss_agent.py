@@ -2473,6 +2473,54 @@ Return ONLY the payloads, one per line, no explanations."""
                 except Exception as e:
                     logger.debug(f"[{self.name}] Interactsh poll failed: {e}")
 
+            # v3.2: Visual validation fallback - generate visual payloads and use Vision AI
+            # This is the BULLETPROOF validation when HTTP/browser don't confirm
+            if payload in response_html:
+                logger.info(f"[{self.name}] Payload reflects but not confirmed. Trying visual validation...")
+                dashboard.log(f"[{self.name}] 🎨 Testing visual validation with Vision AI...", "INFO")
+
+                # Get reflection context for visual payload generation
+                reflection_context = self._analyze_reflection_context(response_html, payload)
+                contexts_found = [reflection_context.get("context", "unknown")]
+
+                # Generate visual payloads via DeepSeek
+                visual_payloads = await self._ask_deepseek_visual_payloads(
+                    param=param,
+                    contexts=contexts_found,
+                    sample_payloads={contexts_found[0]: payload}
+                )
+
+                if visual_payloads:
+                    logger.info(f"[{self.name}] Testing {len(visual_payloads)} visual payloads...")
+                    screenshots_dir = self.report_dir / "captures"
+                    screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+                    for i, visual_payload in enumerate(visual_payloads[:5]):  # Max 5 visual payloads
+                        dashboard.set_current_payload(
+                            visual_payload[:50], "XSS Visual", f"Testing [{i+1}/5]", self.name
+                        )
+
+                        evidence = await self._validate_visual_payload(
+                            param=param,
+                            payload=visual_payload,
+                            screenshots_dir=screenshots_dir
+                        )
+
+                        if evidence and evidence.get("vision_confirmed"):
+                            logger.info(f"[{self.name}] ✅ Vision AI confirmed XSS!")
+                            dashboard.log(f"[{self.name}] ✅ Vision AI CONFIRMED visual XSS!", "SUCCESS")
+                            return XSSFinding(
+                                url=url,
+                                parameter=param,
+                                payload=visual_payload,
+                                context=context,
+                                validation_method="visual_vision_ai",
+                                evidence=evidence,
+                                confidence=0.98,
+                                status="VALIDATED_CONFIRMED",
+                                validated=True
+                            )
+
             # v3.2: CANDIDATE fallback - if payload reflects but couldn't be confirmed
             # This prevents losing findings that automated tools can't validate
             # but a human pentester should review
