@@ -199,7 +199,11 @@ def agents():
 
 
 @app.command(name="tui")
-def tui():
+def tui(
+    target: Optional[str] = typer.Argument(
+        None, help="Target URL to scan (optional, can be entered in TUI)"
+    ),
+):
     """Launch the Textual-based Terminal User Interface.
 
     This provides an interactive dashboard with:
@@ -208,12 +212,16 @@ def tui():
     - Findings browser
     - System metrics
 
-    Note: This is an experimental feature (Phase 1 - Foundation).
+    If a target URL is provided, the scan will start automatically.
+
+    Examples:
+        bugtrace tui                    # Open TUI without starting scan
+        bugtrace tui https://example.com # Open TUI and start scanning
     """
     try:
         from bugtrace.core.ui.tui import BugTraceApp
 
-        app_instance = BugTraceApp()
+        app_instance = BugTraceApp(target=target)
         app_instance.run()
     except KeyboardInterrupt:
         # Clean exit on CTRL+C
