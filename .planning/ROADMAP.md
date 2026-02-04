@@ -1,0 +1,99 @@
+# Textual TUI Migration Roadmap
+
+## Milestone: v5.0 - Textual TUI
+
+**Objective:** Migrate BugTraceAI from Rich + threading dashboard to modern Textual TUI with OpenCode-like interactivity.
+
+**Source:** `.ai-context/planning/TEXTUAL_MIGRATION_MASTER_PLAN.md`
+
+---
+
+## Phase 01: Foundation & Structure
+
+**Goal:** Establish Textual app skeleton with CSS grid layout
+
+**Deliverables:**
+- Directory structure: `bugtrace/core/ui/tui/`
+- Main app entry point (`app.py`)
+- Global stylesheet (`styles.tcss`)
+- Screen scaffolding (main, loader)
+- Basic widgets (header, footer)
+
+**Acceptance:**
+- `bugtraceai --tui` launches full-screen app
+- Header/Footer visible
+- Terminal resize works
+- CTRL+C exits cleanly
+
+**Blocks:** Phase 02, Phase 03
+
+---
+
+## Phase 02: Widget Migration & Async Engine
+
+**Goal:** Port Rich rendering to Textual widgets AND wire async pipeline
+
+**Track A - Widgets (Frontend):**
+- Port `ui.py` rendering logic to Textual widgets
+- Metrics widget (CPU/RAM)
+- Pipeline widget (phase progress)
+- Activity widget (sparkline graph)
+- Swarm widget (agent list)
+- Use mock data for visual testing
+
+**Track B - Async (Backend):**
+- Create ScanWorker for pipeline execution
+- Define Message types (AgentUpdate, PipelineProgress, NewFinding)
+- Patch conductor to accept ui_callback
+- Wire message handlers in app
+
+**Acceptance:**
+- All 4 panels render (visual 1:1 with legacy)
+- Widgets resize gracefully
+- Real-time scan updates flow to UI
+- App remains responsive during scan
+
+**Depends on:** Phase 01
+
+---
+
+## Phase 03: High-Fidelity Interaction
+
+**Goal:** Enable TUI-first features for polished UX
+
+**Deliverables:**
+- Interactive DataTable for findings (sortable, navigable)
+- Finding details modal (full request/response, clipboard copy)
+- Log inspector with filter
+- Command input bar (ChatOps)
+
+**Acceptance:**
+- Scroll through hundreds of findings
+- Click finding opens modal
+- Escape closes modals
+- Logs filterable in real-time
+- Experience feels native and polished
+
+**Depends on:** Phase 02
+
+---
+
+## Architecture
+
+```
+[ BugTrace Pipeline ]  <-- Async Messages -->  [ Textual App (Main Thread) ]
+        |                                             |
+   (Background)                                  (UI Layer)
+        |                                             |
+    [ Worker ]                                [ Screens (View) ]
+                                              |-- Header
+                                              |-- Main Dashboard
+                                              |-- Agent Swarm
+                                              |-- Command Palette
+```
+
+## Developer Guidelines
+
+1. **CSS-First:** No dimension calculations in Python, use `.tcss`
+2. **Async All The Way:** Never `time.sleep()`, use `asyncio.sleep()`
+3. **No Global State:** Pass data via Messages or reactive props
