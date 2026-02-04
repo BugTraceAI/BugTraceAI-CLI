@@ -564,7 +564,7 @@ class XSSAgent(BaseAgent, TechContextMixin):
                         surviving_chars=surviving_chars,
                         successful_payloads=[payload],
                         injection_ctx=injection_ctx,
-                        escape_technique="visual_banner_injection",
+                        bypass_technique="visual_banner_injection",
                         bypass_explanation="DeepSeek generated visual payload, Playwright executed, Vision AI confirmed banner visible"
                     )
 
@@ -638,7 +638,7 @@ class XSSAgent(BaseAgent, TechContextMixin):
                     surviving_chars=surviving_chars,
                     successful_payloads=[payload],
                     injection_ctx=injection_ctx,
-                    escape_technique=f"breakout_{reflection.context}",
+                    bypass_technique=f"breakout_{reflection.context}",
                     bypass_explanation=f"Go fuzzer detected reflection in {reflection.context}, validated via Playwright"
                 )
 
@@ -792,7 +792,7 @@ class XSSAgent(BaseAgent, TechContextMixin):
                     surviving_chars=surviving_chars,
                     successful_payloads=[omni_payload],
                     injection_ctx=injection_ctx,
-                    escape_technique="omniprobe_polyglot",
+                    bypass_technique="omniprobe_polyglot",
                     bypass_explanation="OMNI-PROBE polyglot achieved direct execution"
                 )
 
@@ -1348,6 +1348,30 @@ Each payload should target a different context or use a different breakout techn
         """Check for Interactsh OOB interaction."""
         if evidence.get("interactsh_hit"):
             logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Interactsh OOB interaction)")
+            return True
+        return False
+
+    def _has_dialog_detected(self, evidence: Dict) -> bool:
+        """Check for dialog/alert detection."""
+        if evidence.get("dialog_detected") or evidence.get("alert_detected"):
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Dialog/Alert detected)")
+            return True
+        return False
+
+    def _has_vision_proof(self, evidence: Dict, finding_data: Dict = None) -> bool:
+        """Check for Vision AI confirmation."""
+        if evidence.get("vision_confirmed"):
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (Vision AI confirmed banner)")
+            return True
+        return False
+
+    def _has_dom_mutation_proof(self, evidence: Dict) -> bool:
+        """Check for DOM mutation proof."""
+        if evidence.get("dom_mutation") or evidence.get("marker_found"):
+            logger.info(f"[{self.name}] 🚨 AUTHORITY CONFIRMED (DOM mutation proof)")
+            return True
+        return False
+
     def _determine_validation_status(self, test_result: Dict) -> Tuple[str, bool]:
         """
         Determine validation status based on evidence authority.
