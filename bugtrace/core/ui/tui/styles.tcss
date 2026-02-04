@@ -24,6 +24,13 @@ $gradient-2: #e74c3c;
 $gradient-3: #f1fa8c;
 $gradient-4: #f1c40f;
 
+/* Severity colors */
+$severity-critical: #ff5555;
+$severity-high: #f38ba8;
+$severity-medium: #f9e2af;
+$severity-low: #cdd6f4;
+$severity-info: #89b4fa;
+
 /* ============================================
  * SCREEN LAYOUT - CSS GRID
  * ============================================ */
@@ -61,6 +68,7 @@ Screen {
     layout: vertical;
     height: 100%;
     width: 100%;
+    padding: 0 1;
 }
 
 /* Pipeline panel at top */
@@ -71,10 +79,12 @@ Screen {
     margin-bottom: 1;
 }
 
-/* Metrics row - side by side */
-#metrics-row {
+/* ============================================
+ * METRICS ROW - Activity & System Metrics
+ * ============================================ */
+.metrics-row {
     layout: horizontal;
-    height: 8;
+    height: 9;
     margin-bottom: 1;
 }
 
@@ -87,14 +97,51 @@ Screen {
 
 #metrics {
     width: 1fr;
-    border: round $primary-dark;
+    border: round $secondary;
     padding: 0 1;
 }
 
-/* Agent swarm panel - expands to fill remaining space */
-#swarm {
+/* ============================================
+ * MIDDLE ROW - Swarm & Payload Feed
+ * ============================================ */
+.middle-row {
+    layout: horizontal;
     height: 1fr;
-    border: round $secondary;
+    min-height: 12;
+    margin-bottom: 1;
+}
+
+#swarm {
+    width: 1fr;
+    border: round $warning;
+    padding: 0 1;
+    margin-right: 1;
+}
+
+#payload-feed {
+    width: 1fr;
+    border: round $success;
+    padding: 0 1;
+}
+
+/* ============================================
+ * BOTTOM ROW - Findings & Logs
+ * ============================================ */
+.bottom-row {
+    layout: horizontal;
+    height: 10;
+}
+
+#findings {
+    width: 1fr;
+    border: round $error;
+    padding: 0 1;
+    margin-right: 1;
+}
+
+#logs {
+    width: 1fr;
+    border: round $primary-dark;
     padding: 0 1;
 }
 
@@ -132,6 +179,59 @@ Screen {
 
 .text-primary {
     color: $primary;
+}
+
+/* Severity text styles */
+.text-critical {
+    color: $severity-critical;
+    text-style: bold;
+}
+
+.text-high {
+    color: $severity-high;
+}
+
+.text-medium {
+    color: $severity-medium;
+}
+
+.text-low {
+    color: $severity-low;
+}
+
+.text-info {
+    color: $severity-info;
+}
+
+/* ============================================
+ * WIDGET-SPECIFIC OVERRIDES
+ * ============================================ */
+PipelineStatus {
+    height: 5;
+}
+
+ActivityGraph {
+    min-height: 7;
+}
+
+SystemMetrics {
+    min-height: 7;
+}
+
+AgentSwarm {
+    min-height: 10;
+}
+
+PayloadFeed {
+    min-height: 10;
+}
+
+FindingsSummary {
+    min-height: 8;
+}
+
+LogPanel {
+    min-height: 8;
 }
 
 /* ============================================
