@@ -1128,6 +1128,18 @@ Focus on endpoint+resource deduplication. Same resource type = DUPLICATE."""
                 result = await self._test_single_param_from_queue(url, parameter, original_value, finding_data.get("finding", {}))
 
                 if result and result.get("validated"):
+
+                    # ===== DEEP EXPLOITATION (Phase 4b) =====
+                    if settings.IDOR_ENABLE_DEEP_EXPLOITATION:
+                        severity = result.get("severity")
+                        threshold = settings.IDOR_EXPLOITER_SEVERITY_THRESHOLD
+
+                        severity_order = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
+                        if severity_order.get(severity, 0) >= severity_order.get(threshold, 2):
+                            logger.info(f"[{self.name}] 🔬 Starting deep exploitation for {severity} finding...")
+                            result = await self._exploit_deep(result)
+                    # ========================================
+
                     validated_findings.append(result)
 
                     # FINGERPRINT CHECK
