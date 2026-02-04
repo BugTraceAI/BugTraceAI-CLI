@@ -55,8 +55,7 @@ reports/
 data/
 uploads/
 
-# Claude artifacts
-.claude/
+# Claude artifacts (CLAUDE.md is tracked for project memory)
 
 # Dev scripts and archives (local-only)
 scripts/
