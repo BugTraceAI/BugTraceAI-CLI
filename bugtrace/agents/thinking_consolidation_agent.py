@@ -18,7 +18,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional, Set, Tuple
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from loguru import logger
@@ -95,6 +95,10 @@ VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
     "jwt bypass": "jwt",
     "jwt manipulation": "jwt",
     "authentication bypass": "jwt",
+    "jwt_discovered": "jwt",  # NEW: From AuthDiscoveryAgent
+
+    # Session cookies (route to IDOR for authorization testing)
+    "session_cookie_discovered": "idor",  # NEW: From AuthDiscoveryAgent
 
     # Open redirect
     "open redirect": "openredirect",
@@ -116,6 +120,86 @@ VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
     "http header injection": "header_injection",
     "crlf injection": "xss",
     "http response splitting": "xss",
+}
+
+
+# Semantic descriptions for embeddings-based classification (Phase 42: v3.3)
+# Rich descriptions for cosine similarity matching
+SPECIALIST_DESCRIPTIONS: Dict[str, str] = {
+    "xss": (
+        "Cross-site scripting XSS vulnerability involving HTML injection, "
+        "JavaScript execution, script tags, DOM manipulation, alert popups, "
+        "reflected or stored user input rendering in browser context without sanitization"
+    ),
+    "sqli": (
+        "SQL injection database vulnerability with query manipulation, "
+        "boolean-based blind time-based error-based union-based attacks, "
+        "quote escaping, UNION SELECT statements, database enumeration"
+    ),
+    "csti": (
+        "Client-side or server-side template injection SSTI CSTI vulnerability, "
+        "template engine exploitation, Jinja2 AngularJS expression evaluation, "
+        "{{payload}} syntax, code execution through template rendering"
+    ),
+    "lfi": (
+        "Local file inclusion LFI path traversal directory traversal vulnerability, "
+        "file read access, ../ sequences, /etc/passwd access, arbitrary file disclosure"
+    ),
+    "idor": (
+        "Insecure direct object reference IDOR broken access control vulnerability, "
+        "authorization bypass, horizontal vertical privilege escalation, "
+        "session cookie manipulation, user ID parameter tampering, accessing other users data"
+    ),
+    "rce": (
+        "Remote code execution RCE command injection OS command vulnerability, "
+        "shell command execution, deserialization attacks, arbitrary code execution, "
+        "system compromise, ping curl wget exploits"
+    ),
+    "ssrf": (
+        "Server-side request forgery SSRF vulnerability, internal network access, "
+        "URL injection, localhost 127.0.0.1 access, cloud metadata exploitation, "
+        "port scanning through server, HTTP request manipulation"
+    ),
+    "xxe": (
+        "XML external entity XXE vulnerability, XML injection, "
+        "DTD entity expansion, SYSTEM ENTITY declarations, "
+        "file disclosure through XML parsing, out-of-band data exfiltration"
+    ),
+    "jwt": (
+        "JSON Web Token JWT authentication vulnerability, bearer token manipulation, "
+        "none algorithm bypass, weak secret key cracking, signature verification bypass, "
+        "authorization header exploitation, token forgery"
+    ),
+    "openredirect": (
+        "Open redirect URL redirection vulnerability, unvalidated redirects, "
+        "phishing attacks, return_url redirect_uri parameter manipulation, "
+        "Location header injection, unsafe HTTP redirects"
+    ),
+    "prototype_pollution": (
+        "Prototype pollution JavaScript vulnerability, __proto__ manipulation, "
+        "constructor.prototype modification, Node.js object pollution, "
+        "merge deep clone vulnerabilities affecting JavaScript objects"
+    ),
+    "header_injection": (
+        "HTTP header injection CRLF injection vulnerability, response splitting, "
+        "carriage return line feed injection, newline character injection, "
+        "Set-Cookie header manipulation, HTTP response header control"
+    ),
+    "file_upload": (
+        "File upload vulnerability, unrestricted file upload, malicious file upload, "
+        "webshell upload, executable file bypass, MIME type validation bypass, "
+        "arbitrary file write, dangerous file extension"
+    ),
+    "chain_discovery": (
+        "Vulnerability chain discovery, multi-step exploitation path, "
+        "chained vulnerabilities, combined attack vectors, "
+        "escalation through multiple weaknesses"
+    ),
+    "api_security": (
+        "API security vulnerability, REST API GraphQL security issues, "
+        "API authentication bypass, rate limiting issues, API key exposure, "
+        "endpoint security misconfiguration"
+    ),
 }
 
 
@@ -351,8 +435,22 @@ class ThinkingConsolidationAgent(BaseAgent):
             "duplicates_filtered": 0,
             "fp_filtered": 0,
             "distributed": 0,
-            "by_specialist": {}
+            "by_specialist": {},
+            # NEW (Phase 42: v3.3): Classification method tracking
+            "classification_methods": {
+                "keyword_exact": 0,
+                "keyword_substring": 0,
+                "embeddings_high_confidence": 0,
+                "embeddings_medium_confidence": 0,
+                "embeddings_low_confidence": 0,
+                "unknown": 0,
+            }
         }
+
+        # NEW (Phase 42: v3.3): Embeddings infrastructure (lazy loaded)
+        self._embedding_manager = None
+        self._specialist_embeddings = {}  # Cache: {specialist: embedding_vector}
+        self._embeddings_initialized = False
 
         logger.info(f"[{self.name}] Initialized in {self._mode} mode")
 
@@ -478,6 +576,11 @@ class ThinkingConsolidationAgent(BaseAgent):
         """
         Classify finding to determine target specialist queue.
 
+        Uses hybrid approach (Phase 42: v3.3):
+        1. Fast keyword matching (exact → substring)
+        2. Embeddings similarity (if enabled and keywords fail)
+        3. Manual review flag (if confidence low)
+
         Args:
             finding: Finding dict with 'type' field
 
@@ -486,18 +589,208 @@ class ThinkingConsolidationAgent(BaseAgent):
         """
         vuln_type = finding.get("type", "").lower().strip()
 
-        # Direct match
+        # PHASE 1: Keyword matching (fast path)
+        # Direct exact match
         if vuln_type in VULN_TYPE_TO_SPECIALIST:
-            return VULN_TYPE_TO_SPECIALIST[vuln_type]
+            specialist = VULN_TYPE_TO_SPECIALIST[vuln_type]
+            if settings.EMBEDDINGS_LOG_CONFIDENCE:
+                logger.debug(
+                    f"[{self.name}] Classification: '{vuln_type}' → {specialist} "
+                    f"(method: keyword_exact, confidence: 1.0)"
+                )
+            self._stats["classification_methods"]["keyword_exact"] += 1
+            return specialist
 
-        # Partial match (for compound types like "Reflected XSS in parameter")
+        # Substring partial match (for compound types like "Reflected XSS in parameter")
         for pattern, specialist in VULN_TYPE_TO_SPECIALIST.items():
             if pattern in vuln_type:
+                if settings.EMBEDDINGS_LOG_CONFIDENCE:
+                    logger.debug(
+                        f"[{self.name}] Classification: '{vuln_type}' → {specialist} "
+                        f"(method: keyword_substring, pattern: '{pattern}', confidence: 0.9)"
+                    )
+                self._stats["classification_methods"]["keyword_substring"] += 1
                 return specialist
 
-        # Unknown type
+        # PHASE 2: Embeddings similarity (if enabled)
+        if settings.USE_EMBEDDINGS_CLASSIFICATION:
+            # Lazy initialize embeddings on first use
+            if not self._embeddings_initialized and not self._initialize_embeddings():
+                logger.warning(
+                    f"[{self.name}] Unknown vulnerability type (embeddings unavailable): {vuln_type}"
+                )
+                self._stats["classification_methods"]["unknown"] += 1
+                return None
+
+            # Try embeddings classification
+            result = self._classify_with_embeddings(finding)
+            if result is not None:
+                specialist, confidence = result
+
+                # High confidence - use embeddings result
+                if confidence >= settings.EMBEDDINGS_CONFIDENCE_THRESHOLD:
+                    logger.info(
+                        f"[{self.name}] Classification: '{vuln_type}' → {specialist} "
+                        f"(method: embeddings, confidence: {confidence:.3f})"
+                    )
+                    self._stats["classification_methods"]["embeddings_high_confidence"] += 1
+                    return specialist
+
+                # Medium confidence - flag for manual review but still route
+                elif confidence >= settings.EMBEDDINGS_MANUAL_REVIEW_THRESHOLD:
+                    logger.warning(
+                        f"[{self.name}] Classification: '{vuln_type}' → {specialist} "
+                        f"(method: embeddings, confidence: {confidence:.3f}, "
+                        f"flag: MANUAL_REVIEW_RECOMMENDED)"
+                    )
+                    finding["_classification_confidence"] = confidence
+                    finding["_requires_manual_review"] = True
+                    self._stats["classification_methods"]["embeddings_medium_confidence"] += 1
+                    return specialist
+
+                # Low confidence - reject classification
+                else:
+                    logger.warning(
+                        f"[{self.name}] Classification failed: '{vuln_type}' "
+                        f"(method: embeddings, best_match: {specialist}, "
+                        f"confidence: {confidence:.3f} < threshold: {settings.EMBEDDINGS_CONFIDENCE_THRESHOLD})"
+                    )
+                    self._stats["classification_methods"]["embeddings_low_confidence"] += 1
+                    return None
+
+        # PHASE 3: Unknown type (no keyword match, embeddings disabled or failed)
         logger.warning(f"[{self.name}] Unknown vulnerability type: {vuln_type}")
+        self._stats["classification_methods"]["unknown"] += 1
         return None
+
+    def _initialize_embeddings(self) -> bool:
+        """
+        Lazy load embeddings model and pre-compute specialist descriptions.
+        Called once per agent instance on first classification attempt.
+
+        Returns:
+            True if initialization successful, False if fallback to keywords only
+        """
+        if self._embeddings_initialized:
+            return True
+
+        if not settings.USE_EMBEDDINGS_CLASSIFICATION:
+            return False
+
+        try:
+            from bugtrace.core.embeddings import EmbeddingManager, MockEmbeddingModel
+
+            self._embedding_manager = EmbeddingManager.get_instance()
+            logger.info(f"[{self.name}] Loading embeddings model...")
+
+            # Check if using mock model (offline mode)
+            if isinstance(self._embedding_manager._model, MockEmbeddingModel):
+                logger.warning(
+                    f"[{self.name}] Offline mode detected (MockEmbeddingModel), "
+                    f"disabling embeddings classification"
+                )
+                self._embeddings_initialized = False
+                return False
+
+            # Pre-compute embeddings for all specialists
+            for specialist, description in SPECIALIST_DESCRIPTIONS.items():
+                embedding = self._embedding_manager.encode_query(description)
+                self._specialist_embeddings[specialist] = embedding
+
+            self._embeddings_initialized = True
+            logger.info(
+                f"[{self.name}] Embeddings initialized: {len(self._specialist_embeddings)} "
+                f"specialists, {self._embedding_manager.get_embedding_dimension()}D vectors"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Embeddings initialization failed: {e}")
+            logger.warning(f"[{self.name}] Falling back to keyword-only classification")
+            self._embeddings_initialized = False
+            return False
+
+    def _classify_with_embeddings(self, finding: Dict[str, Any]) -> Optional[Tuple[str, float]]:
+        """
+        Classify finding using semantic similarity with specialist descriptions.
+
+        Process:
+        1. Create semantic text from finding (type + parameter + details)
+        2. Encode to embedding vector
+        3. Compare cosine similarity with all specialist embeddings
+        4. Return best match with confidence score
+
+        Args:
+            finding: Finding dictionary with type, parameter, payload, etc.
+
+        Returns:
+            (specialist_name, confidence_score) tuple, or None if unavailable
+        """
+        if not self._embeddings_initialized or not self._embedding_manager:
+            return None
+
+        # Build semantic text representation
+        text_parts = []
+
+        vuln_type = finding.get("type", "")
+        if vuln_type:
+            text_parts.append(f"Vulnerability type: {vuln_type}")
+
+        parameter = finding.get("parameter", "")
+        if parameter:
+            text_parts.append(f"Parameter: {parameter}")
+
+        # Include truncated payload/details for context
+        payload = finding.get("payload", "")
+        if payload:
+            payload_str = str(payload)[:200]
+            text_parts.append(f"Payload: {payload_str}")
+
+        details = finding.get("details", "")
+        if details:
+            details_str = str(details)[:300]
+            text_parts.append(f"Details: {details_str}")
+
+        if not text_parts:
+            logger.debug(f"[{self.name}] Embeddings: No text to encode (empty finding)")
+            return None
+
+        # Encode finding to vector
+        text = " | ".join(text_parts)
+        try:
+            finding_embedding = self._embedding_manager.encode_query(text)
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to encode finding: {e}")
+            return None
+
+        # Calculate cosine similarity with all specialists
+        import numpy as np
+
+        similarities = {}
+        for specialist, spec_embedding in self._specialist_embeddings.items():
+            # Cosine similarity: dot(A, B) / (||A|| * ||B||)
+            similarity = np.dot(finding_embedding, spec_embedding) / (
+                np.linalg.norm(finding_embedding) * np.linalg.norm(spec_embedding)
+            )
+            similarities[specialist] = float(similarity)
+
+        # Find best match
+        if not similarities:
+            return None
+
+        best_specialist = max(similarities, key=similarities.get)
+        best_confidence = similarities[best_specialist]
+
+        # Log top 3 candidates for debugging
+        if settings.EMBEDDINGS_LOG_CONFIDENCE:
+            top_3 = sorted(similarities.items(), key=lambda x: x[1], reverse=True)[:3]
+            top_3_str = ", ".join([f"{s}={c:.3f}" for s, c in top_3])
+            logger.debug(
+                f"[{self.name}] Embeddings similarity: type='{vuln_type}' "
+                f"top_3=[{top_3_str}]"
+            )
+
+        return (best_specialist, best_confidence)
 
     def _calculate_priority(self, finding: Dict[str, Any]) -> float:
         """

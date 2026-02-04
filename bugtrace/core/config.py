@@ -110,6 +110,12 @@ class Settings(BaseSettings):
     THINKING_BACKPRESSURE_DELAY: float = 0.5  # Seconds between retries
     THINKING_EMIT_EVENTS: bool = True  # Emit work_queued events
 
+    # --- Embeddings Classification Configuration (Phase 42: v3.3) ---
+    USE_EMBEDDINGS_CLASSIFICATION: bool = False  # Feature flag (start disabled for safety)
+    EMBEDDINGS_CONFIDENCE_THRESHOLD: float = 0.75  # Min similarity to trust embeddings
+    EMBEDDINGS_MANUAL_REVIEW_THRESHOLD: float = 0.60  # Flag for manual review
+    EMBEDDINGS_LOG_CONFIDENCE: bool = True  # Log classification confidence scores
+
     # --- Worker Pool Configuration (Phase 19: v2.3) ---
     WORKER_POOL_DEFAULT_SIZE: int = 5  # Default workers per specialist
     WORKER_POOL_XSS_SIZE: int = 8  # XSS-specific (high volume)
@@ -422,6 +428,15 @@ class Settings(BaseSettings):
             self.THINKING_BATCH_SIZE = section.getint("BATCH_SIZE")
         if "DEDUP_WINDOW" in section:
             self.THINKING_DEDUP_WINDOW = section.getint("DEDUP_WINDOW")
+        # NEW: Embeddings classification settings
+        if "USE_EMBEDDINGS_CLASSIFICATION" in section:
+            self.USE_EMBEDDINGS_CLASSIFICATION = section.getboolean("USE_EMBEDDINGS_CLASSIFICATION")
+        if "EMBEDDINGS_CONFIDENCE_THRESHOLD" in section:
+            self.EMBEDDINGS_CONFIDENCE_THRESHOLD = section.getfloat("EMBEDDINGS_CONFIDENCE_THRESHOLD")
+        if "EMBEDDINGS_MANUAL_REVIEW_THRESHOLD" in section:
+            self.EMBEDDINGS_MANUAL_REVIEW_THRESHOLD = section.getfloat("EMBEDDINGS_MANUAL_REVIEW_THRESHOLD")
+        if "EMBEDDINGS_LOG_CONFIDENCE" in section:
+            self.EMBEDDINGS_LOG_CONFIDENCE = section.getboolean("EMBEDDINGS_LOG_CONFIDENCE")
 
     def _load_llm_models_config(self, config):
         """Load LLM_MODELS section config."""
