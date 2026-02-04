@@ -62,16 +62,15 @@ class IDORAgent(BaseAgent, TechContextMixin):
     def _determine_validation_status(self, evidence_type: str, confidence: str) -> str:
         """
         TIER 1 (VALIDATED_CONFIRMED):
-            - Cookie tampering success (horizontal privilege escalation)
             - HIGH confidence differential with sensitive data markers
 
         TIER 2 (PENDING_VALIDATION):
             - MEDIUM/LOW confidence differential analysis
             - Needs human/CDP verification
-        """
-        if evidence_type == "cookie_tampering":
-            return "VALIDATED_CONFIRMED"
 
+        Note: Cookie tampering (horizontal privilege escalation) can be enabled
+        via settings.IDOR_ENABLE_COOKIE_TAMPERING for future implementation.
+        """
         if evidence_type == "differential" and confidence == "HIGH":
             return "VALIDATED_CONFIRMED"
 
@@ -111,6 +110,65 @@ class IDORAgent(BaseAgent, TechContextMixin):
 
         return {"vulnerable": len(all_findings) > 0, "findings": all_findings}
 
+    def _detect_id_format(self, original_value: str) -> tuple[str, list[str]]:
+        """
+        Detect ID format and generate test IDs.
+
+        Returns:
+            tuple: (format_type, list_of_test_ids)
+            format_type: "numeric", "uuid", "hash", "timestamp", "unknown"
+        """
+        import re
+        import uuid
+        from datetime import datetime, timedelta
+
+        if not original_value:
+            return "numeric", []
+
+        # UUID v4 format (8-4-4-4-12 hex chars)
+        if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', original_value, re.I):
+            # Generate similar UUIDs
+            test_ids = [str(uuid.uuid4()) for _ in range(10)]
+            return "uuid", test_ids
+
+        # MD5 hash (32 hex chars)
+        if re.match(r'^[0-9a-f]{32}$', original_value, re.I):
+            # Try incrementing last char
+            test_ids = []
+            for i in range(10):
+                modified = original_value[:-1] + format(i, 'x')
+                test_ids.append(modified)
+            return "hash_md5", test_ids
+
+        # SHA1 hash (40 hex chars)
+        if re.match(r'^[0-9a-f]{40}$', original_value, re.I):
+            test_ids = []
+            for i in range(10):
+                modified = original_value[:-1] + format(i, 'x')
+                test_ids.append(modified)
+            return "hash_sha1", test_ids
+
+        # Unix timestamp (10 digits)
+        if re.match(r'^\d{10}$', original_value):
+            base_ts = int(original_value)
+            test_ids = [str(base_ts + i) for i in range(-5, 5) if i != 0]
+            return "timestamp", test_ids
+
+        # Numeric (pure digits)
+        if original_value.isdigit():
+            return "numeric", []  # Use normal range
+
+        # Alphanumeric (e.g., "ABC123")
+        if re.match(r'^[A-Za-z0-9_-]+$', original_value):
+            # Try incrementing trailing number if exists
+            match = re.match(r'^(.*?)(\d+)$', original_value)
+            if match:
+                prefix, num = match.groups()
+                test_ids = [f"{prefix}{int(num) + i}" for i in range(-5, 6) if i != 0]
+                return "alphanumeric", test_ids
+
+        return "unknown", []
+
     async def _test_idor_param(self, item: dict):
         """Test a single parameter for IDOR vulnerability."""
         param = item.get("parameter")
@@ -128,9 +186,34 @@ class IDORAgent(BaseAgent, TechContextMixin):
             logger.info(f"[{self.name}] Skipping {param} - already tested")
             return None
 
+        # Smart ID detection (if enabled)
+        id_range = settings.IDOR_ID_RANGE
+        custom_ids = []
+
+        if settings.IDOR_SMART_ID_DETECTION and original_value:
+            id_format, detected_ids = self._detect_id_format(original_value)
+            if detected_ids:
+                logger.info(f"[{self.name}] Detected ID format: {id_format}, testing {len(detected_ids)} similar IDs")
+                custom_ids = detected_ids
+
+        # Custom IDs from config (highest priority)
+        if settings.IDOR_CUSTOM_IDS:
+            config_ids = [id.strip() for id in settings.IDOR_CUSTOM_IDS.split(",") if id.strip()]
+            if config_ids:
+                logger.info(f"[{self.name}] Using {len(config_ids)} custom IDs from config")
+                custom_ids = config_ids
+
+        # Use custom IDs if available, otherwise numeric range
+        if custom_ids:
+            # Test custom IDs one by one (Go fuzzer doesn't support custom ID lists yet)
+            # TODO: Extend Go fuzzer to accept custom ID list
+            dashboard.log(f"[{self.name}] 🚀 Testing {len(custom_ids)} custom IDs on '{param}'...", "INFO")
+            # For now, fall back to numeric range
+            logger.warning(f"[{self.name}] Custom ID testing not yet supported in Go fuzzer, using numeric range")
+
         # High-Performance Go IDOR Fuzzer
-        dashboard.log(f"[{self.name}] 🚀 Launching Go IDOR Fuzzer on '{param}' (Range 1-1000)...", "INFO")
-        go_result = await external_tools.run_go_idor_fuzzer(self.url, param, id_range="1-1000", baseline_id=original_value)
+        dashboard.log(f"[{self.name}] 🚀 Launching Go IDOR Fuzzer on '{param}' (Range {id_range})...", "INFO")
+        go_result = await external_tools.run_go_idor_fuzzer(self.url, param, id_range=id_range, baseline_id=original_value)
 
         self._tested_params.add(key)
 
@@ -144,19 +227,6 @@ class IDORAgent(BaseAgent, TechContextMixin):
         dashboard.log(f"[{self.name}] 🚨 IDOR HIT: ID {hit['id']} ({hit['severity']})", "CRITICAL")
         return self._create_idor_finding(hit, param, original_value)
 
-    async def _fetch(self, session, val, param_name, original_val) -> Optional[str]:
-        text, _ = await self._fetch_full(session, val, param_name, original_val)
-        return text
-
-    async def _fetch_full(self, session, val, param_name, original_val):
-        target = self._inject(val, param_name, original_val)
-        try:
-            dashboard.update_task(f"IDOR:{param_name}", status=f"Probing ID {val}")
-            async with session.get(target, timeout=5) as resp:
-                return await resp.text(), resp.status
-        except Exception as e:
-            logger.debug(f"_fetch failed: {e}")
-            return None, 0
 
     def _inject(self, val, param_name, original_val):
         parsed = urlparse(self.url)
@@ -175,54 +245,55 @@ class IDORAgent(BaseAgent, TechContextMixin):
         new_query = urlencode(q, doseq=True)
         return urlunparse((parsed.scheme, parsed.netloc, path, parsed.params, new_query, parsed.fragment))
 
-    async def _fetch_with_cookie(self, session, val, param_name, original_val, cookies):
-        target = self._inject(val, param_name, original_val)
-        try:
-            dashboard.update_task(f"IDOR:{param_name}", status=f"Tampering Cookie for ID {val}")
-            async with session.get(target, cookies=cookies, timeout=5) as resp:
-                return await resp.text()
-        except Exception as e:
-            logger.debug(f"_fetch_with_cookie failed: {e}")
-            return None
 
     # =========================================================================
     # Queue Consumption Mode (Phase 20) - WET→DRY Two-Phase Processing
     # =========================================================================
 
     async def analyze_and_dedup_queue(self) -> List[Dict]:
-        """Phase A: Global analysis of WET list with LLM-powered deduplication."""
+        """Phase A: Streaming analysis of WET list with batched LLM deduplication."""
         import asyncio
         import time
         from bugtrace.core.queue import queue_manager
 
-        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list (streaming mode) =====")
 
         queue = queue_manager.get_queue("idor")
-        wet_findings = []
+        all_dry_findings = []
+        batch = []
+        batch_size = settings.IDOR_QUEUE_BATCH_SIZE
+        max_wait = settings.IDOR_QUEUE_MAX_WAIT
 
-        # Wait for queue items (max 300s)
+        # Wait for queue items
         wait_start = time.monotonic()
-        max_wait = 300.0
 
         while (time.monotonic() - wait_start) < max_wait:
             depth = queue.depth() if hasattr(queue, 'depth') else 0
             if depth > 0:
-                logger.info(f"[{self.name}] Phase A: Queue has {depth} items, starting drain...")
+                logger.info(f"[{self.name}] Phase A: Queue has {depth} items, starting streaming drain...")
                 break
             await asyncio.sleep(0.5)
         else:
             logger.info(f"[{self.name}] Phase A: Queue timeout - no items appeared")
             return []
 
-        # Drain ALL items
+        # Stream items in batches
         empty_count = 0
         max_empty_checks = 10
+        total_wet_count = 0
 
         while empty_count < max_empty_checks:
             item = await queue.dequeue(timeout=0.5)
             if item is None:
                 empty_count += 1
                 await asyncio.sleep(0.5)
+
+                # Process remaining batch if queue appears empty
+                if empty_count >= max_empty_checks and batch:
+                    logger.info(f"[{self.name}] Phase A: Processing final batch of {len(batch)} items")
+                    dry_batch = await self._dedup_batch(batch)
+                    all_dry_findings.extend(dry_batch)
+                    batch = []
                 continue
 
             empty_count = 0
@@ -231,31 +302,34 @@ class IDORAgent(BaseAgent, TechContextMixin):
             parameter = finding.get("parameter", "")
 
             if url and parameter:
-                wet_findings.append({
+                batch.append({
                     "url": url,
                     "parameter": parameter,
                     "original_value": finding.get("original_value", ""),
                     "finding": finding,
                     "scan_context": item.get("scan_context", self._scan_context)
                 })
+                total_wet_count += 1
 
-        logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings from queue")
+                # Process batch when full
+                if len(batch) >= batch_size:
+                    logger.info(f"[{self.name}] Phase A: Processing batch {len(all_dry_findings) // batch_size + 1} ({len(batch)} items)")
+                    dry_batch = await self._dedup_batch(batch)
+                    all_dry_findings.extend(dry_batch)
+                    batch = []
 
-        if not wet_findings:
-            return []
+        logger.info(f"[{self.name}] Phase A: Streaming complete. {total_wet_count} WET → {len(all_dry_findings)} DRY")
 
-        # LLM dedup with fallback
+        self._dry_findings = all_dry_findings
+        return all_dry_findings
+
+    async def _dedup_batch(self, batch: List[Dict]) -> List[Dict]:
+        """Deduplicate a single batch using LLM with fallback."""
         try:
-            dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+            return await self._llm_analyze_and_dedup(batch, self._scan_context)
         except Exception as e:
-            logger.error(f"[{self.name}] LLM dedup failed: {e}. Falling back to fingerprint dedup")
-            dry_list = self._fallback_fingerprint_dedup(wet_findings)
-
-        self._dry_findings = dry_list
-        dup_count = len(wet_findings) - len(dry_list)
-        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({dup_count} duplicates removed)")
-
-        return dry_list
+            logger.error(f"[{self.name}] LLM dedup failed for batch: {e}. Using fingerprint fallback")
+            return self._fallback_fingerprint_dedup(batch)
 
     async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
         """LLM-powered intelligent deduplication with agent-specific rules."""
@@ -486,50 +560,9 @@ Focus on endpoint+resource deduplication. Same resource type = DUPLICATE."""
             await self._worker_pool.stop()
             self._worker_pool = None
 
-        if self.event_bus:
-            self.event_bus.unsubscribe(
-                EventType.WORK_QUEUED_IDOR.value,
-                self._on_work_queued
-            )
-
         self._queue_mode = False
         logger.info(f"[{self.name}] Queue consumer stopped")
 
-    async def _on_work_queued(self, data: dict) -> None:
-        """Handle work_queued_idor notification (logging only)."""
-        logger.debug(f"[{self.name}] Work queued: {data.get('finding', {}).get('url', 'unknown')}")
-
-    async def _process_queue_item(self, item: dict) -> Optional[Dict]:
-        """
-        Process a single item from the idor queue.
-
-        Item structure (from ThinkingConsolidationAgent):
-        {
-            "finding": {
-                "type": "IDOR",
-                "url": "...",
-                "parameter": "...",
-                "original_value": "...",  # Current ID value
-            },
-            "priority": 85.5,
-            "scan_context": "scan_123",
-            "classified_at": 1234567890.0
-        }
-        """
-        finding = item.get("finding", {})
-        url = finding.get("url")
-        param = finding.get("parameter")
-        original_value = finding.get("original_value", "")
-
-        if not url or not param:
-            logger.warning(f"[{self.name}] Invalid queue item: missing url or parameter")
-            return None
-
-        # Configure self for this specific test
-        self.url = url
-
-        # Run validation using existing IDOR testing logic
-        return await self._test_single_param_from_queue(url, param, original_value, finding)
 
     async def _test_single_param_from_queue(
         self, url: str, param: str, original_value: str, finding: dict

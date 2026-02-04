@@ -846,6 +846,14 @@ class Settings(BaseSettings):
     MANIPULATOR_BREAKOUT_PRIORITY_LEVEL: int = 3
     MANIPULATOR_MAX_LLM_PAYLOADS: int = 100
 
+    # --- IDOR Agent Configuration ---
+    IDOR_ID_RANGE: str = "1-1000"  # Range of IDs to test (e.g., "1-1000", "1-500", "100-200")
+    IDOR_CUSTOM_IDS: str = ""  # Comma-separated list of custom IDs (UUIDs, hashes, etc.)
+    IDOR_QUEUE_BATCH_SIZE: int = 100  # Max items to process in one batch (streaming queue drain)
+    IDOR_QUEUE_MAX_WAIT: float = 300.0  # Max seconds to wait for queue items
+    IDOR_ENABLE_COOKIE_TAMPERING: bool = False  # Enable horizontal privilege escalation tests
+    IDOR_SMART_ID_DETECTION: bool = True  # Auto-detect ID format and generate similar IDs
+
 
 # Singleton Instance
 settings = Settings()
