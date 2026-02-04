@@ -59,6 +59,7 @@ class BugTraceApp(App):
     def __init__(
         self,
         target: Optional[str] = None,
+        demo_mode: bool = False,
         *args,
         **kwargs,
     ) -> None:
@@ -66,11 +67,13 @@ class BugTraceApp(App):
 
         Args:
             target: Optional target URL for scanning.
+            demo_mode: When True, widgets show animated demo data.
             *args: Positional arguments passed to parent App.
             **kwargs: Keyword arguments passed to parent App.
         """
         super().__init__(*args, **kwargs)
         self.target = target
+        self.demo_mode = demo_mode
         self.scan_worker: Optional[Worker] = None
         self._shutdown_event = asyncio.Event()
         self._scan_start_time: Optional[float] = None
@@ -81,17 +84,23 @@ class BugTraceApp(App):
         """Called when app is mounted.
 
         Shows the loader screen initially, which transitions to MainScreen
-        after initialization completes.
+        after initialization completes. In demo mode, skips loader and goes
+        straight to demo dashboard.
         """
         from bugtrace.core.ui.tui.screens.loader import LoaderScreen
 
-        self.push_screen(LoaderScreen())
+        if self.demo_mode:
+            # Skip loader in demo mode, go straight to main screen with demo data
+            from bugtrace.core.ui.tui.screens.main import MainScreen
+            self.push_screen(MainScreen(demo_mode=True))
+        else:
+            self.push_screen(LoaderScreen())
 
         # Install TUI logging handler
         self._install_logging_handler()
 
-        # Auto-start scan if target provided
-        if self.target:
+        # Auto-start scan if target provided (not in demo mode)
+        if self.target and not self.demo_mode:
             # Defer scan start until after screens are mounted
             self.set_timer(0.5, self._auto_start_scan)
 

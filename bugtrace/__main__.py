@@ -203,6 +203,9 @@ def tui(
     target: Optional[str] = typer.Argument(
         None, help="Target URL to scan (optional, can be entered in TUI)"
     ),
+    demo: bool = typer.Option(
+        False, "--demo", help="Run in demo mode with animated mock data"
+    ),
 ):
     """Launch the Textual-based Terminal User Interface.
 
@@ -215,13 +218,14 @@ def tui(
     If a target URL is provided, the scan will start automatically.
 
     Examples:
-        bugtrace tui                    # Open TUI without starting scan
+        bugtrace tui                     # Open TUI without starting scan
         bugtrace tui https://example.com # Open TUI and start scanning
+        bugtrace tui --demo              # Open TUI with animated demo data
     """
     try:
         from bugtrace.core.ui.tui import BugTraceApp
 
-        app_instance = BugTraceApp(target=target)
+        app_instance = BugTraceApp(target=target, demo_mode=demo)
         app_instance.run()
     except KeyboardInterrupt:
         # Clean exit on CTRL+C
