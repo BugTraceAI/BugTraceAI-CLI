@@ -40,7 +40,7 @@ app = typer.Typer(context_settings=CONTEXT_SETTINGS, add_completion=False)
 console = Console()
 
 # Commands that don't need instance locking (read-only or special)
-SKIP_LOCK_COMMANDS = {'agents', 'summary', 'mcp'}
+SKIP_LOCK_COMMANDS = {'agents', 'summary', 'mcp', 'tui'}
 
 
 @app.callback(invoke_without_command=True)
@@ -196,6 +196,39 @@ def agents():
 
     console.print(table)
     console.print("\n[dim]Run with: bugtrace scan <url> or bugtrace full <url>[/dim]")
+
+
+@app.command(name="tui")
+def tui():
+    """Launch the Textual-based Terminal User Interface.
+
+    This provides an interactive dashboard with:
+    - Real-time scan progress visualization
+    - Agent swarm monitoring
+    - Findings browser
+    - System metrics
+
+    Note: This is an experimental feature (Phase 1 - Foundation).
+    """
+    try:
+        from bugtrace.core.ui.tui import BugTraceApp
+
+        app_instance = BugTraceApp()
+        app_instance.run()
+    except KeyboardInterrupt:
+        # Clean exit on CTRL+C
+        pass
+    except ImportError as e:
+        console.print(f"[bold red]Error:[/bold red] Textual TUI dependencies not installed.")
+        console.print(f"[dim]Install with: pip install textual[/dim]")
+        console.print(f"[dim]Details: {e}[/dim]")
+        raise typer.Exit(code=1)
+    except Exception as e:
+        console.print(f"[bold red]TUI Error:[/bold red] {e}")
+        import traceback
+        traceback.print_exc()
+        raise typer.Exit(code=1)
+
 
 def _load_url_list(file_path: str, target: str) -> list:
     """
