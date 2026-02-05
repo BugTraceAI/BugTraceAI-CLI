@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
 from textual import work
 from textual.app import App
 from textual.binding import Binding
+from textual.widgets import DataTable
 from textual.worker import Worker, WorkerState
 
 from .messages import (
@@ -27,12 +28,16 @@ from .messages import (
 )
 from .widgets.activity import ActivityGraph
 from .widgets.findings import FindingsSummary
+from .widgets.findings_table import FindingsTable
 from .widgets.log_panel import LogPanel
+from .widgets.log_inspector import LogInspector
 from .widgets.metrics import SystemMetrics
 from .widgets.payload_feed import PayloadFeed
 from .widgets.pipeline import PipelineStatus
 from .widgets.swarm import AgentSwarm
+from .widgets.command_input import CommandInput, COMMANDS
 from .workers import TUILoggingHandler, UICallback
+from .screens.modals import FindingDetailsModal
 
 if TYPE_CHECKING:
     from textual.screen import Screen
@@ -380,3 +385,18 @@ class BugTraceApp(App):
             timeout=10,
         )
         self.sub_title = f"Complete: {message.total_findings} findings"
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Open finding details when row selected in findings table.
+
+        Only handles selections from the FindingsTable widget.
+        """
+        # Only handle findings table
+        if not isinstance(event.data_table, FindingsTable):
+            return
+
+        table = event.data_table
+        finding = table.get_finding(event.row_key.value)
+
+        if finding:
+            self.push_screen(FindingDetailsModal(finding))
