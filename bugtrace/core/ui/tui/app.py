@@ -320,16 +320,30 @@ class BugTraceApp(App):
     def on_new_finding(self, message: NewFinding) -> None:
         """Handle new vulnerability finding.
 
-        Updates the FindingsSummary widget and shows notification.
+        Updates both FindingsSummary (legacy) and FindingsTable (new) widgets.
         """
         self._total_findings += 1
 
+        # Update FindingsSummary (legacy widget)
         try:
             findings = self.query_one("#findings", FindingsSummary)
             findings.add_finding(
                 finding_type=message.finding_type,
                 details=message.details,
                 severity=message.severity.upper(),
+            )
+        except Exception:
+            pass  # Widget may not be mounted yet
+
+        # Also add to FindingsTable (new interactive widget)
+        try:
+            table = self.query_one("#findings-table", FindingsTable)
+            table.add_finding(
+                finding_type=message.finding_type,
+                details=message.details,
+                severity=message.severity,
+                param=message.param,
+                payload=message.payload,
             )
         except Exception:
             pass  # Widget may not be mounted yet
