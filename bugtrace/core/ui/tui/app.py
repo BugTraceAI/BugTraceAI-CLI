@@ -400,3 +400,108 @@ class BugTraceApp(App):
 
         if finding:
             self.push_screen(FindingDetailsModal(finding))
+
+    # =========================================================
+    # COMMAND HANDLERS: Process ChatOps commands
+    # =========================================================
+
+    def on_command_input_command_submitted(
+        self, message: CommandInput.CommandSubmitted
+    ) -> None:
+        """Handle commands from the command input bar."""
+        cmd = message.command.strip()
+
+        # Parse command and arguments
+        parts = cmd.split(maxsplit=1)
+        command = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+
+        if command in ("/stop", "stop"):
+            self._handle_stop()
+
+        elif command in ("/pause", "pause"):
+            self._handle_pause()
+
+        elif command in ("/resume", "resume"):
+            self._handle_resume()
+
+        elif command in ("/help", "help", "?"):
+            self._show_help()
+
+        elif command in ("/filter", "filter"):
+            self._apply_filter(args)
+
+        elif command in ("/show", "show"):
+            self._show_agent(args)
+
+        elif command in ("/clear", "clear"):
+            self._clear_logs()
+
+        elif command in ("/export", "export"):
+            self._export_findings()
+
+        else:
+            self.notify(f"Unknown command: {command}", severity="warning")
+            self.notify("Type /help for available commands")
+
+    def _handle_stop(self) -> None:
+        """Stop the current scan."""
+        if self.scan_worker and self.scan_worker.state == WorkerState.RUNNING:
+            self.scan_worker.cancel()
+            self.notify("Scan stopped")
+        else:
+            self.notify("No scan running", severity="warning")
+
+    def _handle_pause(self) -> None:
+        """Pause the scan (placeholder)."""
+        self.notify("Pause not implemented yet", severity="warning")
+
+    def _handle_resume(self) -> None:
+        """Resume the scan (placeholder)."""
+        self.notify("Resume not implemented yet", severity="warning")
+
+    def _show_help(self) -> None:
+        """Show help for available commands."""
+        help_lines = ["Available commands:"]
+        for cmd, desc in COMMANDS.items():
+            help_lines.append(f"  {cmd}: {desc}")
+
+        # Write to log inspector if available
+        try:
+            inspector = self.query_one("#log-inspector", LogInspector)
+            for line in help_lines:
+                inspector.log(line, level="INFO")
+        except Exception:
+            pass
+
+        self.notify("Help written to log panel")
+
+    def _apply_filter(self, filter_text: str) -> None:
+        """Apply filter to log inspector."""
+        try:
+            inspector = self.query_one("#log-inspector", LogInspector)
+            filter_input = inspector.query_one("#log-filter")
+            filter_input.value = filter_text
+            self.notify(f"Filter applied: {filter_text}")
+        except Exception as e:
+            self.notify(f"Filter failed: {e}", severity="error")
+
+    def _show_agent(self, agent_name: str) -> None:
+        """Filter to show only specific agent."""
+        if not agent_name:
+            self.notify("Usage: /show <agent-name>", severity="warning")
+            return
+        self._apply_filter(agent_name)
+
+    def _clear_logs(self) -> None:
+        """Clear the log inspector."""
+        try:
+            inspector = self.query_one("#log-inspector", LogInspector)
+            inspector.clear()
+            self.notify("Logs cleared")
+        except Exception:
+            pass
+
+    def _export_findings(self) -> None:
+        """Export findings to file (placeholder)."""
+        self.notify("Export not implemented yet", severity="warning")
