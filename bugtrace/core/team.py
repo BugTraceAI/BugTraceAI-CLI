@@ -125,6 +125,11 @@ class TeamOrchestrator:
         logger.info("Event Bus integrated into TeamOrchestrator")
         logger.info("Phase 1 Agents loaded: AssetDiscovery, APISecurity, ChainDiscovery")
 
+        # Subscribe to findings for TUI updates
+        from bugtrace.core.event_bus import EventType
+        self.event_bus.subscribe(EventType.VULNERABILITY_DETECTED.value, self._on_vulnerability_detected)
+        logger.info("EventBus -> TUI bridge registered for VULNERABILITY_DETECTED")
+
         # Initialize ThinkingConsolidationAgent for V3 pipeline
         from bugtrace.agents.thinking_consolidation_agent import ThinkingConsolidationAgent
         self.thinking_agent = ThinkingConsolidationAgent(scan_context=self.scan_context)
@@ -307,6 +312,30 @@ class TeamOrchestrator:
 
         # Initialize state
         self.processed_urls = set()
+
+    async def _on_vulnerability_detected(self, finding: dict) -> None:
+        """Bridge EventBus findings to TUI via conductor.
+
+        This method is subscribed to VULNERABILITY_DETECTED events and
+        forwards findings to conductor.notify_finding() which routes
+        to the TUI if ui_callback is set.
+        """
+        from bugtrace.core.conductor import conductor
+
+        # Extract fields with fallbacks for different finding formats
+        finding_type = finding.get("type", finding.get("finding_type", "Unknown"))
+        details = finding.get("details", finding.get("url", "No details"))
+        severity = finding.get("severity", "medium")
+        param = finding.get("parameter", finding.get("param"))
+        payload = finding.get("payload")
+
+        conductor.notify_finding(
+            finding_type=finding_type,
+            details=details,
+            severity=severity,
+            param=param,
+            payload=payload,
+        )
 
         # Inject scan_id into ThinkingConsolidationAgent for DB persistence
         if hasattr(self, 'thinking_agent'):
