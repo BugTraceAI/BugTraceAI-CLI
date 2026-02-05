@@ -84,10 +84,10 @@
 
 **Depends on:** Phase 02
 
-**Plans:** 3 plans
+**Plans:** 3 plans ✓
 - [x] 03-01-PLAN.md - FindingsTable + Modal (Wave 1)
 - [x] 03-02-PLAN.md - LogInspector + CommandInput (Wave 1)
-- [ ] 03-03-PLAN.md - Integration & Polish (Wave 2)
+- [x] 03-03-PLAN.md - Integration & Polish (Wave 2)
 
 ---
 
