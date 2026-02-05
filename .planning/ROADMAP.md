@@ -27,6 +27,9 @@
 
 **Blocks:** Phase 02, Phase 03
 
+**Plans:** 1 plan
+- [x] 01-01-PLAN.md - TUI Foundation & Structure
+
 ---
 
 ## Phase 02: Widget Migration & Async Engine
@@ -55,6 +58,11 @@
 
 **Depends on:** Phase 01
 
+**Plans:** 3 plans
+- [x] 02-01-PLAN.md - Widget Migration (Frontend)
+- [x] 02-02-PLAN.md - Async Engine Wiring (Backend)
+- [ ] 02-03-PLAN.md - Gap Closure: Wire message handlers to widgets
+
 ---
 
 ## Phase 03: High-Fidelity Interaction
@@ -75,6 +83,9 @@
 - Experience feels native and polished
 
 **Depends on:** Phase 02
+
+**Plans:** 0 plans
+- [ ] TBD (created by /gsd:plan-phase)
 
 ---
 

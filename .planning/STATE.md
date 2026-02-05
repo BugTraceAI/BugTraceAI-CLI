@@ -4,17 +4,32 @@
 
 **Milestone:** v5.0 - Textual TUI Migration
 **Phase:** 02 - Widget Migration & Async Engine
-**Status:** Complete
+**Status:** Gap Closure Pending
 
 ## Phase Progress
 
 | Phase | Name | Status | Plans |
 |-------|------|--------|-------|
 | 01 | Foundation & Structure | **Complete** | 1/1 |
-| 02 | Widget Migration & Async Engine | **Complete** | 2/2 |
+| 02 | Widget Migration & Async Engine | **Gap Closure** | 2/3 |
 | 03 | High-Fidelity Interaction | Ready | 0/1 |
 
-**Progress:** [========....] 75% (3/4 plans complete)
+**Progress:** [========....] 67% (2/3 plans complete, 1 gap closure pending)
+
+## Gap Closure Required
+
+**Gap identified by:** 02-VERIFICATION.md (2026-02-05)
+**Root cause:** Message handlers in app.py were implemented as stubs that only log, but do not call widget methods.
+
+**What's missing:**
+- `on_agent_update()` must call `swarm.update_agent()`
+- `on_pipeline_progress()` must set `pipeline.phase`, `pipeline.progress`
+- `on_new_finding()` must call `findings.add_finding()`
+- `on_payload_tested()` must call `feed.add_payload()`
+- `on_log_entry()` must call `logs.log()`
+- `on_metrics_update()` must set `metrics.cpu_usage`, `metrics.ram_usage`
+
+**Plan created:** 02-03-PLAN.md (gap_closure: true)
 
 ## Decisions Made
 
@@ -48,7 +63,7 @@
 - SparklineBuffer, Dashboard class
 - Multi-page UI (main, findings, logs, stats, agents, queues, config)
 
-**New TUI:** `bugtrace/core/ui/tui/` (Phase 2 complete)
+**New TUI:** `bugtrace/core/ui/tui/` (Phase 2 in gap closure)
 - CSS grid layout with Textual
 - BugTraceApp with loader/main screens
 - 7 custom widgets: Pipeline, Activity, Metrics, Swarm, PayloadFeed, Findings, LogPanel
@@ -63,20 +78,21 @@ The `--demo` flag and all subcommand options fail due to `allow_interspersed_arg
 
 ## Session Continuity
 
-**Last session:** 2026-02-05 00:19 UTC
-**Stopped at:** Completed 02-01-PLAN.md (Widget Migration)
+**Last session:** 2026-02-05 01:00 UTC
+**Stopped at:** Verification found gaps, created 02-03-PLAN.md
 **Resume file:** None
 
 ## Next Action
 
-Execute `/gsd:execute-phase 03` to build high-fidelity interactions
+Execute `/gsd:execute-phase 02` to run gap closure plan 02-03
 
 ## Plan Summary
 
 **Phase 01:** 1 plan (foundation, CSS, app skeleton) - **COMPLETE**
-**Phase 02:** 2 plans (widgets + async) - **COMPLETE**
+**Phase 02:** 3 plans (widgets + async + gap closure) - **GAP CLOSURE PENDING**
   - 02-01: Widget Migration - **COMPLETE**
   - 02-02: Async Engine Wiring - **COMPLETE**
+  - 02-03: Gap Closure (wire message handlers) - **PENDING**
 **Phase 03:** 1 plan (interactions, modals, commands) - **READY**
 
 ## Completed Summaries
