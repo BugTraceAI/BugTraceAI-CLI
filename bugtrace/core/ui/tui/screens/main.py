@@ -4,14 +4,15 @@ This screen displays the primary dashboard view with:
 - Phase pipeline progress
 - Activity graph and system metrics
 - Agent swarm status
-- Payload feed
-- Findings summary and activity log
+- Findings table with interactive selection
+- Payload feed and log inspector
+- Command input bar
 """
 
 from __future__ import annotations
 
 from textual.app import ComposeResult
-from textual.containers import Container
+from textual.containers import Container, Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, Header
 
@@ -22,6 +23,9 @@ from bugtrace.core.ui.tui.widgets.swarm import AgentSwarm
 from bugtrace.core.ui.tui.widgets.payload_feed import PayloadFeed
 from bugtrace.core.ui.tui.widgets.findings import FindingsSummary
 from bugtrace.core.ui.tui.widgets.log_panel import LogPanel
+from bugtrace.core.ui.tui.widgets.findings_table import FindingsTable
+from bugtrace.core.ui.tui.widgets.log_inspector import LogInspector
+from bugtrace.core.ui.tui.widgets.command_input import CommandInput
 
 
 class MainScreen(Screen):
@@ -55,32 +59,44 @@ class MainScreen(Screen):
     def compose(self) -> ComposeResult:
         """Compose the main screen layout.
 
-        Yields widgets in a structured layout matching the legacy
-        Rich dashboard appearance.
+        Yields widgets in a structured grid layout:
+        - Top: Pipeline status
+        - Row 1: Activity + Metrics | Agent Swarm
+        - Row 2: Findings Table (full width)
+        - Row 3: Payload Feed | Log Inspector
+        - Bottom: Command Input bar
 
         Yields:
             Widget: The composed widgets for this screen.
         """
         yield Header(show_clock=True)
-        yield Container(
-            PipelineStatus(id="pipeline"),
-            Container(
-                ActivityGraph(id="activity"),
-                SystemMetrics(id="metrics"),
-                classes="metrics-row",
-            ),
-            Container(
-                AgentSwarm(id="swarm"),
-                PayloadFeed(id="payload-feed"),
-                classes="middle-row",
-            ),
-            Container(
-                FindingsSummary(id="findings"),
-                LogPanel(id="logs"),
-                classes="bottom-row",
-            ),
-            id="main-content",
-        )
+
+        with Container(id="main-content"):
+            # Top: Pipeline status
+            yield PipelineStatus(id="pipeline")
+
+            # Row 1: Activity + Metrics | Swarm
+            with Horizontal(classes="dashboard-row"):
+                with Vertical(classes="left-panel"):
+                    yield ActivityGraph(id="activity")
+                    yield SystemMetrics(id="metrics")
+                yield AgentSwarm(id="swarm")
+
+            # Row 2: Findings Table (full width)
+            yield FindingsTable(id="findings-table")
+
+            # Row 3: Payload Feed | Log Inspector
+            with Horizontal(classes="dashboard-row"):
+                yield PayloadFeed(id="payload-feed")
+                yield LogInspector(id="log-inspector")
+
+            # Legacy widgets hidden but kept for backward compatibility
+            # Kept in compose for demo mode to work
+            with Container(classes="hidden-legacy"):
+                yield FindingsSummary(id="findings")
+                yield LogPanel(id="logs")
+
+        yield CommandInput(id="command-input")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -98,6 +114,41 @@ class MainScreen(Screen):
             self.query_one("#payload-feed", PayloadFeed).demo_mode = True
             self.query_one("#findings", FindingsSummary).demo_mode = True
             self.query_one("#logs", LogPanel).demo_mode = True
+        except Exception:
+            pass
+
+        # Add demo findings to FindingsTable
+        try:
+            table = self.query_one("#findings-table", FindingsTable)
+            demo_findings = [
+                ("XSS", "Reflected XSS in search", "HIGH", "q", "<script>alert(1)</script>"),
+                ("SQLi", "SQL Injection in login", "CRITICAL", "username", "' OR 1=1--"),
+                ("SSRF", "SSRF via image URL", "MEDIUM", "image_url", "http://169.254.169.254/"),
+                ("Open Redirect", "Unvalidated redirect", "LOW", "next", "//evil.com"),
+            ]
+            for finding_type, details, severity, param, payload in demo_findings:
+                table.add_finding(
+                    finding_type=finding_type,
+                    details=details,
+                    severity=severity,
+                    param=param,
+                    payload=payload,
+                )
+        except Exception:
+            pass
+
+        # Add demo logs to LogInspector
+        try:
+            inspector = self.query_one("#log-inspector", LogInspector)
+            demo_logs = [
+                ("INFO", "[XSSAgent] Starting scan..."),
+                ("INFO", "[XSSAgent] Testing 42 payloads on /search"),
+                ("WARNING", "[XSSAgent] Possible reflection detected"),
+                ("SUCCESS", "[XSSAgent] Confirmed XSS in 'q' parameter"),
+                ("ERROR", "[SQLiAgent] Connection timeout"),
+            ]
+            for level, message in demo_logs:
+                inspector.log(message, level=level)
         except Exception:
             pass
 
