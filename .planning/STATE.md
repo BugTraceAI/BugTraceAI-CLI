@@ -12,16 +12,16 @@
 |-------|------|--------|-------|
 | 01 | Foundation & Structure | **Complete** | 1/1 |
 | 02 | Widget Migration & Async Engine | **Complete** | 3/3 |
-| 03 | High-Fidelity Interaction | **In Progress** | 1/3 |
+| 03 | High-Fidelity Interaction | **In Progress** | 2/3 |
 
-**Progress:** [===========.] 86% (5/6 plans complete)
+**Progress:** [===========.] 86% (6/7 plans complete)
 
 ## Last Completed Plan
 
-**Plan:** 03-01 (FindingsTable + Modal)
-**What:** Created FindingsTable widget with sortable DataTable, FindingDetailsModal with clipboard copy
-**Commits:** bf2f138, 5543da5, 6d3a95e, 6e0ee26
-**Summary:** `.planning/phases/03-interactions/03-01-SUMMARY.md`
+**Plan:** 03-02 (LogInspector + CommandInput)
+**What:** Created LogInspector with real-time filtering and CommandInput with history-based ChatOps commands
+**Commits:** 16530d0, 02fb609, b3e91fb, b9225ef
+**Summary:** `.planning/phases/03-interactions/03-02-SUMMARY.md`
 
 ## Decisions Made
 
@@ -42,6 +42,8 @@
 | 2026-02-05 | DataTable extension for FindingsTable | O(1) lookup via row key |
 | 2026-02-05 | Inline CSS for modal | Self-contained component |
 | 2026-02-05 | Optional pyperclip for clipboard | Graceful degradation |
+| 2026-02-05 | LogInspector stores up to 2000 logs | Prevents OOM while allowing history |
+| 2026-02-05 | 8 ChatOps commands in COMMANDS dict | /stop, /pause, /resume, /help, /filter, /show, /clear, /export |
 
 ## Patterns Established
 
@@ -56,6 +58,8 @@
 - **Query-one pattern:** try query_one("#id", WidgetClass) + call method, except pass
 - **ModalScreen pattern:** Escape binding + dismiss action for modals
 - **TYPE_CHECKING guard:** For circular import avoidance in modals
+- **Filter pattern:** Store all data, re-render on filter change
+- **History pattern:** List with index navigation, max entries limit
 
 ## Context
 
@@ -67,9 +71,11 @@
 **New TUI:** `bugtrace/core/ui/tui/` (Phase 3 In Progress)
 - CSS grid layout with Textual
 - BugTraceApp with loader/main screens
-- 7 custom widgets: Pipeline, Activity, Metrics, Swarm, PayloadFeed, Findings, LogPanel
+- 9 custom widgets: Pipeline, Activity, Metrics, Swarm, PayloadFeed, Findings, LogPanel, LogInspector, CommandInput
 - **FindingsTable:** Interactive DataTable for vulnerability browsing
 - **FindingDetailsModal:** Full details with payload/request/response
+- **LogInspector:** Filterable log viewer with RichLog
+- **CommandInput:** ChatOps command bar with history
 - Message types: AgentUpdate, PipelineProgress, NewFinding, etc.
 - UICallback bridges pipeline to TUI
 - CLI entry point: `bugtrace tui [target] [--demo]`
@@ -82,12 +88,12 @@ The `--demo` flag and all subcommand options fail due to `allow_interspersed_arg
 ## Session Continuity
 
 **Last session:** 2026-02-05 07:09 UTC
-**Stopped at:** Completed 03-01-PLAN.md (FindingsTable + Modal)
+**Stopped at:** Completed 03-02-PLAN.md (LogInspector + CommandInput)
 **Resume file:** None
 
 ## Next Action
 
-Execute `/gsd:execute-phase 03` to continue with 03-02-PLAN.md (LogInspector + CommandInput)
+Execute `/gsd:execute-phase 03` to continue with 03-03-PLAN.md (Integration & Polish)
 
 ## Plan Summary
 
@@ -95,8 +101,8 @@ Execute `/gsd:execute-phase 03` to continue with 03-02-PLAN.md (LogInspector + C
 **Phase 02:** 3 plans (widgets + async + gap closure) - **COMPLETE**
 **Phase 03:** 3 plans (interactions, modals, commands) - **IN PROGRESS**
   - 03-01: FindingsTable + Modal - **COMPLETE**
-  - 03-02: LogInspector + CommandInput - **READY**
-  - 03-03: Integration & Polish - **WAITING**
+  - 03-02: LogInspector + CommandInput - **COMPLETE**
+  - 03-03: Integration & Polish - **READY**
 
 ## Completed Summaries
 
@@ -105,3 +111,4 @@ Execute `/gsd:execute-phase 03` to continue with 03-02-PLAN.md (LogInspector + C
 - `.planning/phases/02-widgets-async/02-02-SUMMARY.md` - Async Engine Wiring
 - `.planning/phases/02-widgets-async/02-03-SUMMARY.md` - Gap Closure (Message Handler Wiring)
 - `.planning/phases/03-interactions/03-01-SUMMARY.md` - FindingsTable + Modal
+- `.planning/phases/03-interactions/03-02-SUMMARY.md` - LogInspector + CommandInput
