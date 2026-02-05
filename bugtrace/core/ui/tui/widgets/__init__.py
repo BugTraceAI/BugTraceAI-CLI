@@ -12,6 +12,8 @@ from bugtrace.core.ui.tui.widgets.swarm import AgentSwarm
 from bugtrace.core.ui.tui.widgets.payload_feed import PayloadFeed
 from bugtrace.core.ui.tui.widgets.findings import FindingsSummary
 from bugtrace.core.ui.tui.widgets.log_panel import LogPanel
+from bugtrace.core.ui.tui.widgets.log_inspector import LogInspector
+from bugtrace.core.ui.tui.widgets.command_input import CommandInput, COMMANDS
 
 __all__ = [
     "BugTraceHeader",
@@ -23,4 +25,7 @@ __all__ = [
     "PayloadFeed",
     "FindingsSummary",
     "LogPanel",
+    "LogInspector",
+    "CommandInput",
+    "COMMANDS",
 ]
