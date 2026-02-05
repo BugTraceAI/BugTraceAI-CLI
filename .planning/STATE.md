@@ -3,8 +3,8 @@
 ## Current Status
 
 **Milestone:** v5.0 - Textual TUI Migration
-**Phase:** 02 - Widget Migration & Async Engine
-**Status:** Complete
+**Phase:** 03 - High-Fidelity Interaction
+**Status:** In progress
 
 ## Phase Progress
 
@@ -12,16 +12,16 @@
 |-------|------|--------|-------|
 | 01 | Foundation & Structure | **Complete** | 1/1 |
 | 02 | Widget Migration & Async Engine | **Complete** | 3/3 |
-| 03 | High-Fidelity Interaction | Ready | 0/1 |
+| 03 | High-Fidelity Interaction | **In Progress** | 1/3 |
 
-**Progress:** [==========..] 80% (3/4 plans complete)
+**Progress:** [===========.] 86% (5/6 plans complete)
 
 ## Last Completed Plan
 
-**Plan:** 02-03 (Gap Closure)
-**What:** Wired 6 message handlers in app.py to call widget update methods via query_one()
-**Commit:** 524ca5f
-**Summary:** `.planning/phases/02-widgets-async/02-03-SUMMARY.md`
+**Plan:** 03-01 (FindingsTable + Modal)
+**What:** Created FindingsTable widget with sortable DataTable, FindingDetailsModal with clipboard copy
+**Commits:** bf2f138, 5543da5, 6d3a95e, 6e0ee26
+**Summary:** `.planning/phases/03-interactions/03-01-SUMMARY.md`
 
 ## Decisions Made
 
@@ -39,6 +39,9 @@
 | 2026-02-05 | SparklineBuffer utility | Shared between ActivityGraph and SystemMetrics |
 | 2026-02-05 | Each widget has demo_mode | reactive attribute for visual testing |
 | 2026-02-05 | Wrap query_one() in try/except | Graceful degradation when widgets not mounted |
+| 2026-02-05 | DataTable extension for FindingsTable | O(1) lookup via row key |
+| 2026-02-05 | Inline CSS for modal | Self-contained component |
+| 2026-02-05 | Optional pyperclip for clipboard | Graceful degradation |
 
 ## Patterns Established
 
@@ -51,6 +54,8 @@
 - **Reactive widgets:** All widget data exposed via reactive() for auto-refresh
 - **Demo mode:** --demo flag enables animated mock data for testing
 - **Query-one pattern:** try query_one("#id", WidgetClass) + call method, except pass
+- **ModalScreen pattern:** Escape binding + dismiss action for modals
+- **TYPE_CHECKING guard:** For circular import avoidance in modals
 
 ## Context
 
@@ -59,13 +64,14 @@
 - SparklineBuffer, Dashboard class
 - Multi-page UI (main, findings, logs, stats, agents, queues, config)
 
-**New TUI:** `bugtrace/core/ui/tui/` (Phase 2 Complete)
+**New TUI:** `bugtrace/core/ui/tui/` (Phase 3 In Progress)
 - CSS grid layout with Textual
 - BugTraceApp with loader/main screens
 - 7 custom widgets: Pipeline, Activity, Metrics, Swarm, PayloadFeed, Findings, LogPanel
+- **FindingsTable:** Interactive DataTable for vulnerability browsing
+- **FindingDetailsModal:** Full details with payload/request/response
 - Message types: AgentUpdate, PipelineProgress, NewFinding, etc.
 - UICallback bridges pipeline to TUI
-- **Message handlers wired to widgets via query_one()**
 - CLI entry point: `bugtrace tui [target] [--demo]`
 
 ## Known Issues
@@ -75,22 +81,22 @@ The `--demo` flag and all subcommand options fail due to `allow_interspersed_arg
 
 ## Session Continuity
 
-**Last session:** 2026-02-05 06:44 UTC
-**Stopped at:** Completed 02-03-PLAN.md (gap closure)
+**Last session:** 2026-02-05 07:09 UTC
+**Stopped at:** Completed 03-01-PLAN.md (FindingsTable + Modal)
 **Resume file:** None
 
 ## Next Action
 
-Execute `/gsd:execute-phase 03` to start Phase 3 (High-Fidelity Interaction)
+Execute `/gsd:execute-phase 03` to continue with 03-02-PLAN.md (LogInspector + CommandInput)
 
 ## Plan Summary
 
 **Phase 01:** 1 plan (foundation, CSS, app skeleton) - **COMPLETE**
 **Phase 02:** 3 plans (widgets + async + gap closure) - **COMPLETE**
-  - 02-01: Widget Migration - **COMPLETE**
-  - 02-02: Async Engine Wiring - **COMPLETE**
-  - 02-03: Gap Closure (wire message handlers) - **COMPLETE**
-**Phase 03:** 1 plan (interactions, modals, commands) - **READY**
+**Phase 03:** 3 plans (interactions, modals, commands) - **IN PROGRESS**
+  - 03-01: FindingsTable + Modal - **COMPLETE**
+  - 03-02: LogInspector + CommandInput - **READY**
+  - 03-03: Integration & Polish - **WAITING**
 
 ## Completed Summaries
 
@@ -98,3 +104,4 @@ Execute `/gsd:execute-phase 03` to start Phase 3 (High-Fidelity Interaction)
 - `.planning/phases/02-widgets-async/02-01-SUMMARY.md` - Widget Migration (Frontend)
 - `.planning/phases/02-widgets-async/02-02-SUMMARY.md` - Async Engine Wiring
 - `.planning/phases/02-widgets-async/02-03-SUMMARY.md` - Gap Closure (Message Handler Wiring)
+- `.planning/phases/03-interactions/03-01-SUMMARY.md` - FindingsTable + Modal
