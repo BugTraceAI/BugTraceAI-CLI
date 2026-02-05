@@ -4,7 +4,7 @@
 
 **Milestone:** v5.0 - Textual TUI Migration
 **Phase:** 03 - High-Fidelity Interaction
-**Status:** In progress
+**Status:** Complete
 
 ## Phase Progress
 
@@ -12,16 +12,16 @@
 |-------|------|--------|-------|
 | 01 | Foundation & Structure | **Complete** | 1/1 |
 | 02 | Widget Migration & Async Engine | **Complete** | 3/3 |
-| 03 | High-Fidelity Interaction | **In Progress** | 2/3 |
+| 03 | High-Fidelity Interaction | **Complete** | 3/3 |
 
-**Progress:** [===========.] 86% (6/7 plans complete)
+**Progress:** [============] 100% (7/7 plans complete)
 
 ## Last Completed Plan
 
-**Plan:** 03-02 (LogInspector + CommandInput)
-**What:** Created LogInspector with real-time filtering and CommandInput with history-based ChatOps commands
-**Commits:** 16530d0, 02fb609, b3e91fb, b9225ef
-**Summary:** `.planning/phases/03-interactions/03-02-SUMMARY.md`
+**Plan:** 03-03 (Integration & Polish)
+**What:** Integrated FindingsTable, LogInspector, CommandInput into MainScreen with row-to-modal navigation, ChatOps commands, and keyboard shortcuts
+**Commits:** 296a3a7, 33db40d, 5d3c0c5, 5d6c689, ddcbe01, d801efd, 9befb4b
+**Summary:** `.planning/phases/03-interactions/03-03-SUMMARY.md`
 
 ## Decisions Made
 
@@ -44,6 +44,9 @@
 | 2026-02-05 | Optional pyperclip for clipboard | Graceful degradation |
 | 2026-02-05 | LogInspector stores up to 2000 logs | Prevents OOM while allowing history |
 | 2026-02-05 | 8 ChatOps commands in COMMANDS dict | /stop, /pause, /resume, /help, /filter, /show, /clear, /export |
+| 2026-02-05 | Keep legacy widgets hidden but mounted | Backward compatibility |
+| 2026-02-05 | Dual-path message handlers | Update both legacy and new widgets |
+| 2026-02-05 | Keyboard shortcuts: f, l, :, ?, q | vim-like muscle memory |
 
 ## Patterns Established
 
@@ -60,6 +63,9 @@
 - **TYPE_CHECKING guard:** For circular import avoidance in modals
 - **Filter pattern:** Store all data, re-render on filter change
 - **History pattern:** List with index navigation, max entries limit
+- **ChatOps pattern:** Parse command + args, dispatch to handler methods
+- **Focus actions:** action_focus_* pattern with try/except
+- **Dual-path handlers:** Update both legacy and new widgets
 
 ## Context
 
@@ -68,7 +74,7 @@
 - SparklineBuffer, Dashboard class
 - Multi-page UI (main, findings, logs, stats, agents, queues, config)
 
-**New TUI:** `bugtrace/core/ui/tui/` (Phase 3 In Progress)
+**New TUI:** `bugtrace/core/ui/tui/` (Phase 3 COMPLETE)
 - CSS grid layout with Textual
 - BugTraceApp with loader/main screens
 - 9 custom widgets: Pipeline, Activity, Metrics, Swarm, PayloadFeed, Findings, LogPanel, LogInspector, CommandInput
@@ -79,6 +85,8 @@
 - Message types: AgentUpdate, PipelineProgress, NewFinding, etc.
 - UICallback bridges pipeline to TUI
 - CLI entry point: `bugtrace tui [target] [--demo]`
+- Keyboard shortcuts: f (findings), l (logs), : (command), ? (help), q (quit)
+- ChatOps commands: /stop, /help, /filter, /show, /clear, /export
 
 ## Known Issues
 
@@ -87,22 +95,27 @@ The `--demo` flag and all subcommand options fail due to `allow_interspersed_arg
 
 ## Session Continuity
 
-**Last session:** 2026-02-05 07:09 UTC
-**Stopped at:** Completed 03-02-PLAN.md (LogInspector + CommandInput)
+**Last session:** 2026-02-05 07:15 UTC
+**Stopped at:** Completed 03-03-PLAN.md (Integration & Polish)
 **Resume file:** None
 
 ## Next Action
 
-Execute `/gsd:execute-phase 03` to continue with 03-03-PLAN.md (Integration & Polish)
+Milestone v5.0 (Textual TUI Migration) is **COMPLETE**. All 3 phases with 7 plans executed successfully.
+
+Options:
+- `/gsd:complete-milestone` - Archive and prepare for next milestone
+- `/gsd:verify-work` - Manual acceptance testing
+- `/gsd:add-phase <description>` - Add another phase before completing
 
 ## Plan Summary
 
 **Phase 01:** 1 plan (foundation, CSS, app skeleton) - **COMPLETE**
 **Phase 02:** 3 plans (widgets + async + gap closure) - **COMPLETE**
-**Phase 03:** 3 plans (interactions, modals, commands) - **IN PROGRESS**
+**Phase 03:** 3 plans (interactions, modals, commands) - **COMPLETE**
   - 03-01: FindingsTable + Modal - **COMPLETE**
   - 03-02: LogInspector + CommandInput - **COMPLETE**
-  - 03-03: Integration & Polish - **READY**
+  - 03-03: Integration & Polish - **COMPLETE**
 
 ## Completed Summaries
 
@@ -112,3 +125,4 @@ Execute `/gsd:execute-phase 03` to continue with 03-03-PLAN.md (Integration & Po
 - `.planning/phases/02-widgets-async/02-03-SUMMARY.md` - Gap Closure (Message Handler Wiring)
 - `.planning/phases/03-interactions/03-01-SUMMARY.md` - FindingsTable + Modal
 - `.planning/phases/03-interactions/03-02-SUMMARY.md` - LogInspector + CommandInput
+- `.planning/phases/03-interactions/03-03-SUMMARY.md` - Integration & Polish
