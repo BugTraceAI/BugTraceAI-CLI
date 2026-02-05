@@ -306,3 +306,27 @@ LoaderScreen {
 #command-input:focus {
     background: $surface-lighten-1;
 }
+
+/* ============================================
+ * FINDINGS TABLE
+ * ============================================ */
+#findings-table {
+    height: 100%;
+    border: solid $primary;
+}
+
+#findings-table > .datatable--header {
+    background: $primary-darken-2;
+    text-style: bold;
+}
+
+#findings-table > .datatable--cursor {
+    background: $primary;
+}
+
+/* ============================================
+ * MODAL OVERLAY
+ * ============================================ */
+ModalScreen {
+    background: $background 80%;
+}
