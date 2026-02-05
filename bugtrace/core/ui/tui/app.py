@@ -383,11 +383,19 @@ class BugTraceApp(App):
     def on_log_entry(self, message: LogEntry) -> None:
         """Handle log entry.
 
-        Routes to LogPanel widget.
+        Routes to both LogPanel (legacy) and LogInspector (new) widgets.
         """
+        # Update LogPanel (legacy widget)
         try:
             logs = self.query_one("#logs", LogPanel)
             logs.log(message.message, level=message.level)
+        except Exception:
+            pass  # Widget may not be mounted yet
+
+        # Also add to LogInspector (new filterable widget)
+        try:
+            inspector = self.query_one("#log-inspector", LogInspector)
+            inspector.log(message.message, level=message.level)
         except Exception:
             pass  # Widget may not be mounted yet
 
