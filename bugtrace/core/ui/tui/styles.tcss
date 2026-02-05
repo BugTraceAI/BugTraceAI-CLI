@@ -280,3 +280,29 @@ LoaderScreen {
 .logo-line-4 {
     color: $gradient-4;
 }
+
+/* ============================================
+ * LOG INSPECTOR
+ * ============================================ */
+#log-inspector {
+    height: 100%;
+}
+
+#log-inspector #log-filter {
+    background: $surface;
+}
+
+#log-inspector #log-view {
+    background: $surface-darken-1;
+}
+
+/* ============================================
+ * COMMAND INPUT
+ * ============================================ */
+#command-input {
+    background: $surface;
+}
+
+#command-input:focus {
+    background: $surface-lighten-1;
+}
