@@ -63,9 +63,12 @@ class BugTraceApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit", priority=True),
         Binding("d", "toggle_dark", "Toggle Dark"),
-        Binding("escape", "back", "Back", show=False),
-        Binding("?", "help", "Help"),
+        Binding("escape", "unfocus", "Unfocus", show=False),
+        Binding("?", "show_help", "Help"),
         Binding("s", "start_scan", "Start Scan", show=False),
+        Binding("f", "focus_findings", "Findings"),
+        Binding("l", "focus_logs", "Logs"),
+        Binding(":", "focus_command", "Command"),
     ]
 
     def __init__(
@@ -225,14 +228,34 @@ class BugTraceApp(App):
         """Toggle dark mode on/off."""
         self.dark = not self.dark
 
-    def action_back(self) -> None:
-        """Go back to previous screen if possible."""
-        if len(self.screen_stack) > 1:
-            self.pop_screen()
+    def action_focus_findings(self) -> None:
+        """Focus the findings table."""
+        try:
+            self.query_one("#findings-table").focus()
+        except Exception:
+            pass
 
-    def action_help(self) -> None:
-        """Show help screen (placeholder for Phase 3)."""
-        self.notify("Help: Press 'q' to quit, 'd' to toggle dark mode, 's' to start scan")
+    def action_focus_logs(self) -> None:
+        """Focus the log inspector."""
+        try:
+            self.query_one("#log-inspector").focus()
+        except Exception:
+            pass
+
+    def action_focus_command(self) -> None:
+        """Focus the command input."""
+        try:
+            self.query_one("#command-input").focus()
+        except Exception:
+            pass
+
+    def action_show_help(self) -> None:
+        """Show help via command handler."""
+        self._show_help()
+
+    def action_unfocus(self) -> None:
+        """Remove focus from current widget."""
+        self.screen.set_focus(None)
 
     @property
     def is_shutting_down(self) -> bool:
