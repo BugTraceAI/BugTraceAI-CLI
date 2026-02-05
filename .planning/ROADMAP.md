@@ -58,7 +58,7 @@
 
 **Depends on:** Phase 01
 
-**Plans:** 3 plans ✓
+**Plans:** 3 plans
 - [x] 02-01-PLAN.md - Widget Migration (Frontend)
 - [x] 02-02-PLAN.md - Async Engine Wiring (Backend)
 - [x] 02-03-PLAN.md - Gap Closure: Wire message handlers to widgets
@@ -84,10 +84,39 @@
 
 **Depends on:** Phase 02
 
-**Plans:** 3 plans ✓
+**Plans:** 3 plans
 - [x] 03-01-PLAN.md - FindingsTable + Modal (Wave 1)
 - [x] 03-02-PLAN.md - LogInspector + CommandInput (Wave 1)
 - [x] 03-03-PLAN.md - Integration & Polish (Wave 2)
+
+---
+
+## Phase 04: Gap Closure - EventBus to TUI Integration
+
+**Goal:** Wire EventBus VULNERABILITY_DETECTED events to TUI so FindingsTable displays real scan findings
+
+**Problem:**
+- Specialists emit `VULNERABILITY_DETECTED` via `self.emit_finding()` (base.py)
+- ReportingAgent subscribes to collect findings
+- **Nothing bridges** EventBus events to `conductor.notify_finding()`
+- Result: FindingsTable stays empty during real scans
+
+**Fix:**
+Add an event subscriber in TeamOrchestrator that calls `conductor.notify_finding()` when `VULNERABILITY_DETECTED` is emitted
+
+**Deliverables:**
+- Event subscriber in TeamOrchestrator
+- End-to-end flow: Specialist -> EventBus -> conductor.notify_finding() -> UICallback -> TUI
+
+**Acceptance:**
+- Real scan findings appear in FindingsTable
+- No duplicate findings (proper deduplication)
+- Works with both TUI and legacy dashboard
+
+**Depends on:** Phase 03
+
+**Plans:** 1 plan
+- [ ] 04-01-PLAN.md - EventBus-to-Conductor Bridge
 
 ---
 
@@ -104,6 +133,8 @@
                                               |-- Agent Swarm
                                               |-- Command Palette
 ```
+
+---
 
 ## Developer Guidelines
 
