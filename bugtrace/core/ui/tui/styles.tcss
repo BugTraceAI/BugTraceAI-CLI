@@ -102,6 +102,22 @@ Screen {
 }
 
 /* ============================================
+ * DASHBOARD LAYOUT (New Layout)
+ * ============================================ */
+.dashboard-row {
+    layout: horizontal;
+    height: auto;
+    min-height: 8;
+    margin-bottom: 1;
+}
+
+.left-panel {
+    width: 1fr;
+    max-width: 40;
+    margin-right: 1;
+}
+
+/* ============================================
  * MIDDLE ROW - Swarm & Payload Feed
  * ============================================ */
 .middle-row {
@@ -143,6 +159,13 @@ Screen {
     width: 1fr;
     border: round $primary-dark;
     padding: 0 1;
+}
+
+/* ============================================
+ * HIDDEN LEGACY WIDGETS
+ * ============================================ */
+.hidden-legacy {
+    display: none;
 }
 
 /* ============================================
@@ -282,41 +305,17 @@ LoaderScreen {
 }
 
 /* ============================================
- * LOG INSPECTOR
- * ============================================ */
-#log-inspector {
-    height: 100%;
-}
-
-#log-inspector #log-filter {
-    background: $surface;
-}
-
-#log-inspector #log-view {
-    background: $surface-darken-1;
-}
-
-/* ============================================
- * COMMAND INPUT
- * ============================================ */
-#command-input {
-    background: $surface;
-}
-
-#command-input:focus {
-    background: $surface-lighten-1;
-}
-
-/* ============================================
- * FINDINGS TABLE
+ * FINDINGS TABLE SECTION
  * ============================================ */
 #findings-table {
-    height: 100%;
-    border: solid $primary;
+    height: 12;
+    min-height: 8;
+    margin: 1 0;
+    border: solid $error;
 }
 
 #findings-table > .datatable--header {
-    background: $primary-darken-2;
+    background: $surface-light;
     text-style: bold;
 }
 
@@ -325,8 +324,58 @@ LoaderScreen {
 }
 
 /* ============================================
+ * LOG INSPECTOR
+ * ============================================ */
+#log-inspector {
+    width: 1fr;
+    min-height: 10;
+    border: round $primary-dark;
+}
+
+#log-inspector #log-filter {
+    background: $surface;
+}
+
+#log-inspector #log-view {
+    background: $surface;
+}
+
+/* ============================================
+ * COMMAND INPUT
+ * ============================================ */
+#command-input {
+    dock: bottom;
+    height: 3;
+    background: $surface;
+    margin: 0 1;
+    border: solid $primary;
+}
+
+#command-input:focus {
+    background: $surface-light;
+    border: solid $warning;
+}
+
+/* ============================================
  * MODAL OVERLAY
  * ============================================ */
 ModalScreen {
     background: $background 80%;
+}
+
+/* ============================================
+ * RESPONSIVE: Small terminals
+ * ============================================ */
+@media (width < 100) {
+    .dashboard-row {
+        layout: vertical;
+    }
+
+    .left-panel {
+        max-width: 100%;
+    }
+
+    #findings-table {
+        height: 8;
+    }
 }
