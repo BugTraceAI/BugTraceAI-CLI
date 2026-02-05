@@ -25,6 +25,13 @@ from .messages import (
     PipelineProgress,
     ScanComplete,
 )
+from .widgets.activity import ActivityGraph
+from .widgets.findings import FindingsSummary
+from .widgets.log_panel import LogPanel
+from .widgets.metrics import SystemMetrics
+from .widgets.payload_feed import PayloadFeed
+from .widgets.pipeline import PipelineStatus
+from .widgets.swarm import AgentSwarm
 from .workers import TUILoggingHandler, UICallback
 
 if TYPE_CHECKING:
@@ -253,21 +260,34 @@ class BugTraceApp(App):
 
         Updates the AgentSwarm widget with new agent status.
         """
-        # For now, log the update. Widget integration comes in Plan 02-01.
-        self.log.info(
-            f"Agent {message.agent_name}: {message.status} "
-            f"(queue={message.queue}, processed={message.processed}, vulns={message.vulns})"
-        )
+        try:
+            swarm = self.query_one("#swarm", AgentSwarm)
+            swarm.update_agent(
+                message.agent_name,
+                message.status,
+                queue=message.queue,
+                processed=message.processed,
+                vulns=message.vulns,
+            )
+        except Exception:
+            pass  # Widget may not be mounted yet
 
     def on_pipeline_progress(self, message: PipelineProgress) -> None:
         """Handle pipeline progress update.
 
         Updates the PipelineStatus widget with new progress.
         """
-        # For now, update title. Widget integration comes in Plan 02-01.
+        try:
+            pipeline = self.query_one("#pipeline", PipelineStatus)
+            pipeline.phase = message.phase
+            pipeline.progress = message.progress * 100  # Convert 0-1 to 0-100
+            if message.status_msg:
+                pipeline.status_msg = message.status_msg
+        except Exception:
+            pass  # Widget may not be mounted yet
+
+        # Also update app subtitle for visibility
         self.sub_title = f"{message.phase}: {int(message.progress * 100)}%"
-        if message.status_msg:
-            self.log.info(f"Pipeline: {message.status_msg}")
 
     def on_new_finding(self, message: NewFinding) -> None:
         """Handle new vulnerability finding.
@@ -275,6 +295,16 @@ class BugTraceApp(App):
         Updates the FindingsSummary widget and shows notification.
         """
         self._total_findings += 1
+
+        try:
+            findings = self.query_one("#findings", FindingsSummary)
+            findings.add_finding(
+                finding_type=message.finding_type,
+                details=message.details,
+                severity=message.severity.upper(),
+            )
+        except Exception:
+            pass  # Widget may not be mounted yet
 
         # Show notification for findings
         severity_colors = {
@@ -295,36 +325,49 @@ class BugTraceApp(App):
 
         Updates the PayloadFeed widget with test result.
         """
-        # Log for now. Widget integration comes in Plan 02-01.
-        result_indicator = {"success": "+", "fail": "-", "blocked": "!"}
-        self.log.debug(
-            f"[{result_indicator.get(message.result, '?')}] "
-            f"{message.agent}: {message.payload[:50]}..."
-        )
+        try:
+            feed = self.query_one("#payload-feed", PayloadFeed)
+            # Map result to status
+            status_map = {"success": "confirmed", "fail": "failed", "blocked": "blocked"}
+            status = status_map.get(message.result, "testing")
+            feed.add_payload(
+                payload=message.payload,
+                agent=message.agent,
+                status=status,
+            )
+        except Exception:
+            pass  # Widget may not be mounted yet
 
     def on_log_entry(self, message: LogEntry) -> None:
         """Handle log entry.
 
         Routes to LogPanel widget.
         """
-        # Use Textual's built-in logging for now
-        log_methods = {
-            "DEBUG": self.log.debug,
-            "INFO": self.log.info,
-            "WARNING": self.log.warning,
-            "ERROR": self.log.error,
-            "CRITICAL": self.log.error,
-        }
-        log_func = log_methods.get(message.level.upper(), self.log.info)
-        log_func(message.message)
+        try:
+            logs = self.query_one("#logs", LogPanel)
+            logs.log(message.message, level=message.level)
+        except Exception:
+            pass  # Widget may not be mounted yet
 
     def on_metrics_update(self, message: MetricsUpdate) -> None:
         """Handle system metrics update.
 
         Updates SystemMetrics and ActivityGraph widgets.
         """
-        # Widget integration comes in Plan 02-01
-        pass
+        try:
+            metrics = self.query_one("#metrics", SystemMetrics)
+            metrics.cpu_usage = message.cpu
+            metrics.ram_usage = message.ram
+        except Exception:
+            pass  # Widget may not be mounted yet
+
+        try:
+            activity = self.query_one("#activity", ActivityGraph)
+            activity.req_rate = message.req_rate
+            if message.req_rate > activity.peak_rate:
+                activity.peak_rate = message.req_rate
+        except Exception:
+            pass  # Widget may not be mounted yet
 
     def on_scan_complete(self, message: ScanComplete) -> None:
         """Handle scan completion.
