@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import aiohttp
@@ -59,7 +59,58 @@ class SSRFAgent(BaseAgent, TechContextMixin):
         # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._ssrf_prime_directive: str = ""
-        
+
+    # =========================================================================
+    # FINDING VALIDATION: SSRF-specific validation (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> Tuple[bool, str]:
+        """
+        SSRF-specific validation before emitting finding.
+
+        Validates:
+        1. Basic requirements (type, url) via parent
+        2. Has callback evidence OR internal access confirmation
+        3. Payload contains URL manipulation patterns
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # Extract from nested structure if needed
+        nested = finding.get("finding", {})
+        evidence = finding.get("evidence", {})
+        status = finding.get("status", nested.get("status", ""))
+
+        # SSRF-specific: Must have confirmation
+        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+            has_callback = evidence.get("interactsh_callback") or evidence.get("callback_received")
+            has_internal = evidence.get("internal_access") or evidence.get("response_leaked")
+            if not (has_callback or has_internal):
+                return False, "SSRF requires proof: callback received or internal access confirmed"
+
+        # SSRF-specific: Payload should contain URL patterns
+        payload = finding.get("payload", nested.get("payload", ""))
+        ssrf_markers = ['http://', 'https://', 'localhost', '127.0.0.1', '169.254', 'file://', '@', '%40']
+        if payload and not any(m in str(payload).lower() for m in ssrf_markers):
+            return False, f"SSRF payload missing URL patterns: {payload[:50]}"
+
+        return True, ""
+
+    def _emit_ssrf_finding(self, finding_dict: Dict, scan_context: str = None) -> Optional[Dict]:
+        """
+        Helper to emit SSRF finding using BaseAgent.emit_finding() with validation.
+        """
+        if "type" not in finding_dict:
+            finding_dict["type"] = "SSRF"
+
+        if scan_context:
+            finding_dict["scan_context"] = scan_context
+
+        finding_dict["agent"] = self.name
+        return self.emit_finding(finding_dict)
+
     async def _test_with_go_fuzzer(self, param: str) -> list:
         """Test parameter with Go SSRF fuzzer."""
         findings = []
@@ -323,12 +374,56 @@ class SSRFAgent(BaseAgent, TechContextMixin):
         logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings")
         if not wet_findings:
             return []
+
+        # ========== AUTONOMOUS PARAMETER DISCOVERY ==========
+        logger.info(f"[{self.name}] Phase A: Expanding WET findings with SSRF-focused discovery...")
+        expanded_wet_findings = []
+        seen_urls = set()
+
+        for wet_item in wet_findings:
+            url = wet_item["url"]
+
+            # Only discover params once per unique URL (avoid redundant fetches)
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                # Discover ALL params on this URL
+                all_params = await self._discover_ssrf_params(url)
+
+                if not all_params:
+                    # Fallback: keep original param if discovery fails
+                    logger.warning(f"[{self.name}] No params discovered on {url}, keeping original")
+                    expanded_wet_findings.append(wet_item)
+                    continue
+
+                # Create a WET item for EACH discovered parameter
+                for param_name, param_value in all_params.items():
+                    expanded_wet_findings.append({
+                        "url": url,
+                        "parameter": param_name,
+                        "finding": wet_item.get("finding", {}),  # Copy original finding
+                        "scan_context": wet_item.get("scan_context", self._scan_context),
+                        "_discovered": True  # Mark as autonomously discovered
+                    })
+
+                logger.info(f"[{self.name}] 🔍 Expanded {url}: {len(all_params)} params discovered")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
+                # Fallback: keep original finding
+                expanded_wet_findings.append(wet_item)
+
+        logger.info(f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → {len(expanded_wet_findings)} testable params")
+
+        # ========== DEDUPLICATION ==========
         try:
-            dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+            dry_list = await self._llm_analyze_and_dedup(expanded_wet_findings, self._scan_context)
         except:
-            dry_list = self._fallback_fingerprint_dedup(wet_findings)
+            dry_list = self._fallback_fingerprint_dedup(expanded_wet_findings)
         self._dry_findings = dry_list
-        logger.info(f"[{self.name}] Phase A: {len(wet_findings)} WET → {len(dry_list)} DRY ({len(wet_findings)-len(dry_list)} duplicates removed)")
+        logger.info(f"[{self.name}] Phase A: {len(expanded_wet_findings)} WET → {len(dry_list)} DRY ({len(expanded_wet_findings)-len(dry_list)} duplicates removed)")
         return dry_list
 
     async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
@@ -362,12 +457,46 @@ class SSRFAgent(BaseAgent, TechContextMixin):
 WET FINDINGS (may contain duplicates):
 {json.dumps(wet_findings, indent=2)}
 
-Return ONLY unique findings in JSON format:
-{{"findings": [...]}}"""
+## DEDUPLICATION RULES
+
+1. **CRITICAL - Autonomous Discovery:**
+   - If items have "_discovered": true, they are DIFFERENT PARAMETERS discovered autonomously
+   - Even if they share the same "finding" object, treat them as SEPARATE based on "parameter" field
+   - Same URL + DIFFERENT param → DIFFERENT (keep all)
+   - Same URL + param + DIFFERENT target → DIFFERENT (keep both)
+
+2. **Standard Deduplication:**
+   - Same URL + Same param + Same internal target → DUPLICATE (keep best)
+   - Different endpoints → DIFFERENT (keep both)
+
+3. **Prioritization:**
+   - Rank by exploitability: callback= > url= > redirect= > other
+   - Remove findings unlikely to succeed given cloud provider detection
+
+## OUTPUT FORMAT (JSON only):
+{{
+  "findings": [
+    {{
+      "url": "...",
+      "parameter": "...",
+      "rationale": "why this is unique and exploitable",
+      "attack_priority": 1-5
+    }}
+  ],
+  "duplicates_removed": <count>,
+  "reasoning": "Brief explanation of deduplication strategy"
+}}
+
+Return ONLY unique findings in this JSON format."""
 
         system_prompt = f"""You are an expert SSRF deduplication analyst.
 
 {ssrf_prime_directive}
+
+## AUTONOMOUS DISCOVERY RULES:
+- Items with "_discovered": true are DIFFERENT PARAMETERS discovered autonomously
+- Same URL + DIFFERENT param → KEEP ALL
+- Only merge if: Same URL + Same param + Same internal target
 
 Focus on parameter+target deduplication. Same internal target via different bypasses = DUPLICATE."""
 
@@ -403,14 +532,18 @@ Focus on parameter+target deduplication. Same internal target via different bypa
                     fp = self._generate_ssrf_fingerprint(f["url"], f["parameter"], result.get("payload",""))
                     if fp not in self._emitted_findings:
                         self._emitted_findings.add(fp)
-                        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-                            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                        if settings.WORKER_POOL_EMIT_EVENTS:
+                            status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
+                            self._emit_ssrf_finding({
                                 "specialist": "ssrf",
-                                "finding": {"type": "SSRF", "url": result.get("url"), "parameter": result.get("param"), "payload": result.get("payload")},
-                                "status": result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value),
-                                "validation_requires_cdp": result.get("status") == ValidationStatus.PENDING_VALIDATION.value,
-                                "scan_context": self._scan_context,
-                            })
+                                "type": "SSRF",
+                                "url": result.get("url"),
+                                "parameter": result.get("param"),
+                                "payload": result.get("payload"),
+                                "status": status,
+                                "evidence": result.get("evidence", {}),
+                                "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
+                            }, scan_context=self._scan_context)
                         logger.info(f"[{self.name}] ✅ Emitted unique: {f['url']}?{f['parameter']}")
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: {e}")
@@ -518,6 +651,71 @@ Focus on parameter+target deduplication. Same internal target via different bypa
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
+    async def _discover_ssrf_params(self, url: str) -> Dict[str, str]:
+        """
+        SSRF-focused parameter discovery for a given URL.
+
+        Extracts ALL testable parameters from:
+        1. URL query string
+        2. HTML forms (input, textarea, select)
+        3. Prioritizes params with URL-like names: url, callback, target, redirect, proxy, fetch, webhook
+
+        Returns:
+            Dict mapping param names to default values
+            Example: {"url": "http://example.com", "callback": "", "target": ""}
+
+        Architecture Note:
+            Specialists must be AUTONOMOUS - they discover their own attack surface.
+            The finding from DASTySAST is just a "signal" that the URL is interesting.
+            We IGNORE the specific parameter and test ALL discoverable params.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, parse_qs
+        from bs4 import BeautifulSoup
+
+        all_params = {}
+
+        # 1. Extract URL query parameters
+        try:
+            parsed = urlparse(url)
+            url_params = parse_qs(parsed.query)
+            for param_name, values in url_params.items():
+                all_params[param_name] = values[0] if values else ""
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        # 2. Fetch HTML and extract form parameters
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+
+            if html:
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract from <input>, <textarea>, <select> with name attribute
+                for tag in soup.find_all(["input", "textarea", "select"]):
+                    param_name = tag.get("name")
+                    if param_name and param_name not in all_params:
+                        # Include hidden inputs (often contain URLs)
+                        input_type = tag.get("type", "text").lower()
+                        if input_type not in ["submit", "button", "reset"]:
+                            # Skip CSRF tokens
+                            if "csrf" not in param_name.lower():
+                                # Get default value
+                                default_value = tag.get("value", "")
+                                all_params[param_name] = default_value
+
+                                # Prioritize URL-like parameter names
+                                ssrf_keywords = ["url", "callback", "target", "redirect", "proxy", "fetch", "webhook", "api", "endpoint"]
+                                if any(keyword in param_name.lower() for keyword in ssrf_keywords):
+                                    logger.info(f"[{self.name}] 🎯 Found SSRF-likely param: {param_name}")
+
+        except Exception as e:
+            logger.error(f"[{self.name}] HTML parsing failed: {e}")
+
+        logger.info(f"[{self.name}] 🔍 Discovered {len(all_params)} params on {url}: {list(all_params.keys())}")
+        return all_params
+
     def _generate_ssrf_fingerprint(self, url: str, parameter: str, payload: str) -> tuple:
         """
         Generate SSRF finding fingerprint for expert deduplication.
@@ -573,19 +771,17 @@ Focus on parameter+target deduplication. Same internal target via different bypa
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            self._emit_ssrf_finding({
                 "specialist": "ssrf",
-                "finding": {
-                    "type": "SSRF",
-                    "url": self.url,
-                    "parameter": result.get("param"),
-                    "payload": result.get("payload"),
-                },
+                "type": "SSRF",
+                "url": self.url,
+                "parameter": result.get("param"),
+                "payload": result.get("payload"),
                 "status": status,
+                "evidence": result.get("evidence", {}),
                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
-                "scan_context": self._scan_context,
-            })
+            }, scan_context=self._scan_context)
 
         logger.info(f"[{self.name}] Confirmed SSRF: {self.url}?{result.get('param')} [status={status}]")
 
