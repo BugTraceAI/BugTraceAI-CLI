@@ -25,7 +25,7 @@ import httpx
 from bugtrace.agents.nuclei_agent import NucleiAgent
 from bugtrace.agents.gospider_agent import GoSpiderAgent
 from bugtrace.agents.analysis_agent import DASTySASTAgent
-from bugtrace.agents.xss_agent import XSSAgent
+from bugtrace.agents.xss import XSSAgent  # Use package, not monolith
 from bugtrace.agents.csti_agent import CSTIAgent
 from bugtrace.agents.sqlmap_agent import SQLMapAgent
 from bugtrace.agents.jwt_agent import JWTAgent
@@ -42,9 +42,9 @@ from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
 # Event Bus integration
 from bugtrace.core.event_bus import event_bus
 
-# Pipeline orchestration (v2.3)
+# Pipeline orchestration (v2.3, simplified in Sprint 5)
 from bugtrace.core.pipeline import (
-    PipelineOrchestrator, PipelineLifecycle, PipelinePhase, PipelineState
+    PipelineLifecycle, PipelinePhase, PipelineState
 )
 
 # Centralized HTTP client management (v2.4)
@@ -138,15 +138,16 @@ class TeamOrchestrator:
         # Specialist worker pools will be initialized async in _run_hunter_core
         self._specialist_workers_started = False
 
-        # Pipeline orchestration (v2.3)
-        self._pipeline: Optional[PipelineOrchestrator] = None
+        # Pipeline orchestration (v2.3, simplified in Sprint 5)
+        # PipelineState directly managed by TeamOrchestrator (no more PipelineOrchestrator wrapper)
+        self._pipeline_state: Optional[PipelineState] = None
         self._lifecycle: Optional[PipelineLifecycle] = None
         logger.info("Pipeline orchestration infrastructure initialized")
 
     async def _init_specialist_workers(self):
         """Initialize specialist worker pools for V3 pipeline."""
         from bugtrace.agents.sqli_agent import SQLiAgent
-        from bugtrace.agents.xss_agent import XSSAgent
+        from bugtrace.agents.xss import XSSAgent  # Use package, not monolith
         from bugtrace.agents.csti_agent import CSTIAgent
         from bugtrace.agents.lfi_agent import LFIAgent
         from bugtrace.agents.idor_agent import IDORAgent
@@ -313,6 +314,9 @@ class TeamOrchestrator:
         # Initialize state
         self.processed_urls = set()
 
+        # Initialize scan state (url_queue, etc.)
+        self._init_state()
+
     async def _on_vulnerability_detected(self, finding: dict) -> None:
         """Bridge EventBus findings to TUI via conductor.
 
@@ -337,6 +341,8 @@ class TeamOrchestrator:
             payload=payload,
         )
 
+    def _init_state(self):
+        """Initialize scan state attributes."""
         # Inject scan_id into ThinkingConsolidationAgent for DB persistence
         if hasattr(self, 'thinking_agent'):
             self.thinking_agent.scan_id = self.scan_id
@@ -353,16 +359,14 @@ class TeamOrchestrator:
                 logger.info(f"Resumed scan: {len(self.processed_urls)} URLs already processed, {len(self.url_queue)} pending.")
 
     def _init_pipeline(self):
-        """Initialize 5-phase pipeline orchestration."""
-        self._pipeline = PipelineOrchestrator(
-            scan_id=str(self.scan_id),
-            event_bus=self.event_bus
-        )
+        """Initialize 6-phase pipeline state machine (Sprint 5 simplified)."""
+        # Create PipelineState directly (no wrapper needed)
+        self._pipeline_state = PipelineState(scan_id=str(self.scan_id))
         self._lifecycle = PipelineLifecycle(
-            state=self._pipeline.state,
+            state=self._pipeline_state,
             event_bus=self.event_bus
         )
-        logger.info(f"[TeamOrchestrator] Pipeline initialized for scan {self.scan_id}")
+        logger.info(f"[TeamOrchestrator] Pipeline state initialized for scan {self.scan_id}")
 
     def set_auth(self, creds: str):
         self.auth_creds = creds
@@ -381,9 +385,57 @@ class TeamOrchestrator:
 
     def get_pipeline_state(self) -> Optional[Dict]:
         """Get current pipeline state."""
-        if self._pipeline:
-            return self._pipeline.get_state()
+        if self._pipeline_state:
+            return self._pipeline_state.to_dict()
         return None
+
+    async def _start_pipeline(self) -> None:
+        """Start the pipeline (transition to RECONNAISSANCE and emit event)."""
+        from bugtrace.core.event_bus import EventType
+
+        if not self._pipeline_state:
+            logger.warning("[TeamOrchestrator] Pipeline not initialized")
+            return
+
+        # Transition to RECONNAISSANCE
+        self._pipeline_state.transition(PipelinePhase.RECONNAISSANCE, "Pipeline started")
+
+        # Emit pipeline started event
+        await self.event_bus.emit(EventType.PIPELINE_STARTED, {
+            "scan_context": self.scan_context,
+            "scan_id": str(self.scan_id),
+            "phase": PipelinePhase.RECONNAISSANCE.value
+        })
+
+        logger.info(f"[TeamOrchestrator] Pipeline started for scan {self.scan_id}")
+
+    async def _stop_pipeline(self) -> None:
+        """Stop the pipeline (transition to COMPLETE and emit event)."""
+        from bugtrace.core.event_bus import EventType
+
+        if not self._pipeline_state:
+            logger.warning("[TeamOrchestrator] Pipeline not initialized")
+            return
+
+        # Transition to COMPLETE if not already terminal
+        current = self._pipeline_state.current_phase
+        if current not in (PipelinePhase.COMPLETE, PipelinePhase.ERROR):
+            try:
+                if self._pipeline_state.can_transition(PipelinePhase.COMPLETE):
+                    self._pipeline_state.transition(PipelinePhase.COMPLETE, "Pipeline stopped")
+            except ValueError:
+                logger.warning(f"[TeamOrchestrator] Could not transition to COMPLETE from {current}")
+
+        # Emit pipeline complete event
+        await self.event_bus.emit(EventType.PIPELINE_COMPLETE, {
+            "scan_context": self.scan_context,
+            "scan_id": str(self.scan_id),
+            "final_phase": self._pipeline_state.current_phase.value,
+            "total_duration": self._pipeline_state.get_total_duration(),
+            "transitions": len(self._pipeline_state.transitions)
+        })
+
+        logger.info(f"[TeamOrchestrator] Pipeline stopped for scan {self.scan_id}")
 
     async def start(self):
         """Starts the Multi-Agent Team."""
@@ -403,7 +455,8 @@ class TeamOrchestrator:
 
             if is_tty:
                 # Interactive mode: use full Rich dashboard with alternate screen
-                with Live(dashboard, refresh_per_second=4, screen=True) as live:
+                # Reduced from 4 to 2 FPS to prevent freeze with high log volume
+                with Live(dashboard, refresh_per_second=2, screen=True) as live:
                     dashboard.active = True
                     await self._run_hunter_core()
                     dashboard.active = False
@@ -1275,14 +1328,7 @@ class TeamOrchestrator:
             dashboard.log(f"📋 URL List Mode: Using {len(self.url_list_provided)} provided URLs", "INFO")
             dashboard.log("⏩ Bypassing GoSpider (list provided)", "INFO")
 
-            try:
-                # Run Nuclei ONLY on main target domain (not on every URL)
-                nuclei_agent = NucleiAgent(self.target, recon_dir)
-                self.tech_profile = await nuclei_agent.run()
-                logger.info(f"[Recon] Tech Profile: {len(self.tech_profile.get('frameworks', []))} frameworks detected on {self.target}")
-            except Exception as e:
-                logger.warning(f"Nuclei detection failed: {e}")
-                self.tech_profile = {"frameworks": [], "infrastructure": []}
+            # NOTE: Nuclei and AuthDiscovery moved to Phase 2
 
             # Use provided URLs directly
             urls_to_scan = self.url_list_provided
@@ -1291,46 +1337,19 @@ class TeamOrchestrator:
             return self._normalize_urls(urls_to_scan)
 
         # ========== Normal Mode (GoSpider) ==========
-        dashboard.log("Starting Phase 1: Reconnaissance (Nuclei + GoSpider)", "INFO")
+        dashboard.log("Starting Phase 1: URL Discovery (GoSpider only)", "INFO")
 
         try:
-            # Run Nuclei for tech detection (Phase 1: Tech-Detect + Auto-Scan)
-            nuclei_agent = NucleiAgent(self.target, recon_dir)
-            self.tech_profile = await nuclei_agent.run()
-            logger.info(f"[Recon] Tech Profile: {len(self.tech_profile.get('frameworks', []))} frameworks, "
-                       f"{len(self.tech_profile.get('infrastructure', []))} infrastructure components")
-
-            # Run GoSpider for URL discovery
+            # Run GoSpider ONLY
             urls_to_scan = await self._run_gospider(recon_dir)
 
-            # Run AuthDiscoveryAgent for JWT/cookie discovery
-            from bugtrace.agents.auth_discovery_agent import AuthDiscoveryAgent
-            auth_discovery_dir = recon_dir / "auth_discovery"
-            auth_discovery_dir.mkdir(exist_ok=True)
-
-            auth_agent = AuthDiscoveryAgent(
-                target=self.target,
-                report_dir=auth_discovery_dir,
-                urls_to_scan=urls_to_scan
-            )
-            auth_results = await auth_agent.run()
-
-            logger.info(
-                f"[AuthDiscovery] Found {len(auth_results['jwts'])} JWTs, "
-                f"{len(auth_results['cookies'])} cookies"
-            )
-            dashboard.log(
-                f"🔑 Discovered {len(auth_results['jwts'])} JWTs and "
-                f"{len(auth_results['cookies'])} session cookies",
-                "INFO"
-            )
+            # NOTE: Nuclei and AuthDiscovery moved to Phase 2
 
             # Legacy token scanning (kept for backward compatibility)
             await self._scan_for_tokens(urls_to_scan)
         except Exception as e:
-            logger.error(f"Reconnaissance crash: {e}", exc_info=True)
+            logger.error(f"URL discovery failed: {e}", exc_info=True)
             urls_to_scan = [self.target]
-            self.tech_profile = self.tech_profile or {"frameworks": [], "infrastructure": []}
 
         return self._normalize_urls(urls_to_scan)
 
@@ -1341,6 +1360,48 @@ class TeamOrchestrator:
         urls_to_scan = await gospider.run()
         logger.info(f"GoSpiderAgent finished. Found {len(urls_to_scan)} URLs")
         return urls_to_scan
+
+    async def _run_nuclei_tech_profile(self, recon_dir: Path) -> Dict:
+        """Run Nuclei for technology detection.
+        Returns tech_profile dict with frameworks, infrastructure, etc."""
+        try:
+            nuclei_agent = NucleiAgent(self.target, recon_dir)
+            tech_profile = await nuclei_agent.run()
+            logger.info(
+                f"[Recon] Tech Profile: {len(tech_profile.get('frameworks', []))} frameworks, "
+                f"{len(tech_profile.get('infrastructure', []))} infrastructure components"
+            )
+            return tech_profile
+        except Exception as e:
+            logger.warning(f"Nuclei detection failed: {e}")
+            return {"frameworks": [], "infrastructure": []}
+
+    async def _run_auth_discovery(self, recon_dir: Path, urls_to_scan: List[str]) -> Dict:
+        """Run AuthDiscoveryAgent for JWT/cookie discovery.
+        Returns dict with 'jwts' and 'cookies' lists."""
+        from bugtrace.agents.auth_discovery_agent import AuthDiscoveryAgent
+
+        auth_discovery_dir = recon_dir / "auth_discovery"
+        auth_discovery_dir.mkdir(exist_ok=True)
+
+        auth_agent = AuthDiscoveryAgent(
+            target=self.target,
+            report_dir=auth_discovery_dir,
+            urls_to_scan=urls_to_scan
+        )
+        auth_results = await auth_agent.run()
+
+        logger.info(
+            f"[AuthDiscovery] Found {len(auth_results['jwts'])} JWTs, "
+            f"{len(auth_results['cookies'])} cookies"
+        )
+        return auth_results
+
+    async def _run_asset_discovery(self, recon_dir: Path) -> Dict:
+        """Run AssetDiscoveryAgent (optional).
+        Returns dict with discovered assets."""
+        logger.info("[AssetDiscovery] Skipped (not yet implemented)")
+        return {"subdomains": [], "endpoints": []}
 
     async def _scan_for_tokens(self, urls_to_scan: list):
         """Scan discovered URLs for authentication tokens."""
@@ -1635,7 +1696,7 @@ class TeamOrchestrator:
         tasks = []
 
         if "XXE_AGENT" in specialist_dispatches:
-            from bugtrace.agents.exploit_specialists import XXEAgent
+            from bugtrace.agents.xxe_agent import XXEAgent
             p_list = list(params_map.get("XXE_AGENT", [])) or None
             xxe_agent = XXEAgent(url, p_list, url_dir)
             tasks.append(run_agent_with_semaphore(self.url_semaphore, xxe_agent, process_result))
@@ -1659,9 +1720,9 @@ class TeamOrchestrator:
             tasks.append(run_agent_with_semaphore(self.url_semaphore, rce_agent, process_result))
 
         if "PROTO_AGENT" in specialist_dispatches:
-            from bugtrace.agents.exploit_specialists import ProtoAgent
+            from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
             p_list = list(params_map.get("PROTO_AGENT", [])) or None
-            proto_agent = ProtoAgent(url, p_list, url_dir)
+            proto_agent = PrototypePollutionAgent(url, p_list, url_dir)
             tasks.append(run_agent_with_semaphore(self.url_semaphore, proto_agent, process_result))
 
         if "FILE_UPLOAD_AGENT" in specialist_dispatches:
@@ -1807,7 +1868,7 @@ class TeamOrchestrator:
 
         # Initialize and start pipeline
         self._init_pipeline()
-        await self._pipeline.start()
+        await self._start_pipeline()
 
         # Setup directories
         scan_dir, recon_dir, analysis_dir, captures_dir = self._setup_scan_directory(start_time)
@@ -1847,7 +1908,7 @@ class TeamOrchestrator:
         dashboard.set_status("Running", "Analysis in progress...")
 
         # Run batch DAST - this is the actual DISCOVERY work
-        self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir)
+        self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir, recon_dir)
 
         # ========== INTEGRITY CHECKPOINT 1: Discovery ==========
         dastysast_dir = self.scan_dir / "dastysast"
@@ -1886,14 +1947,23 @@ class TeamOrchestrator:
         logger.info("ThinkingConsolidationAgent finished - queues ready for specialists")
 
         # ========== INTEGRITY CHECKPOINT 2: Strategy ==========
-        raw_findings_count = batch_metrics.findings_before_dedup
+        dast_findings = batch_metrics.findings_dast
+        auth_findings = batch_metrics.findings_auth
+        total_raw = batch_metrics.findings_before_dedup
         wet_queue_count = findings_count  # Items distributed to specialist queues
 
         if not conductor.verify_integrity("strategy",
-            {'raw_findings_count': raw_findings_count},
+            {
+                'raw_findings_count': total_raw,
+                'dast_findings': dast_findings,
+                'auth_findings': auth_findings
+            },
             {'wet_queue_count': wet_queue_count}):
             dashboard.log("❌ Integrity mismatch: Strategy phase", "WARN")
-            logger.warning(f"[Pipeline] Integrity check FAILED for Strategy. Raw: {raw_findings_count}, WET: {wet_queue_count}")
+            logger.warning(
+                f"[Pipeline] Integrity check FAILED for Strategy. "
+                f"DAST: {dast_findings}, Auth: {auth_findings}, Total: {total_raw}, WET: {wet_queue_count}"
+            )
 
         # Signal STRATEGY complete
         await self._lifecycle.signal_phase_complete(
@@ -1972,7 +2042,7 @@ class TeamOrchestrator:
             PipelinePhase.REPORTING,
             {'report_generated': True}
         )
-        await self._pipeline.stop()
+        await self._stop_pipeline()
 
         # Cleanup
         await self._shutdown_specialist_workers()
@@ -2072,17 +2142,13 @@ class TeamOrchestrator:
             "pending_at_timeout": total_pending
         }
 
-    async def _phase_2_batch_dast(self, dashboard, analysis_dir) -> Dict[str, list]:
-        """Run DAST analysis on ALL URLs in parallel batch."""
-        dashboard.log(f"Running batch DAST on {len(self.urls_to_scan)} URLs...", "INFO")
+    async def _phase_2_batch_dast(self, dashboard, analysis_dir, recon_dir) -> Dict[str, list]:
+        """Run Phase 2: DISCOVERY - Parallel execution of DAST + Reconnaissance."""
 
-        # Start DAST metrics
         batch_metrics.start_dast()
 
-        # Use analysis semaphore for DAST concurrency
+        # ========== TASK 1: DASTySAST Analysis ==========
         analysis_semaphore = get_analysis_semaphore()
-
-        # Progress tracking
         completed_count = {"value": 0}
 
         async def analyze_url(url: str, url_index: int) -> tuple:
@@ -2123,15 +2189,61 @@ class TeamOrchestrator:
 
                 return (url, vulns)
 
-        # Run ALL URLs in parallel - semaphore controls concurrency,
-        # timeout is per-analysis (not per-task including queue wait)
-        # Enumerate URLs to pass index (starting at 1) for numbered reports
-        tasks = [analyze_url(url, idx + 1) for idx, url in enumerate(self.urls_to_scan)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        dast_tasks = [analyze_url(url, idx + 1) for idx, url in enumerate(self.urls_to_scan)]
 
-        # Aggregate results
+        # ========== TASK 2-4: Reconnaissance in Parallel ==========
+        async def run_nuclei_parallel():
+            dashboard.log("🔬 Running Nuclei tech profiling...", "INFO")
+            tech_profile = await self._run_nuclei_tech_profile(recon_dir)
+            self.tech_profile = tech_profile
+            dashboard.log(f"✓ Nuclei: {len(tech_profile.get('frameworks', []))} frameworks", "INFO")
+            return tech_profile
+
+        async def run_auth_discovery_parallel():
+            dashboard.log("🔑 Running authentication discovery...", "INFO")
+            auth_results = await self._run_auth_discovery(recon_dir, self.urls_to_scan)
+            dashboard.log(f"✓ AuthDiscovery: {len(auth_results['jwts'])} JWTs, {len(auth_results['cookies'])} cookies", "INFO")
+            return auth_results
+
+        async def run_asset_discovery_parallel():
+            if getattr(settings, 'ENABLE_ASSET_DISCOVERY', False):
+                dashboard.log("🌐 Running asset discovery...", "INFO")
+                return await self._run_asset_discovery(recon_dir)
+            return {"subdomains": [], "endpoints": []}
+
+        # ========== VERIFY HTTP SESSIONS BEFORE PARALLEL EXECUTION ==========
+        # Force early event loop verification to prevent TypeError in parallel analysis
+        # This ensures httpx clients are recreated if event loop changed since Phase 1
+        try:
+            from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+            # Force session verification for both target and LLM clients
+            await orchestrator.get_client(DestinationType.TARGET)._ensure_session()
+            await orchestrator.get_client(DestinationType.LLM)._ensure_session()
+            logger.debug("[Phase 2] HTTP sessions verified for current event loop")
+        except Exception as e:
+            logger.warning(f"[Phase 2] HTTP session verification failed: {e}")
+
+        # ========== RUN ALL IN PARALLEL ==========
+        logger.info("[Phase 2] Starting parallel execution: DAST + Nuclei + AuthDiscovery")
+
+        parallel_results = await asyncio.gather(
+            *dast_tasks,
+            run_nuclei_parallel(),
+            run_auth_discovery_parallel(),
+            run_asset_discovery_parallel(),
+            return_exceptions=True
+        )
+
+        # ========== PROCESS RESULTS ==========
+        num_dast_tasks = len(dast_tasks)
+        dast_results = parallel_results[:num_dast_tasks]
+        nuclei_result = parallel_results[num_dast_tasks]
+        auth_result = parallel_results[num_dast_tasks + 1]
+        asset_result = parallel_results[num_dast_tasks + 2]
+
+        # Aggregate DAST results
         vulnerabilities_by_url = {}
-        for result in results:
+        for result in dast_results:
             if isinstance(result, Exception):
                 logger.error(f"DAST batch error: {result}")
                 continue
@@ -2139,14 +2251,18 @@ class TeamOrchestrator:
             vulnerabilities_by_url[url] = vulns
             self.processed_urls.add(url)
 
-        total_vulns = sum(len(v) for v in vulnerabilities_by_url.values())
-        dashboard.log(f"Batch DAST complete: {total_vulns} findings from {len(vulnerabilities_by_url)} URLs", "INFO")
+        # Handle reconnaissance errors
+        if isinstance(nuclei_result, Exception):
+            logger.error(f"Nuclei failed in Phase 2: {nuclei_result}")
+            self.tech_profile = {"frameworks": [], "infrastructure": []}
 
-        # End DAST metrics
-        batch_metrics.end_dast(
-            urls_analyzed=len(vulnerabilities_by_url),
-            findings_count=total_vulns
-        )
+        if isinstance(auth_result, Exception):
+            logger.error(f"AuthDiscovery failed in Phase 2: {auth_result}")
+
+        total_vulns = sum(len(v) for v in vulnerabilities_by_url.values())
+        dashboard.log(f"Phase 2 complete: {total_vulns} findings from {len(vulnerabilities_by_url)} URLs", "INFO")
+
+        batch_metrics.end_dast(urls_analyzed=len(vulnerabilities_by_url), findings_count=total_vulns)
 
         return vulnerabilities_by_url
 
@@ -2217,7 +2333,52 @@ class TeamOrchestrator:
                 logger.info(f"Loaded {len(auth_findings)} AuthDiscovery findings")
                 dashboard.log(f"🔑 Loaded {len(auth_findings)} authentication artifacts", "INFO")
 
+                # Track in batch metrics for integrity check
+                batch_metrics.add_auth_findings(len(auth_findings))
+
         logger.info(f"Total {len(all_findings)} findings ready for processing")
+
+        # FIX (2026-02-06): Auto-dispatch CSTIAgent if Angular/Vue detected in tech_profile
+        # This ensures CSTIAgent runs even if DASTySAST didn't flag CSTI (LLM non-determinism)
+        csti_frameworks = ['angular', 'angularjs', 'vue', 'vuejs', 'vue.js']
+        detected_frameworks = self.tech_profile.get('frameworks', [])
+        frameworks_lower = [f.lower() for f in detected_frameworks]
+
+        detected_csti_framework = None
+        for fw in csti_frameworks:
+            if any(fw in f for f in frameworks_lower):
+                detected_csti_framework = fw
+                break
+
+        if detected_csti_framework:
+            # Check if CSTI finding already exists (avoid duplicates)
+            has_csti = any(
+                f.get('type', '').upper() in ['CSTI', 'CLIENT-SIDE TEMPLATE INJECTION', 'TEMPLATE INJECTION']
+                for f in all_findings
+            )
+
+            if not has_csti:
+                # Create synthetic CSTI finding to trigger CSTIAgent
+                synthetic_csti = {
+                    "type": "CSTI",
+                    "parameter": "_auto_dispatch",
+                    "url": self.target,
+                    "severity": "High",
+                    "fp_confidence": 0.9,  # High confidence to pass filters
+                    "confidence_score": 0.9,
+                    "votes": 5,
+                    "skeptical_score": 8,
+                    "reasoning": f"Auto-dispatch: {detected_csti_framework.upper()} framework detected by Nuclei. CSTIAgent will perform deep CSTI analysis.",
+                    "payload": "",
+                    "evidence": f"tech_profile.frameworks contains: {detected_frameworks}",
+                    "_source_file": "auto_dispatch",
+                    "_scan_context": self.scan_context,
+                    "_auto_dispatched": True
+                }
+                all_findings.append(synthetic_csti)
+                logger.info(f"[Auto-Dispatch] Added synthetic CSTI finding (detected: {detected_csti_framework})")
+                dashboard.log(f"🔧 Auto-dispatch: CSTI finding injected ({detected_csti_framework.upper()} detected)", "INFO")
+
         dashboard.log(f"Processing {len(all_findings)} findings...", "INFO")
 
         # Pass to ThinkingAgent for batch processing

@@ -666,7 +666,7 @@ async def _run_xss_agent(target: str, params, report_dir: Path):
     else:
         console.print("[bold yellow]🔥 Running XSSAgent (autonomous mode)...[/bold yellow]\n")
 
-    from bugtrace.agents.xss_agent import XSSAgent
+    from bugtrace.agents.xss import XSSAgent  # Use package, not monolith
     agent = XSSAgent(target, params if params else None, report_dir)
     return await agent.run_loop()
 
