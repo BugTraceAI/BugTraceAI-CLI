@@ -296,13 +296,9 @@ class TeamOrchestrator:
         if existing_scan_id is not None:
             self.scan_id = existing_scan_id
             logger.info(f"Using existing scan ID: {self.scan_id} (from ScanService)")
-        elif resume:
-            self.scan_id = self.db.get_active_scan(self.target)
-            if not self.scan_id:
-                logger.warning(f"No active scan found to resume for {self.target}. Starting new.")
-                self.scan_id = self.db.create_new_scan(self.target)
-                self.resume = False
         else:
+            # Always create new scan (DB = write-only, no reads)
+            # Resume state comes from files, not DB
             self.scan_id = self.db.create_new_scan(self.target)
 
         logger.info(f"TeamOrchestrator initialized for Scan ID: {self.scan_id}")
@@ -526,6 +522,9 @@ class TeamOrchestrator:
 
     async def _run_hunter_core(self):
         """Core Hunter logic separated from UI lifecycle."""
+        # Register scan context with conductor for EventBus routing
+        conductor.set_scan_context(self.scan_id)
+
         dashboard.set_target(self.target)
         dashboard.set_status("Running", "Pipeline starting...")
 
@@ -545,7 +544,7 @@ class TeamOrchestrator:
         # Sequential pipeline execution
         dashboard.log("🔒 Enforcing Sequential Hunter Loop for stability", "INFO")
 
-        if dashboard.stop_requested or self._stop_event.is_set():
+        if await self._check_stop_requested(dashboard):
             return
 
         await self._run_sequential_pipeline(dashboard)
@@ -724,8 +723,8 @@ class TeamOrchestrator:
         
         # Ensure scan_id is available (should be initialized in __init__)
         if not self.scan_id:
-            logger.warning("Scan ID missing for ReportingAgent, attempting to retrieve from DB...")
-            self.scan_id = self.db.get_active_scan(self.target) or 0
+            logger.warning("Scan ID missing for ReportingAgent, using 0 as fallback")
+            self.scan_id = 0
             
         reporting_agent = ReportingAgent(
             scan_id=self.scan_id,
@@ -1461,6 +1460,14 @@ class TeamOrchestrator:
 
         self.url_queue = urls_to_scan
         self._save_checkpoint()
+
+        # Overwrite urls.txt with the final deduplicated list (source of truth)
+        urls_file = self.scan_dir / "recon" / "urls.txt"
+        if urls_file.parent.exists():
+            with open(urls_file, "w") as f:
+                f.write("\n".join(urls_to_scan))
+            logger.info(f"Updated urls.txt with {len(urls_to_scan)} deduplicated URLs")
+
         return urls_to_scan
 
     def _prioritize_urls(self, urls: list) -> list:
@@ -1762,6 +1769,10 @@ class TeamOrchestrator:
 
         while pending:
             done, pending = await asyncio.wait(pending, timeout=0.5, return_when=asyncio.FIRST_COMPLETED)
+            # Pause checkpoint: block here while paused
+            _ctx = getattr(self, '_scan_context', None)
+            if _ctx is not None:
+                await _ctx.wait_if_paused()
             if dashboard.stop_requested or self._stop_event.is_set():
                 dashboard.log("🛑 Stop requested. Cancelling running agents...", "WARN")
                 for task in pending:
@@ -1779,6 +1790,10 @@ class TeamOrchestrator:
 
         self._log_url_processing(url, url_index, total_urls, dashboard)
 
+        # Pause checkpoint + stop check
+        _ctx = getattr(self, '_scan_context', None)
+        if _ctx is not None:
+            await _ctx.wait_if_paused()
         if dashboard.stop_requested or self._stop_event.is_set():
             return []
 
@@ -1818,7 +1833,7 @@ class TeamOrchestrator:
         if dashboard.stop_requested or self._stop_event.is_set():
             return []
 
-        dast = DASTySASTAgent(url, self.tech_profile, url_dir, state_manager=self.state_manager)
+        dast = DASTySASTAgent(url, self.tech_profile, url_dir, state_manager=self.state_manager, scan_context=str(self.scan_id))
         analysis_result = await dast.run()
 
         return analysis_result.get("vulnerabilities", [])
@@ -1869,6 +1884,7 @@ class TeamOrchestrator:
         # Initialize and start pipeline
         self._init_pipeline()
         await self._start_pipeline()
+        conductor.notify_phase_change("reconnaissance", 0.0, "Pipeline started")
 
         # Setup directories
         scan_dir, recon_dir, analysis_dir, captures_dir = self._setup_scan_directory(start_time)
@@ -1890,14 +1906,23 @@ class TeamOrchestrator:
             urls_total=len(self.urls_to_scan),
             scan_id=self.scan_id
         )
+        conductor.notify_phase_change("reconnaissance", 1.0, f"{len(self.urls_to_scan)} URLs discovered")
+        conductor.notify_metrics(urls_discovered=len(self.urls_to_scan))
 
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.RECONNAISSANCE,
             {'urls_found': len(self.urls_to_scan)}
         )
 
-        if self._check_stop_requested(dashboard):
+        if await self._check_stop_requested(dashboard):
             return
+
+        # ========== LONEWOLF: Fire and forget ==========
+        if settings.LONEWOLF_ENABLED:
+            from bugtrace.agents.lone_wolf import LoneWolf
+            wolf = LoneWolf(self.target, self.scan_dir)
+            asyncio.create_task(wolf.run())
+            logger.info("[Pipeline] LoneWolf launched in background")
 
         # ========== PHASE 2: DISCOVERY (Batch DAST) ==========
         # DASTySASTAgent analyzes ALL URLs in parallel
@@ -1906,6 +1931,7 @@ class TeamOrchestrator:
         dashboard.log(f"🔬 Running batch DAST on {len(self.urls_to_scan)} URLs", "INFO")
         dashboard.set_phase("🔬 HUNTING VULNS")
         dashboard.set_status("Running", "Analysis in progress...")
+        conductor.notify_phase_change("discovery", 0.0, f"Analyzing {len(self.urls_to_scan)} URLs")
 
         # Run batch DAST - this is the actual DISCOVERY work
         self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir, recon_dir)
@@ -1914,21 +1940,39 @@ class TeamOrchestrator:
         dastysast_dir = self.scan_dir / "dastysast"
         urls_count = len(self.urls_to_scan)
         reports_generated = len(list(dastysast_dir.glob("*.json"))) if dastysast_dir.exists() else 0
-        errors_count = urls_count - len(self.vulnerabilities_by_url)
+        errors_count = urls_count - reports_generated  # FIX: count by actual JSON files, not in-memory dict
 
-        if not conductor.verify_integrity("discovery",
+        conductor.verify_integrity("discovery",
             {'urls_count': urls_count},
-            {'dast_reports_count': reports_generated, 'errors': errors_count}):
-            dashboard.log("❌ Integrity mismatch: Discovery phase", "CRITICAL")
-            logger.error(f"[Pipeline] Integrity check FAILED for Discovery. URLs: {urls_count}, Reports: {reports_generated}")
+            {'dast_reports_count': reports_generated, 'errors': errors_count})
+
+        # PIPELINE GATE: Stop before STRATEGY if not all URLs have JSON files
+        if errors_count > 0:
+            dashboard.log(
+                f"❌ PIPELINE STOPPED: {errors_count}/{urls_count} URLs missing dastysast JSON after retries. "
+                f"Cannot proceed to STRATEGY with incomplete data.",
+                "CRITICAL"
+            )
+            logger.error(
+                f"[Pipeline] HALTED before STRATEGY: {errors_count}/{urls_count} URLs have no dastysast JSON. "
+                f"Reports generated: {reports_generated}"
+            )
+            conductor.notify_phase_change("discovery", 1.0, f"FAILED: {errors_count} URLs missing")
+            await self._lifecycle.signal_phase_complete(
+                PipelinePhase.DISCOVERY,
+                {'urls_analyzed': reports_generated, 'errors': errors_count, 'halted': True}
+            )
+            return
 
         # Signal DISCOVERY complete AFTER batch DAST finishes
+        conductor.notify_phase_change("discovery", 1.0, f"{reports_generated} URLs analyzed")
+        conductor.notify_metrics(urls_discovered=len(self.urls_to_scan), urls_analyzed=reports_generated)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.DISCOVERY,
-            {'urls_analyzed': len(self.vulnerabilities_by_url)}
+            {'urls_analyzed': reports_generated}
         )
 
-        if self._check_stop_requested(dashboard):
+        if await self._check_stop_requested(dashboard):
             return
 
         # ========== PHASE 3: STRATEGY (Batch Processing) ==========
@@ -1937,6 +1981,8 @@ class TeamOrchestrator:
         dashboard.log("🧠 ThinkingAgent processing findings batch", "INFO")
         dashboard.set_phase("🧠 STRATEGY")
         dashboard.set_status("Running", "Deduplication in progress...")
+        conductor.notify_phase_change("strategy", 0.0, "Deduplication in progress")
+        conductor.notify_log("INFO", "[STRATEGY] ThinkingAgent processing findings batch")
 
         # Process all JSON files from scan_dir/dastysast/ (where Phase 2 saves them)
         # ThinkingAgent processes batch, fills queues, and TERMINATES
@@ -1945,6 +1991,7 @@ class TeamOrchestrator:
         findings_count = await self._phase_3_strategy(dashboard, analysis_json_dir)
 
         logger.info("ThinkingConsolidationAgent finished - queues ready for specialists")
+        conductor.notify_log("INFO", f"[STRATEGY] {findings_count} findings distributed to specialist queues")
 
         # ========== INTEGRITY CHECKPOINT 2: Strategy ==========
         dast_findings = batch_metrics.findings_dast
@@ -1966,18 +2013,20 @@ class TeamOrchestrator:
             )
 
         # Signal STRATEGY complete
+        conductor.notify_phase_change("strategy", 1.0, f"{findings_count} findings distributed")
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.STRATEGY,
             {'findings_processed': findings_count}
         )
 
-        if self._check_stop_requested(dashboard):
+        if await self._check_stop_requested(dashboard):
             return
 
         # ========== PHASE 4: EXPLOITATION (Queue Consumption) ==========
         # Specialists consume from queues in true parallel
         logger.info("=== PHASE 4: EXPLOITATION (Specialist Queue Processing) ===")
         dashboard.log(f"⚡ Specialists processing findings from queues", "INFO")
+        conductor.notify_phase_change("exploitation", 0.0, "Specialists attacking")
 
         # Initialize specialist workers NOW (consume WET → create DRY → attack DRY)
         if not self._specialist_workers_started:
@@ -1985,9 +2034,9 @@ class TeamOrchestrator:
             self._specialist_workers_started = True
             logger.info("Specialist worker pools initialized and consuming queues")
 
-        # Wait for specialists to drain queues and complete exploitation
+        # Collect final queue stats (specialists already awaited via asyncio.gather)
         batch_metrics.start_queue_drain()
-        queue_results = await self._wait_for_specialist_queues(dashboard, timeout=300.0)
+        queue_results = await self._wait_for_specialist_queues(dashboard, timeout=5.0)
         batch_metrics.end_queue_drain(
             findings_distributed=queue_results.get('items_distributed', 0),
             by_specialist=queue_results.get('by_specialist', {})
@@ -2015,29 +2064,38 @@ class TeamOrchestrator:
         await self._checkpoint("Batch Analysis & Queue-based Exploitation")
 
         # Signal EXPLOITATION complete AFTER queue drain finishes
+        conductor.notify_phase_change("exploitation", 1.0, f"{queue_results.get('items_distributed', 0)} items processed")
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.EXPLOITATION,
             {'findings_exploited': self.thinking_agent.get_stats().get('distributed', 0) if self.thinking_agent else 0}
         )
 
-        if self._check_stop_requested(dashboard):
+        if await self._check_stop_requested(dashboard):
             return
 
         # ========== PHASE 5: VALIDATION ==========
         all_findings_for_review = self.state_manager.get_findings()
         logger.info("=== PHASE 5: VALIDATION (Global Review) ===")
+        conductor.notify_phase_change("validation", 0.0, f"Reviewing {len(all_findings_for_review)} findings")
+        conductor.notify_log("INFO", f"[VALIDATION] Reviewing {len(all_findings_for_review)} findings")
         await self._phase_3_global_review(dashboard, scan_dir)
+        conductor.notify_phase_change("validation", 1.0, "Review complete")
+        conductor.notify_log("INFO", "[VALIDATION] Global review complete")
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.VALIDATION,
             {'findings_reviewed': len(all_findings_for_review)}
         )
 
-        if self._check_stop_requested(dashboard):
+        if await self._check_stop_requested(dashboard):
             return
 
         # ========== PHASE 6: REPORTING ==========
         logger.info("=== PHASE 6: REPORTING ===")
+        conductor.notify_phase_change("reporting", 0.0, "Generating reports")
+        conductor.notify_log("INFO", "[REPORTING] Generating final reports")
         await self._phase_4_reporting(dashboard, scan_dir)
+        conductor.notify_phase_change("reporting", 1.0, "Reports generated")
+        conductor.notify_log("INFO", "[REPORTING] Reports generated")
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.REPORTING,
             {'report_generated': True}
@@ -2053,6 +2111,7 @@ class TeamOrchestrator:
         batch_metrics.log_summary()
 
         duration = (datetime.now() - start_time).total_seconds()
+        conductor.notify_complete(len(all_findings), duration)
         logger.info(f"=== V3 BATCH PIPELINE COMPLETE in {duration:.1f}s ===")
         logger.info(f"V3 Batch Pipeline: {batch_metrics.time_saved_percent:.1f}% faster than sequential")
 
@@ -2067,13 +2126,16 @@ class TeamOrchestrator:
         self.tech_profile = {"frameworks": [], "server": "unknown"}
         self.urls_to_scan = await self._run_reconnaissance(dashboard, recon_dir)
 
-    async def _wait_for_specialist_queues(self, dashboard, timeout: float = 300.0) -> Dict[str, Any]:
+    async def _wait_for_specialist_queues(self, dashboard, timeout: float = 5.0) -> Dict[str, Any]:
         """
-        Wait for specialist queues to drain after batch DAST.
+        Collect final specialist queue stats after specialists have completed.
+
+        Specialists are already awaited via asyncio.gather() in dispatch_specialists(),
+        so this is primarily for dashboard/logging. Short timeout (5s) for 1-2 status checks.
 
         Args:
             dashboard: UI dashboard for status updates
-            timeout: Maximum seconds to wait for queues to drain
+            timeout: Maximum seconds to collect stats (default 5s)
 
         Returns:
             Dict of specialist -> items_processed counts
@@ -2082,10 +2144,11 @@ class TeamOrchestrator:
         import time
 
         start_time = time.monotonic()
-        check_interval = 2.0  # Check every 2 seconds
+        check_interval = 3.0  # 1-2 checks within 5s timeout
         last_log_time = start_time
 
-        dashboard.log("Waiting for specialist queues to drain...", "INFO")
+        dashboard.log("Collecting specialist queue stats...", "INFO")
+        conductor.notify_log("INFO", "[EXPLOITATION] Collecting final specialist stats...")
 
         while (time.monotonic() - start_time) < timeout:
             # Get queue depths
@@ -2109,20 +2172,35 @@ class TeamOrchestrator:
             # Update dashboard with queue stats in real-time
             dashboard.set_progress_metrics(queue_stats=queue_stats, scan_id=self.scan_id)
 
-            # Log progress every 10 seconds with detailed breakdown
-            if (time.monotonic() - last_log_time) >= 10.0:
+            # Emit agent updates for WEB dashboard
+            for specialist, stats in queue_stats.items():
+                depth = stats.get('depth', 0)
+                processed = stats.get('processed', 0)
+                status = "active" if depth > 0 else ("complete" if processed > 0 else "idle")
+                conductor.notify_agent_update(
+                    agent=specialist.upper(),
+                    status=status,
+                    queue=depth,
+                    processed=processed,
+                )
+
+            # Log progress every 5 seconds with detailed breakdown
+            if (time.monotonic() - last_log_time) >= 5.0:
                 # Build breakdown of non-empty queues
                 non_empty = [f"{s.upper()}:{queue_stats[s]['depth']}"
                             for s in queue_stats if queue_stats[s]['depth'] > 0]
                 if non_empty:
                     breakdown = ", ".join(non_empty)
                     dashboard.log(f"Queues pending: {breakdown} ({total_pending} total)", "INFO")
+                    conductor.notify_log("INFO", f"[EXPLOITATION] Queues pending: {breakdown} ({total_pending} total)")
                 else:
                     dashboard.log(f"Queues: {total_pending} items pending", "INFO")
+                    conductor.notify_log("INFO", f"[EXPLOITATION] {total_pending} items pending")
                 last_log_time = time.monotonic()
 
             if total_pending == 0:
                 dashboard.log("All specialist queues drained", "SUCCESS")
+                conductor.notify_log("INFO", "[EXPLOITATION] All specialist queues drained")
                 break
 
             await asyncio.sleep(check_interval)
@@ -2131,6 +2209,7 @@ class TeamOrchestrator:
 
         if total_pending > 0:
             dashboard.log(f"Queue drain timeout after {elapsed:.1f}s, {total_pending} items remaining", "WARN")
+            conductor.notify_log("WARNING", f"[EXPLOITATION] Queue drain timeout after {elapsed:.1f}s, {total_pending} items remaining")
 
         # Collect ThinkingAgent stats
         stats = self.thinking_agent.get_stats() if self.thinking_agent else {}
@@ -2142,54 +2221,71 @@ class TeamOrchestrator:
             "pending_at_timeout": total_pending
         }
 
-    async def _phase_2_batch_dast(self, dashboard, analysis_dir, recon_dir) -> Dict[str, list]:
-        """Run Phase 2: DISCOVERY - Parallel execution of DAST + Reconnaissance."""
+    async def _phase_2_batch_dast(self, dashboard, analysis_dir, recon_dir=None) -> Dict[str, list]:
+        """Run Phase 2: DISCOVERY - Parallel execution of DAST + Reconnaissance.
+
+        Includes retry logic: after initial parallel run, checks which URL indices
+        are missing dastysast JSON files and retries them with reduced concurrency.
+        Pipeline stops if any URLs still missing after DAST_MAX_RETRIES rounds.
+        """
 
         batch_metrics.start_dast()
 
-        # ========== TASK 1: DASTySAST Analysis ==========
-        analysis_semaphore = get_analysis_semaphore()
+        # ========== SETUP ==========
+        dastysast_dir = self.scan_dir / "dastysast"
+        dastysast_dir.mkdir(exist_ok=True)
+        total_urls = len(self.urls_to_scan)
+        analysis_timeout = getattr(settings, 'DAST_ANALYSIS_TIMEOUT', 180.0)
+        max_retries = getattr(settings, 'DAST_MAX_RETRIES', 5)
         completed_count = {"value": 0}
 
-        async def analyze_url(url: str, url_index: int) -> tuple:
-            async with analysis_semaphore:
-                # Log concurrency status
-                active = settings.MAX_CONCURRENT_ANALYSIS - analysis_semaphore._value
-                logger.info(f"[DAST] ▶ Starting ({active}/{settings.MAX_CONCURRENT_ANALYSIS} active): {url[:60]}")
+        # Build index: url_index (1-based) → url
+        url_index_map = {idx + 1: url for idx, url in enumerate(self.urls_to_scan)}
 
-                # Create dastysast/ folder for numbered reports
-                dastysast_dir = self.scan_dir / "dastysast"
-                dastysast_dir.mkdir(exist_ok=True)
+        # ========== TASK 1: DASTySAST Analysis ==========
+        async def _run_dast_batch(url_indices: list, concurrency_limit: int) -> list:
+            """Run DAST analysis on a batch of URL indices with given concurrency."""
+            semaphore = asyncio.Semaphore(concurrency_limit)
 
-                dast = DASTySASTAgent(
-                    url, self.tech_profile, dastysast_dir,
-                    state_manager=self.state_manager,
-                    scan_context=self.scan_context,
-                    url_index=url_index
-                )
+            async def _bounded_analyze(url_index: int) -> tuple:
+                url = url_index_map[url_index]
+                async with semaphore:
+                    logger.info(f"[DAST] ▶ Starting: {url[:60]}")
+                    conductor.notify_log("INFO", f"[DAST] Analyzing URL {url_index}/{total_urls}: {url[:80]}")
 
-                # FIX v3.1: Timeout INSIDE semaphore - only counts analysis time,
-                # not time waiting for semaphore slot. This ensures ALL URLs get
-                # analyzed even with high concurrency limits.
-                # FIX v3.2: Increased timeout from 120s to configurable value (default 180s)
-                # to allow probes + LLM analysis to complete
-                analysis_timeout = getattr(settings, 'DAST_ANALYSIS_TIMEOUT', 180.0)
-                try:
-                    result = await asyncio.wait_for(dast.run(), timeout=analysis_timeout)
-                    vulns = result.get("vulnerabilities", [])
-                except asyncio.TimeoutError:
-                    logger.warning(f"[DAST] Analysis timed out after {analysis_timeout}s: {url[:50]}...")
-                    vulns = []
+                    dast = DASTySASTAgent(
+                        url, self.tech_profile, dastysast_dir,
+                        state_manager=self.state_manager,
+                        scan_context=str(self.scan_id),
+                        url_index=url_index
+                    )
 
-                logger.info(f"[DAST] ✓ Completed ({len(vulns)} findings): {url[:60]}")
+                    try:
+                        result = await asyncio.wait_for(dast.run(), timeout=analysis_timeout)
+                        vulns = result.get("vulnerabilities", [])
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[DAST] Analysis timed out after {analysis_timeout}s: {url[:50]}...")
+                        vulns = []
+                    except Exception as e:
+                        logger.error(f"[DAST] Analysis failed for {url[:50]}: {e}")
+                        vulns = []
 
-                # Update progress counter and dashboard
-                completed_count["value"] += 1
-                dashboard.set_progress_metrics(urls_analyzed=completed_count["value"], scan_id=self.scan_id)
+                    logger.info(f"[DAST] ✓ Completed ({len(vulns)} findings): {url[:60]}")
+                    completed_count["value"] += 1
+                    dashboard.set_progress_metrics(urls_analyzed=completed_count["value"], scan_id=self.scan_id)
+                    conductor.notify_log("INFO", f"[DAST] URL {completed_count['value']}/{total_urls} complete ({len(vulns)} findings)")
+                    conductor.notify_metrics(urls_analyzed=completed_count["value"], urls_discovered=total_urls)
 
-                return (url, vulns)
+                    return (url, vulns)
 
-        dast_tasks = [analyze_url(url, idx + 1) for idx, url in enumerate(self.urls_to_scan)]
+            tasks = [_bounded_analyze(idx) for idx in url_indices]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        def _get_missing_indices() -> list:
+            """Check dastysast/ dir and return URL indices that have no JSON file."""
+            existing = {int(f.stem) for f in dastysast_dir.glob("*.json") if f.stem.isdigit()}
+            expected = set(url_index_map.keys())
+            return sorted(expected - existing)
 
         # ========== TASK 2-4: Reconnaissance in Parallel ==========
         async def run_nuclei_parallel():
@@ -2212,38 +2308,55 @@ class TeamOrchestrator:
             return {"subdomains": [], "endpoints": []}
 
         # ========== VERIFY HTTP SESSIONS BEFORE PARALLEL EXECUTION ==========
-        # Force early event loop verification to prevent TypeError in parallel analysis
-        # This ensures httpx clients are recreated if event loop changed since Phase 1
         try:
             from bugtrace.core.http_orchestrator import orchestrator, DestinationType
-            # Force session verification for both target and LLM clients
             await orchestrator.get_client(DestinationType.TARGET)._ensure_session()
             await orchestrator.get_client(DestinationType.LLM)._ensure_session()
             logger.debug("[Phase 2] HTTP sessions verified for current event loop")
         except Exception as e:
             logger.warning(f"[Phase 2] HTTP session verification failed: {e}")
 
-        # ========== RUN ALL IN PARALLEL ==========
-        logger.info("[Phase 2] Starting parallel execution: DAST + Nuclei + AuthDiscovery")
+        # ========== INITIAL RUN: ALL DAST + RECON IN PARALLEL ==========
+        initial_concurrency = settings.MAX_CONCURRENT_ANALYSIS
+        all_indices = sorted(url_index_map.keys())
+        dast_batch_task = _run_dast_batch(all_indices, initial_concurrency)
 
-        parallel_results = await asyncio.gather(
-            *dast_tasks,
-            run_nuclei_parallel(),
-            run_auth_discovery_parallel(),
-            run_asset_discovery_parallel(),
-            return_exceptions=True
-        )
+        if recon_dir:
+            logger.info("[Phase 2] Starting parallel execution: DAST + Nuclei + AuthDiscovery")
+            parallel_results = await asyncio.gather(
+                dast_batch_task,
+                run_nuclei_parallel(),
+                run_auth_discovery_parallel(),
+                run_asset_discovery_parallel(),
+                return_exceptions=True
+            )
 
-        # ========== PROCESS RESULTS ==========
-        num_dast_tasks = len(dast_tasks)
-        dast_results = parallel_results[:num_dast_tasks]
-        nuclei_result = parallel_results[num_dast_tasks]
-        auth_result = parallel_results[num_dast_tasks + 1]
-        asset_result = parallel_results[num_dast_tasks + 2]
+            dast_results = parallel_results[0] if not isinstance(parallel_results[0], Exception) else []
+            nuclei_result = parallel_results[1]
+            auth_result = parallel_results[2]
 
-        # Aggregate DAST results
+            if isinstance(parallel_results[0], Exception):
+                logger.error(f"DAST batch task failed: {parallel_results[0]}")
+                dast_results = []
+
+            # Handle reconnaissance errors
+            if isinstance(nuclei_result, Exception):
+                logger.error(f"Nuclei failed in Phase 2: {nuclei_result}")
+                self.tech_profile = {"frameworks": [], "infrastructure": []}
+
+            if isinstance(auth_result, Exception):
+                logger.error(f"AuthDiscovery failed in Phase 2: {auth_result}")
+        else:
+            # Deprecated path: no recon_dir, DAST only
+            logger.info("[Phase 2] Starting DAST-only execution (deprecated path)")
+            dast_results = await dast_batch_task
+            if isinstance(dast_results, Exception):
+                logger.error(f"DAST batch task failed: {dast_results}")
+                dast_results = []
+
+        # Aggregate initial DAST results
         vulnerabilities_by_url = {}
-        for result in dast_results:
+        for result in (dast_results if isinstance(dast_results, list) else []):
             if isinstance(result, Exception):
                 logger.error(f"DAST batch error: {result}")
                 continue
@@ -2251,18 +2364,84 @@ class TeamOrchestrator:
             vulnerabilities_by_url[url] = vulns
             self.processed_urls.add(url)
 
-        # Handle reconnaissance errors
-        if isinstance(nuclei_result, Exception):
-            logger.error(f"Nuclei failed in Phase 2: {nuclei_result}")
-            self.tech_profile = {"frameworks": [], "infrastructure": []}
+        # ========== RETRY LOOP: Missing URLs with Adaptive Concurrency ==========
+        missing_indices = _get_missing_indices()
 
-        if isinstance(auth_result, Exception):
-            logger.error(f"AuthDiscovery failed in Phase 2: {auth_result}")
+        if missing_indices:
+            logger.warning(
+                f"[DAST Retry] {len(missing_indices)}/{total_urls} URLs missing JSON files after initial run. "
+                f"Will retry up to {max_retries} rounds."
+            )
+            dashboard.log(
+                f"⚠ {len(missing_indices)} URLs timed out - retrying with reduced concurrency",
+                "WARNING"
+            )
+
+        for retry_round in range(1, max_retries + 1):
+            missing_indices = _get_missing_indices()
+            if not missing_indices:
+                break
+
+            # Adaptive concurrency: reduce each round
+            # Round 1: initial/2, Round 2: initial/3, Round 3+: 1
+            if retry_round <= 2:
+                retry_concurrency = max(1, initial_concurrency // (retry_round + 1))
+            else:
+                retry_concurrency = 1
+
+            logger.info(
+                f"[DAST Retry] Round {retry_round}/{max_retries}: "
+                f"{len(missing_indices)} missing URLs, concurrency={retry_concurrency}"
+            )
+            dashboard.log(
+                f"🔄 Retry {retry_round}/{max_retries}: {len(missing_indices)} URLs (concurrency={retry_concurrency})",
+                "WARNING"
+            )
+            conductor.notify_log(
+                "WARNING",
+                f"[DAST] Retry round {retry_round}: {len(missing_indices)} URLs, concurrency={retry_concurrency}"
+            )
+
+            # Reset completed_count for progress tracking in retry
+            completed_count["value"] = total_urls - len(missing_indices)
+
+            retry_results = await _run_dast_batch(missing_indices, retry_concurrency)
+
+            for result in retry_results:
+                if isinstance(result, Exception):
+                    logger.error(f"DAST retry error: {result}")
+                    continue
+                url, vulns = result
+                vulnerabilities_by_url[url] = vulns
+                self.processed_urls.add(url)
+
+        # ========== FINAL CHECK: Pipeline gate ==========
+        final_missing = _get_missing_indices()
+        if final_missing:
+            missing_urls = [url_index_map[idx] for idx in final_missing]
+            logger.error(
+                f"[DAST] FATAL: {len(final_missing)}/{total_urls} URLs still missing after "
+                f"{max_retries} retry rounds. Missing indices: {final_missing}"
+            )
+            for idx in final_missing:
+                logger.error(f"[DAST] Missing index {idx}: {url_index_map[idx][:80]}")
+            dashboard.log(
+                f"❌ FATAL: {len(final_missing)} URLs failed after {max_retries} retries - pipeline will stop",
+                "CRITICAL"
+            )
+            conductor.notify_log(
+                "CRITICAL",
+                f"[DAST] {len(final_missing)} URLs permanently failed. Pipeline stopping before STRATEGY."
+            )
 
         total_vulns = sum(len(v) for v in vulnerabilities_by_url.values())
-        dashboard.log(f"Phase 2 complete: {total_vulns} findings from {len(vulnerabilities_by_url)} URLs", "INFO")
+        reports_generated = len(list(dastysast_dir.glob("*.json")))
+        dashboard.log(
+            f"Phase 2 complete: {total_vulns} findings from {reports_generated}/{total_urls} URLs",
+            "INFO"
+        )
 
-        batch_metrics.end_dast(urls_analyzed=len(vulnerabilities_by_url), findings_count=total_vulns)
+        batch_metrics.end_dast(urls_analyzed=reports_generated, findings_count=total_vulns)
 
         return vulnerabilities_by_url
 
@@ -2378,6 +2557,62 @@ class TeamOrchestrator:
                 all_findings.append(synthetic_csti)
                 logger.info(f"[Auto-Dispatch] Added synthetic CSTI finding (detected: {detected_csti_framework})")
                 dashboard.log(f"🔧 Auto-dispatch: CSTI finding injected ({detected_csti_framework.upper()} detected)", "INFO")
+
+        # FIX (2026-02-08): Auto-dispatch SQLiAgent when reflecting params exist but no SQLi finding
+        # SQLi is the most common web vuln - if DASTySAST found ANY parameter, SQLi should be tested.
+        # Previous scans found SQLi on ginandjuice.shop but LLM non-determinism caused it to be missed.
+        has_sqli = any(
+            'sqli' in f.get('type', '').lower() or 'sql' in f.get('type', '').lower()
+            for f in all_findings
+        )
+        has_any_param_finding = any(
+            f.get('parameter') and f.get('parameter') not in ('', 'General DOM', 'DOM', 'DOM/Body')
+            for f in all_findings
+        )
+
+        if not has_sqli and has_any_param_finding:
+            synthetic_sqli = {
+                "type": "SQLi",
+                "parameter": "_auto_dispatch",
+                "url": self.target,
+                "severity": "High",
+                "fp_confidence": 0.9,
+                "confidence_score": 0.9,
+                "votes": 5,
+                "skeptical_score": 8,
+                "reasoning": "Auto-dispatch: Reflecting parameters detected by DASTySAST. SQLiAgent will perform autonomous SQL injection testing on all discovered parameters.",
+                "payload": "",
+                "evidence": "Auto-dispatched because DASTySAST found reflecting parameters but no SQLi classification",
+                "_source_file": "auto_dispatch",
+                "_scan_context": self.scan_context,
+                "_auto_dispatched": True
+            }
+            all_findings.append(synthetic_sqli)
+            logger.info("[Auto-Dispatch] Added synthetic SQLi finding (reflecting params detected, no SQLi from LLM)")
+            dashboard.log("🔧 Auto-dispatch: SQLi finding injected (reflecting params detected)", "INFO")
+
+        # Inject Nuclei misconfiguration findings (HSTS missing, cookie flags, etc.)
+        misconfigs = self.tech_profile.get("misconfigurations", [])
+        if misconfigs:
+            for mc in misconfigs:
+                all_findings.append({
+                    "type": "MISSING_SECURITY_HEADER",
+                    "parameter": mc.get("template_id", mc["name"]),
+                    "url": mc.get("matched_at", self.target),
+                    "severity": mc.get("severity", "info").capitalize(),
+                    "fp_confidence": 0.95,
+                    "confidence_score": 0.95,
+                    "votes": 5,
+                    "skeptical_score": 9,
+                    "probe_validated": True,
+                    "reasoning": mc.get("description", mc["name"]),
+                    "description": mc.get("description", mc["name"]),
+                    "evidence": f"Nuclei template: {mc.get('template_id', 'unknown')}",
+                    "_source_file": "nuclei_misconfiguration",
+                    "_scan_context": self.scan_context,
+                })
+            logger.info(f"[Nuclei] Injected {len(misconfigs)} misconfiguration findings")
+            dashboard.log(f"🔒 Nuclei: {len(misconfigs)} security misconfigurations detected", "INFO")
 
         dashboard.log(f"Processing {len(all_findings)} findings...", "INFO")
 
@@ -2514,10 +2749,9 @@ class TeamOrchestrator:
         # Phase 2A: Batch DAST Discovery (runs in parallel)
         self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir)
 
-        # Phase 2B: Wait for ThinkingAgent to distribute to queues
-        # and for specialist workers to process their items
+        # Phase 2B: Collect final queue stats (specialists already awaited via asyncio.gather)
         batch_metrics.start_queue_drain()
-        queue_results = await self._wait_for_specialist_queues(dashboard, timeout=300.0)
+        queue_results = await self._wait_for_specialist_queues(dashboard, timeout=5.0)
         batch_metrics.end_queue_drain(
             findings_distributed=queue_results.get('items_distributed', 0),
             by_specialist=queue_results.get('by_specialist', {})
@@ -2569,8 +2803,14 @@ class TeamOrchestrator:
         logger.info(f"Scan {self.scan_id} marked as COMPLETED")
         logger.info("Phase 4 complete")
 
-    def _check_stop_requested(self, dashboard) -> bool:
-        """Check if stop was requested and update scan status."""
+    async def _check_stop_requested(self, dashboard) -> bool:
+        """Check if stop was requested and update scan status.
+        Also blocks here while scan is paused (resume unblocks)."""
+        # Pause checkpoint: blocks if scan is paused, returns immediately if not
+        scan_ctx = getattr(self, '_scan_context', None)
+        if scan_ctx is not None:
+            await scan_ctx.wait_if_paused()
+
         if dashboard.stop_requested or self._stop_event.is_set():
             dashboard.log("🛑 Stop requested. Skipping remaining phases.", "WARN")
             from bugtrace.schemas.db_models import ScanStatus
@@ -2649,7 +2889,13 @@ class TeamOrchestrator:
                 # 1. Wet files already exist in specialists/wet/ (created by thinking agent)
                 # No need to copy - they're already in the right place
 
-                # 2. Dry summary - deduped/processed findings per specialist
+                # 2. Dry summary - skip if specialist already wrote findings-level DRY file
+                dry_file = dry_dir / f"{specialist}_dry.json"
+                if dry_file.exists():
+                    logger.debug(f"[Specialist Reports] {specialist} DRY file already written by specialist, skipping")
+                    continue
+
+                # Fallback: write queue stats if specialist didn't produce a DRY file
                 dry_data = {
                     "specialist": specialist,
                     "scan_id": self.scan_id,
@@ -2660,10 +2906,10 @@ class TeamOrchestrator:
                         "current_depth": queue.depth() if hasattr(queue, 'depth') else 0,
                     },
                     "work_items_received": getattr(queue, 'total_enqueued', 0),
-                    "status": "COMPLETE" if queue.depth() == 0 else "TIMEOUT_PENDING"
+                    "status": "COMPLETE" if queue.depth() == 0 else "TIMEOUT_PENDING",
+                    "note": "Stats-only fallback (specialist did not write DRY file)"
                 }
 
-                dry_file = dry_dir / f"{specialist}_dry.json"
                 with open(dry_file, "w", encoding="utf-8") as f:
                     json.dump(dry_data, f, indent=2, default=str)
 
@@ -2966,8 +3212,8 @@ class TeamOrchestrator:
     async def _generate_v2_report(self, findings: list, urls: list, tech_profile: dict, scan_dir: Path, start_time: datetime):
         """Phase 4: Generates a premium report based on the sequential scan results."""
         try:
-            # Load findings from database
-            findings = self._load_findings_from_db()
+            # Load findings from files (DB = write-only)
+            findings = self._load_findings_from_files()
 
             logger.info(f"Starting report generation with {len(findings)} findings")
             dashboard.log(f"📊 Generating final reports with {len(findings)} findings...", "INFO")
@@ -2984,32 +3230,16 @@ class TeamOrchestrator:
             logger.error(f"Failed to generate V2 report: {e}", exc_info=True)
             dashboard.log(f"❌ Report generation failed: {e}", "ERROR")
 
-    def _load_findings_from_db(self) -> list:
-        """Load findings from database."""
-        from bugtrace.core.database import get_db_manager
-        db = get_db_manager()
+    def _load_findings_from_files(self) -> list:
+        """Load findings from specialist JSON files (source of truth). DB = write-only."""
+        if hasattr(self, "state_manager") and self.state_manager:
+            findings = self.state_manager.get_findings()
+            if findings:
+                logger.info(f"Loaded {len(findings)} findings from files for reporting.")
+                return findings
 
-        findings = []
-        if hasattr(self, "scan_id"):
-            db_findings = db.get_findings_for_scan(self.scan_id)
-            if db_findings:
-                logger.info(f"Loaded {len(db_findings)} findings from DB for reporting.")
-                for db_f in db_findings:
-                    findings.append({
-                        "id": db_f.id,
-                        "type": str(db_f.type.value if hasattr(db_f.type, 'value') else db_f.type),
-                        "severity": db_f.severity,
-                        "description": db_f.details,
-                        "payload": db_f.payload_used,
-                        "url": db_f.attack_url,
-                        "parameter": db_f.vuln_parameter,
-                        "validated": (db_f.status == "VALIDATED_CONFIRMED"),
-                        "status": db_f.status,
-                        "validator_notes": db_f.validator_notes,
-                        "screenshot_path": db_f.proof_screenshot_path,
-                        "reproduction": db_f.reproduction_command
-                    })
-        return findings
+        logger.warning("No findings loaded from files for reporting.")
+        return []
 
     def _build_data_collector(self, findings: list, urls: list, tech_profile: dict, start_time: datetime):
         """Build data collector with deduplicated findings."""
