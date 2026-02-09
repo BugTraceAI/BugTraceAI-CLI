@@ -3,8 +3,8 @@
 ## Current Status
 
 **Milestone:** v5.0 - Textual TUI Migration
-**Phase:** 03 - High-Fidelity Interaction
-**Status:** Complete
+**Phase:** 04 - Gap Closure (EventBus → TUI)
+**Status:** Pending Planning
 
 ## Phase Progress
 
@@ -13,8 +13,9 @@
 | 01 | Foundation & Structure | **Complete** | 1/1 |
 | 02 | Widget Migration & Async Engine | **Complete** | 3/3 |
 | 03 | High-Fidelity Interaction | **Complete** | 3/3 |
+| 04 | Gap Closure (EventBus → TUI) | Pending | 0/? |
 
-**Progress:** [============] 100% (7/7 plans complete)
+**Progress:** [==========░░] 87% (7/8+ plans complete)
 
 ## Last Completed Plan
 
@@ -93,20 +94,29 @@
 **CLI Option Parsing (Pre-existing)**
 The `--demo` flag and all subcommand options fail due to `allow_interspersed_args=True` in CONTEXT_SETTINGS. This affects all CLI subcommand options, not just TUI. Requires architectural fix.
 
+## Quick Tasks
+
+| ID | Name | Status | Summary |
+|----|------|--------|---------|
+| 001 | LoneWolf Autonomous Agent | **Complete** | `.planning/quick/001-lonewolf-autonomous-agent/001-SUMMARY.md` |
+
 ## Session Continuity
 
-**Last session:** 2026-02-05 07:15 UTC
-**Stopped at:** Completed 03-03-PLAN.md (Integration & Polish)
+**Last session:** 2026-02-09 10:55 UTC
+**Stopped at:** Completed quick task 001 (LoneWolf Autonomous Agent)
 **Resume file:** None
 
 ## Next Action
 
-Milestone v5.0 (Textual TUI Migration) is **COMPLETE**. All 3 phases with 7 plans executed successfully.
+Phase 04 (Gap Closure) added after milestone audit found critical integration gap.
 
-Options:
-- `/gsd:complete-milestone` - Archive and prepare for next milestone
-- `/gsd:verify-work` - Manual acceptance testing
-- `/gsd:add-phase <description>` - Add another phase before completing
+**Critical Gap:** EventBus VULNERABILITY_DETECTED events not routed to TUI.
+- Specialists emit findings via `self.emit_finding()`
+- ReportingAgent collects them
+- **TUI never receives them** - conductor.notify_finding() is never called
+- Result: FindingsTable stays empty during real scans
+
+**Next:** `/gsd:plan-phase 04` to create execution plan
 
 ## Plan Summary
 
@@ -116,6 +126,8 @@ Options:
   - 03-01: FindingsTable + Modal - **COMPLETE**
   - 03-02: LogInspector + CommandInput - **COMPLETE**
   - 03-03: Integration & Polish - **COMPLETE**
+**Phase 04:** Gap Closure (EventBus → TUI) - **PENDING**
+  - Context: `.planning/phases/04-gap-closure/04-CONTEXT.md`
 
 ## Completed Summaries
 
