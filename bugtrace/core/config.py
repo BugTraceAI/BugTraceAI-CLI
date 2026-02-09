@@ -85,6 +85,9 @@ class Settings(BaseSettings):
         "SSRF": 5,     # High risk
         "LFI": 5,      # High risk
         "XSS": 5,      # Medium, easy to verify
+        "CSTI": 3,     # v3.2.1: Low threshold - needs specialist validation to confirm
+        "SSTI": 3,     # v3.2.1: Low threshold - needs specialist validation to confirm
+        "TEMPLATE": 3, # v3.2.1: Catch-all for template injection types
         "JWT": 6,      # Medium
         "FILE_UPLOAD": 6,  # Medium
         "IDOR": 6,     # Lower risk
@@ -99,6 +102,7 @@ class Settings(BaseSettings):
 
     # --- DAST Analysis Timeout (Phase 38: v3.2) ---
     DAST_ANALYSIS_TIMEOUT: float = 180.0  # Seconds per URL analysis (probes + LLM)
+    DAST_MAX_RETRIES: int = 5  # Max retry rounds for URLs missing dastysast JSON (pipeline stops if still missing)
 
     # --- ThinkingConsolidationAgent settings (Phase 18: v2.3) ---
     THINKING_MODE: str = "streaming"  # "streaming" | "batch"
@@ -398,6 +402,8 @@ class Settings(BaseSettings):
             self.MAX_CONCURRENT_SPECIALISTS = section.getint("MAX_CONCURRENT_SPECIALISTS")
         if "DAST_ANALYSIS_TIMEOUT" in section:
             self.DAST_ANALYSIS_TIMEOUT = section.getfloat("DAST_ANALYSIS_TIMEOUT")
+        if "DAST_MAX_RETRIES" in section:
+            self.DAST_MAX_RETRIES = section.getint("DAST_MAX_RETRIES")
         # NOTE: MAX_CONCURRENT_VALIDATION is NOT loaded from config
         # CDP client only supports 1 concurrent session - hardcoded in defaults
 
@@ -495,6 +501,22 @@ class Settings(BaseSettings):
         if "RCE_SELF_VALIDATE" in section:
             self.RCE_SELF_VALIDATE = section.getboolean("RCE_SELF_VALIDATE")
 
+    def _load_lonewolf_config(self, config):
+        """Load LONEWOLF section config."""
+        if "LONEWOLF" not in config:
+            return
+        section = config["LONEWOLF"]
+        if "ENABLED" in section:
+            self.LONEWOLF_ENABLED = section.getboolean("ENABLED")
+        if "MODEL" in section:
+            self.LONEWOLF_MODEL = section["MODEL"]
+        if "RATE_LIMIT" in section:
+            self.LONEWOLF_RATE_LIMIT = section.getfloat("RATE_LIMIT")
+        if "MAX_CONTEXT" in section:
+            self.LONEWOLF_MAX_CONTEXT = section.getint("MAX_CONTEXT")
+        if "RESPONSE_TRUNCATE" in section:
+            self.LONEWOLF_RESPONSE_TRUNCATE = section.getint("RESPONSE_TRUNCATE")
+
     def _load_paths_config(self, config):
         """Load PATHS section config for LOG_DIR and REPORT_DIR.
 
@@ -571,6 +593,7 @@ class Settings(BaseSettings):
         self._load_conductor_and_scanning_config(config)
         self._load_analysis_and_misc_config(config)
         self._load_authority_config(config)
+        self._load_lonewolf_config(config)
 
     # --- Configuration Validation (TASK-120) ---
     def validate_config(self) -> List[str]:
@@ -863,6 +886,13 @@ class Settings(BaseSettings):
     MANIPULATOR_ENABLE_AGENTIC_FALLBACK: bool = False
     MANIPULATOR_BREAKOUT_PRIORITY_LEVEL: int = 3
     MANIPULATOR_MAX_LLM_PAYLOADS: int = 100
+
+    # --- LONEWOLF Autonomous Agent Configuration ---
+    LONEWOLF_ENABLED: bool = False          # Disabled by default until tested
+    LONEWOLF_MODEL: str = "deepseek/deepseek-r1"  # LLM for reasoning
+    LONEWOLF_RATE_LIMIT: float = 1.0       # HTTP requests per second
+    LONEWOLF_MAX_CONTEXT: int = 20         # Sliding window size (actions remembered)
+    LONEWOLF_RESPONSE_TRUNCATE: int = 2000 # Max chars kept from HTTP responses
 
     # --- IDOR Agent Configuration ---
     IDOR_ID_RANGE: str = "1-1000"  # Range of IDs to test (e.g., "1-1000", "1-500", "100-200")
