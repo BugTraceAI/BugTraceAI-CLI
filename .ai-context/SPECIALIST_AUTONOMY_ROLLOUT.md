@@ -1,8 +1,8 @@
 # Specialist Autonomy Rollout Plan
 
-**Status:** 🚧 In Progress
-**Completed:** XSSAgent ✅, SSRFAgent ✅
-**Remaining:** 10 specialists
+**Status:** ✅ COMPLETE
+**Completed:** XSSAgent ✅, SSRFAgent ✅, IDORAgent ✅, RCEAgent ✅, SQLiAgent ✅, OpenRedirectAgent ✅, LFIAgent ✅, CSTIAgent ✅, HeaderInjectionAgent ✅, PrototypePollutionAgent ✅, FileUploadAgent ✅, XXEAgent ✅, JWTAgent ✅
+**Remaining:** 0 specialists (13/13 complete)
 
 ---
 
@@ -14,14 +14,24 @@
 |-------|--------|------|-------|
 | **XSSAgent** | ✅ Done | 2026-02-06 | Finds XSS in `searchTerm` (discovered from HTML form) |
 | **SSRFAgent** | ✅ Done | 2026-02-06 | Discovers URL-like params (`url`, `callback`, `target`, etc.) from forms |
+| **IDORAgent** | ✅ Done | 2026-02-06 | Discovers IDs from URL query, path segments, and forms. Extracts RESTful IDs like `/users/123` |
+| **RCEAgent** | ✅ Done | 2026-02-06 | Discovers ALL params from HTML forms, prioritizes cmd/exec/shell/run/system params |
+| **SQLiAgent** | ✅ Done | 2026-02-06 | Discovers SQL injection params from URL query + HTML forms (all input types including hidden) |
+| **OpenRedirectAgent** | ✅ Done | 2026-02-06 | Discovers redirect params from forms, prioritizes redirect-like names (`redirect`, `next`, `return_url`, `goto`, `continue`, `callback`) |
+| **LFIAgent** | ✅ Done | 2026-02-06 | Discovers file/path params from forms, prioritizes params with file extensions in values (`file`, `path`, `template`, `document`, `page`, `include`) |
+| **CSTIAgent** | ✅ Done | 2026-02-06 | Discovers ALL params from URL query + HTML forms, prioritizes CSTI-related params (`template`, `message`, `content`, `subject`, `body`, `text`, `comment`), detects template engines |
+| **HeaderInjectionAgent** | ✅ Done | 2026-02-06 | Discovers ALL params from URL query + HTML forms that might influence HTTP headers (`redirect`, `language`, `locale`, `encoding`, `charset`, `url`, `callback`) |
+| **PrototypePollutionAgent** | ✅ Done | 2026-02-06 | Discovers ALL params from URL query + HTML forms, prioritizes PP-relevant names (`merge`, `extend`, `options`, `config`, `settings`, `data`, `object`, `props`), detects JSON POST acceptance |
+| **FileUploadAgent** | ✅ Done | 2026-02-06 | Discovers ALL upload forms/endpoints, extracts accept filters, detects drag-and-drop zones, includes all form fields |
+| **XXEAgent** | ✅ Done | 2026-02-06 | Discovers XML file uploads (accept=".xml"), multipart forms, and XML API endpoints. Tests Content-Type acceptance with OPTIONS |
 
 ---
 
-## 🔥 HIGH PRIORITY (Apply Next)
+## Implementation Details (All Complete)
 
-These agents frequently miss vulnerabilities because they only test URL parameters sent by DASTySAST.
+Reference documentation for the discovery strategies implemented in each specialist.
 
-### 1. SQLiAgent ⭐⭐⭐
+### 1. SQLiAgent ✅
 **File:** `bugtrace/agents/sqli_agent.py`
 
 **Why High Priority:**
@@ -38,14 +48,14 @@ async def _discover_sqli_params(self, url: str) -> Dict[str, str]:
     # - Hidden inputs (type="hidden")
     # Skip:
     # - JS variables (not injectable for SQLi)
-    # - CSRF tokens
+    # Include CSRF tokens (some apps have SQLi in token validation)
 ```
 
 **Impact:** Will find SQLi in form-only parameters like `sortBy`, `pageSize`, `itemsPerPage`
 
 ---
 
-### 2. SSRFAgent ⭐⭐⭐
+### 2. SSRFAgent ✅
 **File:** `bugtrace/agents/ssrf_agent.py`
 
 **Why High Priority:**
@@ -68,7 +78,7 @@ async def _discover_ssrf_params(self, url: str) -> Dict[str, str]:
 
 ---
 
-### 3. OpenRedirectAgent ⭐⭐
+### 3. OpenRedirectAgent ✅
 **File:** `bugtrace/agents/openredirect_agent.py`
 
 **Why High Priority:**
@@ -90,7 +100,7 @@ async def _discover_openredirect_params(self, url: str) -> Dict[str, str]:
 
 ---
 
-### 4. IDORAgent ⭐⭐
+### 4. IDORAgent ✅
 **File:** `bugtrace/agents/idor_agent.py`
 
 **Why Medium-High Priority:**
@@ -113,7 +123,7 @@ async def _discover_idor_params(self, url: str) -> Dict[str, str]:
 
 ---
 
-### 5. LFIAgent ⭐⭐
+### 5. LFIAgent ✅
 **File:** `bugtrace/agents/lfi_agent.py`
 
 **Why Medium Priority:**
@@ -135,9 +145,9 @@ async def _discover_lfi_params(self, url: str) -> Dict[str, str]:
 
 ---
 
-## 🟡 MEDIUM PRIORITY
+## Injection & Template Attacks
 
-### 6. RCEAgent ⭐
+### 6. RCEAgent ✅
 **File:** `bugtrace/agents/rce_agent.py`
 
 **Why Medium Priority:**
@@ -155,7 +165,7 @@ async def _discover_rce_params(self, url: str) -> Dict[str, str]:
 
 ---
 
-### 7. CSTIAgent ⭐
+### 7. CSTIAgent ✅
 **File:** `bugtrace/agents/csti_agent.py`
 
 **Why Medium Priority:**
@@ -173,7 +183,7 @@ async def _discover_csti_params(self, url: str) -> Dict[str, str]:
 
 ---
 
-### 8. HeaderInjectionAgent ⭐
+### 8. HeaderInjectionAgent ✅
 **File:** `bugtrace/agents/header_injection_agent.py`
 
 **Why Medium Priority:**
@@ -190,9 +200,9 @@ async def _discover_header_params(self, url: str) -> Dict[str, str]:
 
 ---
 
-## 🟢 LOWER PRIORITY
+## Specialized Attacks
 
-### 9. PrototypePollutionAgent
+### 9. PrototypePollutionAgent ✅
 **File:** `bugtrace/agents/prototype_pollution_agent.py`
 
 **Why Lower Priority:**
@@ -205,7 +215,7 @@ async def _discover_header_params(self, url: str) -> Dict[str, str]:
 
 ---
 
-### 10. XXEAgent
+### ✅ 10. XXEAgent (DONE - 2026-02-06)
 **File:** `bugtrace/agents/xxe_agent.py`
 
 **Why Lower Priority:**
@@ -213,12 +223,14 @@ async def _discover_header_params(self, url: str) -> Dict[str, str]:
 - Less common in modern apps
 
 **Discovery Strategy:**
-- Look for `<input type="file" accept=".xml">`
-- Check for XML content-type acceptance
+- Look for `<input type="file" accept=".xml">` ✅ IMPLEMENTED
+- Check for XML content-type acceptance ✅ IMPLEMENTED
+- Detect multipart/form-data forms ✅ IMPLEMENTED
+- Test endpoints with OPTIONS to verify XML acceptance ✅ IMPLEMENTED
 
 ---
 
-### 11. FileUploadAgent
+### 11. FileUploadAgent ✅
 **File:** `bugtrace/agents/fileupload_agent.py`
 
 **Why Lower Priority:**
@@ -231,7 +243,7 @@ async def _discover_header_params(self, url: str) -> Dict[str, str]:
 
 ---
 
-### 12. JWTAgent
+### 12. JWTAgent ✅
 **File:** `bugtrace/agents/jwt_agent.py`
 
 **Why Lower Priority:**
@@ -263,27 +275,24 @@ These agents don't test parameters, so autonomous discovery doesn't apply:
 
 ---
 
-## Implementation Order (Recommended)
+## Implementation Order (Completed 2026-02-06)
 
-### Phase 1: Critical Injection Attacks (Week 1)
-1. ✅ **XSSAgent** - DONE
-2. **SQLiAgent** - Most impactful
-3. **SSRFAgent** - Often missed in hidden params
-4. **RCEAgent** - Critical if found
+All 12 specialists were implemented in a single day:
+1. ✅ **XSSAgent** - `_discover_xss_params()` xss_agent.py:3452
+2. ✅ **SQLiAgent** - `_discover_sqli_params()` sqli_agent.py:1490
+3. ✅ **SSRFAgent** - `_discover_ssrf_params()` ssrf_agent.py:683
+4. ✅ **RCEAgent** - `_discover_rce_params()` rce_agent.py:239
+5. ✅ **IDORAgent** - `_discover_idor_params()` idor_agent.py:1219
+6. ✅ **OpenRedirectAgent** - `_discover_openredirect_params()` openredirect_agent.py:375
+7. ✅ **LFIAgent** - `_discover_lfi_params()` lfi_agent.py:750
+8. ✅ **CSTIAgent** - `_discover_csti_params()` csti_agent.py:1100
+9. ✅ **HeaderInjectionAgent** - `_discover_header_params()` header_injection_agent.py:416
+10. ✅ **PrototypePollutionAgent** - `_discover_prototype_pollution_params()` prototype_pollution_agent.py:710
+11. ✅ **XXEAgent** - `_discover_xxe_params()` xxe_agent.py:828
+12. ✅ **FileUploadAgent** - `_discover_upload_forms()` fileupload_agent.py:103
 
-### Phase 2: Access Control & Logic (Week 2)
-5. **IDORAgent** - RESTful paths
-6. **OpenRedirectAgent** - Login flows
-7. **LFIAgent** - Template selectors
-
-### Phase 3: Template & Header Attacks (Week 3)
-8. **CSTIAgent** - Email templates
-9. **HeaderInjectionAgent** - Hidden headers
-
-### Phase 4: Specialized Attacks (Week 4)
-10. **PrototypePollutionAgent** - JSON bodies
-11. **XXEAgent** - XML uploads
-12. **FileUploadAgent** - File forms
+**Also has autonomous discovery (not in original plan):**
+13. ✅ **JWTAgent** - `_discover_tokens()` jwt_agent.py:244 (JWT regex in URL/body/cookies/localStorage)
 
 ---
 
@@ -395,25 +404,33 @@ Track for each agent:
 |-------|-----------------|---------|-----------|---------|--------|--------|
 | XSSAgent | ✅ | ✅ | ✅ | ✅ | ✅ | **✅ DONE** |
 | SSRFAgent | ✅ | ✅ | ✅ | N/A | ⏳ | **✅ DONE** |
-| SQLiAgent | ❌ | ❌ | ❌ | ❌ | ❌ | 🔴 TODO |
-| OpenRedirectAgent | ❌ | ❌ | ❌ | ❌ | ❌ | 🔴 TODO |
-| IDORAgent | ❌ | ❌ | ❌ | ❌ | ❌ | 🔴 TODO |
-| LFIAgent | ❌ | ❌ | ❌ | ❌ | ❌ | 🔴 TODO |
-| RCEAgent | ❌ | ❌ | ❌ | ❌ | ❌ | 🔴 TODO |
-| CSTIAgent | ❌ | ❌ | ❌ | ❌ | ❌ | 🔴 TODO |
-| HeaderInjectionAgent | ❌ | ❌ | ❌ | ❌ | ❌ | 🔴 TODO |
-| PrototypePollutionAgent | ❌ | ❌ | ❌ | ❌ | ❌ | 🔴 TODO |
-| XXEAgent | ❌ | ❌ | ❌ | ❌ | ❌ | 🔴 TODO |
-| FileUploadAgent | ❌ | ❌ | ❌ | ❌ | ❌ | 🔴 TODO |
+| IDORAgent | ✅ | ✅ | ✅ | N/A | ⏳ | **✅ DONE** |
+| RCEAgent | ✅ | ✅ | ✅ | ✅ | ⏳ | **✅ DONE** |
+| SQLiAgent | ✅ | ✅ | ✅ | ✅ | ⏳ | **✅ DONE** |
+| OpenRedirectAgent | ✅ | ✅ | ✅ | ✅ | ⏳ | **✅ DONE** |
+| LFIAgent | ✅ | ✅ | ✅ | ✅ | ⏳ | **✅ DONE** |
+| CSTIAgent | ✅ | ✅ | ✅ | ✅ | ⏳ | **✅ DONE** |
+| HeaderInjectionAgent | ✅ | ✅ | ✅ | ❌ | ⏳ | **✅ DONE** |
+| PrototypePollutionAgent | ✅ | ✅ | ✅ | ✅ | ⏳ | **✅ DONE** |
+| XXEAgent | ✅ | ✅ | ✅ | ✅ | ⏳ | **✅ DONE** |
+| FileUploadAgent | ✅ | ✅ | ✅ | N/A | ⏳ | **✅ DONE** |
 
 ---
 
-**Next Action:** Implement SQLiAgent autonomous discovery (highest remaining priority)
+**Next Action:** ✅ ALL SPECIALISTS COMPLETE! Specialist Autonomy Rollout finished.
 
 **Reference:** See [SPECIALIST_AUTONOMY_PATTERN.md](SPECIALIST_AUTONOMY_PATTERN.md) for implementation guide
 
 **Recent Updates:**
+- 2026-02-06: XXEAgent autonomous discovery implemented ✅ **ROLLOUT COMPLETE**
+- 2026-02-06: PrototypePollutionAgent autonomous discovery implemented ✅
+- 2026-02-06: HeaderInjectionAgent autonomous discovery implemented ✅
+- 2026-02-06: CSTIAgent autonomous discovery implemented ✅
+- 2026-02-06: LFIAgent autonomous discovery implemented ✅
 - 2026-02-06: SSRFAgent autonomous discovery implemented ✅
+- 2026-02-06: IDORAgent autonomous discovery implemented ✅
+- 2026-02-06: RCEAgent autonomous discovery implemented ✅
+- 2026-02-06: SQLiAgent autonomous discovery implemented ✅
 
 ---
 

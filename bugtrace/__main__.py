@@ -34,9 +34,8 @@ def _save_qlearning_data():
         pass
 
 
-# Configure Click context to allow options after positional args: ./bugtraceai-cli URL --xss
-CONTEXT_SETTINGS = dict(allow_interspersed_args=True)
-app = typer.Typer(context_settings=CONTEXT_SETTINGS, add_completion=False)
+# Note: allow_interspersed_args must NOT be set at app level or it swallows subcommand options
+app = typer.Typer(add_completion=False)
 console = Console()
 
 # Commands that don't need instance locking (read-only or special)
@@ -71,7 +70,7 @@ def main_callback(ctx: typer.Context):
 @app.command(name="scan")
 def scan(
     target: str = typer.Argument(..., help="The target URL to scan (Hunter phase)"),
-    url_list_file: Optional[str] = typer.Option(None, help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
+    url_list_file: Optional[str] = typer.Option(None, "--url-list-file", "-ul", help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
     clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
@@ -97,7 +96,7 @@ def audit(
 @app.command(name="full")
 def full_scan(
     target: str = typer.Argument(..., help="The target URL for full engagement"),
-    url_list_file: Optional[str] = typer.Option(None, help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
+    url_list_file: Optional[str] = typer.Option(None, "--url-list-file", "-ul", help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
     clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
@@ -495,21 +494,18 @@ async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Pa
 
 
 async def _check_and_resume_scan(target: str, db, resume: bool) -> bool:
-    """Check for active scan and prompt for resume if needed."""
+    """Check for active scan state from files (DB = write-only)."""
     try:
-        active_scan_id = db.get_active_scan(target)
-        if active_scan_id and not resume:
-            scan_state_json = db.get_checkpoint(active_scan_id)
-            if scan_state_json:
-                import json
-                state = json.loads(scan_state_json)
-                processed = len(state.get("processed_urls", []))
-                queued = len(state.get("url_queue", []))
-                total = processed + queued
-                pct = int((processed / total * 100)) if total > 0 else 0
-
+        from bugtrace.core.state_manager import StateManager
+        sm = StateManager(target)
+        state = sm.load_state()
+        if state and not resume:
+            processed = len(state.get("processed_urls", []))
+            queued = len(state.get("url_queue", []))
+            total = processed + queued
+            if total > 0 and queued > 0:
+                pct = int((processed / total * 100))
                 console.print(f"\n[bold yellow]⚠️  Found UNFINISHED SCAN for {target}[/bold yellow]")
-                console.print(f"   • Scan ID: {active_scan_id}")
                 console.print(f"   • Progress: {processed} analyzed / {total} total (~{pct}%)")
                 console.print(f"   • Queued: {queued} URLs waiting")
                 console.print("[green]🔄 Auto-resuming detected active scan...[/green]")
@@ -524,11 +520,11 @@ async def _run_auditor_phase(target: str, db, scan_id: int, orchestrator, common
     """Run Auditor (Validator) phase."""
     from bugtrace.core.validator_engine import ValidationEngine
 
-    sid = scan_id or (orchestrator.scan_id if orchestrator else db.get_active_scan(target))
+    sid = scan_id or (orchestrator.scan_id if orchestrator else None)
 
-    # Fallback to latest completed scan
+    # Fallback: use 0 (DB writes will still work, just won't match a specific scan)
     if not sid:
-        sid = db.get_latest_scan_id(target)
+        sid = 0
 
     out_dir = common_output_dir if common_output_dir else None
 
@@ -537,7 +533,7 @@ async def _run_auditor_phase(target: str, db, scan_id: int, orchestrator, common
         return
 
     console.print(f"\n[bold yellow]🛡️  Launching Auditor (Validator) Phase (Processing findings for Scan {sid})...[/bold yellow]")
-    engine = ValidationEngine(scan_id=sid, output_dir=out_dir)
+    engine = ValidationEngine(scan_id=sid, output_dir=out_dir, scan_dir=out_dir, target_url=target)
     await engine.run(continuous=continuous)
     console.print(f"[bold green]✅ Auditor Phase Complete.[/bold green]")
 

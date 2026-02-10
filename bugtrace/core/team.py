@@ -1417,31 +1417,41 @@ class TeamOrchestrator:
                     "location": "recon_discovery"
                 })
 
+    @staticmethod
+    def _url_fingerprint(url: str) -> str:
+        """Generate a fingerprint for dedup: scheme+host+path+sorted_param_names.
+
+        URLs with same path and same parameter names but different values
+        are considered duplicates. E.g.:
+          /art.php?id=1  and  /art.php?id=UNION+SELECT...  → same fingerprint
+          /?cmd=ls       and  /?cmd=whoami                  → same fingerprint
+          /search?q=foo  and  /search?q=bar&page=1          → different (different params)
+        """
+        parsed = urlparse(url)
+        param_names = sorted(parse_qs(parsed.query, keep_blank_values=True).keys())
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{'&'.join(param_names)}"
+
     def _normalize_urls(self, urls_to_scan: list) -> list:
-        """Deduplicate, normalize, and prioritize URLs."""
-        unique_urls = set()
-        normalized_list = []
-        has_parameterized = False
+        """Deduplicate, normalize, and prioritize URLs.
+
+        Deduplicates by path+param_names (ignoring param values) so that
+        URLs like ?id=1 and ?id=UNION_PAYLOAD count as the same endpoint.
+        Always ensures self.target is first in the list.
+        """
+        # Step 1: Ensure target URL is first (before dedup)
+        target_fp = self._url_fingerprint(self.target)
+        seen_fingerprints = {target_fp}
+        normalized_list = [self.target]
+        has_parameterized = '?' in self.target or '=' in self.target
 
         for u in urls_to_scan:
-            u_norm = u.rstrip('/')
-            if '?' in u_norm or '=' in u_norm:
+            if '?' in u or '=' in u:
                 has_parameterized = True
 
-            if u_norm not in unique_urls:
-                unique_urls.add(u_norm)
+            fp = self._url_fingerprint(u)
+            if fp not in seen_fingerprints:
+                seen_fingerprints.add(fp)
                 normalized_list.append(u)
-
-        # Smart Filter: If we have parameterized URLs, remove PLAIN root URL (no params)
-        # FIX: Only remove root if it has NO parameters (e.g., https://example.com/)
-        # If target itself has params (e.g., /catalog?category=X), keep it!
-        if has_parameterized:
-            root_norm = self.target.rstrip('/')
-            # Only filter out root if it has no query params
-            if '?' not in root_norm and '=' not in root_norm:
-                normalized_list = [u for u in normalized_list if u.rstrip('/') != root_norm]
-            if not normalized_list:
-                normalized_list = [self.target]
 
         urls_to_scan = normalized_list
         logger.info(f"Deduplicated URLs to scan: {len(urls_to_scan)}")
@@ -1457,6 +1467,15 @@ class TeamOrchestrator:
         if len(urls_to_scan) > self.max_urls:
             logger.info(f"Enforcing MAX_URLS={self.max_urls}: Trimming {len(urls_to_scan)} -> {self.max_urls} URLs")
             urls_to_scan = urls_to_scan[:self.max_urls]
+
+        # Always ensure user-provided target is first (may have been reordered by prioritization)
+        target_norm = self.target.rstrip('/')
+        for i, u in enumerate(urls_to_scan):
+            if u.rstrip('/') == target_norm:
+                if i > 0:
+                    urls_to_scan.insert(0, urls_to_scan.pop(i))
+                    logger.info(f"[Priority] Moved user target to position 1: {self.target}")
+                break
 
         self.url_queue = urls_to_scan
         self._save_checkpoint()
@@ -2530,24 +2549,45 @@ class TeamOrchestrator:
                 break
 
         if detected_csti_framework:
-            # Check if CSTI finding already exists (avoid duplicates)
-            has_csti = any(
-                f.get('type', '').upper() in ['CSTI', 'CLIENT-SIDE TEMPLATE INJECTION', 'TEMPLATE INJECTION']
-                for f in all_findings
-            )
+            # FIX (2026-02-10): ALWAYS inject synthetic CSTI with real reflecting params.
+            # DASTySAST may find CSTI on wrong params (e.g., "ng-app", "postId") while the
+            # actual vulnerable param is "category". CSTIAgent's smart probe will skip
+            # non-reflecting params anyway, so injecting extras is safe (no false positives).
+            reflecting_params = [
+                f for f in all_findings
+                if f.get('parameter') and f['parameter'] not in (
+                    '', '_auto_dispatch', 'auto_dispatch',
+                    'General DOM', 'DOM', 'DOM/Body',
+                    'ng-app', 'ng-controller', 'v-if', 'v-for',  # framework attrs, not injectable
+                )
+            ]
 
-            if not has_csti:
-                # Create synthetic CSTI finding to trigger CSTIAgent
+            # Deduplicate: only inject for params NOT already in CSTI findings
+            existing_csti_params = set()
+            for f in all_findings:
+                ftype = f.get('type', '').upper()
+                if ftype in ['CSTI', 'CLIENT-SIDE TEMPLATE INJECTION', 'TEMPLATE INJECTION']:
+                    existing_csti_params.add(f.get('parameter', ''))
+
+            # Inject synthetic CSTI findings for each real reflecting param not already covered
+            injected_count = 0
+            seen_params = set()
+            for rf in reflecting_params:
+                param = rf["parameter"]
+                if param in existing_csti_params or param in seen_params:
+                    continue
+                seen_params.add(param)
+                synth_url = rf.get("url", self.target)
                 synthetic_csti = {
                     "type": "CSTI",
-                    "parameter": "_auto_dispatch",
-                    "url": self.target,
+                    "parameter": param,
+                    "url": synth_url,
                     "severity": "High",
-                    "fp_confidence": 0.9,  # High confidence to pass filters
+                    "fp_confidence": 0.9,
                     "confidence_score": 0.9,
                     "votes": 5,
                     "skeptical_score": 8,
-                    "reasoning": f"Auto-dispatch: {detected_csti_framework.upper()} framework detected by Nuclei. CSTIAgent will perform deep CSTI analysis.",
+                    "reasoning": f"Auto-dispatch: {detected_csti_framework.upper()} framework detected. Testing param '{param}' for CSTI.",
                     "payload": "",
                     "evidence": f"tech_profile.frameworks contains: {detected_frameworks}",
                     "_source_file": "auto_dispatch",
@@ -2555,8 +2595,36 @@ class TeamOrchestrator:
                     "_auto_dispatched": True
                 }
                 all_findings.append(synthetic_csti)
-                logger.info(f"[Auto-Dispatch] Added synthetic CSTI finding (detected: {detected_csti_framework})")
-                dashboard.log(f"🔧 Auto-dispatch: CSTI finding injected ({detected_csti_framework.upper()} detected)", "INFO")
+                injected_count += 1
+
+            if injected_count == 0 and not existing_csti_params:
+                # No reflecting params AND no existing CSTI — fallback to target URL params
+                from urllib.parse import urlparse, parse_qs
+                parsed_target = urlparse(self.target)
+                target_params = parse_qs(parsed_target.query)
+                synth_param = list(target_params.keys())[0] if target_params else "_auto_dispatch"
+                synthetic_csti = {
+                    "type": "CSTI",
+                    "parameter": synth_param,
+                    "url": self.target,
+                    "severity": "High",
+                    "fp_confidence": 0.9,
+                    "confidence_score": 0.9,
+                    "votes": 5,
+                    "skeptical_score": 8,
+                    "reasoning": f"Auto-dispatch: {detected_csti_framework.upper()} framework detected by Nuclei.",
+                    "payload": "",
+                    "evidence": f"tech_profile.frameworks contains: {detected_frameworks}",
+                    "_source_file": "auto_dispatch",
+                    "_scan_context": self.scan_context,
+                    "_auto_dispatched": True
+                }
+                all_findings.append(synthetic_csti)
+                injected_count = 1
+
+            if injected_count > 0:
+                logger.info(f"[Auto-Dispatch] Injected {injected_count} synthetic CSTI findings with real params (detected: {detected_csti_framework})")
+                dashboard.log(f"Auto-dispatch: {injected_count} CSTI findings injected ({detected_csti_framework.upper()} detected)", "INFO")
 
         # FIX (2026-02-08): Auto-dispatch SQLiAgent when reflecting params exist but no SQLi finding
         # SQLi is the most common web vuln - if DASTySAST found ANY parameter, SQLi should be tested.
@@ -2571,10 +2639,22 @@ class TeamOrchestrator:
         )
 
         if not has_sqli and has_any_param_finding:
+            # FIX (2026-02-10): Use real reflecting param, not "_auto_dispatch"
+            first_real_sqli = next(
+                (f for f in all_findings
+                 if f.get('parameter') and f['parameter'] not in (
+                     '', '_auto_dispatch', 'auto_dispatch',
+                     'General DOM', 'DOM', 'DOM/Body',
+                 )),
+                None
+            )
+            sqli_param = first_real_sqli["parameter"] if first_real_sqli else "_auto_dispatch"
+            sqli_url = first_real_sqli.get("url", self.target) if first_real_sqli else self.target
+
             synthetic_sqli = {
                 "type": "SQLi",
-                "parameter": "_auto_dispatch",
-                "url": self.target,
+                "parameter": sqli_param,
+                "url": sqli_url,
                 "severity": "High",
                 "fp_confidence": 0.9,
                 "confidence_score": 0.9,
@@ -2588,8 +2668,87 @@ class TeamOrchestrator:
                 "_auto_dispatched": True
             }
             all_findings.append(synthetic_sqli)
-            logger.info("[Auto-Dispatch] Added synthetic SQLi finding (reflecting params detected, no SQLi from LLM)")
-            dashboard.log("🔧 Auto-dispatch: SQLi finding injected (reflecting params detected)", "INFO")
+            logger.info(f"[Auto-Dispatch] Added synthetic SQLi finding: param='{sqli_param}' (reflecting params detected)")
+            dashboard.log(f"Auto-dispatch: SQLi finding injected for param='{sqli_param}'", "INFO")
+
+        # Gap 2 Fix: Auto-dispatch HeaderInjectionAgent when header reflection detected or params exist
+        # CRLF/Header Injection is often missed because DASTySAST only checks body reflection.
+        # HeaderInjectionAgent has autonomous _discover_header_params() - just needs the trigger.
+        has_header_injection = any(
+            'header' in f.get('type', '').lower() or 'crlf' in f.get('type', '').lower()
+            for f in all_findings
+        )
+        has_header_reflection = any(
+            f.get('header_reflection') or f.get('context') == 'response_header'
+            for f in all_findings
+        )
+
+        if not has_header_injection and (has_header_reflection or has_any_param_finding):
+            # FIX (2026-02-10): Use real reflecting param
+            hi_real = next(
+                (f for f in all_findings
+                 if f.get('parameter') and f['parameter'] not in (
+                     '', '_auto_dispatch', 'auto_dispatch',
+                     'General DOM', 'DOM', 'DOM/Body',
+                 )),
+                None
+            )
+            synthetic_header = {
+                "type": "Header Injection",
+                "parameter": hi_real["parameter"] if hi_real else "_auto_dispatch",
+                "url": hi_real.get("url", self.target) if hi_real else self.target,
+                "severity": "High",
+                "fp_confidence": 0.9,
+                "confidence_score": 0.9,
+                "votes": 5,
+                "skeptical_score": 8,
+                "reasoning": "Auto-dispatch: " + (
+                    "Probe marker reflected in response headers (CRLF candidate)"
+                    if has_header_reflection
+                    else "Reflecting parameters detected. HeaderInjectionAgent will test for CRLF/response splitting."
+                ),
+                "payload": "",
+                "evidence": "Header reflection detected" if has_header_reflection else "Auto-dispatched for parameter coverage",
+                "_source_file": "auto_dispatch",
+                "_scan_context": self.scan_context,
+                "_auto_dispatched": True
+            }
+            all_findings.append(synthetic_header)
+            logger.info(f"[Auto-Dispatch] Added synthetic Header Injection finding (header_reflection={has_header_reflection})")
+            dashboard.log(f"🔧 Auto-dispatch: Header Injection finding injected", "INFO")
+
+        # Auto-dispatch XSSAgent when no XSS finding from DASTySAST.
+        # XSSAgent handles DOM XSS (Phase B.2) which requires Playwright.
+        # DOM XSS can exist even without reflected params (e.g., jQuery href sinks).
+        has_xss = any(
+            f.get("type", "").upper() in ("XSS", "DOM_XSS", "CROSS-SITE SCRIPTING")
+            for f in all_findings
+        )
+        if not has_xss:
+            first_url = self.target
+            for f in all_findings:
+                if f.get("url"):
+                    first_url = f["url"]
+                    break
+            synthetic_xss = {
+                "type": "XSS",
+                "parameter": "auto_dispatch",
+                "url": first_url,
+                "severity": "High",
+                "fp_confidence": 0.9,
+                "confidence_score": 0.9,
+                "votes": 5,
+                "skeptical_score": 8,
+                "reasoning": "Auto-dispatch: XSSAgent will perform autonomous XSS testing including DOM XSS detection via Playwright.",
+                "payload": "",
+                "evidence": "Auto-dispatched for DOM XSS coverage (Phase B.2)",
+                "_source_file": "auto_dispatch",
+                "_scan_context": self.scan_context,
+                "_auto_dispatched": True
+            }
+            all_findings.append(synthetic_xss)
+            logger.info("[Auto-Dispatch] Added synthetic XSS finding for DOM XSS coverage")
+            dashboard.log("🔧 Auto-dispatch: XSS finding injected (DOM XSS coverage)", "INFO")
 
         # Inject Nuclei misconfiguration findings (HSTS missing, cookie flags, etc.)
         misconfigs = self.tech_profile.get("misconfigurations", [])

@@ -66,6 +66,8 @@ class ScanContext:
 
         # Per-scan isolation primitives
         self.stop_event = asyncio.Event()  # asyncio.Event for single-loop safety (INF-01)
+        self._resume_event = asyncio.Event()  # Cleared when paused, set when running
+        self._resume_event.set()  # Start in "not paused" state
         self.settings_snapshot: Dict[str, Any] = {}  # frozen copy at scan start
 
         # Findings tracking
@@ -100,12 +102,31 @@ class ScanContext:
         Updates status to "stopping" to indicate shutdown is in progress.
         """
         self.stop_event.set()
+        self._resume_event.set()  # Unblock if paused so it can stop
         self.status = "stopping"
+
+    def request_pause(self):
+        """Pause the scan. Pipeline will block at next checkpoint."""
+        self._resume_event.clear()
+        self.status = "paused"
+
+    def request_resume(self):
+        """Resume a paused scan."""
+        self._resume_event.set()
+        self.status = "running"
+
+    async def wait_if_paused(self):
+        """Call at pipeline checkpoints. Blocks until resumed if paused."""
+        await self._resume_event.wait()
+
+    @property
+    def is_paused(self) -> bool:
+        return self.status == "paused"
 
     @property
     def is_running(self) -> bool:
         """Check if scan is in an active state."""
-        return self.status in ("initializing", "running")
+        return self.status in ("initializing", "running", "paused")
 
     @property
     def uptime_seconds(self) -> float:
@@ -124,7 +145,7 @@ class ScanContext:
         return {
             "scan_id": self.scan_id,
             "target": self.options.target_url,
-            "status": self.status,
+            "status": self.status.upper(),
             "progress": self.progress,
             "uptime_seconds": self.uptime_seconds,
             "findings_count": self.findings_count,

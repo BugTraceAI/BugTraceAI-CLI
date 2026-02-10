@@ -2,13 +2,18 @@
 Summary generation for scan findings.
 
 Provides aggregated views of findings by severity, type, and validation status.
+
+v3: FILE-BASED - reads from specialist JSON files (DB = write-only from CLI).
 """
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from datetime import datetime
+from pathlib import Path
 import json
 from rich.table import Table
 from rich.console import Console
+
+from bugtrace.core.config import settings
 
 
 @dataclass
@@ -37,53 +42,123 @@ class ScanSummary:
     pending: int = 0
 
 
+def _find_latest_scan_dir(target_url: Optional[str] = None) -> Optional[Path]:
+    """Find the latest scan directory for a target (or overall latest)."""
+    report_dir = Path(settings.REPORT_DIR)
+    if not report_dir.exists():
+        return None
+
+    if target_url:
+        from urllib.parse import urlparse
+        domain = urlparse(target_url).netloc.split(":")[0]
+        scan_dirs = sorted(report_dir.glob(f"{domain}_*"), reverse=True)
+    else:
+        scan_dirs = sorted(report_dir.iterdir(), reverse=True)
+        scan_dirs = [d for d in scan_dirs if d.is_dir()]
+
+    return scan_dirs[0] if scan_dirs else None
+
+
+def _load_findings_from_scan_dir(scan_dir: Path) -> List[Dict]:
+    """Load findings from specialist JSON files in a scan directory."""
+    specialists_dir = scan_dir / "specialists"
+    if not specialists_dir.exists():
+        return []
+
+    findings = []
+    seen_keys = set()
+
+    for subdir in ["results", "dry", "wet"]:
+        subdir_path = specialists_dir / subdir
+        if not subdir_path.exists():
+            continue
+
+        for json_file in sorted(subdir_path.glob("*.json")):
+            try:
+                content = json_file.read_text(encoding="utf-8").strip()
+                if not content:
+                    continue
+
+                data = json.loads(content)
+
+                # Handle wrapper format: {"findings": [...]}
+                if isinstance(data, dict) and "findings" in data:
+                    raw_findings = data["findings"]
+                elif isinstance(data, list):
+                    raw_findings = data
+                else:
+                    continue
+
+                for f in raw_findings:
+                    if not isinstance(f, dict):
+                        continue
+
+                    dedup_key = (
+                        f.get("url", ""),
+                        f.get("parameter", ""),
+                        f.get("type", ""),
+                        f.get("payload", ""),
+                    )
+                    if dedup_key in seen_keys:
+                        continue
+                    seen_keys.add(dedup_key)
+
+                    findings.append(f)
+            except (json.JSONDecodeError, Exception):
+                continue
+
+    return findings
+
+
 def generate_scan_summary(scan_id: Optional[int] = None, target_url: Optional[str] = None) -> ScanSummary:
     """
     Generate aggregated summary for a scan.
 
+    v3: Reads from files (DB = write-only from CLI).
+
     Args:
-        scan_id: Specific scan ID (takes priority)
-        target_url: Target URL (uses latest scan for this target)
+        scan_id: Ignored (kept for API compatibility)
+        target_url: Target URL (finds latest scan directory)
 
     Returns:
         ScanSummary with aggregated findings data
 
     Raises:
-        ValueError: If no scans found or scan doesn't exist
+        ValueError: If no scans found
     """
-    from bugtrace.core.database import get_db_manager
-    from bugtrace.schemas.db_models import FindingStatus
+    scan_dir = _find_latest_scan_dir(target_url)
 
-    db = get_db_manager()
-
-    # Resolve scan_id
-    if scan_id is None:
-        if target_url:
-            scan_id = db.get_latest_scan_id(target_url)
-        else:
-            scan_id = db.get_most_recent_scan_id()
-
-    if scan_id is None:
+    if scan_dir is None:
         raise ValueError("No scans found. Run a scan first.")
 
-    # Get scan info
-    scan_info = db.get_scan_info(scan_id)
-    if scan_info is None:
-        raise ValueError(f"Scan {scan_id} not found.")
+    # Extract info from directory name (format: domain_YYYYMMDD_HHMMSS)
+    dir_name = scan_dir.name
+    parts = dir_name.rsplit("_", 2)
+    if len(parts) >= 3:
+        domain = parts[0]
+        try:
+            scan_date = datetime.strptime(f"{parts[1]}_{parts[2]}", "%Y%m%d_%H%M%S")
+        except ValueError:
+            scan_date = datetime.fromtimestamp(scan_dir.stat().st_ctime)
+    else:
+        domain = dir_name
+        scan_date = datetime.fromtimestamp(scan_dir.stat().st_ctime)
 
-    # Get findings
-    findings = db.get_findings_for_scan(scan_id)
+    resolved_target = target_url or domain
+
+    # Load findings from files
+    findings = _load_findings_from_scan_dir(scan_dir)
 
     summary = ScanSummary(
-        scan_id=scan_id,
-        target_url=scan_info.target_url,
-        scan_date=scan_info.timestamp,
-        status=scan_info.status.value,
+        scan_id=scan_id or 0,
+        target_url=resolved_target,
+        scan_date=scan_date,
+        status="completed",
     )
 
-    # Count by severity
+    # Count by severity and type
     for f in findings:
-        sev = (f.severity or "INFO").upper()
+        sev = (f.get("severity") or "INFO").upper()
         if sev == "CRITICAL":
             summary.critical += 1
         elif sev == "HIGH":
@@ -95,16 +170,15 @@ def generate_scan_summary(scan_id: Optional[int] = None, target_url: Optional[st
         else:
             summary.info += 1
 
-        # Count by type
-        vuln_type = f.type.value if hasattr(f.type, 'value') else str(f.type)
+        vuln_type = str(f.get("type", "Unknown")).upper()
         summary.by_type[vuln_type] = summary.by_type.get(vuln_type, 0) + 1
 
-        # Count by validation status
-        if f.status == FindingStatus.VALIDATED_CONFIRMED:
+        status = f.get("status", "")
+        if status == "VALIDATED_CONFIRMED":
             summary.validated += 1
-        elif f.status == FindingStatus.MANUAL_REVIEW_RECOMMENDED:
+        elif status == "MANUAL_REVIEW_RECOMMENDED":
             summary.manual_review += 1
-        elif f.status == FindingStatus.VALIDATED_FALSE_POSITIVE:
+        elif status == "VALIDATED_FALSE_POSITIVE":
             summary.false_positive += 1
         else:
             summary.pending += 1

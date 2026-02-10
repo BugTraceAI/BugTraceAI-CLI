@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import aiohttp
 from bugtrace.agents.base import BaseAgent
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
@@ -50,6 +50,58 @@ class XXEAgent(BaseAgent, TechContextMixin):
         # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._xxe_prime_directive: str = ""
+
+    # =========================================================================
+    # FINDING VALIDATION: XXE-specific validation (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> Tuple[bool, str]:
+        """
+        XXE-specific validation before emitting finding.
+
+        Validates:
+        1. Basic requirements (type, url) via parent
+        2. Has XXE evidence (file content, OOB callback, entity resolved)
+        3. Payload contains XML entity patterns
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # Extract from nested structure if needed
+        nested = finding.get("finding", {})
+        evidence = finding.get("evidence", nested.get("evidence", {}))
+        status = finding.get("status", nested.get("status", ""))
+
+        # XXE-specific: Must have evidence or confirmed status
+        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+            has_file = "root:x:" in str(evidence) or "passwd" in str(evidence)
+            has_oob = evidence.get("interactsh_callback") if isinstance(evidence, dict) else False
+            has_entity = "BUGTRACE_XXE" in str(evidence)
+            if not (has_file or has_oob or has_entity):
+                return False, "XXE requires proof: file content, OOB callback, or entity resolved"
+
+        # XXE-specific: Payload should contain XML entity patterns
+        payload = finding.get("payload", nested.get("payload", ""))
+        xxe_markers = ['<!ENTITY', '<!DOCTYPE', 'SYSTEM', 'file://', 'http://', '&xxe;', '<?xml']
+        if payload and not any(m in str(payload) for m in xxe_markers):
+            return False, f"XXE payload missing XML entity patterns: {payload[:50]}"
+
+        return True, ""
+
+    def _emit_xxe_finding(self, finding_dict: Dict, scan_context: str = None) -> Optional[Dict]:
+        """
+        Helper to emit XXE finding using BaseAgent.emit_finding() with validation.
+        """
+        if "type" not in finding_dict:
+            finding_dict["type"] = "XXE"
+
+        if scan_context:
+            finding_dict["scan_context"] = scan_context
+
+        finding_dict["agent"] = self.name
+        return self.emit_finding(finding_dict)
 
     def _determine_validation_status(self, payload: str, evidence: str = "success") -> str:
         """
@@ -264,8 +316,9 @@ class XXEAgent(BaseAgent, TechContextMixin):
         Process:
         1. Wait for queue to have items (max 300s - matches team.py timeout)
         2. Drain ALL items until queue is stable empty (10 consecutive checks)
-        3. LLM analysis with agent-specific dedup rules (fallback to fingerprints)
-        4. Return DRY list (deduplicated findings)
+        3. AUTONOMOUS DISCOVERY: Expand each URL into multiple XXE endpoints
+        4. LLM analysis with agent-specific dedup rules (fallback to fingerprints)
+        5. Return DRY list (deduplicated findings)
 
         Returns:
             List of deduplicated findings (DRY list)
@@ -323,18 +376,72 @@ class XXEAgent(BaseAgent, TechContextMixin):
             logger.info(f"[{self.name}] Phase A: No findings to deduplicate")
             return []
 
+        # ========== AUTONOMOUS PARAMETER DISCOVERY ==========
+        # Strategy: ALWAYS keep original WET findings + ADD discovered endpoints
+        logger.info(f"[{self.name}] Phase A: Expanding WET findings with XXE-focused discovery...")
+        expanded_wet_findings = []
+        seen_urls = set()
+        seen_endpoints = set()
+
+        # 1. Always include ALL original WET findings first (DASTySAST signals)
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            endpoint_key = (url, wet_item.get("endpoint_type", ""), wet_item.get("method", ""))
+            if endpoint_key not in seen_endpoints:
+                seen_endpoints.add(endpoint_key)
+                expanded_wet_findings.append(wet_item)
+
+        # 2. Discover additional XXE endpoints per unique URL
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                xxe_endpoints = await self._discover_xxe_params(url)
+                if not xxe_endpoints:
+                    continue
+
+                new_count = 0
+                for endpoint_data in xxe_endpoints:
+                    ep_url = endpoint_data.get("url", url)
+                    endpoint_key = (ep_url, endpoint_data.get("type", "unknown"), endpoint_data.get("method", "POST"))
+                    if endpoint_key not in seen_endpoints:
+                        seen_endpoints.add(endpoint_key)
+                        expanded_wet_findings.append({
+                            "url": ep_url,
+                            "endpoint_type": endpoint_data.get("type", "unknown"),
+                            "accept_filter": endpoint_data.get("accept", ""),
+                            "method": endpoint_data.get("method", "POST"),
+                            "context": wet_item.get("context", "unknown"),
+                            "finding": wet_item.get("finding", {}),
+                            "scan_context": wet_item.get("scan_context", self._scan_context),
+                            "_discovered": True
+                        })
+                        new_count += 1
+
+                if new_count:
+                    logger.info(f"[{self.name}] 🔍 Discovered {new_count} additional XXE endpoints on {url}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
+
+        logger.info(f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → {len(expanded_wet_findings)} testable XXE endpoints")
+
+        # ========== DEDUPLICATION ==========
         # 3. LLM analysis and dedup (with fingerprint fallback)
         try:
-            dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+            dry_list = await self._llm_analyze_and_dedup(expanded_wet_findings, self._scan_context)
         except Exception as e:
             logger.error(f"[{self.name}] LLM dedup failed: {e}. Falling back to fingerprint dedup")
-            dry_list = self._fallback_fingerprint_dedup(wet_findings)
+            dry_list = self._fallback_fingerprint_dedup(expanded_wet_findings)
 
         # 4. Store and return DRY list
         self._dry_findings = dry_list
 
-        dup_count = len(wet_findings) - len(dry_list)
-        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({dup_count} duplicates removed)")
+        dup_count = len(expanded_wet_findings) - len(dry_list)
+        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(expanded_wet_findings)} WET → {len(dry_list)} DRY ({dup_count} duplicates removed)")
 
         return dry_list
 
@@ -360,7 +467,7 @@ class XXEAgent(BaseAgent, TechContextMixin):
         # Infer XML parser for context
         xml_parser = self._infer_xml_parser(lang)
 
-        prompt = f"""You are analyzing {len(wet_findings)} potential XXE findings.
+        prompt = f"""You are analyzing {len(wet_findings)} potential XXE endpoints.
 
 {xxe_prime_directive}
 
@@ -371,18 +478,39 @@ class XXEAgent(BaseAgent, TechContextMixin):
 - Server: {server}
 - Likely XML Parser: {xml_parser}
 
+## DEDUPLICATION RULES
+
+1. **CRITICAL - Autonomous Discovery:**
+   - If items have "_discovered": true, they are DIFFERENT XXE ENDPOINTS discovered autonomously
+   - Even if they share the same "finding" object, treat them as SEPARATE based on "url" and "endpoint_type"
+   - Same URL + DIFFERENT endpoint_type → DIFFERENT (keep all)
+   - Different URLs → DIFFERENT (keep all)
+
+2. **Endpoint-Based Deduplication:**
+   - Same URL + Same endpoint_type → DUPLICATE (keep best)
+   - Different XML parsing contexts → DIFFERENT (keep both)
+
+3. **Prioritization:**
+   - file_upload_xml > multipart_form > xml_api_endpoint > generic_xml_test
+   - Rank by likelihood of XXE based on tech stack
+
 WET LIST:
 {json.dumps(wet_findings, indent=2)}
 
 Return JSON array of UNIQUE findings only:
-{{"findings": [...]}}
+{{
+  "findings": [...],
+  "duplicates_removed": <count>,
+  "reasoning": "Brief explanation of dedup decisions"
+}}
 """
 
         system_prompt = f"""You are an expert security analyst specializing in XXE deduplication.
 
 {xxe_prime_directive}
 
-Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerability."""
+Focus on endpoint-based deduplication. Different XXE endpoints = different vulnerabilities.
+Respect the "_discovered": true flag - these are autonomously discovered endpoints and should NOT be deduplicated unless they are truly identical."""
 
         response = await llm_client.generate(
             prompt=prompt,
@@ -402,7 +530,7 @@ Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerabil
         """
         Fallback fingerprint-based deduplication (no LLM).
 
-        Uses existing `_generate_xxe_fingerprint()` method to identify duplicates.
+        Uses URL + endpoint_type to identify duplicates.
 
         Args:
             wet_findings: All findings from queue
@@ -410,6 +538,8 @@ Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerabil
         Returns:
             Deduplicated findings list
         """
+        from urllib.parse import urlparse
+
         seen_fingerprints = set()
         dry_list = []
 
@@ -419,12 +549,21 @@ Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerabil
             if not url:
                 continue
 
-            # Generate fingerprint using existing method
-            fingerprint = self._generate_xxe_fingerprint(url)
+            # For autonomous discoveries, use URL + endpoint_type for fingerprint
+            if finding_data.get("_discovered"):
+                endpoint_type = finding_data.get("endpoint_type", "generic")
+                parsed = urlparse(url)
+                # Fingerprint: (scheme, host, path, endpoint_type)
+                fingerprint = (parsed.scheme, parsed.netloc, parsed.path.rstrip('/'), endpoint_type)
+            else:
+                # Legacy: use existing method for non-discovered findings
+                fingerprint = self._generate_xxe_fingerprint(url)
 
             if fingerprint not in seen_fingerprints:
                 seen_fingerprints.add(fingerprint)
                 dry_list.append(finding_data)
+            else:
+                logger.debug(f"[{self.name}] Fingerprint dedup: {fingerprint}")
 
         return dry_list
 
@@ -447,9 +586,11 @@ Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerabil
 
         for idx, finding_data in enumerate(self._dry_findings, 1):
             url = finding_data.get("url", "")
+            endpoint_type = finding_data.get("endpoint_type", "unknown")
+            method = finding_data.get("method", "POST")
             finding = finding_data.get("finding", {})
 
-            logger.info(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Testing {url}")
+            logger.info(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Testing {endpoint_type} on {url}")
 
             try:
                 # Execute XXE attack using existing method
@@ -457,34 +598,42 @@ Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerabil
                 result = await self._test_single_url_from_queue(url, finding)
 
                 if result and result.get("validated"):
+                    # Add endpoint metadata to result
+                    result["endpoint_type"] = endpoint_type
+                    result["http_method"] = method
+
                     validated_findings.append(result)
 
                     # FINGERPRINT CHECK: Prevent duplicate emissions
-                    fingerprint = self._generate_xxe_fingerprint(url)
+                    # Use endpoint-specific fingerprint for autonomous discoveries
+                    if finding_data.get("_discovered"):
+                        from urllib.parse import urlparse
+                        parsed = urlparse(url)
+                        fingerprint = (parsed.scheme, parsed.netloc, parsed.path.rstrip('/'), endpoint_type)
+                    else:
+                        fingerprint = self._generate_xxe_fingerprint(url)
 
                     if fingerprint not in self._emitted_findings:
                         self._emitted_findings.add(fingerprint)
 
-                        # Emit VULNERABILITY_DETECTED event
-                        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+                        # Emit VULNERABILITY_DETECTED event with validation
+                        if settings.WORKER_POOL_EMIT_EVENTS:
                             status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
-
-                            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                            self._emit_xxe_finding({
                                 "specialist": "xxe",
-                                "finding": {
-                                    "type": "XXE",
-                                    "url": result.get("url"),
-                                    "payload": result.get("payload"),
-                                    "severity": result.get("severity"),
-                                    "description": result.get("description"),
-                                    "reproduction": result.get("reproduction"),
-                                },
+                                "type": "XXE",
+                                "url": result.get("url"),
+                                "payload": result.get("payload"),
+                                "severity": result.get("severity"),
+                                "description": result.get("description"),
+                                "reproduction": result.get("reproduction"),
+                                "endpoint_type": endpoint_type,
                                 "status": status,
+                                "evidence": result.get("evidence", {}),
                                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
-                                "scan_context": self._scan_context,
-                            })
+                            }, scan_context=self._scan_context)
 
-                        logger.info(f"[{self.name}] ✅ Emitted unique XXE finding: {url}")
+                        logger.info(f"[{self.name}] ✅ Emitted unique XXE finding: {url} (type={endpoint_type})")
                     else:
                         logger.debug(f"[{self.name}] ⏭️  Skipped duplicate: {fingerprint}")
 
@@ -563,6 +712,7 @@ Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerabil
             report_specialist_start,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
 
         self._queue_mode = True
@@ -584,6 +734,7 @@ Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerabil
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "xxe")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -674,6 +825,144 @@ Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerabil
 
         return fingerprint
 
+    async def _discover_xxe_params(self, url: str) -> List[Dict[str, str]]:
+        """
+        XXE-focused endpoint discovery.
+
+        Extracts ALL testable XXE endpoints from:
+        1. File upload forms with accept=".xml"
+        2. Forms with enctype="multipart/form-data"
+        3. Endpoints that accept Content-Type: application/xml
+
+        Returns:
+            List of dicts with XXE endpoint info:
+            [
+                {
+                    "url": "https://example.com/upload",
+                    "type": "file_upload",
+                    "accept": ".xml",
+                    "method": "POST"
+                },
+                {
+                    "url": "https://example.com/api/process",
+                    "type": "xml_endpoint",
+                    "method": "POST"
+                }
+            ]
+
+        Architecture Note:
+            Specialists must be AUTONOMOUS - they discover their own attack surface.
+            The finding from DASTySAST is just a "signal" that the URL is interesting.
+            We IGNORE the specific parameter and discover ALL XXE endpoints.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, urljoin
+        from bs4 import BeautifulSoup
+
+        xxe_endpoints = []
+
+        # 1. Fetch HTML
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+            if html:
+                self._last_discovery_html = html  # Cache for URL resolution
+
+            if not html:
+                logger.warning(f"[{self.name}] No HTML content for {url}")
+                # Fallback: test the URL itself as XML endpoint
+                return [{"url": url, "type": "xml_endpoint", "method": "POST"}]
+
+            soup = BeautifulSoup(html, "html.parser")
+            parsed_url = urlparse(url)
+            base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+            # 2. Extract file upload forms with .xml acceptance
+            for form in soup.find_all("form"):
+                # Check for file inputs
+                file_inputs = form.find_all("input", {"type": "file"})
+
+                for file_input in file_inputs:
+                    accept_attr = file_input.get("accept", "")
+
+                    # Prioritize .xml file uploads
+                    if ".xml" in accept_attr.lower() or "xml" in accept_attr.lower():
+                        action = form.get("action", "")
+                        method = form.get("method", "POST").upper()
+
+                        # Resolve relative URLs
+                        if action:
+                            endpoint_url = urljoin(url, action)
+                        else:
+                            endpoint_url = url
+
+                        xxe_endpoints.append({
+                            "url": endpoint_url,
+                            "type": "file_upload_xml",
+                            "accept": accept_attr,
+                            "method": method
+                        })
+                        logger.debug(f"[{self.name}] Found XML file upload: {endpoint_url} (accept={accept_attr})")
+
+                    # Also check multipart forms (might accept XML)
+                    enctype = form.get("enctype", "")
+                    if "multipart" in enctype and not accept_attr:
+                        action = form.get("action", "")
+                        method = form.get("method", "POST").upper()
+
+                        if action:
+                            endpoint_url = urljoin(url, action)
+                        else:
+                            endpoint_url = url
+
+                        xxe_endpoints.append({
+                            "url": endpoint_url,
+                            "type": "multipart_form",
+                            "accept": "any",
+                            "method": method
+                        })
+                        logger.debug(f"[{self.name}] Found multipart form: {endpoint_url}")
+
+            # 3. Check if current URL accepts XML (test with HEAD/OPTIONS)
+            try:
+                async with orchestrator.session(DestinationType.TARGET) as session:
+                    # Send OPTIONS request to check allowed content types
+                    async with session.options(url, timeout=3) as resp:
+                        content_type_header = resp.headers.get("Accept", "")
+                        if "xml" in content_type_header.lower():
+                            xxe_endpoints.append({
+                                "url": url,
+                                "type": "xml_api_endpoint",
+                                "accept": "application/xml",
+                                "method": "POST"
+                            })
+                            logger.debug(f"[{self.name}] Endpoint accepts XML: {url}")
+            except Exception as e:
+                logger.debug(f"[{self.name}] OPTIONS request failed: {e}")
+
+            # 4. Fallback: if no specific XXE endpoints found, test URL as generic XML endpoint
+            if not xxe_endpoints:
+                logger.debug(f"[{self.name}] No specific XXE endpoints found, testing URL as XML endpoint")
+                xxe_endpoints.append({
+                    "url": url,
+                    "type": "generic_xml_test",
+                    "accept": "",
+                    "method": "POST"
+                })
+
+        except Exception as e:
+            logger.error(f"[{self.name}] XXE discovery failed for {url}: {e}")
+            # Fallback: test the URL itself
+            xxe_endpoints.append({
+                "url": url,
+                "type": "fallback",
+                "method": "POST"
+            })
+
+        logger.info(f"[{self.name}] 🔍 Discovered {len(xxe_endpoints)} XXE endpoints on {url}: {[ep['type'] for ep in xxe_endpoints]}")
+
+        return xxe_endpoints
+
     async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
         """Handle completed queue item processing."""
         if result is None:
@@ -703,18 +992,16 @@ Focus on endpoint-based deduplication. Same XML endpoint = single XXE vulnerabil
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            self._emit_xxe_finding({
                 "specialist": "xxe",
-                "finding": {
-                    "type": "XXE",
-                    "url": result.get("url"),
-                    "payload": result.get("payload"),
-                },
+                "type": "XXE",
+                "url": result.get("url"),
+                "payload": result.get("payload"),
                 "status": status,
+                "evidence": result.get("evidence", {}),
                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
-                "scan_context": self._scan_context,
-            })
+            }, scan_context=self._scan_context)
 
         logger.info(f"[{self.name}] Confirmed XXE: {result.get('url')} [status={status}]")
 

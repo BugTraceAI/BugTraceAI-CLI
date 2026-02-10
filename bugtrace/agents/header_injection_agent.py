@@ -14,7 +14,7 @@ Burp Scanner finds these as "HTTP Response Header Injection" which allows:
 import asyncio
 import aiohttp
 import json
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
@@ -117,6 +117,55 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
         # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._header_injection_prime_directive: str = ""
+
+    # =========================================================================
+    # FINDING VALIDATION: Header Injection-specific validation (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> Tuple[bool, str]:
+        """
+        Header Injection-specific validation before emitting finding.
+
+        Validates:
+        1. Basic requirements (type, url) via parent
+        2. Has header injection evidence (header reflected)
+        3. Payload contains CRLF patterns
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # Extract from nested structure if needed
+        nested = finding.get("finding", {})
+        evidence = finding.get("evidence", {})
+
+        # Header injection-specific: Must have header name or evidence
+        header_name = finding.get("header_name", nested.get("header_name", ""))
+        has_evidence = header_name or evidence.get("header_reflected")
+        if not has_evidence:
+            return False, "Header Injection requires proof: injected header name or evidence"
+
+        # Header injection-specific: Payload should contain CRLF patterns
+        payload = finding.get("payload", nested.get("payload", ""))
+        crlf_markers = ['%0d', '%0a', '\r', '\n', '%250d', '%250a', '%E5%98%8']
+        if payload and not any(m in str(payload) for m in crlf_markers):
+            return False, f"Header Injection payload missing CRLF patterns: {payload[:50]}"
+
+        return True, ""
+
+    def _emit_header_injection_finding(self, finding_dict: Dict, scan_context: str = None) -> Optional[Dict]:
+        """
+        Helper to emit Header Injection finding using BaseAgent.emit_finding() with validation.
+        """
+        if "type" not in finding_dict:
+            finding_dict["type"] = "HEADER_INJECTION"
+
+        if scan_context:
+            finding_dict["scan_context"] = scan_context
+
+        finding_dict["agent"] = self.name
+        return self.emit_finding(finding_dict)
 
     async def run_loop(self):
         """Standard run loop."""
@@ -361,12 +410,103 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
         return self._stats
 
     # =========================================================================
+    # AUTONOMOUS PARAMETER DISCOVERY (Specialist Autonomy Pattern)
+    # =========================================================================
+
+    async def _discover_header_params(self, url: str) -> Dict[str, str]:
+        """
+        Header Injection-focused parameter discovery.
+
+        Extracts ALL testable parameters from:
+        1. URL query string
+        2. HTML forms (input, textarea, select)
+
+        Prioritizes parameters that might influence HTTP headers:
+        - redirect, language, locale, encoding, charset
+        - url, callback, next, return, ref
+
+        Returns:
+            Dict mapping param names to default values
+            Example: {"redirect": "/home", "locale": "en", "searchTerm": ""}
+
+        Architecture Note:
+            Specialists must be AUTONOMOUS - they discover their own attack surface.
+            The finding from DASTySAST is just a "signal" that the URL is interesting.
+            We IGNORE the specific parameter and test ALL discoverable params.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, parse_qs
+        from bs4 import BeautifulSoup
+
+        all_params = {}
+
+        # 1. Extract URL query parameters
+        try:
+            parsed = urlparse(url)
+            url_params = parse_qs(parsed.query)
+            for param_name, values in url_params.items():
+                all_params[param_name] = values[0] if values else ""
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        # 2. Fetch HTML and extract form parameters + link parameters
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+
+            if html:
+                self._last_discovery_html = html  # Cache for URL resolution
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract from <input>, <textarea>, <select>
+                for tag in soup.find_all(["input", "textarea", "select"]):
+                    param_name = tag.get("name")
+                    if param_name and param_name not in all_params:
+                        input_type = tag.get("type", "text").lower()
+
+                        # Skip non-testable input types
+                        if input_type not in ["submit", "button", "reset"]:
+                            # Include CSRF tokens for header injection (they can trigger headers)
+                            default_value = tag.get("value", "")
+                            all_params[param_name] = default_value
+
+                # Extract params from <a> href links (same-origin only)
+                # Many sites put params in navigation links, not forms
+                # e.g. <a href="/catalog?category=Juice">
+                parsed_base = urlparse(url)
+                for a_tag in soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    try:
+                        parsed_href = urlparse(href)
+                        # Same-origin or relative links only
+                        if parsed_href.netloc and parsed_href.netloc != parsed_base.netloc:
+                            continue
+                        href_params = parse_qs(parsed_href.query)
+                        for p_name, p_vals in href_params.items():
+                            if p_name not in all_params:
+                                all_params[p_name] = p_vals[0] if p_vals else ""
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            logger.error(f"[{self.name}] HTML parsing failed: {e}")
+
+        logger.info(f"[{self.name}] 🔍 Discovered {len(all_params)} params on {url}: {list(all_params.keys())}")
+        return all_params
+
+    # =========================================================================
     # WET → DRY Two-Phase Processing (Phase A: Deduplication, Phase B: Exploitation)
     # =========================================================================
 
     async def analyze_and_dedup_queue(self) -> List[Dict]:
         """
-        PHASE A: Drain WET findings from queue and deduplicate using LLM + fingerprint fallback.
+        PHASE A: Drain WET findings from queue, expand with autonomous discovery, and deduplicate.
+
+        Flow:
+        1. Drain WET queue (signals from DASTySAST)
+        2. Expand each signal by discovering ALL params on that URL
+        3. Deduplicate with LLM (respects _discovered flag)
+        4. Return DRY list ready for exploitation
 
         Returns:
             List of DRY (deduplicated) findings
@@ -405,7 +545,12 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
 
             finding = item.get("finding", {}) if isinstance(item, dict) else {}
             if finding:
-                wet_findings.append(finding)
+                wet_findings.append({
+                    "url": finding.get("url", ""),
+                    "parameter": finding.get("parameter", ""),
+                    "finding": finding,
+                    "scan_context": item.get("scan_context", self._scan_context),
+                })
 
         logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings from queue")
 
@@ -413,13 +558,87 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
             logger.info(f"[{self.name}] Phase A: No findings to process")
             return []
 
-        # LLM-powered deduplication
-        dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+        # ========== AUTONOMOUS PARAMETER DISCOVERY ==========
+        # Strategy: ALWAYS keep original WET params + ADD discovered params
+        logger.info(f"[{self.name}] Phase A: Expanding WET findings with autonomous discovery...")
+        expanded_wet_findings = []
+        seen_urls = set()
+        seen_params = set()
+
+        # 1. Always include ALL original WET params first (DASTySAST signals)
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            param = wet_item.get("parameter", "") or (wet_item.get("finding", {}) or {}).get("parameter", "")
+            if param and (url, param) not in seen_params:
+                seen_params.add((url, param))
+                expanded_wet_findings.append(wet_item)
+
+        # 2. Discover additional params per unique URL
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                all_params = await self._discover_header_params(url)
+                if not all_params:
+                    continue
+
+                new_count = 0
+                for param_name, param_value in all_params.items():
+                    if (url, param_name) not in seen_params:
+                        seen_params.add((url, param_name))
+                        expanded_wet_findings.append({
+                            "url": url,
+                            "parameter": param_name,
+                            "context": wet_item.get("context", "unknown"),
+                            "finding": wet_item.get("finding", {}),
+                            "scan_context": wet_item.get("scan_context", self._scan_context),
+                            "_discovered": True
+                        })
+                        new_count += 1
+
+                if new_count:
+                    logger.info(f"[{self.name}] 🔍 Discovered {new_count} additional params on {url}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
+
+        # 2.5 Resolve endpoint URLs from HTML links/forms + reasoning fallback
+        from bugtrace.agents.specialist_utils import resolve_param_endpoints, resolve_param_from_reasoning
+        if hasattr(self, '_last_discovery_html') and self._last_discovery_html:
+            for base_url in seen_urls:
+                endpoint_map = resolve_param_endpoints(self._last_discovery_html, base_url)
+                # Fallback: extract endpoints from DASTySAST reasoning text
+                reasoning_map = resolve_param_from_reasoning(expanded_wet_findings, base_url)
+                for k, v in reasoning_map.items():
+                    if k not in endpoint_map:
+                        endpoint_map[k] = v
+                if endpoint_map:
+                    resolved_count = 0
+                    for item in expanded_wet_findings:
+                        if item.get("url") == base_url:
+                            param = item.get("parameter", "")
+                            if param in endpoint_map and endpoint_map[param] != base_url:
+                                item["url"] = endpoint_map[param]
+                                resolved_count += 1
+                    if resolved_count:
+                        logger.info(f"[{self.name}] 🔗 Resolved {resolved_count} params to actual endpoint URLs")
+
+        logger.info(f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → {len(expanded_wet_findings)} testable params")
+
+        # ========== DEDUPLICATION ==========
+        try:
+            dry_list = await self._llm_analyze_and_dedup(expanded_wet_findings, self._scan_context)
+        except Exception as e:
+            logger.warning(f"[{self.name}] LLM dedup failed: {e}, using fallback")
+            dry_list = self._fallback_fingerprint_dedup(expanded_wet_findings)
 
         # Store for later phases
         self._dry_findings = dry_list
 
-        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({len(wet_findings) - len(dry_list)} duplicates removed)")
+        logger.info(f"[{self.name}] Phase A: {len(expanded_wet_findings)} WET → {len(dry_list)} DRY ({len(expanded_wet_findings) - len(dry_list)} duplicates removed)")
 
         return dry_list
 
@@ -427,6 +646,8 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
         """
         Use LLM to intelligently deduplicate Header Injection findings.
         Falls back to fingerprint-based dedup if LLM fails.
+
+        CRITICAL: Respects autonomous discovery - same URL + DIFFERENT param = DIFFERENT finding.
         """
         import json
         from bugtrace.core.llm_client import llm_client
@@ -452,10 +673,26 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
 - CDN: {cdn or 'None'}
 - WAF: {waf or 'None'}
 
+## DEDUPLICATION RULES
+
+1. **CRITICAL - Autonomous Discovery:**
+   - If items have "_discovered": true, they are DIFFERENT PARAMETERS discovered autonomously
+   - Even if they share the same "finding" object, treat them as SEPARATE based on "parameter" field
+   - Same URL + DIFFERENT param → DIFFERENT (keep all)
+   - Same URL + param + DIFFERENT context → DIFFERENT (keep both)
+
+2. **Standard Deduplication:**
+   - Same URL + Same param + Same context → DUPLICATE (keep best)
+   - Different endpoints → DIFFERENT (keep both)
+
+3. **Prioritization:**
+   - Rank by exploitability given the tech stack
+   - Remove findings unlikely to succeed
+
 EXAMPLES:
-- /page?param=X (X-Injected) + /other?param=Y (X-Injected) = DUPLICATE ✓
-- /page?param=X (X-Injected) + /page?param=Y (Set-Cookie) = DIFFERENT ✗
-- example.com (X-Injected) + other.com (X-Injected) = DUPLICATE ✓
+- /page?redirect=X + /page?locale=Y (both _discovered=true) = DIFFERENT ✓ (keep both)
+- /page?param=X (X-Injected) + /other?param=Y (X-Injected) = DUPLICATE ✓ (same param name across URLs)
+- /page?param=X (X-Injected) + /page?param=Y (Set-Cookie) = DIFFERENT ✗ (different headers)
 
 WET FINDINGS (may contain duplicates):
 {json.dumps(wet_findings, indent=2)}
@@ -465,14 +702,21 @@ Return ONLY unique findings in JSON format:
   "findings": [
     {{"url": "...", "parameter": "...", "header_name": "...", ...}},
     ...
-  ]
+  ],
+  "duplicates_removed": <count>,
+  "reasoning": "Brief explanation"
 }}"""
 
         system_prompt = f"""You are an expert CRLF/Header Injection deduplication analyst.
 
 {header_injection_prime_directive}
 
-Your job is to identify and remove duplicate findings while preserving unique injected header names. Focus on header name-only deduplication."""
+Your job is to identify and remove duplicate findings while preserving:
+1. Unique parameter names (autonomous discovery)
+2. Different injection contexts
+3. Different injected headers
+
+Focus on header name-only deduplication UNLESS parameters are different."""
 
         try:
             response = await llm_client.generate(
@@ -500,15 +744,23 @@ Your job is to identify and remove duplicate findings while preserving unique in
     def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
         """
         Fallback fingerprint-based deduplication if LLM fails.
-        Uses _generate_headerinjection_fingerprint for expert dedup.
+
+        For autonomous discovery: Uses (url, parameter) as fingerprint.
+        This ensures same URL with DIFFERENT params = DIFFERENT findings.
         """
         seen = set()
         dry_list = []
 
         for finding in wet_findings:
-            header_name = finding.get("header_name", finding.get("injected_header", "X-Injected"))
-
-            fingerprint = self._generate_headerinjection_fingerprint(header_name)
+            # If autonomously discovered, fingerprint by URL+param
+            if finding.get("_discovered"):
+                url = finding.get("url", "")
+                param = finding.get("parameter", "")
+                fingerprint = (url, param)
+            else:
+                # Standard header injection: fingerprint by header name only
+                header_name = finding.get("header_name", finding.get("injected_header", "X-Injected"))
+                fingerprint = self._generate_headerinjection_fingerprint(header_name)
 
             if fingerprint not in seen:
                 seen.add(fingerprint)
@@ -563,17 +815,16 @@ Your job is to identify and remove duplicate findings while preserving unique in
 
                     validated_findings.append(result)
 
-                    # Emit event
-                    if self.event_bus:
-                        self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
-                            "type": "HEADER_INJECTION",
-                            "url": result.get("url", url),
-                            "parameter": result.get("parameter", parameter),
-                            "header_name": result.get("header_name", header_name),
-                            "severity": result.get("severity", "MEDIUM"),
-                            "scan_context": self._scan_context,
-                            "agent": self.name
-                        })
+                    # Emit event with validation
+                    self._emit_header_injection_finding({
+                        "type": "HEADER_INJECTION",
+                        "url": result.get("url", url),
+                        "parameter": result.get("parameter", parameter),
+                        "header_name": result.get("header_name", header_name),
+                        "payload": result.get("payload", ""),
+                        "severity": result.get("severity", "MEDIUM"),
+                        "evidence": {"header_reflected": True},
+                    }, scan_context=self._scan_context)
 
                     logger.info(f"[{self.name}] ✓ Header Injection confirmed: header={header_name}")
                 else:
@@ -651,6 +902,7 @@ Your job is to identify and remove duplicate findings while preserving unique in
             report_specialist_start,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
         from bugtrace.core.queue import queue_manager
 
@@ -673,6 +925,7 @@ Your job is to identify and remove duplicate findings while preserving unique in
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "header_injection")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -799,21 +1052,20 @@ Your job is to identify and remove duplicate findings while preserving unique in
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        # Emit vulnerability_detected event
-        if self.event_bus and getattr(settings, 'WORKER_POOL_EMIT_EVENTS', True):
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+        # Emit vulnerability_detected event with validation
+        if getattr(settings, 'WORKER_POOL_EMIT_EVENTS', True):
+            self._emit_header_injection_finding({
                 "specialist": "header_injection",
-                "finding": {
-                    "type": "Header Injection",
-                    "url": result["url"],
-                    "parameter": result["parameter"],
-                    "payload": result["payload"],
-                    "severity": result["severity"],
-                },
+                "type": "HEADER_INJECTION",
+                "url": result["url"],
+                "parameter": result["parameter"],
+                "header_name": result["parameter"],
+                "payload": result["payload"],
+                "severity": result["severity"],
                 "status": result["status"],
-                "validation_requires_cdp": False,  # CRLF doesn't need CDP
-                "scan_context": self._scan_context,
-            })
+                "evidence": {"header_reflected": True},
+                "validation_requires_cdp": False,
+            }, scan_context=self._scan_context)
 
         logger.info(f"[{self.name}] Confirmed Header Injection: {result['url']}?{result['parameter']}")
 

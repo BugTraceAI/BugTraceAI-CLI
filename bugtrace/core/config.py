@@ -43,9 +43,9 @@ class Settings(BaseSettings):
     GLM_API_KEY: Optional[str] = Field(default=None, min_length=20, description="GLM API key")
     
     # --- LLM Models ---
-    DEFAULT_MODEL: str = "google/gemini-3-flash-preview"
-    CODE_MODEL: str = "qwen/qwen-2.5-coder-32b-instruct"
-    ANALYSIS_MODEL: str = "x-ai/grok-code-fast-1"
+    DEFAULT_MODEL: str = "moonshotai/kimi-k2-thinking"
+    CODE_MODEL: str = "moonshotai/kimi-k2-thinking"
+    ANALYSIS_MODEL: str = "moonshotai/kimi-k2-thinking"
     
     # --- AUTHORITY Configuration ---
     ENABLE_SELF_VALIDATION: bool = True
@@ -67,14 +67,17 @@ class Settings(BaseSettings):
     WAF_DETECTION_MODELS: str = ""
     
     # Model for payload mutation (DeepSeek has fewer safety restrictions)
-    MUTATION_MODEL: str = "deepseek/deepseek-chat"
+    MUTATION_MODEL: str = "deepseek/deepseek-v3.2"
     
     MIN_CREDITS: float = 2.0
     MAX_CONCURRENT_REQUESTS: int = 1
     LLM_REQUEST_TIMEOUT: float = 120.0  # Seconds to wait for LLM API response (prevent indefinite hang)
 
     # Model for skeptical analysis in DASTySAST agent
-    SKEPTICAL_MODEL: str = "google/gemini-3-flash-preview"
+    SKEPTICAL_MODEL: str = "moonshotai/kimi-k2-thinking"
+
+    # Model for reporting (PoC enrichment, CVSS scoring - needs uncensored analysis)
+    REPORTING_MODEL: str = "deepseek/deepseek-v3.2"
 
     # Skeptical Review Thresholds (0-10 scale)
     # CRITICAL vulns have LOWER thresholds to avoid missing them
@@ -93,6 +96,10 @@ class Settings(BaseSettings):
         "IDOR": 6,     # Lower risk
         "DEFAULT": 5   # Fallback
     }
+
+    # --- Anthropic OAuth (direct API, $0 on Pro/Max) ---
+    ANTHROPIC_OAUTH_ENABLED: bool = False
+    ANTHROPIC_TOKEN_FILE: str = "~/.bugtrace/auth.json"
 
     # --- False Positive Filtering (Phase 17: v2.3) ---
     FP_CONFIDENCE_THRESHOLD: float = 0.5  # Minimum fp_confidence to pass filtering (0.0-1.0)
@@ -289,16 +296,15 @@ class Settings(BaseSettings):
     
     # --- ANALYSIS Configuration (Multi-Model URL Analysis) ---
     ANALYSIS_ENABLE: bool = True
-    # Using Gemini 2.5 Flash for testing - consistent JSON output
-    ANALYSIS_PENTESTER_MODEL: str = "google/gemini-3-flash-preview"
-    ANALYSIS_BUG_BOUNTY_MODEL: str = "google/gemini-3-flash-preview"
-    ANALYSIS_AUDITOR_MODEL: str = "google/gemini-3-flash-preview"
+    ANALYSIS_PENTESTER_MODEL: str = "moonshotai/kimi-k2-thinking"
+    ANALYSIS_BUG_BOUNTY_MODEL: str = "moonshotai/kimi-k2-thinking"
+    ANALYSIS_AUDITOR_MODEL: str = "moonshotai/kimi-k2-thinking"
     ANALYSIS_CONFIDENCE_THRESHOLD: float = 0.7
     ANALYSIS_SKIP_THRESHOLD: float = 0.3
     ANALYSIS_CONSENSUS_VOTES: int = 2
     
     # --- VALIDATION Configuration (Vision-Based XSS Validation) ---
-    VALIDATION_VISION_MODEL: str = "qwen/qwen3-vl-8b-thinking"
+    VALIDATION_VISION_MODEL: str = "google/gemini-3-flash-preview"
     VALIDATION_VISION_ENABLED: bool = True
     VALIDATION_VISION_ONLY_FOR_XSS: bool = True
     VALIDATION_MAX_VISION_CALLS_PER_URL: int = 3
@@ -517,6 +523,16 @@ class Settings(BaseSettings):
         if "RESPONSE_TRUNCATE" in section:
             self.LONEWOLF_RESPONSE_TRUNCATE = section.getint("RESPONSE_TRUNCATE")
 
+    def _load_anthropic_config(self, config):
+        """Load ANTHROPIC section config for direct Claude API via OAuth."""
+        if "ANTHROPIC" not in config:
+            return
+        section = config["ANTHROPIC"]
+        if "ENABLED" in section:
+            self.ANTHROPIC_OAUTH_ENABLED = section.getboolean("ENABLED")
+        if "TOKEN_FILE" in section:
+            self.ANTHROPIC_TOKEN_FILE = section["TOKEN_FILE"].strip()
+
     def _load_paths_config(self, config):
         """Load PATHS section config for LOG_DIR and REPORT_DIR.
 
@@ -594,6 +610,7 @@ class Settings(BaseSettings):
         self._load_analysis_and_misc_config(config)
         self._load_authority_config(config)
         self._load_lonewolf_config(config)
+        self._load_anthropic_config(config)
 
     # --- Configuration Validation (TASK-120) ---
     def validate_config(self) -> List[str]:
@@ -888,7 +905,7 @@ class Settings(BaseSettings):
     MANIPULATOR_MAX_LLM_PAYLOADS: int = 100
 
     # --- LONEWOLF Autonomous Agent Configuration ---
-    LONEWOLF_ENABLED: bool = False          # Disabled by default until tested
+    LONEWOLF_ENABLED: bool = True            # Override via .conf [LONEWOLF] ENABLED
     LONEWOLF_MODEL: str = "deepseek/deepseek-r1"  # LLM for reasoning
     LONEWOLF_RATE_LIMIT: float = 1.0       # HTTP requests per second
     LONEWOLF_MAX_CONTEXT: int = 20         # Sliding window size (actions remembered)

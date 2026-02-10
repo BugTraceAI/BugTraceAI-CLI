@@ -24,6 +24,10 @@ from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_f
 # v3.2.0: Import TechContextMixin for context-aware CSTI detection
 from bugtrace.agents.mixins.tech_context import TechContextMixin
 
+# v3.4: ManipulatorOrchestrator for HTTP attack campaigns
+from bugtrace.tools.manipulator.orchestrator import ManipulatorOrchestrator
+from bugtrace.tools.manipulator.models import MutableRequest, MutationStrategy
+
 @dataclass
 class CSTIFinding:
     """
@@ -54,6 +58,9 @@ class CSTIFinding:
     reproduction_command: str = ""
     evidence: Dict[str, Any] = field(default_factory=dict)
     
+    # Alternative confirmed payloads (up to 5)
+    successful_payloads: List[str] = field(default_factory=list)
+
     # Validation status
     validated: bool = True
     status: str = "VALIDATED_CONFIRMED"
@@ -419,7 +426,7 @@ class CSTIAgent(BaseAgent, TechContextMixin):
 
     def _finding_to_dict(self, finding: CSTIFinding) -> Dict:
         """Convert CSTIFinding object to dictionary for report."""
-        return {
+        result = {
             "type": finding.type,
             "url": finding.url,
             "parameter": finding.parameter,
@@ -427,15 +434,15 @@ class CSTIAgent(BaseAgent, TechContextMixin):
             "severity": finding.severity,
             "template_engine": finding.template_engine,
             "injection_type": f"{finding.engine_type} Template Injection",
-            
+
             "validated": finding.validated,
             "status": finding.status,
             "description": finding.description,
             "reproduction": finding.reproduction_command,
             "reproduction_steps": finding.reproduction_steps, # List
-            
+
             "evidence": finding.evidence,
-            
+
             # Additional metadata for deep dive report
             "csti_metadata": {
                 "engine": finding.template_engine,
@@ -445,6 +452,11 @@ class CSTIAgent(BaseAgent, TechContextMixin):
                 "verified_url": finding.verified_url
             }
         }
+
+        if finding.successful_payloads:
+            result["successful_payloads"] = finding.successful_payloads
+
+        return result
     
     def _generate_repro_steps(self, url: str, param: str, payload: str, curl_cmd: str) -> List[str]:
         """Generate step-by-step reproduction instructions."""
@@ -456,6 +468,79 @@ class CSTIAgent(BaseAgent, TechContextMixin):
             f"5. Alternative: Run the provided cURL command:",
             f"   `{curl_cmd}`"
         ]
+
+    # =========================================================================
+    # FINDING VALIDATION: CSTI-specific validation (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> Tuple[bool, str]:
+        """
+        CSTI-specific validation before emitting finding.
+
+        Validates:
+        1. Basic requirements (type, url) via parent
+        2. Template engine is identified
+        3. Has arithmetic proof or engine fingerprint evidence
+        4. Payload contains template syntax
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # CSTI-specific: Must have template engine identified
+        template_engine = finding.get("template_engine", "unknown")
+        if template_engine == "unknown":
+            # Check nested finding structure
+            nested = finding.get("finding", {})
+            template_engine = nested.get("template_engine", "unknown")
+
+        if template_engine == "unknown":
+            return False, "CSTI requires identified template engine"
+
+        # CSTI-specific: Must have proof (arithmetic, fingerprint, or Interactsh)
+        evidence = finding.get("evidence", {})
+        has_arithmetic = evidence.get("arithmetic_proof") or finding.get("arithmetic_proof")
+        has_fingerprint = evidence.get("fingerprint") or template_engine != "unknown"
+        has_interactsh = evidence.get("interactsh_callback")
+
+        if not (has_arithmetic or has_fingerprint or has_interactsh):
+            return False, "CSTI requires proof: arithmetic evaluation, fingerprint, or Interactsh callback"
+
+        # CSTI-specific: Payload should contain template syntax
+        payload = finding.get("payload", "")
+        if not payload:
+            nested = finding.get("finding", {})
+            payload = nested.get("payload", "")
+
+        template_markers = ['{{', '}}', '${', '}', '#{', '<%', '%>', '#set', '$x']
+        if payload and not any(m in str(payload) for m in template_markers):
+            return False, f"CSTI payload missing template syntax: {payload[:50]}"
+
+        return True, ""
+
+    def _emit_csti_finding(self, finding_dict: Dict, scan_context: str = None) -> Optional[Dict]:
+        """
+        Helper to emit CSTI finding using BaseAgent.emit_finding() with validation.
+
+        Args:
+            finding_dict: Finding dictionary to emit
+            scan_context: Optional scan context to include
+
+        Returns:
+            The finding dict if emitted, None if rejected
+        """
+        # Ensure required fields
+        if "type" not in finding_dict:
+            finding_dict["type"] = "CSTI"
+
+        if scan_context:
+            finding_dict["scan_context"] = scan_context
+
+        finding_dict["agent"] = self.name
+
+        # Use BaseAgent's validated emit
+        return self.emit_finding(finding_dict)
 
     def _record_bypass_result(self, payload: str, success: bool):
         """Record result for Q-Learning feedback."""
@@ -906,12 +991,16 @@ Response format (XML):
         
         # COST OPTIMIZATION (2026-02-01): Check reflection before LLM
         # If it's a client-side engine (Angular/Vue) and not reflected, LLM is likely a waste
+        # v3.2 FIX: Skip this check for JS-rendered sites (empty HTML) - Angular renders dynamically
         is_client_side = any(e in ["angular", "vue"] for e in engines)
-        if is_client_side:
+        is_js_rendered = len(html.strip()) < 500  # JS-rendered sites have minimal initial HTML
+        if is_client_side and not is_js_rendered:
             is_reflected = await self._check_light_reflection(session, param)
             if not is_reflected:
                 logger.debug(f"[{self.name}] Param '{param}' not reflected, skipping LLM for cost saving.")
                 return []
+        elif is_client_side and is_js_rendered:
+            logger.info(f"[{self.name}] JS-rendered site detected with {engines[0]} - skipping HTTP reflection check")
 
         # Phase 1: LLM Smart Analysis
         if engines != ["unknown"]:
@@ -976,11 +1065,25 @@ Response format (XML):
     async def _prepare_scan(self):
         """Prepare for template injection scan.
 
+        IMPROVED (2026-02-06): AUTONOMOUS SPECIALIST PATTERN v1.0
+        - Discovers ALL params from URL query + HTML forms
+        - Prioritizes CSTI-related params (template, message, content, subject, body)
+        - Detects template engine framework (Angular, Vue, Jinja2, etc.)
+
         IMPROVED (2026-01-30): Auto-discover params from URL and HTML.
         FIXED (2026-02-01): URL query params are FIRST-CLASS citizens (before provided params).
         """
-        # CRITICAL: Auto-discover params from URL (first-class citizens)
-        discovered_params = self._discover_all_params()
+        # AUTONOMOUS DISCOVERY: Fetch HTML and extract ALL testable params
+        try:
+            discovered_params_dict = await self._discover_csti_params(self.url)
+
+            # Convert to list format and prioritize CSTI-related params
+            discovered_params = self._prioritize_csti_params(discovered_params_dict)
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Autonomous discovery failed: {e}, falling back to old method")
+            # Fallback to old sync method if async discovery fails
+            discovered_params = self._discover_all_params()
 
         # FIXED: URL query params come FIRST, then merge with provided params
         discovered_names = {p.get("parameter") for p in discovered_params}
@@ -990,19 +1093,141 @@ Response format (XML):
             if p.get("parameter") not in discovered_names:
                 discovered_params.append(p)
 
-        # URL query params are now first-class (tested first)
-        self.params = self._prioritize_params(discovered_params)
+        # CSTI-specific prioritization already applied in _prioritize_csti_params()
+        # No need for double prioritization - the autonomous method already orders params
+        self.params = discovered_params
 
         # Log what we're testing
         param_names = [p.get("parameter") for p in self.params]
-        logger.info(f"[{self.name}] 🎯 Parameters to test: {param_names}")
+        logger.info(f"[{self.name}] 🎯 Parameters to test (CSTI-prioritized): {param_names}")
         dashboard.log(f"[{self.name}] Testing {len(self.params)} params: {param_names[:5]}{'...' if len(param_names) > 5 else ''}", "INFO")
 
         await self._detect_waf_async()
         await self._setup_interactsh()
 
+    async def _discover_csti_params(self, url: str) -> Dict[str, str]:
+        """
+        CSTI-focused parameter discovery (AUTONOMOUS SPECIALIST PATTERN v1.0).
+
+        Extracts ALL testable parameters from:
+        1. URL query string
+        2. HTML forms (input, textarea, select) - template content
+        3. Prioritizes CSTI-related param names (template, message, content, subject, body)
+
+        Returns:
+            Dict mapping param names to default values
+            Example: {"category": "Juice", "template": "", "message": ""}
+
+        Architecture Note:
+            Specialists must be AUTONOMOUS - they discover their own attack surface.
+            The finding from DASTySAST is just a "signal" that the URL is interesting.
+            We IGNORE the specific parameter and test ALL discoverable params.
+
+        Ref: .ai-context/SPECIALIST_AUTONOMY_PATTERN.md
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, parse_qs
+        from bs4 import BeautifulSoup
+
+        all_params = {}
+
+        # 1. Extract URL query parameters
+        try:
+            parsed = urlparse(url)
+            url_params = parse_qs(parsed.query)
+            for param_name, values in url_params.items():
+                all_params[param_name] = values[0] if values else ""
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        # 2. Fetch HTML and extract form parameters
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+
+            if html:
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract from <input>, <textarea>, <select> with name attribute
+                for tag in soup.find_all(["input", "textarea", "select"]):
+                    param_name = tag.get("name")
+                    if param_name and param_name not in all_params:
+                        # Exclude CSRF tokens and submit buttons
+                        input_type = tag.get("type", "text").lower()
+                        if input_type not in ["submit", "button", "reset"]:
+                            if "csrf" not in param_name.lower() and "token" not in param_name.lower():
+                                # Get default value
+                                default_value = tag.get("value", "")
+                                all_params[param_name] = default_value
+
+                # 3. Extract params from <a> href links (same-origin only)
+                parsed_base = urlparse(url)
+                for a_tag in soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    if href.startswith(("javascript:", "mailto:", "#", "tel:")):
+                        continue
+                    try:
+                        from urllib.parse import urljoin
+                        resolved = urljoin(url, href)
+                        parsed_href = urlparse(resolved)
+                        if parsed_href.netloc and parsed_href.netloc != parsed_base.netloc:
+                            continue
+                        href_params = parse_qs(parsed_href.query)
+                        for p_name, p_vals in href_params.items():
+                            if p_name not in all_params and "csrf" not in p_name.lower() and "token" not in p_name.lower():
+                                all_params[p_name] = p_vals[0] if p_vals else ""
+                    except Exception:
+                        continue
+
+                # 4. CSTI-specific: Detect template engine in use
+                detected_engines = TemplateEngineFingerprinter.fingerprint(html)
+                if detected_engines and detected_engines[0] != "unknown":
+                    logger.info(f"[{self.name}] 🔍 Detected template engine(s): {', '.join(detected_engines)}")
+
+        except Exception as e:
+            logger.error(f"[{self.name}] HTML parsing failed: {e}")
+
+        logger.info(f"[{self.name}] 🔍 Discovered {len(all_params)} params on {url}: {list(all_params.keys())}")
+        return all_params
+
+    def _prioritize_csti_params(self, all_params: Dict[str, str]) -> List[Dict]:
+        """
+        Prioritize CSTI-related parameter names.
+
+        High Priority: template, message, content, subject, body, text, comment, description
+        Medium Priority: search, q, query, name, title
+        Low Priority: all others
+        """
+        CSTI_HIGH_PRIORITY = ["template", "message", "content", "subject", "body", "text", "comment", "description", "email_body", "sms_body"]
+        CSTI_MEDIUM_PRIORITY = ["search", "q", "query", "name", "title", "view", "page", "lang", "theme"]
+
+        prioritized = []
+
+        # 1. High priority params first
+        for param_name in CSTI_HIGH_PRIORITY:
+            if param_name in all_params:
+                prioritized.append({"parameter": param_name, "source": "html_form_high_priority"})
+
+        # 2. Medium priority params
+        for param_name in CSTI_MEDIUM_PRIORITY:
+            if param_name in all_params and param_name not in [p["parameter"] for p in prioritized]:
+                prioritized.append({"parameter": param_name, "source": "html_form_medium_priority"})
+
+        # 3. All other discovered params
+        for param_name in all_params.keys():
+            if param_name not in [p["parameter"] for p in prioritized]:
+                prioritized.append({"parameter": param_name, "source": "html_form_discovered"})
+
+        logger.info(f"[{self.name}] 🎯 Prioritized {len(prioritized)} params for CSTI testing")
+        return prioritized
+
     def _discover_all_params(self) -> List[Dict]:
         """
+        DEPRECATED (2026-02-06): Use _discover_csti_params() instead (async).
+
+        This method is kept for backwards compatibility but should be replaced
+        with the async autonomous discovery pattern.
+
         ADDED (2026-01-30): Auto-discover ALL testable parameters.
         IMPROVED (2026-02-01): URL query params are first-class citizens (no path filtering).
 
@@ -1070,23 +1295,60 @@ Response format (XML):
         """
         4-LEVEL VALIDATION PIPELINE (V2.0) - CSTI/SSTI Alignment
         Ref: BugTraceAI-CLI/docs/architecture/xss-validation-pipeline.md
+
+        v3.2 FIX: For JS-rendered sites (empty response_html), skip L1/L2 and go
+        directly to L3 Playwright for client-side payloads (Angular, Vue).
         """
         evidence = {"payload": payload}
 
+        # v3.2 FIX: Detect JS-rendered site and client-side payload
+        response_len = len(response_html.strip())
+        is_js_rendered = response_len < 500
+        is_client_side_payload = any(marker in payload for marker in ["{{", "${", "constructor", "$eval", "$on"])
+
+        logger.info(f"[{self.name}] CSTI _validate: response_len={response_len}, is_js_rendered={is_js_rendered}, is_client_side={is_client_side_payload}")
+
+        if is_js_rendered and is_client_side_payload:
+            logger.info(f"[{self.name}] JS-rendered site + client-side payload - skipping L1/L2, going to L3 Playwright")
+            # Skip L1/L2, go directly to L3 for client-side CSTI on JS-rendered sites
+            if await self._validate_with_playwright(param, payload, screenshots_dir, evidence):
+                return True, evidence
+            logger.debug(f"[{self.name}] L3 Playwright failed for JS-rendered CSTI, escalating to L4")
+            return False, evidence
+
+        # Standard flow for server-side or non-JS sites
         # Level 1: HTTP Static Reflection Check (Arithmetic/Signatures)
-        if await self._validate_http_reflection(param, payload, response_html, evidence):
-            return True, evidence
+        logger.info(f"[{self.name}] L1 checking: {payload[:40]}...")
+        try:
+            l1_result = await self._validate_http_reflection(param, payload, response_html, evidence)
+            if l1_result:
+                logger.info(f"[{self.name}] L1 CONFIRMED: {evidence.get('method')}")
+                return True, evidence
+            logger.info(f"[{self.name}] L1 returned False")
+        except Exception as e:
+            logger.warning(f"[{self.name}] L1 exception: {e}")
+        logger.info(f"[{self.name}] L1 failed, trying L2")
 
         # Level 2: AI-Powered Manipulator (Logic Evasion)
-        if await self._validate_with_ai_manipulator(param, payload, response_html, evidence):
-            return True, evidence
+        try:
+            l2_result = await self._validate_with_ai_manipulator(param, payload, response_html, evidence)
+            if l2_result:
+                logger.info(f"[{self.name}] L2 CONFIRMED")
+                return True, evidence
+        except Exception as e:
+            logger.warning(f"[{self.name}] L2 exception: {e}")
+        logger.info(f"[{self.name}] L2 failed, trying L3 Playwright")
 
         # Level 3: Playwright Browser Execution (Client-side engines)
-        if await self._validate_with_playwright(param, payload, screenshots_dir, evidence):
-            return True, evidence
+        try:
+            l3_result = await self._validate_with_playwright(param, payload, screenshots_dir, evidence)
+            if l3_result:
+                return True, evidence
+        except Exception as e:
+            logger.warning(f"[{self.name}] L3 exception: {e}")
 
         # Level 4: Escalation (Return False to let Manager/Reactor escalate to AgenticValidator)
-        logger.debug(f"[{self.name}] L1-L3 inconclusive, escalation to L4 (AgenticValidator) required")
+        logger.info(f"[{self.name}] L1-L3 all failed for {payload[:40]}")
         return False, evidence
 
     async def _validate_http_reflection(self, param: str, payload: str, response_html: str, evidence: Dict) -> bool:
@@ -1102,7 +1364,7 @@ Response format (XML):
 
         # Tier 1.2: Signatures and Arithmetic
         # Use existing checks
-        async with http_manager.isolated_session(ConnectionProfile.FAST) as session:
+        async with http_manager.isolated_session(ConnectionProfile.PROBE) as session:
             if await self._check_arithmetic_evaluation(response_html, payload, session, ""):
                 evidence["method"] = "L1: Arithmetic Evaluation"
                 evidence["level"] = 1
@@ -1148,17 +1410,22 @@ Response format (XML):
     async def _validate_with_playwright(self, param: str, payload: str, screenshots_dir: Path, evidence: Dict) -> bool:
         """Level 3: Playwright browser execution (Client-side engines like Angular)."""
         attack_url = self._inject(param, payload)
-        
+
+        logger.info(f"[{self.name}] L3 Playwright validating CSTI: {payload[:50]}...")
+
         # Use verifier pool for efficiency
         from bugtrace.agents.agentic_validator import _verifier_pool
         verifier = await _verifier_pool.get_verifier()
         try:
+            # v3.2: Increased timeout for Angular sandbox escapes (they need DOM processing time)
             result = await verifier.verify_xss(
                 url=attack_url,
                 screenshot_dir=str(screenshots_dir),
-                timeout=8.0,
+                timeout=15.0,  # Increased from 8s for complex Angular payloads
                 max_level=3 # Stay at L3 within the agent
             )
+
+            logger.info(f"[{self.name}] L3 Playwright result: success={result.success}, details={result.details}")
 
             if result.success:
                 evidence.update(result.details or {})
@@ -1199,34 +1466,35 @@ Response format (XML):
     async def _test_payload(self, session, param, payload) -> Tuple[Optional[str], Optional[str]]:
         """
         Injects payload and performs 4-level validation.
-        Returns (content, effective_url) if validated (L1-L3), or triggers escalation (L4).
+        Returns (content, effective_url) if validated (L1-L3).
+        Returns (None, None) if validation fails.
+
+        v3.2.2: Changed to only return content when ACTUALLY validated.
+        Escalation to L4 is now handled separately by the caller.
         """
         target_url = self._inject(param, payload)
-        
+
         # Level 1-2 Check (HTTP)
         try:
             async with session.get(target_url, timeout=5) as resp:
                 content = await resp.text()
                 final_url = str(resp.url)
-                
+
+                logger.debug(f"[{self.name}] CSTI test: response {len(content)} chars for {payload[:30]}")
+
                 validated, evidence = await self._validate(param, payload, content, Path(settings.LOG_DIR))
                 if validated:
                     # L1-L3 confirmed it
+                    logger.info(f"[{self.name}] CSTI VALIDATED: {payload[:50]} via {evidence.get('method', 'unknown')}")
                     return content, final_url
-                
-                # If L3 failed but it might be L4 (CDP required), we still report it as a potential finding
-                # but with PENDING_VALIDATION status if escalate=True.
-                # However, CSTIAgent currently returns findings in a flat list.
-                # To align with Reactor, any inconclusive result from _validate should be escalated.
-                if not validated and "status" not in evidence:
-                    # It's an escalation case (L4)
-                    logger.info(f"[{self.name}] CSTI L1-L3 inconclusive for {payload[:30]}, escalating to L4")
-                    # We return the content anyway to let the caller know SOMETHING interesting happened (reflection)
-                    return content, final_url
+
+                # v3.2.2: Don't return content for escalation - only return when truly validated
+                # The L4 escalation should be handled by a separate mechanism (AgenticValidator)
+                logger.debug(f"[{self.name}] CSTI L1-L3 failed for {payload[:30]}")
 
         except Exception as e:
             logger.debug(f"CSTI test error: {e}")
-            
+
         return None, None
 
     async def _check_arithmetic_evaluation(self, content: str, payload: str, session, final_url: str) -> bool:
@@ -1472,8 +1740,24 @@ Response format (XML):
 
     def _detect_curly_brace_engine(self, payload: str) -> str:
         """Detect engine for curly brace syntax."""
-        if '__class__' in payload or 'config' in payload:
+        # AngularJS detection (client-side)
+        if 'constructor' in payload.lower() or '$on' in payload or '$eval' in payload:
+            return 'angular'
+
+        # Vue.js detection (client-side)
+        if '$emit' in payload or 'v-' in payload:
+            return 'vue'
+
+        # Jinja2 detection (server-side)
+        if '__class__' in payload or 'config' in payload or 'lipsum' in payload:
             return 'jinja2'
+
+        # Mako detection (server-side)
+        if '${' in payload or '%>' in payload:
+            return 'mako'
+
+        # Default to twig for unidentified {{ }} syntax (server-side)
+        # Note: This is a fallback - we should verify engine via fingerprinting ideally
         return 'twig'
 
     def _try_alternative_engine(self, current_engine: str) -> str:
@@ -1787,15 +2071,22 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
     async def exploit_dry_list(self) -> List[Dict]:
         """
-        PHASE B: Exploit all DRY findings and emit validated vulnerabilities.
+        PHASE B: 6-Level Escalation Pipeline for each DRY finding.
+
+        v3.4: Each finding goes through L1→L6 escalation,
+        each level more expensive but catches more edge cases.
 
         Returns:
             List of validated findings
         """
-        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
+        logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list (6-Level Escalation) =====")
         logger.info(f"[{self.name}] Phase B: Exploiting {len(self._dry_findings)} DRY findings...")
 
         validated_findings = []
+
+        # Setup Interactsh for OOB detection across all findings
+        if not self.interactsh:
+            await self._setup_interactsh()
 
         for idx, finding in enumerate(self._dry_findings, 1):
             url = finding.get("url", "")
@@ -1810,15 +2101,14 @@ Different template engines represent different attack surfaces - NEVER merge fin
                 logger.debug(f"[{self.name}] Phase B: Skipping already emitted finding")
                 continue
 
-            # Execute CSTI attack
+            # Execute 6-Level CSTI Escalation Pipeline
             try:
-                result = await self._test_single_param_from_queue(url, parameter, finding)
+                self.url = url
+                result = await self._csti_escalation_pipeline(url, parameter, finding)
 
                 if result and result.validated:
-                    # Mark as emitted
                     self._emitted_findings.add(fingerprint)
 
-                    # Convert to dict for reporting
                     finding_dict = {
                         "url": result.url,
                         "parameter": result.parameter,
@@ -1828,35 +2118,730 @@ Different template engines represent different attack surfaces - NEVER merge fin
                         "engine_type": result.engine_type,
                         "payload": result.payload,
                         "validated": True,
+                        "status": "VALIDATED_CONFIRMED",
                         "description": result.description,
                         "evidence": result.evidence if hasattr(result, 'evidence') else {}
                     }
 
+                    # Add alternative payloads if available
+                    if result.successful_payloads:
+                        finding_dict["successful_payloads"] = result.successful_payloads
+
                     validated_findings.append(finding_dict)
 
-                    # Emit event
-                    if self.event_bus:
-                        self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
-                            "type": "CSTI",
-                            "url": result.url,
-                            "parameter": result.parameter,
-                            "severity": result.severity,
-                            "template_engine": result.template_engine,
-                            "engine_type": result.engine_type,
-                            "payload": result.payload,
-                            "scan_context": self._scan_context,
-                            "agent": self.name
-                        })
+                    self._emit_csti_finding({
+                        "type": "CSTI",
+                        "url": result.url,
+                        "parameter": result.parameter,
+                        "severity": result.severity,
+                        "template_engine": result.template_engine,
+                        "engine_type": result.engine_type,
+                        "payload": result.payload,
+                        "evidence": result.evidence if hasattr(result, 'evidence') else {},
+                        "arithmetic_proof": result.arithmetic_proof if hasattr(result, 'arithmetic_proof') else False,
+                    }, scan_context=self._scan_context)
 
                     logger.info(f"[{self.name}] ✓ CSTI confirmed: {url} param={parameter} engine={template_engine}")
                 else:
-                    logger.debug(f"[{self.name}] ✗ CSTI not confirmed")
+                    logger.debug(f"[{self.name}] ✗ CSTI not confirmed after 6-level escalation")
 
             except Exception as e:
-                logger.error(f"[{self.name}] Phase B: Exploitation failed: {e}")
+                logger.error(f"[{self.name}] Phase B: Escalation pipeline failed: {e}")
 
         logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
         return validated_findings
+
+    # =========================================================================
+    # v3.4: 6-Level CSTI Escalation Pipeline
+    # =========================================================================
+
+    async def _csti_escalation_pipeline(
+        self, url: str, param: str, finding: dict
+    ) -> Optional[CSTIFinding]:
+        """
+        v3.4: 6-Level CSTI Escalation Pipeline.
+
+        Each level is more expensive but catches more edge cases.
+        Stops at the first level that confirms CSTI.
+
+        L0: WET payload        → Test DASTySAST's payload first (free)
+        L1: Template probe     → Polyglot arithmetic check (instant)
+        L2: Bombing 1 (static) → Engine-specific + universal payloads via HTTP
+        L3: Bombing 2 (LLM)    → LLM-generated payloads × WAF encodings via HTTP
+        L4: HTTP Manipulator    → ManipulatorOrchestrator (SSTI strategy + WAF bypass)
+        L5: Browser testing     → Playwright DOM execution (Angular/Vue)
+        L6: CDP Validation      → Flag for AgenticValidator
+        """
+        reflecting_payloads = []  # Template syntax that reflects but isn't confirmed
+
+        # Detect template engines from HTML and finding metadata
+        engines = await self._detect_engines_for_escalation(url, finding)
+
+        # Fetch baseline (no injection) for false positive checking
+        async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
+            baseline_html = await self._get_baseline_content(session)
+
+        # ===== SMART PROBE: Skip if param doesn't reflect template syntax =====
+        smart_result, should_continue = await self._escalation_smart_probe_csti(url, param, engines, baseline_html)
+        if smart_result:
+            return smart_result
+        if not should_continue:
+            return None
+
+        # ===== L0: WET PAYLOAD FIRST (if available) =====
+        wet_payload = finding.get("payload") or finding.get("exploitation_strategy") or finding.get("recommended_payload")
+        if wet_payload:
+            dashboard.log(f"[{self.name}] L0: Testing WET payload on '{param}'", "INFO")
+            result = await self._escalation_l0_wet_payload(url, param, wet_payload, engines, baseline_html)
+            if result:
+                return result
+
+        # ===== L1: TEMPLATE POLYGLOT PROBE =====
+        dashboard.log(f"[{self.name}] L1: Template polyglot probe on '{param}'", "INFO")
+        result = await self._escalation_l1_template_probe(url, param, baseline_html)
+        if result:
+            return result
+
+        # ===== L2: BOMBING 1 - ENGINE-SPECIFIC + UNIVERSAL =====
+        dashboard.log(f"[{self.name}] L2: Static bombardment on '{param}'", "INFO")
+        result, l2_reflecting = await self._escalation_l2_static_bombing(url, param, engines, baseline_html)
+        if result:
+            return result
+        reflecting_payloads.extend(l2_reflecting)
+
+        # ===== L3: BOMBING 2 - LLM PAYLOADS × WAF ENCODINGS =====
+        dashboard.log(f"[{self.name}] L3: LLM bombardment on '{param}'", "INFO")
+        result, l3_reflecting = await self._escalation_l3_llm_bombing(url, param, engines, reflecting_payloads, baseline_html)
+        if result:
+            return result
+        reflecting_payloads.extend(l3_reflecting)
+
+        # ===== L4/L5: Engine-aware ordering =====
+        # Client-side engines (Angular/Vue) only confirm in browser → L5 first
+        # Server-side/unknown engines confirm via HTTP → L4 first
+        has_client_side = any(e in ["angular", "vue"] for e in engines)
+
+        if has_client_side:
+            # Client-side: L5 Browser first, L4 Manipulator fallback
+            if reflecting_payloads:
+                dashboard.log(f"[{self.name}] L5: Browser testing {len(reflecting_payloads)} candidates on '{param}' (client-side priority)", "INFO")
+                result = await self._escalation_l5_browser(url, param, reflecting_payloads)
+                if result:
+                    return result
+
+            dashboard.log(f"[{self.name}] L4: HTTP Manipulator on '{param}' (fallback)", "INFO")
+            result, l4_reflecting = await self._escalation_l4_http_manipulator(url, param)
+            if result:
+                return result
+            reflecting_payloads.extend(l4_reflecting)
+        else:
+            # Server-side/unknown: L4 Manipulator first, L5 Browser fallback
+            dashboard.log(f"[{self.name}] L4: HTTP Manipulator on '{param}'", "INFO")
+            result, l4_reflecting = await self._escalation_l4_http_manipulator(url, param)
+            if result:
+                return result
+            reflecting_payloads.extend(l4_reflecting)
+
+            if reflecting_payloads:
+                dashboard.log(f"[{self.name}] L5: Browser testing {len(reflecting_payloads)} candidates on '{param}'", "INFO")
+                result = await self._escalation_l5_browser(url, param, reflecting_payloads)
+                if result:
+                    return result
+
+        # ===== L6: CDP VALIDATION (AgenticValidator) =====
+        if reflecting_payloads:
+            dashboard.log(f"[{self.name}] L6: Flagging for CDP AgenticValidator on '{param}'", "INFO")
+            result = await self._escalation_l6_cdp(url, param, reflecting_payloads)
+            if result:
+                return result
+
+        dashboard.log(f"[{self.name}] All 6 levels exhausted for '{param}', no CSTI confirmed", "WARN")
+        return None
+
+    # ===== ESCALATION HELPER METHODS =====
+
+    async def _escalation_smart_probe_csti(
+        self, url: str, param: str, engines: List[str], baseline_html: str
+    ) -> tuple:
+        """
+        Smart probe: 1 request to check if template syntax reflects or evaluates.
+
+        Returns:
+            (CSTIFinding or None, should_continue: bool)
+            - If finding returned: confirmed CSTI
+            - should_continue=False: no reflection, skip this param entirely
+            - should_continue=True: reflects, continue normal escalation
+        """
+        probe = "BT_CSTI_49{{7*7}}${7*7}"
+        async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
+            response, verified_url = await self._send_csti_payload_raw(session, param, probe)
+            if response is None:
+                return None, True  # Network error, continue anyway
+
+            # Check if probe marker reflects at all
+            if "BT_CSTI_49" not in response:
+                dashboard.log(
+                    f"[{self.name}] Smart probe: no reflection for '{param}', skipping",
+                    "INFO",
+                )
+                return None, False
+
+            # Check if template evaluation happened (7*7 = 49)
+            # "49" in response AND "7*7" NOT in response AND not in baseline
+            if "49" in response and "7*7" not in response and "49" not in baseline_html:
+                dashboard.log(
+                    f"[{self.name}] Smart probe: CONFIRMED CSTI on '{param}' ({{{{7*7}}}}=49)",
+                    "INFO",
+                )
+                # Detect which engine evaluated
+                engine = "unknown"
+                if any(e in ["angular", "vue"] for e in engines):
+                    engine = engines[0]
+                finding = self._create_finding(param, "{{7*7}}", "smart_probe", verified_url=verified_url)
+                finding.evidence = {
+                    "method": "arithmetic_eval",
+                    "proof": "{{7*7}} evaluated to 49",
+                    "status": "VALIDATED_CONFIRMED",
+                    "level": "smart_probe",
+                    "engine": engine,
+                }
+                return finding, True
+
+            dashboard.log(
+                f"[{self.name}] Smart probe: '{param}' reflects, continuing escalation",
+                "INFO",
+            )
+            return None, True
+
+    async def _detect_engines_for_escalation(self, url: str, finding: dict) -> List[str]:
+        """Detect template engines from HTML fingerprinting + finding metadata + tech_profile."""
+        engines = []
+
+        # From finding metadata
+        suggested = finding.get("template_engine", "unknown")
+        if suggested and suggested != "unknown":
+            engines.append(suggested)
+
+        # From tech_profile (Nuclei detection)
+        if self.tech_profile and self.tech_profile.get("frameworks"):
+            for framework in self.tech_profile["frameworks"]:
+                fw_lower = framework.lower()
+                if "angular" in fw_lower and "angular" not in engines:
+                    engines.append("angular")
+                elif "vue" in fw_lower and "vue" not in engines:
+                    engines.append("vue")
+
+        # From HTML fingerprinting
+        try:
+            async with http_manager.isolated_session(ConnectionProfile.PROBE) as session:
+                html = await self._fetch_page(session)
+                if html:
+                    html_engines = TemplateEngineFingerprinter.fingerprint(html)
+                    for e in html_engines:
+                        if e != "unknown" and e not in engines:
+                            engines.append(e)
+        except Exception:
+            pass
+
+        logger.info(f"[{self.name}] Detected engines for escalation: {engines or ['unknown']}")
+        return engines
+
+    async def _send_csti_payload_raw(self, session, param: str, payload: str) -> Tuple[Optional[str], Optional[str]]:
+        """Fire a CSTI payload and return raw HTTP response. No validation."""
+        target_url = self._inject(param, payload)
+        try:
+            async with session.get(target_url, timeout=8) as resp:
+                content = await resp.text()
+                return content, str(resp.url)
+        except Exception as e:
+            logger.debug(f"[{self.name}] Send payload failed: {e}")
+            return None, None
+
+    def _check_csti_confirmed(self, payload: str, response_html: str, baseline_html: str) -> Tuple[bool, Dict]:
+        """
+        Check if CSTI is confirmed in HTTP response.
+
+        Returns (confirmed, evidence) tuple.
+        Checks: arithmetic evaluation, string multiplication, config reflection,
+        engine signatures, error signatures.
+        """
+        if not response_html:
+            return False, {}
+
+        evidence = {"payload": payload}
+
+        # 1. Arithmetic evaluation (7*7=49)
+        if "49" in response_html and "7*7" in payload:
+            if payload not in response_html:
+                if "49" not in baseline_html:
+                    evidence["method"] = "arithmetic_eval"
+                    evidence["proof"] = "7*7 evaluated to 49"
+                    evidence["status"] = "VALIDATED_CONFIRMED"
+                    return True, evidence
+
+        # 2. Constructor evaluation (return 7*7 → 49)
+        if "constructor" in payload and "49" in response_html:
+            if payload not in response_html and "49" not in baseline_html:
+                evidence["method"] = "constructor_eval"
+                evidence["proof"] = "Constructor payload evaluated to 49"
+                evidence["status"] = "VALIDATED_CONFIRMED"
+                return True, evidence
+
+        # 3. String multiplication ('7'*7 → 7777777)
+        if "7777777" in response_html and "'7'*7" in payload:
+            if payload not in response_html:
+                evidence["method"] = "string_multiplication"
+                evidence["proof"] = "'7'*7 evaluated to 7777777"
+                evidence["status"] = "VALIDATED_CONFIRMED"
+                return True, evidence
+
+        # 4. Config reflection (Jinja2)
+        if "{{config}}" in payload and ("Config" in response_html or "&lt;Config" in response_html):
+            if payload not in response_html:
+                evidence["method"] = "config_reflection"
+                evidence["proof"] = "{{config}} accessed Config object"
+                evidence["status"] = "VALIDATED_CONFIRMED"
+                return True, evidence
+
+        # 5. Engine signatures
+        if ("{{dump(app)}}" in payload or "{{app.request}}" in payload) and ("Symfony" in response_html or "Twig" in response_html):
+            evidence["method"] = "engine_signature_twig"
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True, evidence
+
+        if "{$smarty.version}" in payload and re.search(r"Smarty[- ]\d", response_html):
+            evidence["method"] = "engine_signature_smarty"
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True, evidence
+
+        # 6. Error signatures (template engine errors indicate processing)
+        error_signatures = [
+            "jinja2.exceptions", "Twig_Error_Syntax", "FreeMarker template error",
+            "VelocityException", "org.apache.velocity", "mako.exceptions"
+        ]
+        for sig in error_signatures:
+            if sig in response_html:
+                evidence["method"] = "error_signature"
+                evidence["proof"] = f"Template error: {sig}"
+                evidence["status"] = "VALIDATED_CONFIRMED"
+                return True, evidence
+
+        # 7. Conditional evaluation ({% if %})
+        if "{% if" in payload and "49" in payload:
+            if "{%" not in response_html and "%}" not in response_html and "49" in response_html:
+                evidence["method"] = "conditional_eval"
+                evidence["status"] = "VALIDATED_CONFIRMED"
+                return True, evidence
+
+        # 8. RCE indicators (command output in response)
+        # IMPORTANT: Skip indicators that are part of the payload itself.
+        # If we sent "java.lang.Runtime" and it reflects back, that's NOT proof
+        # of execution - only genuine command OUTPUT (uid=, root:) counts.
+        for indicator in HIGH_IMPACT_INDICATORS:
+            if indicator in response_html and indicator not in baseline_html:
+                if any(rce in payload for rce in ["popen", "exec", "system", "Runtime", "subprocess"]):
+                    # Guard: indicator must NOT be a substring of the payload
+                    # (if it is, the response just reflects our input, not execution output)
+                    if indicator in payload:
+                        continue
+                    evidence["method"] = "rce_indicator"
+                    evidence["proof"] = f"RCE indicator: {indicator}"
+                    evidence["status"] = "VALIDATED_CONFIRMED"
+                    return True, evidence
+
+        return False, evidence
+
+    # ===== ESCALATION LEVEL IMPLEMENTATIONS =====
+
+    async def _escalation_l0_wet_payload(
+        self, url: str, param: str, wet_payload: str, engines: List[str], baseline_html: str
+    ) -> Optional[CSTIFinding]:
+        """L0: Test the WET finding's payload first (from DASTySAST/Skeptic)."""
+        dashboard.set_current_payload(wet_payload[:60], "CSTI L0", "WET payload", self.name)
+
+        async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
+            response, verified_url = await self._send_csti_payload_raw(session, param, wet_payload)
+            if response is not None:
+                confirmed, evidence = self._check_csti_confirmed(wet_payload, response, baseline_html)
+                if confirmed:
+                    evidence["level"] = "L0"
+                    finding = self._create_finding(param, wet_payload, "L0_wet_payload", verified_url=verified_url)
+                    finding.evidence = evidence
+                    return finding
+
+            # Try double-quote variant if single-quote payload failed
+            if "'" in wet_payload:
+                dq_payload = wet_payload.replace("'", '"')
+                dashboard.set_current_payload(dq_payload[:60], "CSTI L0", "WET DQ variant", self.name)
+                response, verified_url = await self._send_csti_payload_raw(session, param, dq_payload)
+                if response is not None:
+                    confirmed, evidence = self._check_csti_confirmed(dq_payload, response, baseline_html)
+                    if confirmed:
+                        evidence["level"] = "L0"
+                        finding = self._create_finding(param, dq_payload, "L0_wet_dq_variant", verified_url=verified_url)
+                        finding.evidence = evidence
+                        return finding
+
+        logger.info(f"[{self.name}] L0: WET payload not confirmed for '{param}'")
+        return None
+
+    async def _escalation_l1_template_probe(
+        self, url: str, param: str, baseline_html: str
+    ) -> Optional[CSTIFinding]:
+        """L1: Send polyglot template probes, check HTTP arithmetic evaluation."""
+        probes = [
+            "{{7*7}}${7*7}<%= 7*7 %>#{7*7}",  # Multi-engine polyglot
+            "{{7*7}}",
+            "${7*7}",
+            "<%= 7*7 %>",
+            "#{7*7}",
+            "{{7*'7'}}",
+        ]
+
+        confirmed_payloads = []
+        first_finding = None
+
+        async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
+            for probe in probes:
+                dashboard.set_current_payload(probe, "CSTI L1", "Polyglot", self.name)
+                response, verified_url = await self._send_csti_payload_raw(session, param, probe)
+                if response is None:
+                    continue
+
+                confirmed, evidence = self._check_csti_confirmed(probe, response, baseline_html)
+                if confirmed:
+                    confirmed_payloads.append(probe)
+                    if not first_finding:
+                        evidence["level"] = "L1"
+                        first_finding = self._create_finding(param, probe, "L1_template_probe", verified_url=verified_url)
+                        first_finding.evidence = evidence
+                    if len(confirmed_payloads) >= 5:
+                        break
+
+        # Check Interactsh OOB
+        if not first_finding and self.interactsh:
+            try:
+                interactions = await self.interactsh.poll()
+                if interactions:
+                    first_finding = self._create_finding(param, probes[0], "L1_interactsh_oob")
+                    first_finding.evidence = {"method": "L1_interactsh_oob", "oob": True, "level": "L1"}
+                    confirmed_payloads.append(probes[0])
+            except Exception:
+                pass
+
+        if first_finding:
+            first_finding.successful_payloads = confirmed_payloads
+            logger.info(f"[{self.name}] L1: {len(confirmed_payloads)} confirmed for '{param}'")
+            return first_finding
+
+        logger.info(f"[{self.name}] L1: No CSTI confirmed for '{param}'")
+        return None
+
+    async def _escalation_l2_static_bombing(
+        self, url: str, param: str, engines: List[str], baseline_html: str
+    ) -> tuple:
+        """L2: Fire all engine-specific + universal payloads via HTTP."""
+        # Build payload list: engine-specific first, then universal, polyglots, WAF bypass
+        all_payloads = []
+        seen = set()
+
+        # Engine-specific payloads first (prioritized)
+        for engine in engines:
+            for p in PAYLOAD_LIBRARY.get(engine, []):
+                if p not in seen:
+                    seen.add(p)
+                    all_payloads.append(p)
+
+        # Universal + polyglots + WAF bypass
+        for key in ["universal", "polyglots", "waf_bypass"]:
+            for p in PAYLOAD_LIBRARY.get(key, []):
+                if p not in seen:
+                    seen.add(p)
+                    all_payloads.append(p)
+
+        # All remaining engine payloads (engines not yet covered)
+        for engine_name in PAYLOAD_LIBRARY:
+            if engine_name not in ["universal", "polyglots", "waf_bypass"] + engines:
+                for p in PAYLOAD_LIBRARY.get(engine_name, []):
+                    if p not in seen:
+                        seen.add(p)
+                        all_payloads.append(p)
+
+        # Replace Interactsh placeholders
+        if self.interactsh_url:
+            all_payloads = [p.replace("{{INTERACTSH}}", self.interactsh_url) for p in all_payloads]
+
+        # Apply WAF bypass encodings
+        all_payloads = await self._get_encoded_payloads(all_payloads)
+
+        logger.info(f"[{self.name}] L2: Bombing {len(all_payloads)} static payloads on '{param}'")
+
+        confirmed_payloads = []
+        first_finding = None
+        reflecting = []
+
+        async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
+            for i, payload in enumerate(all_payloads):
+                if i % 20 == 0 and i > 0:
+                    dashboard.log(f"[{self.name}] L2: Progress {i}/{len(all_payloads)}", "DEBUG")
+                dashboard.set_current_payload(payload[:60], "CSTI L2", f"{i+1}/{len(all_payloads)}", self.name)
+
+                response, verified_url = await self._send_csti_payload_raw(session, param, payload)
+                if response is None:
+                    continue
+
+                # Check for CSTI confirmation
+                confirmed, evidence = self._check_csti_confirmed(payload, response, baseline_html)
+                if confirmed:
+                    confirmed_payloads.append(payload)
+                    if not first_finding:
+                        evidence["level"] = "L2"
+                        first_finding = self._create_finding(param, payload, "L2_static_bombing", verified_url=verified_url)
+                        first_finding.evidence = evidence
+                    if len(confirmed_payloads) >= 5:
+                        break
+                    continue
+
+                # Track payloads where template syntax reflects (for L5 browser)
+                if payload in response or ("49" in response and "49" not in baseline_html):
+                    reflecting.append(payload)
+
+        # Batch OOB check
+        if not first_finding and self.interactsh:
+            try:
+                interactions = await self.interactsh.poll()
+                if interactions:
+                    best = all_payloads[0] if all_payloads else "{{7*7}}"
+                    first_finding = self._create_finding(param, best, "L2_interactsh_oob")
+                    first_finding.evidence = {"method": "L2_interactsh_oob", "oob": True, "level": "L2"}
+                    confirmed_payloads.append(best)
+            except Exception:
+                pass
+
+        if first_finding:
+            first_finding.successful_payloads = confirmed_payloads
+            logger.info(f"[{self.name}] L2: {len(confirmed_payloads)} confirmed, {len(reflecting)} reflecting for '{param}'")
+            return first_finding, reflecting
+
+        logger.info(f"[{self.name}] L2: {len(reflecting)} reflecting, 0 confirmed for '{param}'")
+        return None, reflecting
+
+    async def _escalation_l3_llm_bombing(
+        self, url: str, param: str, engines: List[str],
+        existing_reflecting: list, baseline_html: str
+    ) -> tuple:
+        """L3: Generate LLM CSTI payloads × WAF encodings, fire via HTTP."""
+        engine_hint = engines[0] if engines else "unknown"
+        tech_context = self._csti_prime_directive if hasattr(self, '_csti_prime_directive') else ""
+
+        user_prompt = (
+            f"Target URL: {url}\nParameter: {param}\nDetected engine: {engine_hint}\n"
+            f"Tech context: {tech_context}\n\n"
+            f"Generate 50 advanced CSTI/SSTI payloads for template injection testing. "
+            f"Include variations for: Angular, Vue, Jinja2, Twig, Freemarker, Mako, ERB, Velocity. "
+            f"Focus on arithmetic evaluation (7*7=49), config access, sandbox bypasses, and RCE. "
+            f"Include double-quote variants for servers that reject single quotes. "
+            f"Return each payload in <payload> tags."
+        )
+
+        try:
+            response = await llm_client.generate(user_prompt, system_prompt=self.system_prompt, module_name="CSTI_L3")
+            llm_payloads = XmlParser.extract_list(response, "payload")
+        except Exception as e:
+            logger.error(f"[{self.name}] L3: LLM generation failed: {e}")
+            llm_payloads = []
+
+        if not llm_payloads:
+            logger.info(f"[{self.name}] L3: LLM generated 0 payloads, skipping")
+            return None, []
+
+        # Apply WAF encodings
+        llm_payloads = await self._get_encoded_payloads(llm_payloads)
+
+        # Replace Interactsh placeholders
+        if self.interactsh_url:
+            llm_payloads = [p.replace("{{INTERACTSH}}", self.interactsh_url) for p in llm_payloads]
+
+        logger.info(f"[{self.name}] L3: Bombing {len(llm_payloads)} LLM payloads on '{param}'")
+
+        confirmed_payloads = []
+        first_finding = None
+        reflecting = []
+
+        async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
+            for i, payload in enumerate(llm_payloads):
+                if i % 20 == 0 and i > 0:
+                    dashboard.log(f"[{self.name}] L3: Progress {i}/{len(llm_payloads)}", "DEBUG")
+                dashboard.set_current_payload(payload[:60], "CSTI L3", f"{i+1}/{len(llm_payloads)}", self.name)
+
+                response, verified_url = await self._send_csti_payload_raw(session, param, payload)
+                if response is None:
+                    continue
+
+                confirmed, evidence = self._check_csti_confirmed(payload, response, baseline_html)
+                if confirmed:
+                    confirmed_payloads.append(payload)
+                    if not first_finding:
+                        evidence["level"] = "L3"
+                        first_finding = self._create_finding(param, payload, "L3_llm_bombing", verified_url=verified_url)
+                        first_finding.evidence = evidence
+                    if len(confirmed_payloads) >= 5:
+                        break
+                    continue
+
+                if payload in response or ("49" in response and "49" not in baseline_html):
+                    reflecting.append(payload)
+
+        if first_finding:
+            first_finding.successful_payloads = confirmed_payloads
+            logger.info(f"[{self.name}] L3: {len(confirmed_payloads)} confirmed, {len(reflecting)} reflecting for '{param}'")
+            return first_finding, reflecting
+
+        logger.info(f"[{self.name}] L3: {len(reflecting)} reflecting, 0 confirmed for '{param}'")
+        return None, reflecting
+
+    async def _escalation_l4_http_manipulator(self, url: str, param: str) -> tuple:
+        """L4: ManipulatorOrchestrator - context detection, WAF bypass for SSTI."""
+        reflecting = []
+        try:
+            parsed = urlparse(url)
+            base_params = dict(parse_qs(parsed.query, keep_blank_values=True))
+            # parse_qs returns lists, flatten to single values
+            base_params = {k: v[0] if v else "" for k, v in base_params.items()}
+            if param not in base_params:
+                base_params[param] = "{{7*7}}"
+
+            base_request = MutableRequest(
+                method="GET",
+                url=url.split("?")[0],
+                params=base_params
+            )
+
+            manipulator = ManipulatorOrchestrator(
+                rate_limit=0.3,
+                enable_agentic_fallback=True,
+                enable_llm_expansion=True
+            )
+
+            success, mutation = await manipulator.process_finding(
+                base_request,
+                strategies=[MutationStrategy.SSTI_INJECTION, MutationStrategy.BYPASS_WAF]
+            )
+
+            if success and mutation:
+                working_payload = mutation.params.get(param, str(mutation.params))
+                original_value = base_params.get(param, "{{7*7}}")
+
+                # Verify the TARGET param was actually mutated (not a different param)
+                if working_payload == original_value:
+                    logger.info(f"[{self.name}] L4: ManipulatorOrchestrator exploited different param, not '{param}'")
+                    await manipulator.shutdown()
+                    return None, reflecting
+
+                # Verify payload contains CSTI/SSTI indicators
+                csti_indicators = ["{{", "${", "<%", "#{", "#set", "#if", "#include",
+                                   "7*7", "constructor", "__class__", "config",
+                                   "lipsum", "range(", "dump(", "system(", "exec(",
+                                   "popen(", "Runtime", "Process", "forName"]
+                if not any(ind in working_payload for ind in csti_indicators):
+                    logger.info(f"[{self.name}] L4: ManipulatorOrchestrator payload rejected (no CSTI syntax): {working_payload[:80]}")
+                    await manipulator.shutdown()
+                    return None, reflecting
+
+                logger.info(f"[{self.name}] L4: ManipulatorOrchestrator CONFIRMED: {param}={working_payload[:80]}")
+                await manipulator.shutdown()
+                finding = self._create_finding(param, working_payload, "L4_manipulator", verified_url=url)
+                finding.evidence = {"http_confirmed": True, "level": "L4", "method": "L4_manipulator"}
+                return finding, reflecting
+
+            # Collect blood smell candidates for L5
+            if hasattr(manipulator, 'blood_smell_history') and manipulator.blood_smell_history:
+                for entry in sorted(manipulator.blood_smell_history, key=lambda x: x["smell"]["severity"], reverse=True)[:5]:
+                    blood_payload = entry["request"].params.get(param, "")
+                    if blood_payload:
+                        reflecting.append(blood_payload)
+                logger.info(f"[{self.name}] L4: {len(reflecting)} blood smell candidates for L5")
+
+            await manipulator.shutdown()
+
+        except Exception as e:
+            logger.error(f"[{self.name}] L4: ManipulatorOrchestrator failed: {e}")
+
+        return None, reflecting
+
+    async def _escalation_l5_browser(
+        self, url: str, param: str, reflecting_payloads: list
+    ) -> Optional[CSTIFinding]:
+        """L5: Browser validation (Playwright) for client-side CSTI (Angular/Vue)."""
+        seen = set()
+        candidates = []
+        for p in reflecting_payloads:
+            if p not in seen:
+                seen.add(p)
+                candidates.append(p)
+
+        candidates = candidates[:10]  # Limit to 10 browser tests (expensive)
+        logger.info(f"[{self.name}] L5: Browser testing {len(candidates)} reflecting payloads on '{param}'")
+
+        screenshots_dir = Path(settings.LOG_DIR) / "csti_screenshots"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+        confirmed_payloads = []
+        first_finding = None
+
+        for i, payload in enumerate(candidates):
+            dashboard.set_current_payload(payload[:60], "CSTI L5 Browser", f"{i+1}/{len(candidates)}", self.name)
+            try:
+                evidence = {}
+                if await self._validate_with_playwright(param, payload, screenshots_dir, evidence):
+                    confirmed_payloads.append(payload)
+                    if not first_finding:
+                        logger.info(f"[{self.name}] L5: Playwright CONFIRMED: {payload[:60]}")
+                        first_finding = self._create_finding(param, payload, "L5_browser")
+                        first_finding.evidence = {**evidence, "playwright_confirmed": True, "level": "L5", "method": "L5_browser"}
+                    if len(confirmed_payloads) >= 5:
+                        break
+            except Exception as e:
+                logger.debug(f"[{self.name}] L5: Browser test {i+1} failed: {e}")
+
+        if first_finding:
+            first_finding.successful_payloads = confirmed_payloads
+            logger.info(f"[{self.name}] L5: {len(confirmed_payloads)}/{len(candidates)} confirmed in browser for '{param}'")
+            return first_finding
+
+        logger.info(f"[{self.name}] L5: 0/{len(candidates)} confirmed in browser for '{param}'")
+        return None
+
+    async def _escalation_l6_cdp(
+        self, url: str, param: str, reflecting_payloads: list
+    ) -> Optional[CSTIFinding]:
+        """L6: Flag best reflecting payload for CDP AgenticValidator."""
+        if not reflecting_payloads:
+            return None
+
+        best_payload = reflecting_payloads[0]
+        logger.info(f"[{self.name}] L6: Flagging '{param}' for CDP AgenticValidator (payload: {best_payload[:60]})")
+
+        engine = self._detect_engine_from_payload(best_payload)
+        engine_type = "client-side" if engine in ["angular", "vue"] else "server-side"
+
+        return CSTIFinding(
+            url=url,
+            parameter=param,
+            payload=best_payload,
+            template_engine=engine,
+            engine_type=engine_type,
+            severity="MEDIUM",
+            validated=True,
+            status="NEEDS_CDP_VALIDATION",
+            description=f"Potential {engine} CSTI: template syntax reflects. Best payload: {best_payload[:60]}. Flagged for CDP validation.",
+            evidence={
+                "method": "L6_cdp_flagged",
+                "level": "L6",
+                "reflecting_count": len(reflecting_payloads),
+                "needs_cdp": True
+            }
+        )
 
     async def _generate_specialist_report(self, validated_findings: List[Dict]) -> None:
         """
@@ -1926,6 +2911,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
             report_specialist_progress,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
         from bugtrace.core.queue import queue_manager
 
@@ -1948,6 +2934,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "csti")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -2074,6 +3061,9 @@ Different template engines represent different attack surfaces - NEVER merge fin
         Test a single parameter from queue for CSTI.
 
         Uses existing validation pipeline optimized for queue processing.
+
+        v3.2 FIX: Now tests the WET finding's payload FIRST before falling back
+        to library payloads. DASTySAST often finds the right payload already.
         """
         try:
             # Use HTTPClientManager for proper connection management (v2.4)
@@ -2089,7 +3079,17 @@ Different template engines represent different attack surfaces - NEVER merge fin
                 if suggested_engine and suggested_engine != "unknown":
                     engines = [suggested_engine] + [e for e in engines if e != suggested_engine]
 
-                # Test with targeted payloads first
+                # v3.2 FIX: Try the WET finding's payload FIRST
+                # DASTySAST/Skeptic often identifies the correct payload already
+                # v3.2.1: Also check 'recommended_payload' from LLM deduplication
+                wet_payload = finding.get("payload") or finding.get("exploitation_strategy") or finding.get("recommended_payload")
+                if wet_payload:
+                    logger.info(f"[{self.name}] Testing WET payload first: {wet_payload[:50]}...")
+                    result = await self._test_wet_finding_payload(session, param, wet_payload, engines)
+                    if result:
+                        return self._dict_to_finding(result)
+
+                # Test with targeted payloads from library
                 if engines and engines[0] != "unknown":
                     result = await self._targeted_probe(session, param, engines)
                     if result:
@@ -2113,6 +3113,63 @@ Different template engines represent different attack surfaces - NEVER merge fin
         except Exception as e:
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
+
+    async def _test_wet_finding_payload(
+        self, session, param: str, payload: str, engines: List[str]
+    ) -> Optional[Dict]:
+        """
+        Test the specific payload from WET finding.
+
+        This prioritizes payloads that DASTySAST/Skeptic already identified
+        as promising, rather than always starting from library payloads.
+
+        v3.2.1 FIX: If payload has single quotes and fails (e.g., 500 error),
+        try double-quote variants since some servers reject single quotes.
+        """
+        dashboard.set_current_payload(payload[:30] + "...", f"CSTI:{param}", "WET Payload")
+
+        content, verified_url = await self._test_payload(session, param, payload)
+        # v3.2.2 FIX: Use `is not None` instead of truthiness check
+        # because JS-rendered sites return empty string "" which is falsy but valid
+        if content is not None:
+            # Determine engine from payload
+            engine = self._detect_engine_from_payload(payload)
+            if engine == "unknown" and engines:
+                engine = engines[0]
+
+            finding_obj = self._create_finding(param, payload, "wet_payload_validated", verified_url=verified_url)
+            return self._finding_to_dict(finding_obj)
+
+        # v3.2.1 FIX: Try double-quote variants if single-quote payload failed
+        # Some servers (e.g., ginandjuice.shop) return 500 error for single quotes
+        if "'" in payload:
+            # Try replacing single quotes with double quotes
+            dq_payload = payload.replace("'", '"')
+            logger.info(f"[{self.name}] Single-quote payload failed, trying double-quote variant: {dq_payload[:50]}...")
+            dashboard.set_current_payload(dq_payload[:30] + "...", f"CSTI:{param}", "WET DQ Variant")
+
+            content, verified_url = await self._test_payload(session, param, dq_payload)
+            if content is not None:
+                engine = self._detect_engine_from_payload(dq_payload)
+                if engine == "unknown" and engines:
+                    engine = engines[0]
+                finding_obj = self._create_finding(param, dq_payload, "wet_payload_validated_dq", verified_url=verified_url)
+                return self._finding_to_dict(finding_obj)
+
+            # Also try backtick variant for template literals
+            bt_payload = payload.replace("'", '`')
+            logger.info(f"[{self.name}] Double-quote also failed, trying backtick variant: {bt_payload[:50]}...")
+            dashboard.set_current_payload(bt_payload[:30] + "...", f"CSTI:{param}", "WET BT Variant")
+
+            content, verified_url = await self._test_payload(session, param, bt_payload)
+            if content is not None:
+                engine = self._detect_engine_from_payload(bt_payload)
+                if engine == "unknown" and engines:
+                    engine = engines[0]
+                finding_obj = self._create_finding(param, bt_payload, "wet_payload_validated_bt", verified_url=verified_url)
+                return self._finding_to_dict(finding_obj)
+
+        return None
 
     def _dict_to_finding(self, result: Dict) -> Optional[CSTIFinding]:
         """Convert finding dict back to CSTIFinding object."""
@@ -2186,21 +3243,19 @@ Different template engines represent different attack surfaces - NEVER merge fin
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        # Emit vulnerability_detected event
-        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+        # Emit vulnerability_detected event with validation
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            self._emit_csti_finding({
                 "specialist": "csti",
-                "finding": {
-                    "type": "CSTI",
-                    "url": result.url,
-                    "parameter": result.parameter,
-                    "payload": result.payload,
-                    "template_engine": result.template_engine,
-                },
+                "type": "CSTI",
+                "url": result.url,
+                "parameter": result.parameter,
+                "payload": result.payload,
+                "template_engine": result.template_engine,
+                "evidence": result.evidence if hasattr(result, 'evidence') else {},
                 "status": result.status,
                 "validation_requires_cdp": needs_cdp,
-                "scan_context": self._scan_context,
-            })
+            }, scan_context=self._scan_context)
 
         logger.info(f"[{self.name}] Confirmed CSTI: {result.url}?{result.parameter} ({result.template_engine})")
 

@@ -1,5 +1,6 @@
 from typing import AsyncIterator, List, Optional
 import copy
+import re
 from .base import BaseSpecialist
 from ..models import MutableRequest, MutationStrategy
 
@@ -155,22 +156,36 @@ class PayloadAgent(BaseSpecialist):
         # Relevant if there are parameters or body to inject
         return bool(request.params or request.data or request.json_payload)
 
-    async def generate_mutations(self, request: MutableRequest, strategies: List[MutationStrategy]) -> AsyncIterator[MutableRequest]:
+    # JS-specific contexts where only XSS payloads are relevant
+    JS_CONTEXTS = {
+        "js_string_single", "js_string_double", "script_tag",
+        "javascript_string", "script_block", "script",
+    }
+
+    async def generate_mutations(
+        self, request: MutableRequest, strategies: List[MutationStrategy],
+        context_hint: str = None
+    ) -> AsyncIterator[MutableRequest]:
         if MutationStrategy.PAYLOAD_INJECTION not in strategies:
             return
 
         # Target parameters
         target_keys = list(request.params.keys())
-        
-        # very basic strategy: inject into each parameter
-        for vuln_type, payloads in self.PAYLOADS.items():
+
+        # Context-aware: for JS contexts, prioritize XSS payloads
+        if context_hint and context_hint.lower().replace(" ", "_") in self.JS_CONTEXTS:
+            ordered_types = ["XSS"]  # Only XSS for JS contexts
+        else:
+            ordered_types = list(self.PAYLOADS.keys())
+
+        for vuln_type in ordered_types:
+            payloads = self.PAYLOADS.get(vuln_type, [])
             for payload in payloads:
                 for param in target_keys:
                     mutation = copy.deepcopy(request)
-                    # Inject in existing param
                     mutation.params[param] = payload
                     yield mutation
-                    
+
                     # Also try appending
                     mutation_append = copy.deepcopy(request)
                     mutation_append.params[param] = mutation_append.params[param] + payload
@@ -181,19 +196,51 @@ class PayloadAgent(BaseSpecialist):
     # Keeps detection logic modular and out of orchestrator
 
     @staticmethod
+    def _is_inside_js_string(body: str, pos: int) -> bool:
+        """Check if position in body is inside a JS string literal (not executable)."""
+        before = body[max(0, pos - 300):pos]
+        # Check for patterns like: var x = '...<pos> or var x = "...<pos>
+        return bool(
+            re.search(r"=\s*'[^']*$", before) or
+            re.search(r'=\s*"[^"]*$', before)
+        )
+
+    @staticmethod
     def check_xss_success(body: str, payloads_used: List[str]) -> bool:
-        """Detect XSS success via markers or payload reflection."""
+        """
+        Detect XSS success via markers or payload reflection.
+
+        Context-aware: verifies markers/patterns are NOT inside JS string literals
+        where they would be data, not executable code.
+        """
+        # Markers that indicate XSS execution
         markers = [
             "BUGTRACE-XSS-CONFIRMED", "BUGTRACE-XSS",
             "HACKED BY BUGTRACE", "HACKED BY BUGTRACEAI",
-            "<script>document.write", "document.body.innerHTML"
         ]
-        if any(m in body for m in markers):
-            return True
+
+        for m in markers:
+            if m not in body:
+                continue
+            pos = body.find(m)
+            if not PayloadAgent._is_inside_js_string(body, pos):
+                return True  # Marker in executable context
+
+        # Script-tag patterns: only if outside JS strings
+        script_patterns = ["<script>document.write", "document.body.innerHTML"]
+        for sp in script_patterns:
+            if sp not in body:
+                continue
+            pos = body.find(sp)
+            if not PayloadAgent._is_inside_js_string(body, pos):
+                return True
+
+        # Alert payloads: keep original check
         for payload in payloads_used:
             p = str(payload)
             if "alert(" in p and p in body:
                 return True
+
         return False
 
     @staticmethod

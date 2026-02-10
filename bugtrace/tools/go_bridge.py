@@ -79,9 +79,9 @@ class FuzzResult:
                 status_code=r.get("status_code", 0),
                 response_length=r.get("response_length", 0)
             )
-            for r in data.get("reflections", [])
+            for r in (data.get("reflections") or [])
         ]
-        errors = data.get("errors", [])
+        errors = data.get("errors") or []
 
         return cls(
             target=metadata.get("target", ""),

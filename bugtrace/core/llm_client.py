@@ -14,6 +14,18 @@ from bugtrace.core.ui import dashboard
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.config import settings
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+from bugtrace.core.exceptions import (
+    LLMError,
+    LLMTimeoutError,
+    LLMRateLimitError,
+    LLMParseError,
+    LLMServiceUnavailableError,
+    NetworkError,
+    TimeoutError as BugTraceTimeoutError,
+    ConnectionError as BugTraceConnectionError,
+    JSONParseError,
+    is_transient,
+)
 # Removed: phase_semaphores - no global LLM semaphore needed
 # Each agent runs independently with retry/backoff handling rate limits
 
@@ -35,7 +47,7 @@ CB_SUCCESS_THRESHOLD = 2       # Successes needed to recover from DEGRADED
 
 # LLM Request Timeouts (seconds)
 LLM_TOTAL_TIMEOUT = 90         # Total request timeout
-LLM_CONNECT_TIMEOUT = 10       # Connection establishment timeout
+LLM_CONNECT_TIMEOUT = 30       # Connection establishment timeout
 
 
 def sanitize_text(text: str) -> str:
@@ -99,6 +111,7 @@ class TokenUsageTracker:
     PRICING = {
         "google/gemini-2.5-flash-preview": {"input": 0.05, "output": 0.15},
         "google/gemini-3-flash-preview": {"input": 0.05, "output": 0.15},
+        "moonshotai/kimi-k2-thinking": {"input": 0.40, "output": 1.75},
         "qwen/qwen-2.5-coder-32b-instruct": {"input": 0.20, "output": 0.60},
         "anthropic/claude-3-haiku": {"input": 0.25, "output": 1.25},
         "default": {"input": 0.50, "output": 1.50}
@@ -199,6 +212,10 @@ class LLMClient:
         
         if not self.api_key:
             logger.warning("OPENROUTER_API_KEY is not set. LLM features will be disabled.")
+
+        # Anthropic OAuth token cache (lazy-loaded on first anthropic/ model call)
+        self._anthropic_token_cache: Optional[str] = None
+        self._anthropic_token_expires: float = 0
 
         # No global semaphore - each agent runs independently
         # Rate limiting handled by:
@@ -322,7 +339,7 @@ class LLMClient:
         # Validation/skeptic tasks - FAIL OPEN (assume real to not lose vulnerabilities)
         if any(kw in combined for kw in ["skeptic", "false positive", "validate", "confirm", "verify"]):
             logger.debug("[Fallback] Validation task - FAIL OPEN (CONFIRMED)")
-            return "CONFIRMED"
+            return '{"result": "CONFIRMED", "confidence": 1.0, "reason": "LLM unavailable - fail open"}'
 
         # Payload generation tasks
         if "payload" in combined or "generate" in combined and "xss" in combined:
@@ -456,6 +473,77 @@ class LLMClient:
         messages.append({"role": "user", "content": prompt})
         return messages
 
+    # ========== Anthropic Direct API Methods ==========
+
+    def _is_anthropic_model(self, model: str) -> bool:
+        """Check if model should be routed to Anthropic API instead of OpenRouter."""
+        if not settings.ANTHROPIC_OAUTH_ENABLED:
+            return False
+        return model.startswith("anthropic/")
+
+    async def _ensure_anthropic_token(self) -> Optional[str]:
+        """Lazy-load and auto-refresh Anthropic OAuth token."""
+        import time as _time
+        now = _time.time()
+        if self._anthropic_token_cache and now < self._anthropic_token_expires:
+            return self._anthropic_token_cache
+        try:
+            from bugtrace.core.anthropic_auth import get_valid_token
+            token = await get_valid_token()
+            if token:
+                self._anthropic_token_cache = token
+                self._anthropic_token_expires = now + 300  # Re-check every 5 min
+            return token
+        except Exception as e:
+            logger.error(f"Anthropic token load failed: {e}")
+            return None
+
+    def _build_anthropic_headers(self, token: str, module_name: str) -> Dict[str, str]:
+        """Build headers for direct Anthropic API calls."""
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14",
+        }
+
+    def _build_anthropic_payload(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int
+    ) -> Dict[str, Any]:
+        """Build Anthropic Messages API payload.
+
+        Key differences from OpenAI format:
+        - Model name without 'anthropic/' prefix
+        - System prompt as top-level 'system' field, not in messages
+        - Only 'user' and 'assistant' roles in messages array
+        """
+        # Strip anthropic/ prefix
+        anthropic_model = model.replace("anthropic/", "", 1)
+
+        # Extract system prompt from messages
+        system_text = None
+        filtered_messages = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_text = msg["content"]
+            else:
+                filtered_messages.append(msg)
+
+        payload = {
+            "model": anthropic_model,
+            "messages": filtered_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if system_text:
+            payload["system"] = system_text
+
+        return payload
+
     async def _handle_refusal(
         self,
         text: str,
@@ -522,17 +610,41 @@ class LLMClient:
         model_override: Optional[str],
         system_prompt: Optional[str],
         temperature: float,
-        max_tokens: int
+        max_tokens: int,
+        is_anthropic: bool = False
     ) -> Optional[str]:
         """Process API response and handle errors/refusals."""
         if resp.status == 200:
             data = await resp.json()
-            if 'choices' not in data or len(data['choices']) == 0:
-                self._record_model_call(current_model, success=False, latency_ms=latency_ms)
-                logger.warning(f"LLM Shift: Model {current_model} returned empty response.")
-                return None
 
-            text = data['choices'][0]['message']['content']
+            # Parse response based on provider
+            if is_anthropic:
+                # Anthropic Messages API: content[0].text
+                content = data.get("content", [])
+                if not content:
+                    self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+                    logger.warning(f"Anthropic API: {current_model} returned empty content.")
+                    return None
+                # Extract text from content blocks (skip thinking blocks)
+                text_parts = [block["text"] for block in content if block.get("type") == "text"]
+                text = "\n".join(text_parts) if text_parts else ""
+                if not text:
+                    self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+                    logger.warning(f"Anthropic API: {current_model} returned no text content.")
+                    return None
+                # Map Anthropic usage fields for telemetry
+                if "usage" in data:
+                    data["usage"]["prompt_tokens"] = data["usage"].get("input_tokens", 0)
+                    data["usage"]["completion_tokens"] = data["usage"].get("output_tokens", 0)
+                    data["usage"]["total_tokens"] = data["usage"].get("prompt_tokens", 0) + data["usage"].get("completion_tokens", 0)
+                logger.info(f"Anthropic API: Using {current_model} for {module_name}")
+            else:
+                # OpenRouter/OpenAI format: choices[0].message.content
+                if 'choices' not in data or len(data['choices']) == 0:
+                    self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+                    logger.warning(f"LLM Shift: Model {current_model} returned empty response.")
+                    return None
+                text = data['choices'][0]['message']['content']
 
             # Check for refusal
             result = await self._handle_refusal(
@@ -551,9 +663,27 @@ class LLMClient:
             return text
 
         elif resp.status == 429:
+            # Rate limited - raise typed exception for selective retry
             self._record_model_call(current_model, success=False, latency_ms=latency_ms)
-            logger.warning(f"LLM Shift: Model {current_model} rate limited (429). Shifting...")
+            retry_after = resp.headers.get("Retry-After", "5")
+            try:
+                retry_seconds = float(retry_after)
+            except ValueError:
+                retry_seconds = 5.0
+            logger.warning(f"LLM Shift: Model {current_model} rate limited (429). Retry-After: {retry_seconds}s")
+            raise LLMRateLimitError(
+                f"Rate limited by {current_model}",
+                model=current_model,
+                retry_after=retry_seconds
+            )
+        elif resp.status >= 500:
+            # Server error - transient, allow model shifting
+            self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+            error_text = await resp.text()
+            await self._audit_log(module_name, current_model, prompt, f"ERROR: {resp.status} - {error_text}")
+            logger.warning(f"LLM Shift: Model {current_model} server error ({resp.status}). Shifting...")
         else:
+            # Client error (4xx except 429) - likely permanent
             self._record_model_call(current_model, success=False, latency_ms=latency_ms)
             error_text = await resp.text()
             await self._audit_log(module_name, current_model, prompt, f"ERROR: {resp.status} - {error_text}")
@@ -583,7 +713,7 @@ class LLMClient:
         """
         # No global semaphore - each agent runs independently
         # Rate limiting handled by retry with exponential backoff (tenacity)
-        if not self.api_key:
+        if not self.api_key and not settings.ANTHROPIC_OAUTH_ENABLED:
             logger.warning(f"LLM Client: No API Key found for {module_name}. Skipping generation.")
             await self._audit_log(module_name, "NONE", prompt, "SKIPPED: Missing API Key")
             return None
@@ -604,7 +734,12 @@ class LLMClient:
         await self._apply_degraded_throttling()
 
         # ========== Normal Generation with Model Shifting ==========
-        models_to_try = [model_override] if model_override else self.models
+        # FIX: If model_override is provided, try it first but fallback to PRIMARY_MODELS
+        if model_override:
+            models_to_try = [model_override] + [m for m in self.models if m != model_override]
+        else:
+            models_to_try = self.models
+
         headers = self._build_headers(module_name)
         messages = self._build_messages(prompt, system_prompt)
 
@@ -654,15 +789,59 @@ class LLMClient:
         model_override: Optional[str],
         system_prompt: Optional[str]
     ) -> Optional[str]:
-        """Try generation with each model in the list."""
-        for current_model in models_to_try:
-            result = await self._attempt_model_generation(
-                current_model, headers, messages, module_name, prompt,
-                temperature, max_tokens, model_override, system_prompt
-            )
-            if result:
-                return result
+        """Try generation with each model in the list.
 
+        For each model, attempts 3 retries with exponential backoff before shifting to next model.
+        Handles typed exceptions for better retry logic.
+        """
+        for current_model in models_to_try:
+            # Try this model up to 3 times with exponential backoff
+            for retry_attempt in range(3):
+                try:
+                    result = await self._attempt_model_generation(
+                        current_model, headers, messages, module_name, prompt,
+                        temperature, max_tokens, model_override, system_prompt
+                    )
+
+                    if result:
+                        if retry_attempt > 0:
+                            logger.info(f"LLM Retry Success: {current_model} succeeded on attempt {retry_attempt + 1}")
+                        return result
+
+                except LLMTimeoutError as e:
+                    # Transient timeout - retry with longer wait
+                    if retry_attempt < 2:
+                        wait_time = 2 ** (retry_attempt + 1)  # 2s, 4s, 8s for timeouts
+                        logger.warning(
+                            f"LLM Timeout {retry_attempt + 1}/3: {current_model}, "
+                            f"waiting {wait_time}s before retry..."
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    # After 3 timeouts, shift to next model
+                    break
+
+                except LLMRateLimitError as e:
+                    # Rate limited - use retry_after if available, else longer backoff
+                    retry_after = e.context.get("retry_after_seconds", 5)
+                    logger.warning(f"LLM Rate Limited: {current_model}, waiting {retry_after}s...")
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                # If result is None (not an exception), wait before retrying
+                if retry_attempt < 2:
+                    wait_time = 2 ** retry_attempt  # 1s, 2s, 4s
+                    logger.warning(
+                        f"LLM Retry {retry_attempt + 1}/3: {current_model} failed, "
+                        f"waiting {wait_time}s before retry..."
+                    )
+                    await asyncio.sleep(wait_time)
+
+            # After 3 failed retries, shift to next model
+            logger.warning(
+                f"LLM Shift: {current_model} failed after 3 retries. "
+                f"Shifting to next model..."
+            )
             await asyncio.sleep(0.5)
 
         return None
@@ -682,8 +861,23 @@ class LLMClient:
         """Attempt generation with a single model.
 
         Uses explicit timeouts (90s total, 10s connect) to prevent hanging.
+        Routes anthropic/ models to Anthropic API, everything else to OpenRouter.
         """
-        payload = self._build_request_payload(current_model, messages, temperature, max_tokens)
+        # Route to Anthropic API or OpenRouter based on model prefix
+        is_anthropic = self._is_anthropic_model(current_model)
+        if is_anthropic:
+            token = await self._ensure_anthropic_token()
+            if not token:
+                logger.warning(f"Anthropic OAuth token unavailable, skipping {current_model}")
+                return None  # Triggers model shifting to next (OpenRouter) model
+            api_url = "https://api.anthropic.com/v1/messages"
+            api_headers = self._build_anthropic_headers(token, module_name)
+            api_payload = self._build_anthropic_payload(current_model, messages, temperature, max_tokens)
+        else:
+            api_url = self.base_url
+            api_headers = headers
+            api_payload = self._build_request_payload(current_model, messages, temperature, max_tokens)
+
         start_time = time.time()
 
         # Explicit timeout configuration for resilience
@@ -696,24 +890,49 @@ class LLMClient:
         try:
             async with orchestrator.session(DestinationType.LLM) as session:
                 async with session.post(
-                    self.base_url,
-                    headers=headers,
-                    json=payload,
+                    api_url,
+                    headers=api_headers,
+                    json=api_payload,
                     timeout=timeout
                 ) as resp:
                     latency_ms = (time.time() - start_time) * 1000
                     return await self._handle_api_response(
                         resp, current_model, module_name, prompt,
                         latency_ms, model_override, system_prompt,
-                        temperature, max_tokens
+                        temperature, max_tokens,
+                        is_anthropic=is_anthropic
                     )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
+            # Transient: LLM request timed out - worth retrying
             latency_ms = (time.time() - start_time) * 1000
             self._record_model_call(current_model, success=False, latency_ms=latency_ms)
             await self._audit_log(module_name, current_model, prompt, f"TIMEOUT after {latency_ms:.0f}ms")
             logger.warning(f"LLM Shift Timeout with {current_model} after {latency_ms:.0f}ms")
-            return None
+            raise LLMTimeoutError(
+                f"LLM request timed out after {latency_ms:.0f}ms",
+                model=current_model,
+                context={"latency_ms": latency_ms, "module": module_name},
+                cause=e
+            ) from None  # Suppress chained exception for cleaner logs
+        except aiohttp.ClientConnectorError as e:
+            # Transient: Network connection failed
+            latency_ms = (time.time() - start_time) * 1000
+            self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+            await self._audit_log(module_name, current_model, prompt, f"CONNECTION_ERROR: {str(e)}")
+            logger.warning(f"LLM connection error with {current_model}: {e}")
+            return None  # Allow model shifting
+        except aiohttp.ClientError as e:
+            # Transient: Other aiohttp errors (SSL, etc.)
+            latency_ms = (time.time() - start_time) * 1000
+            self._record_model_call(current_model, success=False, latency_ms=latency_ms)
+            await self._audit_log(module_name, current_model, prompt, f"CLIENT_ERROR: {str(e)}")
+            logger.warning(f"LLM client error with {current_model}: {e}")
+            return None  # Allow model shifting
+        except LLMError:
+            # Re-raise typed LLM exceptions
+            raise
         except Exception as e:
+            # Catch-all for unexpected errors
             latency_ms = (time.time() - start_time) * 1000
             self._record_model_call(current_model, success=False, latency_ms=latency_ms)
             await self._audit_log(module_name, current_model, prompt, f"EXCEPTION: {str(e)}")
@@ -1052,9 +1271,14 @@ class LLMClient:
         temperature: float
     ) -> str:
         """Call vision API with image messages."""
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://bugtraceai.com",
+            "X-Title": f"Bugtrace-{module_name}",
+        }
         payload = {
-            "model": model_override or "qwen/qwen3-vl-8b-thinking",
+            "model": model_override or settings.VALIDATION_VISION_MODEL,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": 100
@@ -1116,6 +1340,7 @@ class LLMClient:
 
         except json.JSONDecodeError as e:
             logger.warning(f"Invalid JSON in LLM response: {e}")
+            # Don't raise - return None for graceful degradation
             return None
 
     # ========== TASK-131: Request Caching ==========

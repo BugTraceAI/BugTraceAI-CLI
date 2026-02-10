@@ -268,6 +268,53 @@ async def stop_scan(
         )
 
 
+@router.post("/scans/{scan_id}/pause", response_model=StopScanResponse)
+async def pause_scan(
+    scan_id: int,
+    scan_service: ScanServiceDep,
+):
+    """
+    Pause a running scan. The scan freezes at the next checkpoint
+    and can be resumed later with POST /api/scans/{scan_id}/resume.
+
+    Raises:
+        404: Scan not found or not running
+    """
+    try:
+        result = await scan_service.pause_scan(scan_id)
+        logger.info(f"Scan {scan_id} paused")
+        return StopScanResponse(**result)
+    except ValueError as e:
+        logger.error(f"Cannot pause scan {scan_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+
+
+@router.post("/scans/{scan_id}/resume", response_model=StopScanResponse)
+async def resume_scan(
+    scan_id: int,
+    scan_service: ScanServiceDep,
+):
+    """
+    Resume a paused scan.
+
+    Raises:
+        404: Scan not found or not paused
+    """
+    try:
+        result = await scan_service.resume_scan(scan_id)
+        logger.info(f"Scan {scan_id} resumed")
+        return StopScanResponse(**result)
+    except ValueError as e:
+        logger.error(f"Cannot resume scan {scan_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+
+
 @router.delete("/scans/{scan_id}", response_model=DeleteScanResponse)
 async def delete_scan(
     scan_id: int,

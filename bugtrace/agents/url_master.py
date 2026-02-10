@@ -173,30 +173,21 @@ class URLMasterAgent(BaseAgent):
         return summary
 
     async def _check_historical_findings(self):
-        """Check database for previous scan results."""
+        """Check for previous scan results from report directories (DB = write-only)."""
         try:
-            from bugtrace.core.database import get_db_manager
-            db = get_db_manager()
+            from bugtrace.core.config import settings
+            from urllib.parse import urlparse
 
-            historical_findings = db.get_findings_for_target(self.url)
-            scan_count = db.get_scan_count(self.url)
+            domain = urlparse(self.url).netloc.split(":")[0]
+            report_dirs = sorted(settings.REPORT_DIR.glob(f"{domain}_*"), reverse=True)
 
-            if historical_findings:
-                logger.info(f"[{self.name}] 📚 Found {scan_count} previous scan(s) with {len(historical_findings)} findings")
-
+            if len(report_dirs) > 1:
+                # Previous scans exist (current scan is report_dirs[0])
+                scan_count = len(report_dirs) - 1
+                logger.info(f"[{self.name}] 📚 Found {scan_count} previous scan(s) on disk")
                 self.thread.update_metadata("previous_scans", scan_count)
-                self.thread.update_metadata("known_vulnerabilities", [
-                    {
-                        "type": f.get("type"),
-                        "parameter": f.get("parameter"),
-                        "severity": f.get("severity")
-                    } for f in historical_findings[:10]
-                ])
-
-                if scan_count > 0 and len(historical_findings) > 0:
-                    logger.info(f"[{self.name}] ⚠️ URL has existing findings. Re-scanning anyway (configurable)")
         except Exception as e:
-            logger.debug(f"[{self.name}] Deduplication check failed (non-critical): {e}")
+            logger.debug(f"[{self.name}] Historical check failed (non-critical): {e}")
 
     async def _execute_iteration(self, initial_prompt: str) -> bool:
         """Execute a single iteration. Returns False if should stop."""
@@ -496,13 +487,9 @@ Response format:
                 logger.warning(f"[{self.name}] Guardrails BLOCKED: {guard_reason}")
                 continue
 
-            finding_data = self._build_finding_data(finding, vuln_type, payload)
-            is_valid, reason = conductor.validate_finding(finding_data)
-
-            if is_valid:
-                self._handle_valid_finding(finding, vuln_type, payload)
-            else:
-                self._handle_invalid_finding(finding, reason)
+            # NOTE: Conductor validation removed (2026-02-04)
+            # Specialists now self-validate via BaseAgent.emit_finding()
+            self._handle_valid_finding(finding, vuln_type, payload)
 
     def _prepare_finding_payload(self, finding: Dict) -> tuple:
         """Extract vulnerability type and payload from finding."""
@@ -747,11 +734,10 @@ Response format:
                 logger.warning(f"[{self.name}] Failed to embed finding #{idx}: {e}")
 
     def _log_historical_findings(self, db, summary: Dict):
-        """Check and log historical findings for context."""
-        historical = db.get_findings_for_target(self.url)
-        if historical:
-            logger.info(f"[{self.name}] 📚 Found {len(historical)} historical findings for this URL")
-            summary['historical_findings_count'] = len(historical)
+        """Log historical findings count (informational only, no DB reads)."""
+        # DB is write-only from CLI. Historical data is informational.
+        # Previous scans are already checked in _check_historical_findings() via disk.
+        pass
     
     # =========================================================================
     # EXHAUSTIVE MODE - Automatically test common vulns on all parameters

@@ -53,7 +53,57 @@ class JWTAgent(BaseAgent, TechContextMixin):
         # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._jwt_prime_directive: str = ""
-        
+
+    # =========================================================================
+    # FINDING VALIDATION: JWT-specific validation (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> Tuple[bool, str]:
+        """
+        JWT-specific validation before emitting finding.
+
+        Validates:
+        1. Basic requirements (type, url) via parent
+        2. Has attack evidence (alg:none, weak secret, key confusion)
+        3. Has token or attack type specified
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # Extract from nested structure if needed
+        nested = finding.get("finding", {})
+        evidence = finding.get("evidence", nested.get("evidence", {}))
+
+        # JWT-specific: Must have attack type or vulnerability type
+        attack_type = finding.get("attack_type", nested.get("attack_type", ""))
+        vuln_type = finding.get("vulnerability_type", nested.get("vulnerability_type", ""))
+
+        if not (attack_type or vuln_type):
+            return False, "JWT requires attack_type or vulnerability_type"
+
+        # JWT-specific: Must have some evidence
+        has_token = finding.get("token") or nested.get("token")
+        has_proof = evidence.get("forged_token") or evidence.get("cracked_secret") or attack_type
+        if not (has_token or has_proof):
+            return False, "JWT requires token evidence or attack proof"
+
+        return True, ""
+
+    def _emit_jwt_finding(self, finding_dict: Dict, scan_context: str = None) -> Optional[Dict]:
+        """
+        Helper to emit JWT finding using BaseAgent.emit_finding() with validation.
+        """
+        if "type" not in finding_dict:
+            finding_dict["type"] = "JWT"
+
+        if scan_context:
+            finding_dict["scan_context"] = scan_context
+
+        finding_dict["agent"] = self.name
+        return self.emit_finding(finding_dict)
+
     def _setup_event_subscriptions(self):
         """Subscribe to token discovery events."""
         if self.event_bus:
@@ -269,29 +319,6 @@ class JWTAgent(BaseAgent, TechContextMixin):
             data += '=' * (4 - missing_padding)
         return base64.urlsafe_b64decode(data).decode('utf-8')
 
-    async def _get_llm_strategy(self, decoded: Dict, url: str, location: str) -> Optional[Dict]:
-        """Ask LLM to analyze the token and propose an attack plan."""
-        from bugtrace.utils.parsers import XmlParser
-        
-        prompt = f"""
-        TARGET: {url}
-        LOCATION: {location}
-        JWT_HEADER: {json.dumps(decoded['header'])}
-        JWT_PAYLOAD: {json.dumps(decoded['payload'])}
-        
-        Analyze this token. Is there a clear path to privilege escalation or authentication bypass?
-        Generate a plan using known JWT attack vectors.
-        """
-        
-        response = await llm_client.generate(
-            prompt=prompt,
-            module_name="JWT_AGENT",
-            system_prompt=self.system_prompt
-        )
-        
-        tags = ["thought", "plan", "payload", "target_location"]
-        return XmlParser.extract_tags(response, tags)
-
     async def _verify_token_works(self, forged_token: str, url: str, location: str) -> bool:
         """
         Sends a request with the forged token to verify validation bypass.
@@ -319,10 +346,20 @@ class JWTAgent(BaseAgent, TechContextMixin):
         """Execute test request with forged token."""
         return await self._token_make_request(url, forged_token, location)
 
+    async def _rate_limit(self):
+        """Rate limiting to prevent WAF triggers and server overload."""
+        import asyncio
+        delay = settings.JWT_RATE_LIMIT_DELAY
+        if delay > 0:
+            await asyncio.sleep(delay)
+
     async def _token_make_request(self, target_url: str, token: str, loc: str) -> Tuple[int, str, str]:
         """Make HTTP request with token in appropriate location."""
         import aiohttp
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        # Apply rate limiting before request
+        await self._rate_limit()
 
         headers = {}
         final_url = target_url
@@ -516,12 +553,32 @@ class JWTAgent(BaseAgent, TechContextMixin):
         if not signature_actual:
             return
 
-        wordlist = ["secret", "password", "123456", "jwt", "key", "auth", "admin", "token", "1234567890", "mysupersecret"]
+        # Load wordlist from file
+        wordlist = self._load_jwt_wordlist()
 
         for secret in wordlist:
             if self._test_secret(signing_input, signature_actual, secret):
                 await self._exploit_cracked_secret(secret, decoded, parts, token, url, location)
                 return
+
+    def _load_jwt_wordlist(self) -> List[str]:
+        """Load JWT secret wordlist from file."""
+        wordlist_path = settings.BASE_DIR / "bugtrace" / "data" / "jwt_secrets.txt"
+
+        try:
+            with open(wordlist_path, 'r') as f:
+                # Skip comments and empty lines
+                wordlist = [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.strip().startswith('#')
+                ]
+            logger.debug(f"[{self.name}] Loaded {len(wordlist)} secrets from wordlist")
+            return wordlist
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to load wordlist: {e}, using fallback")
+            # Fallback to original hardcoded list
+            return ["secret", "password", "123456", "jwt", "key", "auth", "admin", "token", "1234567890", "mysupersecret"]
 
     def _prepare_brute_force(self, parts: List[str]) -> Tuple[bytes, Optional[bytes]]:
         """Prepare signing input and signature for brute force."""
@@ -785,62 +842,28 @@ class JWTAgent(BaseAgent, TechContextMixin):
             if not decoded:
                 return
 
-            self.think(f"Token Analysis: Alg={decoded['header'].get('alg')}, Claims={list(decoded['payload'].keys())}")
+            alg = decoded['header'].get('alg', 'unknown')
+            claims = list(decoded['payload'].keys())
+            self.think(f"Token Analysis: Alg={alg}, Claims={claims}")
 
-            # 2. Get attack strategy
-            strategy = await self._get_attack_strategy(decoded, url, location)
+            # 2. Execute all relevant attacks based on token properties
+            # Always try 'none' algorithm bypass (works regardless of original alg)
+            await self._check_none_algorithm(token, url, location)
 
-            # 3. Execute Attack Plan
-            await self._execute_attack_plan(strategy, token, url, location)
+            # Try brute force if HS256 (symmetric key)
+            if alg == 'HS256':
+                await self._attack_brute_force(token, url, location)
+
+            # Try KID injection if KID header present
+            if 'kid' in decoded['header']:
+                await self._attack_kid_injection(token, url, location)
+
+            # Try key confusion if RS256 (asymmetric to symmetric)
+            if alg == 'RS256':
+                await self._attack_key_confusion(token, url, location)
 
         except Exception as e:
             logger.error(f"[{self.name}] Token analysis failed: {e}", exc_info=True)
-
-    async def _get_attack_strategy(self, decoded: Dict, url: str, location: str) -> Dict:
-        """Get attack strategy from LLM or use fallback."""
-        strategy = await self._get_llm_strategy(decoded, url, location)
-        if strategy:
-            return strategy
-
-        # Fallback to standard attacks if LLM fails
-        return {"plan": ["Check None Algorithm", "Brute Force Secret", "Check KID Injection"]}
-
-    async def _execute_attack_plan(self, strategy: Dict, token: str, url: str, location: str):
-        """Execute attack plan steps."""
-        plan_raw = strategy.get("plan")
-        if not plan_raw:
-            return
-
-        steps = self._parse_plan_steps(plan_raw)
-        for step in steps:
-            self.think(f"Executing step: {step}")
-            await self._execute_attack_step(step, token, url, location)
-
-    def _parse_plan_steps(self, plan_raw) -> List[str]:
-        """Parse plan into list of steps."""
-        if isinstance(plan_raw, str):
-            return [s.strip() for s in plan_raw.split('\n') if s.strip()]
-        return plan_raw
-
-    async def _execute_attack_step(self, step: str, token: str, url: str, location: str):
-        """Execute a single attack step based on keyword matching."""
-        step_lower = step.lower()
-
-        if "none" in step_lower:
-            await self._check_none_algorithm(token, url, location)
-            return
-
-        if "brute" in step_lower or "secret" in step_lower:
-            await self._attack_brute_force(token, url, location)
-            return
-
-        if "kid" in step_lower or "injection" in step_lower:
-            await self._attack_kid_injection(token, url, location)
-            return
-
-        if "confusion" in step_lower or "rsa" in step_lower or "hs256" in step_lower:
-            await self._attack_key_confusion(token, url, location)
-            return
 
     # ========================================
     # WET → DRY Two-Phase Processing (Phase A: Deduplication, Phase B: Exploitation)
@@ -979,9 +1002,10 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
 
         for finding in wet_findings:
             url = finding.get("url", "")
+            token = finding.get("token", "")
             vuln_type = finding.get("vuln_type", finding.get("type", "JWT"))
 
-            fingerprint = self._generate_jwt_fingerprint(url, vuln_type)
+            fingerprint = self._generate_jwt_fingerprint(url, vuln_type, token)
 
             if fingerprint not in seen:
                 seen.add(fingerprint)
@@ -1010,7 +1034,7 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
             logger.info(f"[{self.name}] Phase B: [{idx}/{len(self._dry_findings)}] Testing {url} type={vuln_type}")
 
             # Check fingerprint to avoid re-emitting
-            fingerprint = self._generate_jwt_fingerprint(url, vuln_type)
+            fingerprint = self._generate_jwt_fingerprint(url, vuln_type, token)
             if fingerprint in self._emitted_findings:
                 logger.debug(f"[{self.name}] Phase B: Skipping already emitted finding")
                 continue
@@ -1036,16 +1060,16 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
 
                     validated_findings.append(result)
 
-                    # Emit event
-                    if self.event_bus:
-                        self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
-                            "type": "JWT",
-                            "url": result.get("url", url),
-                            "vuln_type": result.get("vuln_type", vuln_type),
-                            "severity": result.get("severity", "HIGH"),
-                            "scan_context": self._scan_context,
-                            "agent": self.name
-                        })
+                    # Emit event with validation
+                    self._emit_jwt_finding({
+                        "type": "JWT",
+                        "url": result.get("url", url),
+                        "vulnerability_type": result.get("vuln_type", vuln_type),
+                        "attack_type": result.get("vuln_type", vuln_type),
+                        "severity": result.get("severity", "HIGH"),
+                        "token": result.get("token", ""),
+                        "evidence": result.get("evidence", {}),
+                    }, scan_context=self._scan_context)
 
                     logger.info(f"[{self.name}] ✓ JWT vulnerability confirmed: {url} type={vuln_type}")
                 else:
@@ -1122,6 +1146,7 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
             report_specialist_start,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
 
         self._queue_mode = True
@@ -1143,6 +1168,7 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "jwt")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -1202,20 +1228,33 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
-    def _generate_jwt_fingerprint(self, url: str, vuln_type: str) -> tuple:
+    def _generate_jwt_fingerprint(self, url: str, vuln_type: str, token: str = None) -> tuple:
         """
         Generate JWT finding fingerprint for expert deduplication.
+
+        Args:
+            url: Target URL
+            vuln_type: Vulnerability type (e.g., "none algorithm", "weak secret")
+            token: JWT token string (optional, but recommended for accurate dedup)
 
         Returns:
             Tuple fingerprint for deduplication
         """
         from urllib.parse import urlparse
+        import hashlib
 
         parsed = urlparse(url)
 
-        # JWT signature: Token-specific (netloc + vulnerability type)
+        # JWT signature: Token-specific (netloc + vulnerability type + token hash)
         # JWT vulnerabilities are token-specific, not URL-specific
-        fingerprint = ("JWT", parsed.netloc, vuln_type)
+        # Different tokens on same domain can have different vulnerabilities
+        if token:
+            # Use first 8 chars of SHA256 hash for compact fingerprint
+            token_hash = hashlib.sha256(token.encode()).hexdigest()[:8]
+            fingerprint = ("JWT", parsed.netloc, vuln_type, token_hash)
+        else:
+            # Fallback if token not provided (backwards compatibility)
+            fingerprint = ("JWT", parsed.netloc, vuln_type)
 
         return fingerprint
 
@@ -1229,8 +1268,9 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
 
         # EXPERT DEDUPLICATION: Check if we already emitted this finding
         url = result.get("url")
+        token = result.get("token", "")
         vuln_type = result.get("vulnerability_type", result.get("type"))
-        fingerprint = self._generate_jwt_fingerprint(url, vuln_type)
+        fingerprint = self._generate_jwt_fingerprint(url, vuln_type, token)
 
         if fingerprint in self._emitted_findings:
             logger.info(f"[{self.name}] Skipping duplicate JWT finding (already reported)")
@@ -1239,19 +1279,19 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            self._emit_jwt_finding({
                 "specialist": "jwt",
-                "finding": {
-                    "type": "JWT",
-                    "url": result.get("url"),
-                    "vulnerability": result.get("vulnerability_type", result.get("type")),
-                    "severity": result.get("severity"),
-                },
+                "type": "JWT",
+                "url": result.get("url"),
+                "vulnerability_type": result.get("vulnerability_type", result.get("type")),
+                "attack_type": result.get("vulnerability_type", result.get("type")),
+                "severity": result.get("severity"),
+                "token": result.get("token", ""),
                 "status": status,
+                "evidence": result.get("evidence", {}),
                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
-                "scan_context": self._scan_context,
-            })
+            }, scan_context=self._scan_context)
 
         logger.info(f"[{self.name}] Confirmed JWT vulnerability: {result.get('vulnerability_type', result.get('type', 'unknown'))} [status={status}]")
 

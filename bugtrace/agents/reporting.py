@@ -23,10 +23,11 @@ from bugtrace.utils.logger import get_logger
 from bugtrace.core.llm_client import llm_client
 from bugtrace.core.event_bus import EventType, event_bus
 from bugtrace.core.validation_status import ValidationStatus
-from bugtrace.schemas.db_models import ScanTable
+# ScanTable import removed: DB is write-only from CLI
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
+    get_reference_cve,
     normalize_severity,
     format_cve,
 )
@@ -293,8 +294,8 @@ class ReportingAgent(BaseAgent):
                 all_findings.extend(findings)
             logger.info(f"[{self.name}] Loaded {len(all_findings)} findings from wet/ (fallback)")
 
-        # Deduplicate by (url, parameter, payload)
-        all_findings = self._deduplicate_findings(all_findings)
+        # Deduplicate by exact (url, parameter, payload) match
+        all_findings = self._deduplicate_exact(all_findings)
 
         logger.info(f"[{self.name}] Loaded {len(all_findings)} total findings from specialist files")
         return all_findings
@@ -339,6 +340,9 @@ class ReportingAgent(BaseAgent):
             for finding in result_findings:
                 finding = decode_fn(finding)
                 finding["source"] = f"specialist:{specialist}"
+                # Add status fallback for findings from specialist results (they self-validate)
+                if not finding.get("status"):
+                    finding["status"] = "VALIDATED_CONFIRMED"
                 findings.append(finding)
 
             if findings:
@@ -364,6 +368,9 @@ class ReportingAgent(BaseAgent):
                         finding = decode_fn(finding)
                         specialist = entry.get("specialist", wet_file.stem)
                         finding["source"] = f"wet:{specialist}"
+                        # Add status fallback for wet findings
+                        if not finding.get("status"):
+                            finding["status"] = "VALIDATED_CONFIRMED"
                         findings.append(finding)
                     except json.JSONDecodeError:
                         continue
@@ -373,8 +380,8 @@ class ReportingAgent(BaseAgent):
 
         return findings
 
-    def _deduplicate_findings(self, findings: List[Dict]) -> List[Dict]:
-        """Deduplicate findings by (url, parameter, payload) key."""
+    def _deduplicate_exact(self, findings: List[Dict]) -> List[Dict]:
+        """Deduplicate findings by exact (url, parameter, payload) key."""
         seen = set()
         unique = []
         for f in findings:
@@ -479,14 +486,49 @@ class ReportingAgent(BaseAgent):
 
         return {
             "raw": [f for f in all_findings],
-            "validated": [f for f in all_findings if f.get("status") in validated_statuses],
-            "manual_review": [f for f in all_findings if f.get("status") == "MANUAL_REVIEW_RECOMMENDED"],
+            "validated": [
+                f for f in all_findings
+                if f.get("status") in validated_statuses
+                and self._has_minimum_evidence(f)
+            ],
+            "manual_review": [
+                f for f in all_findings
+                if f.get("status") == "MANUAL_REVIEW_RECOMMENDED"
+                or (f.get("status") in validated_statuses and not self._has_minimum_evidence(f))
+            ],
             "false_positives": [f for f in all_findings if f.get("status") == "VALIDATED_FALSE_POSITIVE"],
             "pending": [f for f in all_findings if f.get("status") == "PENDING_VALIDATION"]
         }
 
+    def _has_minimum_evidence(self, finding: Dict) -> bool:
+        """
+        Safety net: check if a finding has minimum evidence quality to be
+        included in validated findings. Findings that claim VALIDATED_CONFIRMED
+        but have zero evidence are re-routed to manual_review instead.
+        """
+        # Non-empty payload = sufficient
+        if (finding.get("payload") or "").strip():
+            return True
+        # Non-trivial evidence dict = sufficient
+        evidence = finding.get("evidence", {})
+        if isinstance(evidence, dict) and evidence and any(v for v in evidence.values() if v):
+            return True
+        elif isinstance(evidence, str) and evidence.strip():
+            return True
+        # Positive confidence or evidence score = sufficient
+        if finding.get("evidence_score", 0) > 0 or finding.get("confidence", 0) > 0.5:
+            return True
+        # Screenshot = sufficient
+        if finding.get("screenshot_path"):
+            return True
+        logger.warning(
+            f"[{self.name}] Quality gate: {finding.get('type')}/{finding.get('parameter')} "
+            f"lacks minimum evidence, routing to manual_review"
+        )
+        return False
+
     def _calculate_scan_stats(self, all_findings: List[Dict]) -> Dict:
-        """Calculate scan statistics (duration, URLs scanned)."""
+        """Calculate scan statistics (duration, URLs scanned, token usage)."""
         stats = {"urls_scanned": 0, "duration": "Unknown"}
         try:
             # Calculate duration
@@ -495,20 +537,38 @@ class ReportingAgent(BaseAgent):
             stats["urls_scanned"] = self._count_urls_scanned(all_findings)
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to calc stats: {e}")
+
+        # Token usage & cost from LLM client
+        try:
+            from bugtrace.core.llm_client import llm_client
+            token_summary = llm_client.token_tracker.get_summary()
+            stats["total_tokens"] = token_summary.get("total", 0)
+            stats["input_tokens"] = token_summary.get("total_input", 0)
+            stats["output_tokens"] = token_summary.get("total_output", 0)
+            stats["estimated_cost"] = token_summary.get("estimated_cost", 0.0)
+            stats["tokens_by_model"] = token_summary.get("by_model", {})
+        except Exception as e:
+            logger.debug(f"[{self.name}] Failed to get token stats: {e}")
+
         return stats
 
     def _calculate_scan_duration(self) -> Dict:
-        """Calculate scan duration from database."""
-        with self.db.get_session() as session:
-            scan = session.get(ScanTable, self.scan_id)
-            if scan and scan.timestamp:
-                duration = datetime.utcnow() - scan.timestamp
+        """Calculate scan duration from scan directory timestamp (DB = write-only)."""
+        try:
+            if self.output_dir and self.output_dir.exists():
+                # Use directory creation time as scan start
+                import os
+                dir_stat = os.stat(self.output_dir)
+                start_time = datetime.fromtimestamp(dir_stat.st_ctime)
+                duration = datetime.now() - start_time
                 hours, remainder = divmod(int(duration.total_seconds()), 3600)
                 minutes, seconds = divmod(remainder, 60)
                 return {
                     "duration": f"{hours}h {minutes}m {seconds}s",
                     "duration_seconds": int(duration.total_seconds())
                 }
+        except Exception as e:
+            logger.debug(f"[{self.name}] Failed to calculate duration: {e}")
         return {}
 
     def _count_urls_scanned(self, all_findings: List[Dict]) -> int:
@@ -528,6 +588,135 @@ class ReportingAgent(BaseAgent):
         # Fallback to counting unique finding URLs
         unique_urls = set(f.get("url") for f in all_findings if f.get("url"))
         return len(unique_urls)
+
+    def _parse_nuclei_tech_for_report(self) -> Dict[str, Any]:
+        """Parse raw Nuclei findings into a structured tech summary for the report.
+
+        Extracts actual version numbers, EOL status, and product names from
+        raw_tech_findings and raw_vuln_findings instead of showing template names.
+
+        Returns:
+            Dict with keys: technologies (list of dicts), waf_details (list), summary (str)
+        """
+        if not self.tech_profile:
+            return {"technologies": [], "waf_details": [], "summary": ""}
+
+        raw_findings = (
+            self.tech_profile.get("raw_tech_findings", [])
+            + self.tech_profile.get("raw_vuln_findings", [])
+        )
+
+        # Known product display names (avoid "Php", show "PHP" etc.)
+        _DISPLAY_NAMES = {
+            "php": "PHP", "asp": "ASP.NET", "iis": "IIS", "aws": "AWS",
+            "gcp": "GCP", "cdn": "CDN", "jquery": "jQuery", "angularjs": "AngularJS",
+            "vuejs": "Vue.js", "nodejs": "Node.js", "reactjs": "React",
+        }
+
+        def _display_name(raw: str) -> str:
+            return _DISPLAY_NAMES.get(raw.lower(), raw.capitalize())
+
+        # Merge findings by product/technology, keeping best version info
+        tech_map: Dict[str, Dict] = {}  # key = normalized product name (lowercase)
+        waf_details_set: set = set()
+        waf_details = []
+
+        for finding in raw_findings:
+            template_id = finding.get("template-id", "")
+            info = finding.get("info", {})
+            name = info.get("name", "")
+            metadata = info.get("metadata", {})
+            extracted = finding.get("extracted-results", [])
+            matcher_name = finding.get("matcher-name", "")
+
+            # WAF detection → only include if verified by NucleiAgent FP filter
+            if template_id == "waf-detect":
+                if not self.tech_profile.get("waf"):
+                    continue  # All WAF detections were filtered as FP
+                waf_type = matcher_name.replace("generic", "").strip() if matcher_name else "Unknown"
+                if waf_type and waf_type.lower() not in waf_details_set:
+                    waf_details_set.add(waf_type.lower())
+                    waf_details.append(_display_name(waf_type))
+                continue
+
+            # Wappalyzer tech-detect → use matcher-name as product
+            if template_id == "tech-detect":
+                product = _display_name(matcher_name) if matcher_name else ""
+                if not product:
+                    continue
+                key = matcher_name.lower() if matcher_name else ""
+                if key not in tech_map:
+                    tech_map[key] = {
+                        "name": product,
+                        "version": None,
+                        "eol": False,
+                        "category": "Technology",
+                    }
+                continue
+
+            # Version/EOL detections → extract product + version
+            raw_product = metadata.get("product", "")
+            product = _display_name(raw_product) if raw_product else ""
+            if not product:
+                # Infer from template-id: e.g. "nginx-version" → "Nginx"
+                raw_product = template_id.split("-")[0] if template_id else ""
+                product = _display_name(raw_product) if raw_product else ""
+            if not product:
+                continue
+
+            key = product.lower()
+            is_eol = "eol" in template_id
+
+            # Extract version from results
+            version = None
+            if extracted:
+                raw_ver = extracted[0]
+                # Clean: "nginx/1.19.0" → "1.19.0"
+                if "/" in raw_ver:
+                    version = raw_ver.split("/", 1)[1]
+                else:
+                    version = raw_ver
+
+            # Determine category
+            category = "Technology"
+            if any(x in key for x in ["nginx", "apache", "iis", "tomcat", "lighttpd"]):
+                category = "Web Server"
+            elif any(x in key for x in ["php", "python", "node", "ruby", "java", "asp", "perl"]):
+                category = "Language / Runtime"
+            elif any(x in key for x in ["angular", "react", "vue", "jquery", "bootstrap"]):
+                category = "Framework"
+            elif any(x in key for x in ["wordpress", "drupal", "joomla", "magento"]):
+                category = "CMS"
+            elif any(x in key for x in ["aws", "azure", "gcp", "cloudfront"]):
+                category = "Infrastructure"
+            elif any(x in key for x in ["cloudflare", "akamai", "fastly"]):
+                category = "CDN"
+
+            if key in tech_map:
+                # Merge: prefer version, accumulate EOL
+                if version and not tech_map[key]["version"]:
+                    tech_map[key]["version"] = version
+                if is_eol:
+                    tech_map[key]["eol"] = True
+                if category != "Technology":
+                    tech_map[key]["category"] = category
+            else:
+                tech_map[key] = {
+                    "name": product,
+                    "version": version,
+                    "eol": is_eol,
+                    "category": category,
+                }
+
+        technologies = sorted(tech_map.values(), key=lambda t: t["name"])
+        return {
+            "technologies": technologies,
+            "waf_details": waf_details,
+            "summary": ", ".join(
+                f"{t['name']} {t['version'] or ''}" .strip()
+                for t in technologies if t["version"]
+            ),
+        }
 
     def _generate_json_reports(self, all_findings: List[Dict], categorized: Dict) -> Dict[str, Path]:
         """Generate JSON report files.
@@ -607,16 +796,10 @@ class ReportingAgent(BaseAgent):
         }
 
     def _get_findings_from_db(self) -> List[Dict]:
-        """Pull findings from database for this scan_id."""
-        db_findings = self.db.get_findings_for_scan(self.scan_id)
-
-        findings = []
-        for f in db_findings:
-            finding = self._db_build_finding_dict(f)
-            self._db_enrich_sqli_metadata(finding, f)
-            findings.append(finding)
-
-        return findings
+        """DEPRECATED: DB is write-only from CLI. Returns empty list.
+        Primary source is _load_specialist_results() which reads from files."""
+        logger.warning(f"[{self.name}] _get_findings_from_db() called but DB is write-only. Returning empty.")
+        return []
 
     def _db_build_finding_dict(self, f) -> Dict:
         """Build finding dictionary from database record."""
@@ -665,8 +848,18 @@ class ReportingAgent(BaseAgent):
         Load Nuclei findings from tech_profile.json.
         Returns tuple: (list of findings, tech_stack dict)
         """
-        tech_profile_path = self.output_dir / "tech_profile.json"
-        if not tech_profile_path.exists():
+        # Try multiple possible locations (NucleiAgent saves to recon/ subdir)
+        possible_paths = [
+            self.output_dir / "recon" / "tech_profile.json",
+            self.output_dir / "tech_profile.json",
+        ]
+        tech_profile_path = None
+        for path in possible_paths:
+            if path.exists():
+                tech_profile_path = path
+                break
+
+        if not tech_profile_path:
             logger.debug(f"[{self.name}] No tech_profile.json found")
             return [], {}
 
@@ -692,7 +885,7 @@ class ReportingAgent(BaseAgent):
     def _nuclei_parse_findings(self, tech_profile: Dict) -> List[Dict]:
         """Parse Nuclei findings from tech profile."""
         nuclei_findings = []
-        for finding in tech_profile.get("raw_findings", []):
+        for finding in (tech_profile.get("raw_tech_findings") or []) + (tech_profile.get("raw_vuln_findings") or []):
             info = finding.get("info", {})
             severity = self._nuclei_map_severity(info.get("severity"))
             status = "VALIDATED_CONFIRMED" if severity in ["CRITICAL", "HIGH"] else "PENDING_VALIDATION"
@@ -728,11 +921,16 @@ class ReportingAgent(BaseAgent):
         return severity_map.get(nuclei_sev, "INFO")
 
     def _nuclei_extract_tech_stack(self, tech_profile: Dict) -> Dict:
-        """Extract tech stack info from tech profile."""
+        """Extract full tech stack info from tech profile."""
         return {
             "frameworks": tech_profile.get("frameworks", []),
             "languages": tech_profile.get("languages", []),
-            "servers": tech_profile.get("servers", [])
+            "servers": tech_profile.get("servers", []),
+            "waf": tech_profile.get("waf", []),
+            "infrastructure": tech_profile.get("infrastructure", []),
+            "cdn": tech_profile.get("cdn", []),
+            "cms": tech_profile.get("cms", []),
+            "tech_tags": tech_profile.get("tech_tags", []),
         }
 
     def _write_json(self, findings: List[Dict], filename: str, description: str) -> Path:
@@ -755,6 +953,21 @@ class ReportingAgent(BaseAgent):
 
         logger.info(f"[{self.name}] Wrote {filename} ({len(findings)} findings)")
         return path
+
+    def _normalize_type_for_dedup(self, vuln_type: str) -> str:
+        """
+        Normalize vulnerability type for deduplication grouping.
+
+        Strips technique suffixes so variants group together:
+        - "SQL Injection (Error-Based)" → "SQL INJECTION"
+        - "SQL Injection (Boolean-Based Blind)" → "SQL INJECTION"
+        - "XSS" → "XSS"
+        - "CSTI (AngularJS)" → "CSTI"
+        """
+        normalized = vuln_type.upper().strip()
+        if "(" in normalized:
+            normalized = normalized[:normalized.index("(")].strip()
+        return normalized
 
     def _normalize_parameter_for_dedup(self, param: str) -> str:
         """
@@ -798,12 +1011,13 @@ class ReportingAgent(BaseAgent):
         """
         from collections import defaultdict
 
-        # Group by (type, normalized_parameter)
+        # Group by (normalized_type, normalized_parameter)
         groups = defaultdict(list)
         for f in findings:
             param_raw = f.get("parameter", "")
             param_normalized = self._normalize_parameter_for_dedup(param_raw)
-            key = (f.get("type", "Unknown").upper(), param_normalized)
+            vuln_type = self._normalize_type_for_dedup(f.get("type", "Unknown"))
+            key = (vuln_type, param_normalized)
             groups[key].append(f)
 
         deduplicated = []
@@ -926,6 +1140,10 @@ class ReportingAgent(BaseAgent):
 
         # Add validation method label for report display
         entry["validation_method_label"] = self._extract_validation_method(f)
+
+        # Add alternative payloads if available
+        if f.get("successful_payloads") and len(f["successful_payloads"]) > 1:
+            entry["successful_payloads"] = f["successful_payloads"]
 
         return entry
 
@@ -1078,12 +1296,22 @@ class ReportingAgent(BaseAgent):
 
     def _engagement_build_stats(self, stats: Dict) -> Dict:
         """Build engagement statistics section."""
-        return {
+        result = {
             "urls_scanned": stats.get("urls_scanned", 0),
             "duration": stats.get("duration", "N/A"),
             "duration_seconds": stats.get("duration_seconds", 0),
-            "validation_coverage": "100%"
+            "validation_coverage": "100%",
+            "total_tokens": stats.get("total_tokens", 0),
+            "estimated_cost": stats.get("estimated_cost", 0.0),
         }
+        # Add parsed technology stack
+        tech_data = self._parse_nuclei_tech_for_report()
+        if tech_data["technologies"] or tech_data["waf_details"]:
+            result["tech_stack"] = {
+                "technologies": tech_data["technologies"],
+                "waf": tech_data["waf_details"],
+            }
+        return result
 
     def _engagement_build_summary(
         self,
@@ -1172,53 +1400,29 @@ class ReportingAgent(BaseAgent):
         lines.append(f"| **Tool Version** | BugTraceAI v{settings.VERSION} |")
         lines.append(f"| **Duration** | {stats.get('duration', 'N/A')} |")
         lines.append(f"| **URLs Scanned** | {stats.get('urls_scanned', 0)} |")
+        if stats.get('total_tokens', 0) > 0:
+            lines.append(f"| **LLM Tokens Used** | {stats.get('total_tokens', 0):,} ({stats.get('input_tokens', 0):,} in / {stats.get('output_tokens', 0):,} out) |")
+            lines.append(f"| **Estimated API Cost** | ${stats.get('estimated_cost', 0.0):.4f} |")
         lines.append("")
 
-        # Technology Stack Section (NEW)
+        # Technology Stack Section — parsed from raw Nuclei findings
         if self.tech_profile:
-            lines.append("## Technology Stack\n")
+            tech_data = self._parse_nuclei_tech_for_report()
+            techs = tech_data["technologies"]
+            waf_details = tech_data["waf_details"]
 
-            # Infrastructure
-            if self.tech_profile.get("infrastructure"):
-                lines.append("### Infrastructure")
-                for tech in self.tech_profile["infrastructure"]:
-                    lines.append(f"- {tech}")
+            if techs or waf_details:
+                lines.append("## Technology Stack\n")
+                lines.append("| Component | Version | Category | Notes |")
+                lines.append("|-----------|---------|----------|-------|")
+                for t in techs:
+                    version = t["version"] or "-"
+                    notes = "End-of-Life" if t["eol"] else ""
+                    lines.append(f"| **{t['name']}** | {version} | {t['category']} | {notes} |")
                 lines.append("")
 
-            # Frameworks & Libraries
-            if self.tech_profile.get("frameworks"):
-                lines.append("### Frameworks & Libraries")
-                for framework in self.tech_profile["frameworks"]:
-                    lines.append(f"- {framework}")
-                lines.append("")
-
-            # Web Servers
-            if self.tech_profile.get("servers"):
-                lines.append("### Web Servers")
-                for server in self.tech_profile["servers"]:
-                    lines.append(f"- {server}")
-                lines.append("")
-
-            # Security Controls
-            security_controls = []
-            if self.tech_profile.get("waf"):
-                security_controls.append(("WAF", self.tech_profile["waf"]))
-            if self.tech_profile.get("cdn"):
-                security_controls.append(("CDN", self.tech_profile["cdn"]))
-
-            if security_controls:
-                lines.append("### Security Controls")
-                for control_type, controls in security_controls:
-                    for control in controls:
-                        lines.append(f"- **{control_type}**: {control}")
-                lines.append("")
-
-            # CMS
-            if self.tech_profile.get("cms"):
-                lines.append("### Content Management System")
-                for cms in self.tech_profile["cms"]:
-                    lines.append(f"- {cms}")
-                lines.append("")
+                if waf_details:
+                    lines.append(f"**Security Controls:** WAF detected ({', '.join(waf_details)})\n")
 
             lines.append("---\n")
 
@@ -1296,12 +1500,14 @@ class ReportingAgent(BaseAgent):
         payload = finding.get("payload", "")
         description = finding.get("description", "")
 
-        # Get CWE reference
-        cwe_id = get_cwe_for_vuln(vuln_type) or "N/A"
+        # Get CWE reference: LLM-assigned first, then framework mapping fallback
+        cwe_id = finding.get("cwe") or get_cwe_for_vuln(vuln_type) or "N/A"
         cwe_num = cwe_id.replace("CWE-", "") if cwe_id != "N/A" else "0"
 
-        # Format CVE reference
+        # Format CVE reference: finding first, then framework reference lookup
         cve_raw = finding.get("cve")
+        if not cve_raw:
+            cve_raw = get_reference_cve(vuln_type, finding)
         if cve_raw:
             try:
                 cve_reference = f"[{format_cve(cve_raw)}](https://nvd.nist.gov/vuln/detail/{format_cve(cve_raw)})"
@@ -1353,6 +1559,16 @@ class ReportingAgent(BaseAgent):
         # Validation method label
         validation_method = self._extract_validation_method(finding)
 
+        # Alternative payloads section
+        alt_payloads = finding.get("successful_payloads") or []
+        if len(alt_payloads) > 1:
+            lines = ["\n**Alternative Payloads:**\n"]
+            for i, p in enumerate(alt_payloads, 1):
+                lines.append(f"{i}. `{p}`")
+            alternative_payloads_section = "\n".join(lines) + "\n"
+        else:
+            alternative_payloads_section = ""
+
         # Fill template
         filled = template.format(
             index=index,
@@ -1373,7 +1589,8 @@ class ReportingAgent(BaseAgent):
             http_request=http_request,
             http_response_excerpt=http_response_excerpt,
             screenshot_section=screenshot_section,
-            reproduction_steps=reproduction_steps
+            reproduction_steps=reproduction_steps,
+            alternative_payloads_section=alternative_payloads_section
         )
 
         return filled
@@ -2029,31 +2246,24 @@ class ReportingAgent(BaseAgent):
         """
         Enrich a batch of findings with CVSS scores and professional PoC using LLM.
 
-        Uses a local semaphore to limit concurrent LLM calls and avoid API saturation.
+        v3.5: CVSS uses batch mode (1 LLM call per chunk of 10 findings).
+        PoC still uses individual calls (needs detailed per-finding output).
         """
         if not findings:
             return
 
-        # Limit concurrent LLM calls to avoid saturating the API
-        # Each finding needs 2 LLM calls (CVSS + PoC), so 5 concurrent = 5 findings at a time
-        MAX_CONCURRENT_ENRICHMENT = 5
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_ENRICHMENT)
+        # Phase 1: Batch CVSS Scoring (1 LLM call per chunk of 10)
+        logger.info(f"[{self.name}] Batch CVSS scoring for {len(findings)} findings...")
+        await self._calculate_cvss_batch(findings)
 
-        async def limited_cvss(f):
-            async with semaphore:
-                await self._calculate_cvss(f)
+        # Phase 2: Professional PoC Enrichment (individual, limited concurrency)
+        MAX_CONCURRENT_POC = 5
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_POC)
 
         async def limited_poc(f):
             async with semaphore:
                 await self._enrich_poc_with_llm(f)
 
-        logger.info(f"[{self.name}] Enriching {len(findings)} findings with CVSS/Severity analysis (max {MAX_CONCURRENT_ENRICHMENT} concurrent)...")
-
-        # Phase 1: CVSS Scoring (limited concurrency)
-        cvss_tasks = [limited_cvss(f) for f in findings]
-        await asyncio.gather(*cvss_tasks)
-
-        # Phase 2: Professional PoC Enrichment (limited concurrency)
         logger.info(f"[{self.name}] Generating professional PoC for {len(findings)} findings...")
         poc_tasks = [limited_poc(f) for f in findings]
         await asyncio.gather(*poc_tasks)
@@ -2148,7 +2358,7 @@ Be PRECISE. Imagine the reader has no context about the scan tool."""
         return await llm_client.generate(
             prompt,
             module_name="Reporting-Exploitation",
-            model_override="deepseek/deepseek-chat",
+            model_override=settings.REPORTING_MODEL,
             temperature=0.4  # Slightly higher for more descriptive steps
         )
 
@@ -2207,6 +2417,67 @@ Be PRECISE. Imagine the reader has no context about the scan tool."""
         }
         return contexts.get(vuln_type.upper(), "**Context:** This is a confirmed security vulnerability. Explain the real-world impact.")
 
+    async def _calculate_cvss_batch(self, findings: List[Dict]):
+        """
+        Batch CVSS scoring: 1 LLM call per chunk of 10 findings.
+        Falls back to individual calls on parse failure.
+        """
+        CHUNK_SIZE = 10
+        for chunk_start in range(0, len(findings), CHUNK_SIZE):
+            chunk = findings[chunk_start:chunk_start + CHUNK_SIZE]
+            try:
+                # Build batch prompt
+                findings_text = []
+                for i, f in enumerate(chunk):
+                    findings_text.append(
+                        f"[Finding {i}] Type: {f.get('type')}, URL: {f.get('url')}, "
+                        f"Parameter: {f.get('parameter')}, Payload: {str(f.get('payload', ''))[:100]}, "
+                        f"Description: {str(f.get('description', ''))[:150]}"
+                    )
+                findings_block = "\n".join(findings_text)
+
+                prompt = f"""You are a Senior Penetration Testing Expert. Score ALL findings below in ONE response.
+
+**Findings:**
+{findings_block}
+
+**Severity Calibration:**
+- CRITICAL (9.0-10.0): RCE, SQLi with full DB access, Auth Bypass
+- HIGH (7.0-8.9): Stored XSS, SSRF internal, XXE file read, CSTI/SSTI
+- MEDIUM (4.0-6.9): Reflected XSS, CSRF, Info Disclosure, Open Redirect
+- LOW (0.1-3.9): Misconfigurations, Minor info leaks
+
+For EACH finding, provide: CVSS vector, score, severity, rationale (2-3 sentences), CWE, CVE (or null).
+
+Output STRICT JSON array (no markdown):
+[
+  {{"finding_id": 0, "vector": "CVSS:3.1/...", "score": 9.8, "severity": "CRITICAL", "rationale": "...", "cwe": "CWE-89", "cve": null}},
+  {{"finding_id": 1, "vector": "CVSS:3.1/...", "score": 6.5, "severity": "MEDIUM", "rationale": "...", "cwe": "CWE-79", "cve": null}}
+]"""
+
+                response = await self._cvss_execute_llm(prompt)
+                if response:
+                    # Parse JSON array from response
+                    json_match = re.search(r'\[.*\]', response, re.DOTALL)
+                    if json_match:
+                        results = json.loads(json_match.group(0))
+                        for item in results:
+                            idx = item.get("finding_id", -1)
+                            if 0 <= idx < len(chunk):
+                                self._cvss_update_finding(chunk[idx], item)
+                        logger.info(f"[{self.name}] Batch CVSS: scored {len(results)}/{len(chunk)} findings in 1 call")
+                        continue  # Success, skip fallback
+
+                # Fallback: individual calls for this chunk
+                logger.warning(f"[{self.name}] Batch CVSS parse failed, falling back to individual calls")
+                for f in chunk:
+                    await self._calculate_cvss(f)
+
+            except Exception as e:
+                logger.warning(f"[{self.name}] Batch CVSS failed: {e}, falling back to individual")
+                for f in chunk:
+                    await self._calculate_cvss(f)
+
     async def _calculate_cvss(self, f: Dict):
         """
         Query LLM to calculate CVSS v3.1 score and severity.
@@ -2245,7 +2516,8 @@ Be PRECISE. Imagine the reader has no context about the scan tool."""
                - The complete exploitation path (step-by-step)
                - Real-world impact scenarios
                - Why each CVSS metric was chosen
-            5. If this matches a known CVE, provide it
+            5. Assign the correct CWE ID for this vulnerability class (e.g., CWE-89 for SQL Injection, CWE-79 for XSS, CWE-1336 for Template Injection, CWE-918 for SSRF, CWE-22 for Path Traversal, CWE-611 for XXE, CWE-601 for Open Redirect, CWE-639 for IDOR, CWE-94 for Code Injection, CWE-113 for Header Injection, CWE-434 for File Upload, CWE-347 for JWT, CWE-1321 for Prototype Pollution)
+            6. If this vulnerability relates to a known CVE (especially for specific technologies/libraries like Apache Velocity, Jinja2, AngularJS, Log4j, etc.), provide the most relevant CVE reference. For generic application-level vulnerabilities (like SQLi in a custom parameter), return null.
 
             **CRITICAL: SEVERITY CALIBRATION GUIDELINES**
             Be REALISTIC with scoring - not everything is CRITICAL. Use these guidelines:
@@ -2275,18 +2547,18 @@ Be PRECISE. Imagine the reader has no context about the scan tool."""
                 "score": 9.8,
                 "severity": "CRITICAL",
                 "rationale": "Detailed 3-4 sentence technical explanation of exploitation path and impact...",
+                "cwe": "CWE-89",
                 "cve": "CVE-XXXX-XXXX" or null
             }}
             """
 
     async def _cvss_execute_llm(self, prompt: str) -> Optional[str]:
         """Execute LLM call for CVSS calculation."""
-        # Use DeepSeek for detailed, uncensored security analysis
-        # Gemini is too conservative and avoids explaining exploitation paths
+        # Use uncensored model for detailed security analysis
         return await llm_client.generate(
             prompt,
             module_name="Reporting-CVSS",
-            model_override="deepseek/deepseek-chat",  # DeepSeek Chat (uncensored)
+            model_override=settings.REPORTING_MODEL,
             temperature=0.3  # Higher temp for more creative/detailed explanations
         )
 
@@ -2304,16 +2576,28 @@ Be PRECISE. Imagine the reader has no context about the scan tool."""
         f['severity'] = data.get('severity', f.get('severity')).upper()
         f['cvss_score'] = data.get('score')
         f['cvss_vector'] = data.get('vector')
-        f['cve'] = data.get('cve')
         f['cvss_rationale'] = data.get('rationale')
+
+        vuln_type = f.get('type', '')
+
+        # CWE: LLM response first, then framework mapping as fallback
+        cwe = data.get('cwe')
+        if cwe:
+            f['cwe'] = cwe
+        # (fallback to get_cwe_for_vuln happens in markdown generation)
+
+        # CVE: LLM response first, then framework reference lookup as fallback
+        cve = data.get('cve')
+        if not cve:
+            cve = get_reference_cve(vuln_type, f)
+        f['cve'] = cve
 
         # Append rationale to description or notes
         rationale = data.get('rationale', '')
-        cve = data.get('cve')
 
         enrichment_text = f"\n\n**CVSS Analysis**:\n- **Severity**: {f['severity']} ({f['cvss_score']})\n- **Vector**: `{f['cvss_vector']}`\n- **Rationale**: {rationale}"
         if cve:
-            enrichment_text += f"\n- **Potential CVE**: [{cve}](https://nvd.nist.gov/vuln/detail/{cve})"
+            enrichment_text += f"\n- **Reference CVE**: [{cve}](https://nvd.nist.gov/vuln/detail/{cve})"
 
         # Append to validator_notes instead of overwriting description to keep original clean
         if f.get('validator_notes'):

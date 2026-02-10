@@ -104,6 +104,13 @@ class EventType(str, Enum):
     PIPELINE_RESUMED = "pipeline_resumed"
     PIPELINE_SHUTDOWN = "pipeline_shutdown"
 
+    # Dashboard Events (bridged to WebSocket for WEB frontend)
+    PIPELINE_PROGRESS = "pipeline_progress"
+    AGENT_UPDATE = "agent_update"
+    METRICS_UPDATE = "metrics_update"
+    SCAN_COMPLETE_SUMMARY = "scan_complete_summary"
+    SCAN_LOG = "scan_log"
+
     # Legacy
     NEW_INPUT_DISCOVERED = "new_input_discovered"
     WAF_DETECTED = "waf_detected"

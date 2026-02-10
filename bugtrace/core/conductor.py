@@ -9,8 +9,10 @@ Conductor now only handles:
 - Agent prompt generation
 - UI callback routing (TUI integration)
 """
+import asyncio
 import os
 import time
+import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from datetime import datetime
 from bugtrace.utils.logger import get_logger
@@ -73,7 +75,9 @@ class ConductorV2:
 
         # =========================================================
         # SHARED CONTEXT: Cross-agent communication (Phase 3 v1.5)
+        # Lock protects concurrent access from parallel agents
         # =========================================================
+        self._context_lock = threading.Lock()
         self.shared_context: Dict[str, Any] = {
             "discovered_urls": [],
             "confirmed_vulns": [],
@@ -91,6 +95,9 @@ class ConductorV2:
             "integrity_passes": 0,
             "integrity_failures": 0
         }
+
+        # Scan context for EventBus routing (set by TeamOrchestrator)
+        self._scan_context: Optional[str] = None
 
         logger.info("Conductor V2 initialized (Checkpoint Manager Mode)")
     
@@ -244,33 +251,35 @@ class ConductorV2:
     
     def share_context(self, key: str, value: Any) -> None:
         """
-        Share context data between agents.
-        
+        Share context data between agents (thread-safe).
+
         Args:
             key: Context key (e.g., 'discovered_urls', 'confirmed_vulns')
             value: Value to share (will be appended if key is a list)
         """
-        if key in self.shared_context and isinstance(self.shared_context[key], list):
-            if isinstance(value, list):
-                self.shared_context[key].extend(value)
+        with self._context_lock:
+            if key in self.shared_context and isinstance(self.shared_context[key], list):
+                if isinstance(value, list):
+                    self.shared_context[key].extend(value)
+                else:
+                    self.shared_context[key].append(value)
             else:
-                self.shared_context[key].append(value)
-        else:
-            self.shared_context[key] = value
-    
+                self.shared_context[key] = value
+
     def get_shared_context(self, key: str = None) -> Any:
         """
-        Get shared context data.
-        
+        Get shared context data (thread-safe).
+
         Args:
             key: Specific key to retrieve, or None for all context
-            
+
         Returns:
             Context value or full context dict
         """
-        if key is None:
-            return self.shared_context.copy()
-        return self.shared_context.get(key)
+        with self._context_lock:
+            if key is None:
+                return self.shared_context.copy()
+            return self.shared_context.get(key)
 
     def get_context_summary(self) -> str:
         """Get a text summary of current context for agent prompts."""
@@ -324,7 +333,16 @@ class ConductorV2:
         elif phase == "strategy":
             # Rule: If raw findings exist, WET queue should have items (unless all filtered)
             raw_findings = expected.get('raw_findings_count', 0)
+            dast_findings = expected.get('dast_findings', 0)  # Optional breakdown
+            auth_findings = expected.get('auth_findings', 0)  # Optional breakdown
             wet_items = actual.get('wet_queue_count', 0)
+
+            # Log breakdown if available
+            if dast_findings > 0 or auth_findings > 0:
+                logger.info(
+                    f"[Conductor] Finding sources: DAST={dast_findings}, Auth={auth_findings}, "
+                    f"Total={raw_findings}, WET={wet_items}"
+                )
 
             # 100% filtration is suspicious but not always wrong
             if raw_findings > 0 and wet_items == 0:
@@ -340,24 +358,42 @@ class ConductorV2:
                 logger.error(
                     f"[Conductor] INTEGRITY FAIL (Strategy): "
                     f"WET items ({wet_items}) > raw findings ({raw_findings}). "
+                    f"Breakdown: DAST={dast_findings}, Auth={auth_findings}. "
                     f"ThinkingAgent may be duplicating data!"
                 )
                 self.stats["integrity_failures"] = self.stats.get("integrity_failures", 0) + 1
                 return False
 
         elif phase == "exploitation":
-            # Rule: DRY items must be <= WET items (can't create findings from nothing)
+            # Rule: With autonomous discovery, DRY can exceed WET (specialists discover new params).
+            # Fail only on total failure (WET > 0 but DRY == 0) or extreme expansion (>10x).
             wet_in = expected.get('wet_processed', 0)
             dry_out = actual.get('dry_generated', 0)
 
-            if dry_out > wet_in:
+            if wet_in > 0 and dry_out == 0:
                 logger.error(
                     f"[Conductor] INTEGRITY FAIL (Exploitation): "
-                    f"Hallucination detected! DRY items ({dry_out}) > WET inputs ({wet_in}). "
-                    f"Specialists are inventing data!"
+                    f"Complete failure! WET items ({wet_in}) but no DRY findings. "
+                    f"Specialists may have crashed!"
                 )
                 self.stats["integrity_failures"] = self.stats.get("integrity_failures", 0) + 1
                 return False
+
+            max_expansion = 10
+            if wet_in > 0 and dry_out > wet_in * max_expansion:
+                logger.error(
+                    f"[Conductor] INTEGRITY FAIL (Exploitation): "
+                    f"Excessive expansion! DRY ({dry_out}) > WET ({wet_in}) x {max_expansion}. "
+                    f"Specialists may be hallucinating!"
+                )
+                self.stats["integrity_failures"] = self.stats.get("integrity_failures", 0) + 1
+                return False
+
+            if dry_out > wet_in:
+                logger.info(
+                    f"[Conductor] Autonomous discovery expanded: "
+                    f"WET={wet_in} -> DRY={dry_out} (+{dry_out - wet_in} discovered params)"
+                )
 
         else:
             logger.warning(f"[Conductor] Unknown phase for integrity check: {phase}")
@@ -366,6 +402,33 @@ class ConductorV2:
         logger.info(f"[Conductor] Integrity Check PASSED for {phase}")
         self.stats["integrity_passes"] = self.stats.get("integrity_passes", 0) + 1
         return True
+
+    # =========================================================
+    # EVENT BUS BRIDGE: Emit dashboard events for WebSocket
+    # =========================================================
+
+    def set_scan_context(self, scan_id: int) -> None:
+        """Set scan context for EventBus routing.
+
+        Args:
+            scan_id: Active scan ID (used in all emitted events).
+        """
+        self._scan_context = str(scan_id)
+
+    def _emit_to_event_bus(self, event: str, data: dict) -> None:
+        """Fire-and-forget emit to core EventBus for WebSocket bridge.
+
+        Safe to call from sync context. If no event loop is running,
+        the emission is silently skipped.
+        """
+        if self._scan_context:
+            data["scan_context"] = self._scan_context
+        try:
+            from bugtrace.core.event_bus import event_bus
+            loop = asyncio.get_running_loop()
+            loop.create_task(event_bus.emit(event, data))
+        except RuntimeError:
+            pass  # No event loop running, skip
 
     # =========================================================
     # UI CALLBACK METHODS: For TUI integration (Phase 2)
@@ -387,6 +450,7 @@ class ConductorV2:
         """Notify UI of a pipeline phase change.
 
         Routes to ui_callback if set, otherwise falls back to legacy dashboard.
+        Also emits to EventBus for WebSocket bridge to WEB frontend.
 
         Args:
             phase: Current phase name.
@@ -403,6 +467,13 @@ class ConductorV2:
             except ImportError:
                 pass
 
+        # Bridge to WebSocket for WEB frontend
+        self._emit_to_event_bus("pipeline_progress", {
+            "phase": phase,
+            "progress": progress,
+            "status_msg": status,
+        })
+
     def notify_agent_update(
         self,
         agent: str,
@@ -415,6 +486,7 @@ class ConductorV2:
         """Notify UI of an agent status update.
 
         Routes to ui_callback if set, otherwise falls back to legacy dashboard.
+        Also emits to EventBus for WebSocket bridge to WEB frontend.
 
         Args:
             agent: Name of the agent.
@@ -434,6 +506,15 @@ class ConductorV2:
                 dashboard.update_task(agent, status=status)
             except ImportError:
                 pass
+
+        # Bridge to WebSocket for WEB frontend
+        self._emit_to_event_bus("agent_update", {
+            "agent": agent,
+            "status": status,
+            "queue": queue,
+            "processed": processed,
+            "vulns": vulns,
+        })
 
     def notify_finding(
         self,
@@ -469,6 +550,8 @@ class ConductorV2:
     def notify_log(self, level: str, message: str) -> None:
         """Notify UI of a log message.
 
+        Also emits to EventBus for WebSocket bridge to WEB frontend.
+
         Args:
             level: Log level.
             message: Log message.
@@ -478,6 +561,12 @@ class ConductorV2:
         # Always log to standard logger as well
         log_func = getattr(logger, level.lower(), logger.info)
         log_func(message)
+
+        # Bridge to WebSocket for WEB frontend
+        self._emit_to_event_bus("scan_log", {
+            "level": level,
+            "message": message,
+        })
 
     def notify_metrics(
         self,
@@ -489,6 +578,8 @@ class ConductorV2:
         **kwargs,
     ) -> None:
         """Notify UI of system metrics update.
+
+        Also emits to EventBus for WebSocket bridge to WEB frontend.
 
         Args:
             cpu: CPU usage percentage.
@@ -507,8 +598,19 @@ class ConductorV2:
                 **kwargs,
             )
 
+        # Bridge to WebSocket for WEB frontend
+        self._emit_to_event_bus("metrics_update", {
+            "cpu": cpu,
+            "ram": ram,
+            "req_rate": req_rate,
+            "urls_discovered": urls_discovered,
+            "urls_analyzed": urls_analyzed,
+        })
+
     def notify_complete(self, total_findings: int, duration: float) -> None:
         """Notify UI that the scan is complete.
+
+        Also emits to EventBus for WebSocket bridge to WEB frontend.
 
         Args:
             total_findings: Total vulnerabilities found.
@@ -520,6 +622,12 @@ class ConductorV2:
             logger.info(
                 f"Scan complete: {total_findings} findings in {duration:.1f}s"
             )
+
+        # Bridge to WebSocket for WEB frontend
+        self._emit_to_event_bus("scan_complete_summary", {
+            "total_findings": total_findings,
+            "duration": duration,
+        })
 
 
 # Singleton instance (without callback for backward compatibility)

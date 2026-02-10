@@ -114,6 +114,16 @@ class BugTraceApp(App):
         # Install TUI logging handler
         self._install_logging_handler()
 
+        # DISABLE LEGACY DASHBOARD (Critical for TUI stability)
+        # Prevents tools/external.py from trying to draw to the terminal via Rich
+        try:
+            from bugtrace.core.ui import dashboard as legacy_dashboard
+            legacy_dashboard.active = False
+            # Mock update_task to prevent any drawing attempts
+            legacy_dashboard.update_task = lambda *args, **kwargs: None
+        except ImportError:
+            pass
+
         # Auto-start scan if target provided (not in demo mode)
         if self.target and not self.demo_mode:
             # Defer scan start until after screens are mounted

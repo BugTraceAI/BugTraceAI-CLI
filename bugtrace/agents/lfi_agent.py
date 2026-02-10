@@ -1,6 +1,6 @@
 import logging
 import aiohttp
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from bugtrace.agents.base import BaseAgent
@@ -55,7 +55,58 @@ class LFIAgent(BaseAgent, TechContextMixin):
         # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._lfi_prime_directive: str = ""
-        
+
+    # =========================================================================
+    # FINDING VALIDATION: LFI-specific validation (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> Tuple[bool, str]:
+        """
+        LFI-specific validation before emitting finding.
+
+        Validates:
+        1. Basic requirements (type, url) via parent
+        2. Has file content evidence OR path traversal confirmation
+        3. Payload contains path traversal patterns
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # Extract from nested structure if needed
+        nested = finding.get("finding", {})
+        evidence = finding.get("evidence", {})
+        status = finding.get("status", nested.get("status", ""))
+
+        # LFI-specific: Must have confirmation or status indicating validation
+        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+            has_content = evidence.get("file_content") or evidence.get("signature_found")
+            has_interactsh = evidence.get("interactsh_callback")
+            if not (has_content or has_interactsh):
+                return False, "LFI requires proof: file content signature or Interactsh callback"
+
+        # LFI-specific: Payload should contain path traversal patterns
+        payload = finding.get("payload", nested.get("payload", ""))
+        lfi_markers = ['../', '..\\', 'etc/passwd', 'win.ini', 'php://', 'file://', '%2e%2e']
+        if payload and not any(m in str(payload).lower() for m in lfi_markers):
+            return False, f"LFI payload missing path traversal patterns: {payload[:50]}"
+
+        return True, ""
+
+    def _emit_lfi_finding(self, finding_dict: Dict, scan_context: str = None) -> Optional[Dict]:
+        """
+        Helper to emit LFI finding using BaseAgent.emit_finding() with validation.
+        """
+        if "type" not in finding_dict:
+            finding_dict["type"] = "LFI"
+
+        if scan_context:
+            finding_dict["scan_context"] = scan_context
+
+        finding_dict["agent"] = self.name
+        return self.emit_finding(finding_dict)
+
     def _determine_validation_status(self, response_text: str, payload: str) -> str:
         """
         Determine validation status based on what we actually found.
@@ -290,15 +341,84 @@ class LFIAgent(BaseAgent, TechContextMixin):
         if not wet_findings:
             return []
 
+        # ARCHITECTURE: ALWAYS keep original WET params + ADD discovered params
+        logger.info(f"[{self.name}] Phase A: Expanding WET findings with LFI-focused discovery...")
+        expanded_wet_findings = []
+        seen_urls = set()
+        seen_params = set()
+
+        # 1. Always include ALL original WET params first (DASTySAST signals)
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            param = wet_item.get("parameter", "") or (wet_item.get("finding", {}) or {}).get("parameter", "")
+            if param and (url, param) not in seen_params:
+                seen_params.add((url, param))
+                expanded_wet_findings.append(wet_item)
+
+        # 2. Discover additional params per unique URL
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                all_params = await self._discover_lfi_params(url)
+                if not all_params:
+                    continue
+
+                new_count = 0
+                for param_name, param_value in all_params.items():
+                    if (url, param_name) not in seen_params:
+                        seen_params.add((url, param_name))
+                        expanded_wet_findings.append({
+                            "url": url,
+                            "parameter": param_name,
+                            "finding": wet_item.get("finding", {}),
+                            "scan_context": wet_item.get("scan_context", self._scan_context),
+                            "_discovered": True
+                        })
+                        new_count += 1
+
+                if new_count:
+                    logger.info(f"[{self.name}] 🔍 Discovered {new_count} additional params on {url}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
+
+        # 2.5 Resolve endpoint URLs from HTML links/forms + reasoning fallback
+        from bugtrace.agents.specialist_utils import resolve_param_endpoints, resolve_param_from_reasoning
+        if hasattr(self, '_last_discovery_html') and self._last_discovery_html:
+            for base_url in seen_urls:
+                endpoint_map = resolve_param_endpoints(self._last_discovery_html, base_url)
+                # Fallback: extract endpoints from DASTySAST reasoning text
+                reasoning_map = resolve_param_from_reasoning(expanded_wet_findings, base_url)
+                for k, v in reasoning_map.items():
+                    if k not in endpoint_map:
+                        endpoint_map[k] = v
+                if endpoint_map:
+                    resolved_count = 0
+                    for item in expanded_wet_findings:
+                        if item.get("url") == base_url:
+                            param = item.get("parameter", "")
+                            if param in endpoint_map and endpoint_map[param] != base_url:
+                                item["url"] = endpoint_map[param]
+                                resolved_count += 1
+                    if resolved_count:
+                        logger.info(f"[{self.name}] 🔗 Resolved {resolved_count} params to actual endpoint URLs")
+
+        logger.info(f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → {len(expanded_wet_findings)} testable params")
+
+        # Now deduplicate the expanded list
         try:
-            dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+            dry_list = await self._llm_analyze_and_dedup(expanded_wet_findings, self._scan_context)
         except Exception as e:
             logger.error(f"[{self.name}] LLM dedup failed: {e}. Falling back to fingerprint dedup")
-            dry_list = self._fallback_fingerprint_dedup(wet_findings)
+            dry_list = self._fallback_fingerprint_dedup(expanded_wet_findings)
 
         self._dry_findings = dry_list
-        dup_count = len(wet_findings) - len(dry_list)
-        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({dup_count} duplicates removed)")
+        dup_count = len(expanded_wet_findings) - len(dry_list)
+        logger.info(f"[{self.name}] Phase A: {len(expanded_wet_findings)} WET → {len(dry_list)} DRY ({dup_count} duplicates removed)")
 
         return dry_list
 
@@ -405,21 +525,18 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
                     if fingerprint not in self._emitted_findings:
                         self._emitted_findings.add(fingerprint)
 
-                        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+                        if settings.WORKER_POOL_EMIT_EVENTS:
                             status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
-
-                            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                            self._emit_lfi_finding({
                                 "specialist": "lfi",
-                                "finding": {
-                                    "type": "LFI",
-                                    "url": result.get("url"),
-                                    "parameter": result.get("parameter"),
-                                    "payload": result.get("payload"),
-                                },
+                                "type": "LFI",
+                                "url": result.get("url"),
+                                "parameter": result.get("parameter"),
+                                "payload": result.get("payload"),
                                 "status": status,
+                                "evidence": result.get("evidence", {}),
                                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
-                                "scan_context": self._scan_context,
-                            })
+                            }, scan_context=self._scan_context)
 
                         logger.info(f"[{self.name}] ✅ Emitted unique finding: {url}?{parameter}")
                     else:
@@ -480,6 +597,7 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
             report_specialist_start,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
         from bugtrace.core.queue import queue_manager
 
@@ -502,6 +620,7 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "lfi")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -628,6 +747,92 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
 
         return fingerprint
 
+    async def _discover_lfi_params(self, url: str) -> Dict[str, str]:
+        """
+        LFI-focused parameter discovery for a given URL.
+
+        Extracts ALL testable parameters from:
+        1. URL query string
+        2. HTML forms (input, textarea, select)
+        3. Hidden inputs (often contain file paths)
+        4. Priority: params with file/path-like names or values
+
+        Returns:
+            Dict mapping param names to default values
+            Example: {"file": "header.php", "template": "", "page": "home"}
+
+        Architecture Note:
+            Specialists must be AUTONOMOUS - they discover their own attack surface.
+            The finding from DASTySAST is just a "signal" that the URL is interesting.
+            We IGNORE the specific parameter and test ALL discoverable params.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, parse_qs
+        from bs4 import BeautifulSoup
+        import re
+
+        all_params = {}
+
+        # 1. Extract URL query parameters
+        try:
+            parsed = urlparse(url)
+            url_params = parse_qs(parsed.query)
+            for param_name, values in url_params.items():
+                all_params[param_name] = values[0] if values else ""
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        # 2. Fetch HTML and extract form parameters
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+
+            if html:
+                self._last_discovery_html = html  # Cache for URL resolution
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract from <input>, <textarea>, <select> with name attribute
+                for tag in soup.find_all(["input", "textarea", "select"]):
+                    param_name = tag.get("name")
+                    if param_name and param_name not in all_params:
+                        # For LFI, we DO include hidden inputs (they often contain file paths)
+                        input_type = tag.get("type", "text").lower()
+                        if input_type not in ["submit", "button", "reset"]:
+                            # Skip CSRF tokens
+                            if "csrf" not in param_name.lower() and "token" not in param_name.lower():
+                                default_value = tag.get("value", "")
+                                all_params[param_name] = default_value
+
+                # 3. LFI-specific: Look for params with file-like values
+                # Search for input values that look like file paths
+                for tag in soup.find_all(["input", "textarea"]):
+                    param_name = tag.get("name")
+                    value = tag.get("value", "")
+                    # If value looks like a file path, prioritize this param
+                    if param_name and value and any(ext in value for ext in ['.php', '.html', '.txt', '.xml', '.jsp', '.asp']):
+                        all_params[param_name] = value
+                        logger.debug(f"[{self.name}] 🎯 Priority param found: {param_name}={value} (file extension detected)")
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to extract HTML params: {e}")
+
+        # 4. LFI-specific prioritization: Sort params to test high-priority ones first
+        lfi_priority_names = ['file', 'path', 'template', 'document', 'page', 'include', 'dir', 'folder', 'load', 'read']
+        prioritized_params = {}
+
+        # Add high-priority params first
+        for priority_name in lfi_priority_names:
+            for param_name in list(all_params.keys()):
+                if priority_name in param_name.lower():
+                    prioritized_params[param_name] = all_params.pop(param_name)
+
+        # Add remaining params
+        prioritized_params.update(all_params)
+
+        logger.info(f"[{self.name}] 🔍 Discovered {len(prioritized_params)} params on {url}: {list(prioritized_params.keys())}")
+
+        return prioritized_params
+
     async def _handle_queue_result(self, item: dict, result: Optional[Dict]) -> None:
         """
         Handle completed queue item processing.
@@ -664,20 +869,18 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        # Emit vulnerability_detected event
-        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+        # Emit vulnerability_detected event with validation
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            self._emit_lfi_finding({
                 "specialist": "lfi",
-                "finding": {
-                    "type": "LFI",
-                    "url": result.get("url"),
-                    "parameter": result.get("parameter"),
-                    "payload": result.get("payload"),
-                },
+                "type": "LFI",
+                "url": result.get("url"),
+                "parameter": result.get("parameter"),
+                "payload": result.get("payload"),
                 "status": status,
+                "evidence": result.get("evidence", {}),
                 "validation_requires_cdp": needs_cdp,
-                "scan_context": self._scan_context,
-            })
+            }, scan_context=self._scan_context)
 
         logger.info(f"[{self.name}] Confirmed LFI: {result.get('url')}?{result.get('parameter')}")
 

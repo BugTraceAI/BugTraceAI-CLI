@@ -3,7 +3,7 @@ import aiohttp
 import re
 import json
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from bugtrace.agents.base import BaseAgent
@@ -70,6 +70,57 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
         # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._prototype_pollution_prime_directive: str = ""
+
+    # =========================================================================
+    # FINDING VALIDATION: Prototype Pollution-specific validation (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> Tuple[bool, str]:
+        """
+        Prototype Pollution-specific validation before emitting finding.
+
+        Validates:
+        1. Basic requirements (type, url) via parent
+        2. Has pollution evidence (property set, RCE achieved)
+        3. Payload contains prototype pollution patterns
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # Extract from nested structure if needed
+        nested = finding.get("finding", {})
+        evidence = finding.get("evidence", nested.get("evidence", {}))
+        status = finding.get("status", nested.get("status", ""))
+
+        # PP-specific: Must have evidence or confirmed status
+        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+            has_pollution = evidence.get("pollution_confirmed") if isinstance(evidence, dict) else False
+            has_rce = evidence.get("rce_achieved") if isinstance(evidence, dict) else False
+            if not (has_pollution or has_rce):
+                return False, "Prototype Pollution requires proof: pollution confirmed or RCE achieved"
+
+        # PP-specific: Payload should contain prototype pollution patterns
+        payload = finding.get("payload", nested.get("payload", ""))
+        pp_markers = ['__proto__', 'constructor', 'prototype', '.polluted', 'toString']
+        if payload and not any(m in str(payload) for m in pp_markers):
+            return False, f"Prototype Pollution payload missing pollution patterns: {payload[:50]}"
+
+        return True, ""
+
+    def _emit_prototype_pollution_finding(self, finding_dict: Dict, scan_context: str = None) -> Optional[Dict]:
+        """
+        Helper to emit Prototype Pollution finding using BaseAgent.emit_finding() with validation.
+        """
+        if "type" not in finding_dict:
+            finding_dict["type"] = "PROTOTYPE_POLLUTION"
+
+        if scan_context:
+            finding_dict["scan_context"] = scan_context
+
+        finding_dict["agent"] = self.name
+        return self.emit_finding(finding_dict)
 
     async def run_loop(self) -> Dict:
         """Main execution loop for Prototype Pollution testing."""
@@ -653,12 +704,123 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
         return f"curl '{self.url}'"
 
     # ========================================
+    # AUTONOMOUS PARAMETER DISCOVERY (v3.3 - Specialist Autonomy Pattern)
+    # ========================================
+
+    async def _discover_prototype_pollution_params(self, url: str) -> Dict[str, str]:
+        """
+        Prototype Pollution-focused parameter discovery for a given URL.
+
+        Extracts ALL testable parameters from:
+        1. URL query string
+        2. HTML forms (input, textarea, select) - focus on object-like params
+        3. Detects if endpoint accepts JSON POST bodies (most common PP vector)
+
+        Prioritizes parameters with names suggesting object merging:
+        - obj, data, options, config, params, settings, preferences
+        - merge, extend, clone, copy, assign, update
+        - __proto__, constructor, prototype (explicit pollution attempts)
+
+        Returns:
+            Dict mapping param names to default values
+            Example: {"options": "{}", "config": "", "data": "{}"}
+            Special key: "_accepts_json": True if endpoint accepts JSON POST
+
+        Architecture Note:
+            Specialists must be AUTONOMOUS - they discover their own attack surface.
+            The finding from DASTySAST is just a "signal" that the URL is interesting.
+            We IGNORE the specific parameter and test ALL discoverable params.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, parse_qs
+        from bs4 import BeautifulSoup
+
+        all_params = {}
+
+        # 1. Extract URL query parameters
+        try:
+            parsed = urlparse(url)
+            url_params = parse_qs(parsed.query)
+            for param_name, values in url_params.items():
+                all_params[param_name] = values[0] if values else ""
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        # 2. Fetch HTML and extract form parameters (focus on object-like params)
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+
+            if html:
+                self._last_discovery_html = html  # Cache for URL resolution
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract from <input>, <textarea>, <select> with name attribute
+                for tag in soup.find_all(["input", "textarea", "select"]):
+                    param_name = tag.get("name")
+                    if param_name and param_name not in all_params:
+                        # Exclude CSRF tokens and submit buttons
+                        input_type = tag.get("type", "text").lower()
+                        if input_type not in ["submit", "button", "reset"]:
+                            if "csrf" not in param_name.lower() and "token" not in param_name.lower():
+                                default_value = tag.get("value", "")
+                                all_params[param_name] = default_value
+
+                                # Flag high-priority PP params
+                                param_lower = param_name.lower()
+                                pp_keywords = [
+                                    "obj", "data", "options", "config", "params", "settings",
+                                    "preferences", "merge", "extend", "clone", "copy", "assign",
+                                    "update", "proto", "constructor", "prototype"
+                                ]
+                                if any(keyword in param_lower for keyword in pp_keywords):
+                                    logger.info(f"[{self.name}] 🎯 High-priority PP param found: {param_name}")
+
+        except Exception as e:
+            logger.error(f"[{self.name}] HTML parsing failed: {e}")
+
+        # 3. Check if endpoint accepts JSON POST bodies (MOST COMMON PP VECTOR)
+        json_accepted = await self._probe_json_acceptance(url)
+        if json_accepted:
+            all_params["_accepts_json"] = "true"
+            logger.info(f"[{self.name}] 🎯 Endpoint accepts JSON POST - PP prime target")
+
+        logger.info(f"[{self.name}] 🔍 Discovered {len(all_params)} params on {url}: {list(all_params.keys())}")
+        return all_params
+
+    async def _probe_json_acceptance(self, url: str) -> bool:
+        """
+        Quick probe to check if endpoint accepts JSON POST requests.
+        Returns True if JSON is accepted, False otherwise.
+        """
+        try:
+            async with orchestrator.session(DestinationType.TARGET) as session:
+                # Test with empty JSON object to check acceptance
+                async with session.post(
+                    url,
+                    json={"test": "probe"},
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=3)
+                ) as response:
+                    # 415 = Unsupported Media Type (doesn't accept JSON)
+                    # 405 = Method Not Allowed (doesn't accept POST)
+                    return response.status not in (415, 405)
+
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return False
+
+    # ========================================
     # WET → DRY Two-Phase Processing (Phase A: Deduplication, Phase B: Exploitation)
     # ========================================
 
     async def analyze_and_dedup_queue(self) -> List[Dict]:
         """
         PHASE A: Drain WET findings from queue and deduplicate using LLM + fingerprint fallback.
+
+        NEW (v3.3 - Autonomous Discovery):
+        - Expands each WET finding by discovering ALL params on the URL
+        - Uses browser_manager to extract HTML form params
+        - Creates separate WET items for each discovered param
 
         Returns:
             List of DRY (deduplicated) findings
@@ -703,13 +865,86 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
             logger.info(f"[{self.name}] Phase A: No findings to process")
             return []
 
-        # LLM-powered deduplication
-        dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+        # ========== AUTONOMOUS PARAMETER DISCOVERY (v3.3) ==========
+        # Strategy: ALWAYS keep original WET params + ADD discovered params
+        logger.info(f"[{self.name}] Phase A: Expanding WET findings with PP-focused discovery...")
+        expanded_wet_findings = []
+        seen_urls = set()
+        seen_params = set()
+
+        # 1. Always include ALL original WET params first (DASTySAST signals)
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            if not url:
+                continue
+            param = wet_item.get("parameter", "") or (wet_item.get("finding", {}) or {}).get("parameter", "")
+            if param and (url, param) not in seen_params:
+                seen_params.add((url, param))
+                expanded_wet_findings.append(wet_item)
+
+        # 2. Discover additional params per unique URL
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                all_params = await self._discover_prototype_pollution_params(url)
+                if not all_params:
+                    continue
+
+                new_count = 0
+                for param_name, param_value in all_params.items():
+                    if (url, param_name) not in seen_params:
+                        seen_params.add((url, param_name))
+                        expanded_wet_findings.append({
+                            "url": url,
+                            "parameter": param_name,
+                            "method": "POST" if all_params.get("_accepts_json") else "GET",
+                            "context": wet_item.get("context", "unknown"),
+                            "finding": wet_item.get("finding", {}),
+                            "scan_context": wet_item.get("scan_context", self._scan_context),
+                            "_discovered": True
+                        })
+                        new_count += 1
+
+                if new_count:
+                    logger.info(f"[{self.name}] 🔍 Discovered {new_count} additional params on {url}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
+
+        # 2.5 Resolve endpoint URLs from HTML links/forms + reasoning fallback
+        from bugtrace.agents.specialist_utils import resolve_param_endpoints, resolve_param_from_reasoning
+        if hasattr(self, '_last_discovery_html') and self._last_discovery_html:
+            for base_url in seen_urls:
+                endpoint_map = resolve_param_endpoints(self._last_discovery_html, base_url)
+                # Fallback: extract endpoints from DASTySAST reasoning text
+                reasoning_map = resolve_param_from_reasoning(expanded_wet_findings, base_url)
+                for k, v in reasoning_map.items():
+                    if k not in endpoint_map:
+                        endpoint_map[k] = v
+                if endpoint_map:
+                    resolved_count = 0
+                    for item in expanded_wet_findings:
+                        if item.get("url") == base_url:
+                            param = item.get("parameter", "")
+                            if param in endpoint_map and endpoint_map[param] != base_url:
+                                item["url"] = endpoint_map[param]
+                                resolved_count += 1
+                    if resolved_count:
+                        logger.info(f"[{self.name}] 🔗 Resolved {resolved_count} params to actual endpoint URLs")
+
+        logger.info(f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → {len(expanded_wet_findings)} testable params")
+
+        # LLM-powered deduplication on EXPANDED list
+        dry_list = await self._llm_analyze_and_dedup(expanded_wet_findings, self._scan_context)
 
         # Store for later phases
         self._dry_findings = dry_list
 
-        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({len(wet_findings) - len(dry_list)} duplicates removed)")
+        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(expanded_wet_findings)} WET → {len(dry_list)} DRY ({len(expanded_wet_findings) - len(dry_list)} duplicates removed)")
 
         return dry_list
 
@@ -732,16 +967,27 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
 {prototype_pollution_dedup_context}
 
 DEDUPLICATION RULES FOR PROTOTYPE POLLUTION:
-1. Same endpoint + parameter = DUPLICATE (keep only one)
-2. Different endpoints = DIFFERENT vulnerabilities
-3. Different parameters = DIFFERENT vulnerabilities
-4. JSON body vs query param = DIFFERENT (different attack vectors)
-5. JavaScript-specific: focus on Node.js APIs and frontend code
+
+1. **CRITICAL - Autonomous Discovery:**
+   - If items have "_discovered": true, they are DIFFERENT PARAMETERS discovered autonomously
+   - Even if they share the same "finding" object, treat them as SEPARATE based on "parameter" field
+   - Same URL + DIFFERENT param → DIFFERENT (keep all)
+   - Same URL + param + DIFFERENT context → DIFFERENT (keep both)
+
+2. **Standard Deduplication:**
+   - Same endpoint + parameter + same method = DUPLICATE (keep only one)
+   - Different endpoints = DIFFERENT vulnerabilities
+   - Different parameters = DIFFERENT vulnerabilities
+   - JSON body vs query param = DIFFERENT (different attack vectors)
+
+3. **JavaScript-specific Context:**
+   - Focus on Node.js APIs and frontend code
+   - Prioritize params with PP-relevant names: merge, extend, options, config, settings, data
 
 EXAMPLES:
 - /api/merge?obj[__proto__][polluted]=1 + /api/merge?obj[__proto__][polluted]=2 = DUPLICATE ✓
 - /api/merge?obj[__proto__]=X + /api/extend?obj[__proto__]=X = DIFFERENT ✗
-- /api/merge?obj=X + /api/merge?data=Y = DIFFERENT ✗
+- /api/merge?obj=X + /api/merge?data=Y = DIFFERENT ✗ (different params discovered autonomously)
 - /api/merge (JSON body) + /api/merge?param=X = DIFFERENT ✗
 
 WET FINDINGS (may contain duplicates):
@@ -750,7 +996,7 @@ WET FINDINGS (may contain duplicates):
 Return ONLY unique findings in JSON format:
 {{
   "findings": [
-    {{"url": "...", "parameter": "...", ...}},
+    {{"url": "...", "parameter": "...", "rationale": "why this is unique", ...}},
     ...
   ]
 }}"""
@@ -845,16 +1091,16 @@ Return ONLY unique findings in JSON format:
 
                     validated_findings.append(result)
 
-                    # Emit event
-                    if self.event_bus:
-                        self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
-                            "type": "PROTOTYPE_POLLUTION",
-                            "url": result.get("url", url),
-                            "parameter": result.get("parameter", parameter),
-                            "severity": result.get("severity", "HIGH"),
-                            "scan_context": self._scan_context,
-                            "agent": self.name
-                        })
+                    # Emit event with validation
+                    self._emit_prototype_pollution_finding({
+                        "type": "PROTOTYPE_POLLUTION",
+                        "url": result.get("url", url),
+                        "parameter": result.get("parameter", parameter),
+                        "payload": result.get("payload", "__proto__"),
+                        "severity": result.get("severity", "HIGH"),
+                        "status": result.get("status", "VALIDATED_CONFIRMED"),
+                        "evidence": result.get("evidence", {"pollution_confirmed": True}),
+                    }, scan_context=self._scan_context)
 
                     logger.info(f"[{self.name}] ✓ Prototype Pollution confirmed: {url} param={parameter}")
                 else:
@@ -931,6 +1177,7 @@ Return ONLY unique findings in JSON format:
             report_specialist_start,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
 
         self._queue_mode = True
@@ -952,6 +1199,7 @@ Return ONLY unique findings in JSON format:
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "prototype_pollution")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -1062,20 +1310,18 @@ Return ONLY unique findings in JSON format:
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            self._emit_prototype_pollution_finding({
                 "specialist": "prototype_pollution",
-                "finding": {
-                    "type": "Prototype Pollution",
-                    "url": result.get("url", result.get("test_url")),
-                    "parameter": result.get("param") or result.get("parameter"),
-                    "payload": result.get("payload"),
-                    "rce_escalation": result.get("rce_confirmed", False),
-                },
+                "type": "PROTOTYPE_POLLUTION",
+                "url": result.get("url", result.get("test_url")),
+                "parameter": result.get("param") or result.get("parameter"),
+                "payload": result.get("payload"),
+                "rce_escalation": result.get("rce_confirmed", False),
                 "status": status,
+                "evidence": {"pollution_confirmed": True, "rce_achieved": result.get("rce_confirmed", False)},
                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
-                "scan_context": self._scan_context,
-            })
+            }, scan_context=self._scan_context)
 
         logger.info(f"[{self.name}] Confirmed Prototype Pollution: {result.get('url', result.get('test_url'))} (RCE: {result.get('rce_confirmed', False)}) [status={status}]")
 

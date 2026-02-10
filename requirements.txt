@@ -1,42 +1,60 @@
-typer>=0.9.0
-rich>=13.0.0
-playwright>=1.40.0
-httpx>=0.25.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-loguru>=0.7.0
-aiofiles>=23.0.0
-python-dotenv>=1.0.0
-jinja2>=3.1.0
-markdown>=3.5.0
-lancedb>=0.4.0
-openai>=1.0.0
-psutil>=5.9.0
-sqlparse>=0.4.4
-aiohttp>=3.9.0
-pydantic-settings
-google-generativeai
-pytest
-pytest-asyncio
-black
-isort
-flake8
-fastapi
-uvicorn
-sqlmodel
-tenacity
-filelock
-networkx
-PyJWT
-beautifulsoup4
-PyYAML
-websockets
-cryptography
-opentelemetry-api
-opentelemetry-sdk
+# Core framework
+typer>=0.9.0,<1.0
+rich>=13.0.0,<14.0
+playwright>=1.40.0,<2.0
+httpx>=0.25.0,<1.0
+pydantic>=2.0.0,<3.0
+pydantic-settings>=2.0.0,<3.0
+loguru>=0.7.0,<1.0
+aiofiles>=23.0.0,<25.0
+python-dotenv>=1.0.0,<2.0
+jinja2>=3.1.0,<4.0
+markdown>=3.5.0,<4.0
+psutil>=5.9.0,<7.0
+aiohttp>=3.9.0,<4.0
+
+# Database & ORM
+sqlmodel>=0.0.16,<1.0
+sqlalchemy>=2.0.0,<3.0
+sqlparse>=0.4.4,<1.0
+
+# LLM providers
+openai>=1.0.0,<3.0
+google-generativeai>=0.8.0,<1.0
+
+# Vector DB
+lancedb>=0.4.0,<1.0
+
+# API
+fastapi>=0.100.0,<1.0
+uvicorn>=0.20.0,<1.0
+websockets>=12.0,<17.0
+
+# Security & auth
+PyJWT>=2.8.0,<3.0
+cryptography>=41.0.0,<47.0
+
+# Parsing & utilities
+beautifulsoup4>=4.12.0,<5.0
+PyYAML>=6.0.0,<7.0
+tenacity>=8.0.0,<10.0
+filelock>=3.12.0,<4.0
+networkx>=3.0,<4.0
+
+# Observability
+opentelemetry-api>=1.20.0,<2.0
+opentelemetry-sdk>=1.20.0,<2.0
+
+# ML / Embeddings
 # CPU-only PyTorch (much smaller, no CUDA warnings)
 # Must be installed BEFORE sentence_transformers
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch
-sentence_transformers
-sqlalchemy
+torch>=2.0.0
+sentence_transformers>=2.0.0,<6.0
+
+# Dev dependencies (consider moving to pyproject.toml [dev])
+pytest>=7.0.0,<10.0
+pytest-asyncio>=0.21.0,<2.0
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0

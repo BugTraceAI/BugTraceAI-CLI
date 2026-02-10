@@ -25,6 +25,11 @@ CWE_MAPPINGS = {
     "RCE": "CWE-94",  # Improper Control of Generation of Code
     "OPEN_REDIRECT": "CWE-601",  # URL Redirection to Untrusted Site
     "PROTOTYPE_POLLUTION": "CWE-1321",  # Improperly Controlled Modification of Object Prototype Attributes
+    "CSTI": "CWE-1336",  # Improper Neutralization of Special Elements Used in a Template Engine
+    "SSTI": "CWE-1336",  # Improper Neutralization of Special Elements Used in a Template Engine
+    "HEADER_INJECTION": "CWE-113",  # Improper Neutralization of CRLF Sequences in HTTP Headers
+    "FILE_UPLOAD": "CWE-434",  # Unrestricted Upload of File with Dangerous Type
+    "MISSING_SECURITY_HEADER": "CWE-693",  # Protection Mechanism Failure
 }
 
 
@@ -123,6 +128,53 @@ To remediate Prototype Pollution vulnerabilities:
 6. Use modern JavaScript features and avoid unsafe object merging patterns
 7. Keep all dependencies updated as prototype pollution often comes from libraries
 """,
+    "CSTI": """
+To remediate Client-Side Template Injection (CSTI) / Server-Side Template Injection (SSTI) vulnerabilities:
+1. Never pass user input directly into template expressions
+2. Use sandboxed template engines or disable dangerous features (e.g., code execution)
+3. Implement strict input validation and output encoding for template contexts
+4. For AngularJS: use Content Security Policy (CSP) and avoid ng-bind-html with untrusted data
+5. For server-side engines (Jinja2, Twig, Velocity): disable eval/exec capabilities in production
+6. Consider using logic-less templates (Mustache, Handlebars) when full template power is not needed
+7. Upgrade to frameworks that auto-escape template expressions by default
+""",
+    "SSTI": """
+To remediate Server-Side Template Injection (SSTI) vulnerabilities:
+1. Never pass user input directly into template expressions
+2. Use sandboxed template engines or disable dangerous features (e.g., code execution)
+3. For Jinja2: use SandboxedEnvironment and disable dangerous globals
+4. For Velocity/Freemarker: restrict class access and disable reflection
+5. For Twig: use the sandbox extension with strict whitelist policies
+6. Implement strict input validation before template rendering
+7. Apply principle of least privilege to template engine configurations
+""",
+    "HEADER_INJECTION": """
+To remediate HTTP Header Injection (CRLF Injection) vulnerabilities:
+1. Validate and sanitize all user input used in HTTP headers
+2. Reject or encode CR (\\r) and LF (\\n) characters in header values
+3. Use framework-provided methods for setting HTTP headers (they typically sanitize input)
+4. Implement Content Security Policy (CSP) to mitigate impact of injected headers
+5. Never use raw user input in Set-Cookie, Location, or other sensitive headers
+""",
+    "FILE_UPLOAD": """
+To remediate Unrestricted File Upload vulnerabilities:
+1. Validate file types using both MIME type and file extension whitelists
+2. Verify file content (magic bytes) matches the declared type
+3. Store uploaded files outside the web root directory
+4. Generate random filenames to prevent path traversal
+5. Implement file size limits and rate limiting
+6. Scan uploaded files for malware using antivirus engines
+7. Disable script execution in upload directories (e.g., .htaccess, web.config)
+""",
+    "MISSING_SECURITY_HEADER": """
+To remediate missing security headers:
+1. Enable HSTS (Strict-Transport-Security) with includeSubDomains and preload
+2. Set X-Content-Type-Options: nosniff to prevent MIME sniffing
+3. Set X-Frame-Options: DENY or SAMEORIGIN to prevent clickjacking
+4. Implement Content-Security-Policy (CSP) to restrict resource loading
+5. Set Secure and HttpOnly flags on all session cookies
+6. Set SameSite=Strict or Lax on cookies to prevent CSRF
+""",
 }
 
 
@@ -139,7 +191,93 @@ DEFAULT_SEVERITY = {
     "RCE": Severity.CRITICAL,
     "OPEN_REDIRECT": Severity.MEDIUM,
     "PROTOTYPE_POLLUTION": Severity.HIGH,
+    "CSTI": Severity.HIGH,
+    "SSTI": Severity.CRITICAL,
+    "HEADER_INJECTION": Severity.MEDIUM,
+    "FILE_UPLOAD": Severity.HIGH,
+    "MISSING_SECURITY_HEADER": Severity.LOW,
 }
+
+
+# Reference CVEs: Maps (vuln_type, context) to known CVE references.
+# These are well-known CVEs for specific technologies/engines that serve as
+# references in professional pentest reports. The framework uses these as
+# fallback when the LLM doesn't return a CVE.
+# Key format: "VULN_TYPE" for generic, "VULN_TYPE:context" for engine-specific
+REFERENCE_CVES = {
+    # SSTI/CSTI by template engine
+    "CSTI:velocity": "CVE-2020-13936",    # Apache Velocity arbitrary code execution
+    "CSTI:freemarker": "CVE-2022-24816",  # Apache Freemarker template injection
+    "CSTI:jinja2": "CVE-2019-10906",      # Jinja2 sandbox escape
+    "CSTI:twig": "CVE-2022-39261",        # Twig path traversal / code execution
+    "CSTI:angular": "CVE-2022-25869",     # AngularJS XSS via sandbox escape
+    "CSTI:angularjs": "CVE-2022-25869",
+    "CSTI:pebble": "CVE-2022-37767",      # Pebble template injection
+    "SSTI:velocity": "CVE-2020-13936",
+    "SSTI:freemarker": "CVE-2022-24816",
+    "SSTI:jinja2": "CVE-2019-10906",
+    "SSTI:twig": "CVE-2022-39261",
+    "SSTI:pebble": "CVE-2022-37767",
+    # XXE by parser
+    "XXE": "CVE-2021-29505",              # Generic XML External Entity reference
+    # JWT
+    "JWT:none_algorithm": "CVE-2022-23529",  # JWT none algorithm bypass
+    # Log4j-style (if detected via Nuclei)
+    "RCE:log4j": "CVE-2021-44228",        # Log4Shell
+    "RCE:log4shell": "CVE-2021-44228",
+}
+
+
+def get_reference_cve(vuln_type: str, finding: dict = None) -> Optional[str]:
+    """
+    Look up a reference CVE based on vulnerability type and finding context.
+
+    Checks engine-specific CVEs first, then falls back to generic type CVEs.
+
+    Args:
+        vuln_type: The vulnerability type (e.g., "CSTI", "SQLI")
+        finding: Optional finding dict with context (template_engine, etc.)
+
+    Returns:
+        CVE ID string or None if no reference CVE exists
+    """
+    vuln_upper = vuln_type.upper()
+
+    # Try engine-specific lookup first (CSTI:velocity, SSTI:jinja2, etc.)
+    if finding:
+        engine = (
+            finding.get("template_engine", "") or
+            finding.get("engine", "") or
+            finding.get("technology", "") or
+            ""
+        ).lower().strip()
+        if engine:
+            key = f"{vuln_upper}:{engine}"
+            if key in REFERENCE_CVES:
+                return REFERENCE_CVES[key]
+
+        # Check payload/description for engine hints
+        payload = str(finding.get("payload", "")).lower()
+        desc = str(finding.get("description", "")).lower()
+        context_text = payload + " " + desc
+
+        engine_hints = {
+            "velocity": ["#set(", "$class", "velocity"],
+            "freemarker": ["freemarker", "<#assign", "?new()"],
+            "jinja2": ["__class__", "__mro__", "lipsum", "jinja"],
+            "twig": ["twig", "{{dump(", "{{app."],
+            "angular": ["constructor.constructor", "ng-app", "angular"],
+            "pebble": ["pebble", '{"dumpAll"'],
+            "log4j": ["${jndi:", "log4j", "log4shell"],
+        }
+        for eng, keywords in engine_hints.items():
+            if any(kw in context_text for kw in keywords):
+                key = f"{vuln_upper}:{eng}"
+                if key in REFERENCE_CVES:
+                    return REFERENCE_CVES[key]
+
+    # Generic type lookup
+    return REFERENCE_CVES.get(vuln_upper)
 
 
 def get_cwe_for_vuln(vuln_type: str) -> Optional[str]:

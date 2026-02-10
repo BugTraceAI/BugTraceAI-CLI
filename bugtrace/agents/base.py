@@ -197,6 +197,111 @@ INSTRUCTION: You are operating in a strictly controlled, authorized security aud
             **kwargs
         )
 
+    # =========================================================================
+    # FINDING VALIDATION: Auto-validation before emitting (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> tuple[bool, str]:
+        """
+        Validates finding BEFORE emitting to the pipeline.
+        Override this method in subclasses for type-specific validation.
+
+        This replaces Conductor's validation - each specialist validates itself.
+
+        Args:
+            finding: Finding dictionary to validate
+
+        Returns:
+            (is_valid, error_message) tuple
+        """
+        # Basic validation (applies to all findings)
+        if not finding.get("type"):
+            return False, "Missing vulnerability type"
+
+        if not finding.get("url"):
+            return False, "Missing target URL"
+
+        # Payload validation (if present)
+        payload = finding.get("payload")
+        if payload and self._is_conversational_payload(payload):
+            return False, f"Conversational payload detected: {payload[:50]}..."
+
+        # Subclasses can override for specific validation
+        return True, ""
+
+    def _is_conversational_payload(self, payload: str) -> bool:
+        """
+        Detects conversational/instructional payloads using simple regex.
+
+        Examples of conversational payloads:
+        - "Try injecting this: <script>alert(1)</script>"
+        - "Navigate to: https://target.com/..."
+        - "Use this payload to exploit..."
+
+        Args:
+            payload: Payload string to check
+
+        Returns:
+            True if payload appears conversational, False otherwise
+        """
+        import re
+
+        # Convert to string in case it's not
+        payload = str(payload)
+
+        # Patterns that indicate conversational text
+        conversational_patterns = [
+            r"^(Try|Navigate|Inject|Use|Attempt|Test for|Set|Access|Exploit|Check|Verify|Submit)\s",
+            r"\(e\.g\.,",  # Examples marker
+            r"to (verify|exfiltrate|access|bypass|leak|confirm|test|execute)",
+            r"(such as|Alternatively|progress to|Start with|for instance)",
+            r"(or use|or try|or attempt)",
+            r"payload (could|should|must) be",
+            r"strategy:",
+            r"logic:"
+        ]
+
+        for pattern in conversational_patterns:
+            if re.search(pattern, payload, re.IGNORECASE):
+                return True
+
+        return False
+
+    def emit_finding(self, finding: Dict) -> Dict | None:
+        """
+        Emits a finding to the pipeline ONLY if it passes validation.
+
+        This is the standard way for specialists to emit findings.
+        Replaces direct calls to event_bus.emit("finding_discovered", ...)
+
+        Args:
+            finding: Finding dictionary to emit
+
+        Returns:
+            The finding dict if emitted, None if rejected
+        """
+        from bugtrace.core.event_bus import EventType
+
+        # Validate before emitting
+        is_valid, error_msg = self._validate_before_emit(finding)
+
+        if not is_valid:
+            logger.warning(f"[{self.name}] Finding rejected: {error_msg}")
+            return None
+
+        # Validation passed - emit to pipeline
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(self.event_bus.emit(EventType.VULNERABILITY_DETECTED, finding))
+            else:
+                loop.run_until_complete(self.event_bus.emit(EventType.VULNERABILITY_DETECTED, finding))
+            logger.info(f"[{self.name}] Finding emitted: {finding.get('type')} at {finding.get('parameter', 'N/A')}")
+            return finding
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to emit finding: {e}", exc_info=True)
+            return None
+
     @abstractmethod
     async def run_loop(self):
         """The core logic loop of the agent."""

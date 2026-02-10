@@ -154,12 +154,44 @@ func testPayload(client *http.Client, config Config, payload string) (*models.Re
 		ResponseLength: len(body),
 	}
 
-	// Check unencoded reflection
+	// Check unencoded reflection (exact match)
 	if strings.Contains(bodyStr, payload) {
 		reflection.Reflected = true
 		reflection.Encoded = false
 		reflection.Context = detectContext(bodyStr, payload)
 		return reflection, nil
+	}
+
+	// Check backslash-transform reflection (\ → \\)
+	// Servers often escape backslashes: \';alert()// → \\';alert()//
+	if strings.Contains(payload, "\\") {
+		transformed := strings.ReplaceAll(payload, "\\", "\\\\")
+		if strings.Contains(bodyStr, transformed) {
+			reflection.Reflected = true
+			reflection.Encoded = true
+			reflection.EncodingType = "backslash_escape"
+			reflection.Context = detectContext(bodyStr, transformed)
+			return reflection, nil
+		}
+	}
+
+	// Check executable-part reflection (breakout payloads)
+	// For payloads like \';alert(document.domain)// the server may transform
+	// the breakout prefix but the exec part (alert(document.domain)//) still reflects
+	for _, breakout := range []string{"\\'", "\\\"", "';", "\";"} {
+		if strings.Contains(payload, breakout) {
+			parts := strings.SplitN(payload, breakout, 2)
+			if len(parts) == 2 && len(parts[1]) > 5 {
+				execPart := parts[1]
+				if strings.Contains(bodyStr, execPart) {
+					reflection.Reflected = true
+					reflection.Encoded = true
+					reflection.EncodingType = "partial_exec"
+					reflection.Context = detectContext(bodyStr, execPart)
+					return reflection, nil
+				}
+			}
+		}
 	}
 
 	// Check HTML-encoded reflection
@@ -189,24 +221,46 @@ func detectContext(body, payload string) string {
 		return "unknown"
 	}
 
-	// Simple context detection
-	before := ""
-	if idx > 50 {
-		before = body[idx-50 : idx]
-	} else {
-		before = body[:idx]
+	// Look back up to 200 chars for better context detection
+	lookback := 200
+	start := idx - lookback
+	if start < 0 {
+		start = 0
 	}
-
+	before := body[start:idx]
 	beforeLower := strings.ToLower(before)
 
-	if strings.Contains(beforeLower, "<script") {
-		return "javascript"
+	// Check if inside <script> block
+	lastScriptOpen := strings.LastIndex(beforeLower, "<script")
+	lastScriptClose := strings.LastIndex(beforeLower, "</script")
+	inScript := lastScriptOpen != -1 && (lastScriptClose == -1 || lastScriptOpen > lastScriptClose)
+
+	if inScript {
+		// Refine: is it inside a JS string?
+		trimmed := strings.TrimRight(before, " \t\n\r")
+		if strings.HasSuffix(trimmed, "'") || strings.HasSuffix(trimmed, "= '") {
+			return "js_string_single"
+		}
+		if strings.HasSuffix(trimmed, "\"") || strings.HasSuffix(trimmed, "= \"") {
+			return "js_string_double"
+		}
+		return "script_tag"
 	}
-	if strings.HasSuffix(strings.TrimSpace(before), "=\"") || strings.HasSuffix(strings.TrimSpace(before), "='") {
+
+	// Check HTML attribute context
+	trimmed := strings.TrimSpace(before)
+	if strings.HasSuffix(trimmed, "=\"") || strings.HasSuffix(trimmed, "='") {
 		return "attribute_value"
 	}
-	if strings.HasSuffix(strings.TrimSpace(before), "=") {
+	if strings.HasSuffix(trimmed, "=") {
 		return "attribute_unquoted"
+	}
+
+	// Check if inside an HTML tag (between < and >)
+	lastOpen := strings.LastIndex(before, "<")
+	lastClose := strings.LastIndex(before, ">")
+	if lastOpen != -1 && (lastClose == -1 || lastOpen > lastClose) {
+		return "html_tag"
 	}
 
 	return "html_text"

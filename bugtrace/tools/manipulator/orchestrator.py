@@ -71,7 +71,12 @@ class ManipulatorOrchestrator:
         request_count = 0
         self.blood_smell_history.clear()
 
-        async for mutation in self.payload_agent.generate_mutations(base_request, strategies):
+        # Pass Phase 0 context to Phase 1a for context-aware payload selection
+        detected_context = str(context_info["contexts"][0].value) if context_info["contexts"] else None
+
+        async for mutation in self.payload_agent.generate_mutations(
+            base_request, strategies, context_hint=detected_context
+        ):
             request_count += 1
             if request_count % 20 == 0:
                 logger.info(f"Phase 1a: Progress {request_count} mutations tested")

@@ -56,7 +56,7 @@ source "$VENV_PATH/bin/activate"
 # Check if the first argument is a URL (implicitly "full" command)
 FIRST_ARG="${PYTHON_ARGS[0]}"
 
-if [[ "$FIRST_ARG" != "scan" && "$FIRST_ARG" != "full" && "$FIRST_ARG" != "audit" && "$FIRST_ARG" != -* && -n "$FIRST_ARG" ]]; then
+if [[ "$FIRST_ARG" != "scan" && "$FIRST_ARG" != "full" && "$FIRST_ARG" != "audit" && "$FIRST_ARG" != "tui" && "$FIRST_ARG" != "agents" && "$FIRST_ARG" != "summary" && "$FIRST_ARG" != "serve" && "$FIRST_ARG" != "mcp" && "$FIRST_ARG" != -* && -n "$FIRST_ARG" ]]; then
     # Default to FULL scan if just a target is provided
     python3 -m bugtrace full "${PYTHON_ARGS[@]}"
 else

@@ -215,6 +215,8 @@ class ScanService:
 
         # CRITICAL: Monkey-patch stop_event for graceful shutdown
         orchestrator._stop_event = ctx.stop_event
+        # Pause support: orchestrator checks this at phase boundaries
+        orchestrator._scan_context = ctx
 
         return orchestrator
 
@@ -316,34 +318,14 @@ class ScanService:
             }
 
     async def stop_scan(self, scan_id: int) -> Dict[str, Any]:
-        """
-        Stop a running scan gracefully.
-
-        Args:
-            scan_id: Scan ID to stop
-
-        Returns:
-            Dictionary with scan_id, status, message
-
-        Process:
-            1. Check if scan is active
-            2. Set stop_event (orchestrator checks this)
-            3. Cancel the task
-            4. Return status
-
-        Raises:
-            ValueError: If scan is not active
-        """
+        """Stop a running or paused scan gracefully."""
         async with self._lock:
             if scan_id not in self._active_scans:
                 raise ValueError(f"Scan {scan_id} is not currently running")
 
             ctx = self._active_scans[scan_id]
-
-            # Request stop
             ctx.request_stop()
 
-            # Cancel the task
             if ctx._task and not ctx._task.done():
                 ctx._task.cancel()
 
@@ -353,6 +335,58 @@ class ScanService:
                 "scan_id": scan_id,
                 "status": "stopping",
                 "message": "Stop signal sent to scan",
+            }
+
+    async def pause_scan(self, scan_id: int) -> Dict[str, Any]:
+        """Pause a running scan. Pipeline blocks at next checkpoint."""
+        async with self._lock:
+            if scan_id not in self._active_scans:
+                raise ValueError(f"Scan {scan_id} is not currently running")
+
+            ctx = self._active_scans[scan_id]
+            if ctx.status != "running":
+                raise ValueError(f"Scan {scan_id} is not running (status: {ctx.status})")
+
+            ctx.request_pause()
+            self.db.update_scan_status(scan_id, ScanStatus.PAUSED)
+
+            await self.event_bus.emit("scan.paused", {
+                "scan_id": scan_id,
+                "target": ctx.options.target_url,
+            })
+
+            logger.info(f"Scan {scan_id} paused")
+
+            return {
+                "scan_id": scan_id,
+                "status": "paused",
+                "message": "Scan paused",
+            }
+
+    async def resume_scan(self, scan_id: int) -> Dict[str, Any]:
+        """Resume a paused scan."""
+        async with self._lock:
+            if scan_id not in self._active_scans:
+                raise ValueError(f"Scan {scan_id} is not active")
+
+            ctx = self._active_scans[scan_id]
+            if ctx.status != "paused":
+                raise ValueError(f"Scan {scan_id} is not paused (status: {ctx.status})")
+
+            ctx.request_resume()
+            self.db.update_scan_status(scan_id, ScanStatus.RUNNING)
+
+            await self.event_bus.emit("scan.resumed", {
+                "scan_id": scan_id,
+                "target": ctx.options.target_url,
+            })
+
+            logger.info(f"Scan {scan_id} resumed")
+
+            return {
+                "scan_id": scan_id,
+                "status": "running",
+                "message": "Scan resumed",
             }
 
     async def list_scans(
@@ -879,12 +913,17 @@ class ScanService:
         """Format file-based findings for API response."""
         results = []
         for finding in findings:
-            # Determine status from source directory or explicit status field
+            # Determine status: respect finding's own status from specialist,
+            # only fall back to directory-based inference if no explicit status
             source_dir = finding.get("_source_dir", "wet")
-            status = finding.get("status", "PENDING_VALIDATION")
-            if source_dir == "results":
+            explicit_status = finding.get("status")
+            if explicit_status and explicit_status not in ("", "PENDING_VALIDATION"):
+                status = explicit_status
+            elif source_dir == "results":
                 status = "VALIDATED_CONFIRMED"
             elif source_dir == "dry":
+                status = "PENDING_VALIDATION"
+            else:
                 status = "PENDING_VALIDATION"
 
             results.append({
@@ -895,7 +934,7 @@ class ScanService:
                 "payload": finding.get("payload", ""),
                 "url": finding.get("url", ""),
                 "parameter": finding.get("parameter", ""),
-                "validated": source_dir == "results",
+                "validated": status == "VALIDATED_CONFIRMED",
                 "status": status,
                 "confidence": finding.get("confidence", 0.0),
             })

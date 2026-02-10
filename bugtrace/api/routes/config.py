@@ -177,7 +177,7 @@ def _validate_model_formats(updates: dict) -> list:
             value = updates[key]
             if value and "/" not in value:
                 errors.append(
-                    f"{key} must be in provider/model format (e.g., 'google/gemini-3-flash-preview'), got: {value}"
+                    f"{key} must be in provider/model format (e.g., 'moonshotai/kimi-k2-thinking'), got: {value}"
                 )
     return errors
 

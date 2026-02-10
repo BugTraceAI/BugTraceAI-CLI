@@ -8,7 +8,9 @@ from bugtrace.schemas.models import VulnType, ReflectionContext
 class ScanStatus(str, Enum):
     """Status values for scan lifecycle."""
     PENDING = "PENDING"
+    INITIALIZING = "INITIALIZING"
     RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
     COMPLETED = "COMPLETED"
     STOPPED = "STOPPED"
     FAILED = "FAILED"

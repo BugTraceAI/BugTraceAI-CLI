@@ -136,10 +136,11 @@ def encode_finding_payloads(finding: Dict[str, Any]) -> Dict[str, Any]:
     for field in payload_fields:
         if field in result and result[field]:
             value = str(result[field])
-            # Only encode if not already base64 and has special chars
+            # Add b64 version as supplementary field for tools that need it,
+            # but KEEP the original payload readable in the JSON
             if not is_base64_payload(value) and _needs_encoding(value):
                 result[f"{field}_b64"] = encode_payload_field(value)
-                result[field] = f"[B64:{len(value)}chars]"  # Placeholder showing original length
+                # Keep original payload - json.dumps handles escaping
 
     return result
 

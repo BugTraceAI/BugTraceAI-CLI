@@ -114,7 +114,22 @@ class Dashboard:
         self._init_sparklines()
 
         # Force terminal size
+        self._disable_mouse_reporting()
         self._resize_terminal()
+
+    def _disable_mouse_reporting(self):
+        """Disable terminal mouse reporting to prevent input flood."""
+        try:
+            # Disable multiple mouse tracking modes
+            # 1000: Normal tracking
+            # 1002: Button-event tracking
+            # 1003: Any-event tracking
+            # 1006: SGR extension
+            # 1015: URXVT extension
+            sys.stdout.write("\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
     def _resize_terminal(self):
         """Force terminal to 35 rows x 113 cols."""
@@ -166,6 +181,8 @@ class Dashboard:
         self.payloads_blocked: int = 0
         self.payload_rate: float = 0.0
         self.payload_peak_rate: float = 0.0
+        self._rate_window: List[float] = []  # timestamps of recent payloads
+        self._rate_window_seconds: float = 3.0  # sliding window size
 
         # Payload history for live feed
         self.payload_history: List[Dict] = []
@@ -244,6 +261,7 @@ class Dashboard:
             self.phase_times = {}
             self.agent_stats = {}
             self.specialist_metrics = {}
+            self._rate_window = []
             self._init_sparklines()
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1448,7 +1466,21 @@ class Dashboard:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def log(self, message: str, level: str = "INFO"):
-        """Add a log entry."""
+        """Add a log entry.
+
+        Rate-limited to prevent UI freeze from log flooding.
+        Max 20 messages/second (drops messages if rate exceeded).
+        """
+        # Rate limiting: prevent freeze from log flooding
+        now = time.time()
+        if not hasattr(self, '_last_log_time'):
+            self._last_log_time = 0.0
+
+        if now - self._last_log_time < 0.05:  # Max 20 logs/second
+            return  # Throttled - skip this message
+
+        self._last_log_time = now
+
         timestamp = datetime.now().strftime("%H:%M:%S")
         with self._lock:
             self.logs.append((timestamp, level, message))
@@ -1512,8 +1544,17 @@ class Dashboard:
             if len(self.payload_history) > 50:
                 self.payload_history = self.payload_history[-50:]
 
-            # Update throughput sparkline
-            self.throughput_sparkline.add(1)
+            # Calculate real payload rate using sliding window
+            now = time.time()
+            self._rate_window.append(now)
+            cutoff = now - self._rate_window_seconds
+            self._rate_window = [t for t in self._rate_window if t > cutoff]
+            self.payload_rate = len(self._rate_window) / self._rate_window_seconds
+            if self.payload_rate > self.payload_peak_rate:
+                self.payload_peak_rate = self.payload_rate
+
+            # Update sparklines
+            self.throughput_sparkline.add(self.payload_rate)
             self.requests_sparkline.add(self.payload_rate)
 
     def update_payload_status(self, status: str):

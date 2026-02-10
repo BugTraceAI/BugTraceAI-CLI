@@ -1,0 +1,19 @@
+# Example URL List for BugTraceAI
+# Format: One URL per line
+# Lines starting with # are ignored
+# Only URLs from the same domain as target will be processed
+
+# API Endpoints
+https://ginandjuice.shop/api/products
+https://ginandjuice.shop/api/cart
+
+# Pages with parameters
+https://ginandjuice.shop/product?productId=1
+https://ginandjuice.shop/product?productId=2
+https://ginandjuice.shop/filter?minPrice=0&maxPrice=100
+
+# Admin/Dashboard
+https://ginandjuice.shop/admin/settings
+
+# Search functionality
+https://ginandjuice.shop/search?q=test

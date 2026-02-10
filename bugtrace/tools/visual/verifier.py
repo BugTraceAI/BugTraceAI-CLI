@@ -420,12 +420,53 @@ class XSSVerifier:
         return xss_var
 
     async def _check_csti(self, page, url: str) -> bool:
-        """Check for CSTI arithmetic expression evaluation."""
-        if "{{7*7}}" in url:
-            page_content = await page.content()
-            if "49" in page_content and "{{7*7}}" not in page_content:
-                logger.info(f"[{url}] CSTI Confirmed: Expression evaluated to 49!")
+        """Check for CSTI arithmetic expression evaluation in rendered DOM.
+
+        Uses page.content() (rendered DOM) instead of innerText because Angular/Vue
+        may evaluate {{7*7}} in attributes (e.g., hidden input value="49") that
+        aren't visible in innerText. Strips <script> tags since template markers
+        in JS variables are NOT evaluated by client-side engines.
+        """
+        import re
+        from urllib.parse import unquote
+        decoded_url = unquote(url)
+
+        # Check if URL contains arithmetic template expressions
+        has_arithmetic = any(p in decoded_url for p in ["7*7", "7*'7'", "'7'*7"])
+        has_constructor = "constructor" in decoded_url
+
+        if not has_arithmetic and not has_constructor:
+            return False
+
+        # Get rendered DOM and strip <script> tags (JS vars aren't template-evaluated)
+        page_content = await page.content()
+        page_content_no_scripts = re.sub(
+            r'<script[^>]*>.*?</script>', '', page_content,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+
+        # Also get visible text for string multiply check
+        page_text = await page.evaluate("document.body.innerText")
+
+        # Check 1: 7*7 → 49 (template syntax evaluated, not reflected literally)
+        # Use DOM content (not just innerText) because Angular evaluates {{7*7}}
+        # in attributes like value="49" which innerText doesn't include
+        if has_arithmetic and "49" in page_content_no_scripts:
+            template_markers = ["{{7*7}}", "${7*7}", "<%= 7*7 %>", "#{7*7}", "{{7*'7'}}", "{{'7'*7}}"]
+            if not any(m in page_content_no_scripts for m in template_markers):
+                logger.info(f"[{url}] CSTI Confirmed: arithmetic eval → 49")
                 return True
+
+        # Check 2: '7'*7 → 7777777 (string multiply)
+        if "7777777" in page_text or "7777777" in page_content_no_scripts:
+            logger.info(f"[{url}] CSTI Confirmed: string multiply → 7777777")
+            return True
+
+        # Check 3: constructor eval producing 49
+        if has_constructor and ("49" in page_text or "49" in page_content_no_scripts):
+            logger.info(f"[{url}] CSTI Confirmed: constructor eval → 49")
+            return True
+
         return False
 
     async def _check_visual_defacement(self, page, url: str) -> bool:

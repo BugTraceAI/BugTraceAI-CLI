@@ -7,6 +7,7 @@ The UICallback class translates pipeline events into Textual messages.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from .messages import (
@@ -100,12 +101,17 @@ class UICallback:
     def on_payload_tested(self, payload: str, result: str, agent: str) -> None:
         """Called when a payload is tested.
 
+        DISABLED: Payload testing generates 800-2000 messages during XSS/SQLi scans,
+        causing TUI freeze. Messages are throttled to prevent UI congestion.
+
         Args:
             payload: The payload that was tested.
             result: Result of the test ("success", "fail", "blocked").
             agent: Name of the agent.
         """
-        self.app.post_message(PayloadTested(payload, result, agent))
+        # DISABLED to prevent UI freeze - too many messages
+        # self.app.post_message(PayloadTested(payload, result, agent))
+        pass
 
     def on_log(self, level: str, message: str) -> None:
         """Called for logging messages.
@@ -177,14 +183,26 @@ class TUILoggingHandler(logging.Handler):
         self.app = app
         # Set a reasonable default format
         self.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+        # Rate limiting to prevent UI freeze from log flooding
+        self._last_emit = 0.0
+        self._min_interval = 0.05  # Max 20 messages/second (50ms between messages)
 
     def emit(self, record: logging.LogRecord) -> None:
         """Emit a log record as a Textual message.
+
+        Rate-limited to prevent UI freeze from log flooding.
+        Max 20 messages/second (drops messages if rate exceeded).
 
         Args:
             record: The log record to emit.
         """
         try:
+            # Rate limiting: skip if too soon since last emit
+            now = time.time()
+            if now - self._last_emit < self._min_interval:
+                return  # Throttled - skip this message
+
+            self._last_emit = now
             msg = self.format(record)
             self.app.post_message(LogEntry(record.levelname, msg))
         except Exception:

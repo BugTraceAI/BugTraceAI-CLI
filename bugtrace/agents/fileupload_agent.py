@@ -2,6 +2,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
 import aiohttp
+from urllib.parse import urlparse, urljoin
 from bugtrace.agents.base import BaseAgent
 from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
@@ -10,8 +11,43 @@ from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 logger = logging.getLogger(__name__)
 
 class FileUploadAgent(BaseAgent):
+    """
+    File Upload Vulnerability Specialist.
+
+    AUTONOMOUS SPECIALIST (v3.1):
+    ==============================
+    Does NOT rely on DASTySAST for parameter discovery.
+    Performs its OWN deep discovery of upload endpoints.
+
+    Discovery Strategy:
+    -------------------
+    1. HTML Forms: Extracts ALL <input type="file"> with metadata
+       - Accept filters (allowed extensions)
+       - Multiple file inputs per form
+       - All other form fields (hidden, text, etc.)
+
+    2. Drag-and-drop: Detects data-upload attributes, dropzone classes
+
+    3. Metadata Extraction:
+       - enctype (multipart/form-data, etc.)
+       - Method (POST, PUT)
+       - All required fields for successful submission
+
+    Testing Strategy:
+    -----------------
+    - Phase A: Discover ALL upload endpoints (deduplicated)
+    - Phase B: Test each with LLM-guided bypass attempts
+    - Max bypass rounds: 5 (extension tricks, magic bytes, etc.)
+
+    Deduplication:
+    --------------
+    - By upload endpoint URL (not form ID)
+    - Prevents testing same endpoint multiple times
+
+    Reference: .ai-context/SPECIALIST_AUTONOMY_ROLLOUT.md
+    """
     name = "FileUploadAgent"
-    
+
     def __init__(self, url: str):
         super().__init__(
             name="FileUploadAgent",
@@ -22,61 +58,149 @@ class FileUploadAgent(BaseAgent):
         self.found_forms = []
         self.upload_path = None
         self.MAX_BYPASS_ATTEMPTS = 5
-        
+
         # Deduplication
-        self._tested_params = set()
+        self._tested_params = set()  # Legacy (not used)
+        self._tested_upload_endpoints = set()  # Track tested upload URLs
         
     async def run_loop(self) -> Dict:
-        """Main execution loop for FileUpload testing."""
-        logger.info(f"[{self.name}] Initiating File Upload discovery for {self.url}")
-        
-        # 1. Discover upload forms
+        """
+        Main execution loop for FileUpload testing.
+
+        AUTONOMOUS SPECIALIST PATTERN:
+        - Phase A: Discover ALL upload forms/endpoints (already deduped)
+        - Phase B: Test each form with bypass attempts
+        """
+        logger.info(f"[{self.name}] 🔍 Initiating AUTONOMOUS File Upload discovery for {self.url}")
+
+        # Phase A: AUTONOMOUS DISCOVERY
+        # _discover_upload_forms() now:
+        # 1. Extracts ALL upload forms from HTML
+        # 2. Detects drag-and-drop zones
+        # 3. Extracts accept attributes, all form fields
+        # 4. Dedups by endpoint URL
         forms = await self._discover_upload_forms()
+
         if not forms:
             logger.info(f"[{self.name}] No upload forms found.")
             return {"vulnerable": False, "findings": []}
-            
+
+        logger.info(f"[{self.name}] 🎯 Testing {len(forms)} unique upload endpoints")
+
+        # Phase B: TESTING
+        # Note: Dedup already done in _discover_upload_forms via _tested_upload_endpoints
         findings = []
         for form in forms:
-            # Deduplication check
-            form_key = f"{self.url}#{form.get('id', 'unknown')}"
-            if form_key in self._tested_params:
-                logger.info(f"[{self.name}] Skipping form {form['id']} - already tested")
-                continue
-                
             result = await self._test_form(form)
             if result:
                 findings.append(result)
-                self._tested_params.add(form_key)  # Mark as tested
-                
+
         return {
             "vulnerable": len(findings) > 0,
             "findings": findings
         }
         
     async def _discover_upload_forms(self) -> List[Dict]:
-        """Scrape page for forms containing file inputs."""
+        """
+        AUTONOMOUS file upload discovery.
+
+        Extracts ALL upload-related endpoints from:
+        1. HTML forms with <input type="file">
+        2. Accept attributes (allowed extensions)
+        3. All form fields (hidden, text, etc.)
+        4. Multiple file inputs in same form
+        5. Drag-and-drop zones (data-upload, dropzone classes)
+
+        Returns:
+            List of upload form dictionaries with rich metadata
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+
         try:
-            async with orchestrator.session(DestinationType.TARGET) as session:
-                async with session.get(self.url) as resp:
-                    html = await resp.text()
+            # Use browser to get fully rendered HTML
+            state = await browser_manager.capture_state(self.url)
+            html = state.get("html", "")
+
+            if not html:
+                logger.warning(f"[{self.name}] No HTML content from {self.url}")
+                return []
 
             soup = BeautifulSoup(html, 'html.parser')
             forms = []
-            for form in soup.find_all('form'):
-                file_input = form.find('input', {'type': 'file'})
-                if file_input:
-                    forms.append({
-                        'action': form.get('action', ''),
-                        'method': form.get('method', 'POST').upper(),
-                        'input_name': file_input.get('name', 'file'),
-                        'id': form.get('id', 'unknown_form')
+
+            # Extract all forms with file inputs
+            for form_idx, form in enumerate(soup.find_all('form')):
+                file_inputs = form.find_all('input', {'type': 'file'})
+                if not file_inputs:
+                    continue
+
+                # Extract action URL
+                action = form.get('action', '')
+                action_url = urljoin(self.url, action) if action else self.url
+
+                # Dedup check at endpoint level
+                if action_url in self._tested_upload_endpoints:
+                    logger.info(f"[{self.name}] Skipping duplicate endpoint: {action_url}")
+                    continue
+
+                # Extract ALL form fields (not just file inputs)
+                all_fields = {}
+                for tag in form.find_all(['input', 'textarea', 'select']):
+                    field_name = tag.get('name')
+                    if field_name:
+                        input_type = tag.get('type', 'text').lower()
+                        # Skip submit/button but INCLUDE hidden (may be required)
+                        if input_type not in ['submit', 'button', 'reset']:
+                            all_fields[field_name] = tag.get('value', '')
+
+                # Extract file input details
+                file_inputs_metadata = []
+                for file_input in file_inputs:
+                    file_inputs_metadata.append({
+                        'name': file_input.get('name', 'file'),
+                        'accept': file_input.get('accept', ''),  # Allowed extensions
+                        'multiple': file_input.has_attr('multiple'),  # Multiple files?
+                        'required': file_input.has_attr('required')
                     })
-            
-            logger.info(f"[{self.name}] Discovered {len(forms)} upload forms.")
+
+                form_data = {
+                    'action': action_url,
+                    'method': form.get('method', 'POST').upper(),
+                    'enctype': form.get('enctype', 'multipart/form-data'),
+                    'id': form.get('id', f'form_{form_idx}'),
+                    'file_inputs': file_inputs_metadata,
+                    'all_fields': all_fields  # Includes hidden, text, etc.
+                }
+
+                forms.append(form_data)
+                self._tested_upload_endpoints.add(action_url)
+
+            # Also detect drag-and-drop zones (JavaScript upload)
+            dropzones = soup.find_all(attrs={'data-upload': True})
+            for dz in dropzones:
+                upload_url = dz.get('data-upload')
+                if upload_url and upload_url not in self._tested_upload_endpoints:
+                    forms.append({
+                        'action': urljoin(self.url, upload_url),
+                        'method': 'POST',
+                        'enctype': 'multipart/form-data',
+                        'id': dz.get('id', 'dropzone'),
+                        'file_inputs': [{'name': 'file', 'accept': '', 'multiple': True, 'required': False}],
+                        'all_fields': {},
+                        'dropzone': True
+                    })
+                    self._tested_upload_endpoints.add(upload_url)
+
+            logger.info(f"[{self.name}] 🔍 Discovered {len(forms)} upload forms/endpoints on {self.url}")
+            for form in forms:
+                file_count = len(form.get('file_inputs', []))
+                field_count = len(form.get('all_fields', {}))
+                logger.info(f"  → {form['action']} ({file_count} file inputs, {field_count} fields)")
+
             return forms
+
         except Exception as e:
-            logger.error(f"Discovery failed: {e}", exc_info=True)
+            logger.error(f"[{self.name}] Discovery failed: {e}", exc_info=True)
             return []
 
     def _get_upload_strategy(self, attempt: int, strategy: Optional[Dict], form: Dict) -> Optional[Tuple[str, str, str]]:
@@ -116,8 +240,22 @@ class FileUploadAgent(BaseAgent):
         }
 
     async def _test_form(self, form: Dict) -> Optional[Dict]:
-        """Orchestrate testing for a specific form with bypass loops."""
+        """
+        Orchestrate testing for a specific form with bypass loops.
+
+        Now supports:
+        - Multiple file inputs per form
+        - Accept attribute awareness (allowed extensions)
+        - All form fields (hidden, etc.)
+        """
         dashboard.log(f"[{self.name}] Testing upload form: {form['id']}", "INFO")
+
+        # Log accepted extensions if specified
+        file_inputs = form.get('file_inputs', [])
+        for fi in file_inputs:
+            if fi.get('accept'):
+                logger.info(f"[{self.name}]   Accept filter: {fi['accept']}")
+
         previous_response = ""
 
         for attempt in range(self.MAX_BYPASS_ATTEMPTS + 1):
@@ -134,7 +272,7 @@ class FileUploadAgent(BaseAgent):
             filename, payload, content_type = strategy_result
             dashboard.log(f"[{self.name}] Attempting upload: {filename} ({content_type})", "INFO")
 
-            # Phase 2: Execute Upload
+            # Phase 2: Execute Upload (test first file input)
             success, response_text, uploaded_url = await self._upload_file(form, filename, payload, content_type)
             previous_response = response_text
 
@@ -152,13 +290,39 @@ class FileUploadAgent(BaseAgent):
         return None
 
     async def _llm_get_strategy(self, form_data: Dict, previous_response: str = "") -> Dict:
-        """Call LLM to generate or refine the upload bypass strategy."""
+        """
+        Call LLM to generate or refine the upload bypass strategy.
+
+        Now passes rich metadata:
+        - Accept filter (allowed extensions)
+        - All form fields (hidden, etc.)
+        - Multiple file inputs
+        """
         system_prompt = self.system_prompt
-        
-        user_prompt = f"Analyze this upload form and generate a bypass for RCE:\nForm: {form_data}"
+
+        # Extract useful metadata for LLM
+        file_inputs = form_data.get('file_inputs', [])
+        accept_filters = [fi.get('accept', 'none') for fi in file_inputs]
+        all_fields = form_data.get('all_fields', {})
+
+        user_prompt = f"""Analyze this upload form and generate a bypass for RCE:
+
+Form Action: {form_data['action']}
+Method: {form_data['method']}
+Enctype: {form_data.get('enctype', 'multipart/form-data')}
+
+File Inputs ({len(file_inputs)}):
+{chr(10).join([f"  - {fi['name']} (accept: {fi.get('accept', 'any')}, multiple: {fi.get('multiple', False)})" for fi in file_inputs])}
+
+Other Form Fields ({len(all_fields)}):
+{chr(10).join([f"  - {name}: {value}" for name, value in list(all_fields.items())[:10]])}
+
+Accept Filters: {', '.join(accept_filters) if accept_filters else 'No restrictions detected'}
+"""
+
         if previous_response:
             user_prompt += f"\n\nPrevious attempt failed with this response:\n{previous_response[:2000]}"
-            user_prompt += "\n\nTry a different bypass (e.g. extension change, content-type spoofing, magic bytes)."
+            user_prompt += "\n\nTry a different bypass (e.g. extension change, content-type spoofing, magic bytes, double extensions)."
 
         from bugtrace.core.llm_client import llm_client
         response = await llm_client.generate(
@@ -166,18 +330,35 @@ class FileUploadAgent(BaseAgent):
             system_prompt=system_prompt,
             module_name="FILE_UPLOAD"
         )
-        
+
         from bugtrace.utils.parsers import XmlParser
         tags = ["payload_content", "filename", "content_type", "vulnerable", "validation_url"]
         return XmlParser.extract_tags(response, tags)
 
     async def _upload_file(self, form, filename, content, content_type) -> Tuple[bool, str, str]:
-        """Perform the actual HTTP multipart upload."""
-        from urllib.parse import urljoin
+        """
+        Perform the actual HTTP multipart upload.
 
-        action_url = urljoin(self.url, form['action'])
+        Now includes ALL form fields (hidden, text, etc.) to satisfy
+        server-side validation that might reject incomplete forms.
+        """
+        action_url = form['action']  # Already resolved in _discover_upload_forms
         data = aiohttp.FormData()
-        data.add_field(form['input_name'],
+
+        # Add ALL non-file fields first (hidden, text, etc.)
+        all_fields = form.get('all_fields', {})
+        for field_name, field_value in all_fields.items():
+            # Skip file inputs (they're handled separately)
+            data.add_field(field_name, field_value)
+
+        # Add the file upload (use first file input)
+        file_inputs = form.get('file_inputs', [])
+        if file_inputs:
+            input_name = file_inputs[0]['name']
+        else:
+            input_name = 'file'  # Fallback
+
+        data.add_field(input_name,
                       content,
                       filename=filename,
                       content_type=content_type)
@@ -191,7 +372,7 @@ class FileUploadAgent(BaseAgent):
                     # Dojo validation: Check if text confirms upload
                     return resp.status in [200, 201], text, predicted_url
         except Exception as e:
-            logger.debug(f"operation failed: {e}")
+            logger.debug(f"[{self.name}] Upload operation failed: {e}")
             return False, "", ""
 
     async def _validate_execution(self, url: str) -> bool:

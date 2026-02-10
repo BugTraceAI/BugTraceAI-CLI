@@ -34,6 +34,10 @@ class BatchMetrics:
     findings_distributed: int = 0
     findings_exploited: int = 0
 
+    # Finding sources (for integrity verification)
+    findings_dast: int = 0          # DASTySAST findings only
+    findings_auth: int = 0          # AuthDiscovery findings only
+
     # WET→DRY tracking (integrity verification)
     wet_processed: int = 0  # Total WET items consumed by specialists
     dry_generated: int = 0  # Total DRY items produced after dedup
@@ -56,6 +60,12 @@ class BatchMetrics:
         self.dast_end_time = time.monotonic()
         self.urls_analyzed = urls_analyzed
         self.findings_before_dedup = findings_count
+        self.findings_dast = findings_count  # Track DAST separately
+
+    def add_auth_findings(self, count: int):
+        """Record AuthDiscovery findings count."""
+        self.findings_auth = count
+        self.findings_before_dedup += count
 
     def start_queue_drain(self):
         """Mark queue drain wait start."""
@@ -171,6 +181,7 @@ def get_batch_metrics() -> BatchMetrics:
 
 
 def reset_batch_metrics():
-    """Reset metrics for new scan."""
-    global batch_metrics
-    batch_metrics = BatchMetrics()
+    """Reset metrics for new scan (in-place to preserve all references)."""
+    fresh = BatchMetrics()
+    for attr_name, attr_value in vars(fresh).items():
+        setattr(batch_metrics, attr_name, attr_value)

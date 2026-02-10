@@ -1,7 +1,7 @@
 import logging
 import aiohttp
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from bugtrace.agents.base import BaseAgent
@@ -53,7 +53,59 @@ class RCEAgent(BaseAgent, TechContextMixin):
         # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._rce_prime_directive: str = ""
-        
+
+    # =========================================================================
+    # FINDING VALIDATION: RCE-specific validation (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> Tuple[bool, str]:
+        """
+        RCE-specific validation before emitting finding.
+
+        Validates:
+        1. Basic requirements (type, url) via parent
+        2. Has execution evidence (time delay, output, or callback)
+        3. Payload contains command injection patterns
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # Extract from nested structure if needed
+        nested = finding.get("finding", {})
+        evidence = finding.get("evidence", nested.get("evidence", ""))
+        status = finding.get("status", nested.get("status", ""))
+
+        # RCE-specific: Must have evidence
+        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+            has_time = "delay" in str(evidence).lower() or "sleep" in str(evidence).lower()
+            has_output = evidence.get("command_output") if isinstance(evidence, dict) else False
+            has_callback = evidence.get("interactsh_callback") if isinstance(evidence, dict) else False
+            if not (has_time or has_output or has_callback):
+                return False, "RCE requires proof: time delay, command output, or Interactsh callback"
+
+        # RCE-specific: Payload should contain command patterns
+        payload = finding.get("payload", nested.get("payload", ""))
+        rce_markers = [';', '|', '`', '$', 'sleep', 'ping', 'curl', 'wget', 'cat', 'eval', 'exec', '__import__']
+        if payload and not any(m in str(payload) for m in rce_markers):
+            return False, f"RCE payload missing command injection patterns: {payload[:50]}"
+
+        return True, ""
+
+    def _emit_rce_finding(self, finding_dict: Dict, scan_context: str = None) -> Optional[Dict]:
+        """
+        Helper to emit RCE finding using BaseAgent.emit_finding() with validation.
+        """
+        if "type" not in finding_dict:
+            finding_dict["type"] = "RCE"
+
+        if scan_context:
+            finding_dict["scan_context"] = scan_context
+
+        finding_dict["agent"] = self.name
+        return self.emit_finding(finding_dict)
+
     def _get_time_payloads(self) -> list:
         """Get time-based RCE payloads."""
         return [
@@ -184,6 +236,96 @@ class RCEAgent(BaseAgent, TechContextMixin):
     # QUEUE CONSUMPTION MODE (Phase 20) - WET→DRY
     # =========================================================================
 
+    async def _discover_rce_params(self, url: str) -> Dict[str, str]:
+        """
+        RCE-focused parameter discovery for a given URL.
+
+        Extracts ALL testable parameters from:
+        1. URL query string
+        2. HTML forms (input, textarea, select)
+        3. Prioritizes command-related parameter names
+
+        Returns:
+            Dict mapping param names to default values
+            Example: {"cmd": "", "search": "test", "filter": ""}
+
+        Architecture Note:
+            Specialists must be AUTONOMOUS - they discover their own attack surface.
+            The finding from DASTySAST is just a "signal" that the URL is interesting.
+            We IGNORE the specific parameter and test ALL discoverable params.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, parse_qs
+        from bs4 import BeautifulSoup
+
+        all_params = {}
+
+        # RCE-specific: Command injection keywords (for prioritization)
+        RCE_PRIORITY_KEYWORDS = [
+            'cmd', 'command', 'exec', 'execute', 'run', 'shell', 'system',
+            'eval', 'code', 'script', 'ping', 'wget', 'curl', 'bash',
+            'powershell', 'process', 'task', 'job'
+        ]
+
+        # 1. Extract URL query parameters
+        try:
+            parsed = urlparse(url)
+            url_params = parse_qs(parsed.query)
+            for param_name, values in url_params.items():
+                all_params[param_name] = values[0] if values else ""
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        # 2. Fetch HTML and extract form parameters
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+
+            if html:
+                self._last_discovery_html = html  # Cache for URL resolution
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract from <input>, <textarea>, <select> with name attribute
+                for tag in soup.find_all(["input", "textarea", "select"]):
+                    param_name = tag.get("name")
+                    if param_name and param_name not in all_params:
+                        # Exclude CSRF tokens and submit buttons
+                        input_type = tag.get("type", "text").lower()
+                        if input_type not in ["submit", "button", "reset"]:
+                            # For RCE, we're interested in ALL params, including CSRF
+                            # (though we'll deprioritize CSRF tokens)
+                            if "csrf" not in param_name.lower():
+                                # Get default value
+                                default_value = tag.get("value", "")
+                                all_params[param_name] = default_value
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to extract HTML form params: {e}")
+
+        # 3. Prioritize RCE-related parameters (move to front of dict)
+        # Python 3.7+ dicts maintain insertion order
+        prioritized_params = {}
+
+        # First, add parameters with RCE keywords
+        for param_name in list(all_params.keys()):
+            if any(keyword in param_name.lower() for keyword in RCE_PRIORITY_KEYWORDS):
+                prioritized_params[param_name] = all_params[param_name]
+
+        # Then add remaining parameters
+        for param_name, param_value in all_params.items():
+            if param_name not in prioritized_params:
+                prioritized_params[param_name] = param_value
+
+        logger.info(f"[{self.name}] 🔍 Discovered {len(prioritized_params)} params on {url}: {list(prioritized_params.keys())}")
+
+        # Log if we found high-priority RCE params
+        high_priority = [p for p in prioritized_params.keys()
+                        if any(k in p.lower() for k in RCE_PRIORITY_KEYWORDS)]
+        if high_priority:
+            logger.info(f"[{self.name}] ⚠️ Found {len(high_priority)} HIGH-PRIORITY RCE params: {high_priority}")
+
+        return prioritized_params
+
     async def analyze_and_dedup_queue(self) -> List[Dict]:
         import asyncio, time
         from bugtrace.core.queue import queue_manager
@@ -211,12 +353,82 @@ class RCEAgent(BaseAgent, TechContextMixin):
         logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings")
         if not wet_findings:
             return []
+
+        # ARCHITECTURE: ALWAYS keep original WET params + ADD discovered params
+        logger.info(f"[{self.name}] Phase A: Expanding WET findings with RCE-focused discovery...")
+        expanded_wet_findings = []
+        seen_urls = set()
+        seen_params = set()
+
+        # 1. Always include ALL original WET params first (DASTySAST signals)
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            param = wet_item.get("parameter", "") or (wet_item.get("finding", {}) or {}).get("parameter", "")
+            if param and (url, param) not in seen_params:
+                seen_params.add((url, param))
+                expanded_wet_findings.append(wet_item)
+
+        # 2. Discover additional params per unique URL
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                all_params = await self._discover_rce_params(url)
+                if not all_params:
+                    continue
+
+                new_count = 0
+                for param_name, param_value in all_params.items():
+                    if (url, param_name) not in seen_params:
+                        seen_params.add((url, param_name))
+                        expanded_wet_findings.append({
+                            "url": url,
+                            "parameter": param_name,
+                            "finding": wet_item.get("finding", {}),
+                            "scan_context": wet_item.get("scan_context", self._scan_context),
+                            "_discovered": True
+                        })
+                        new_count += 1
+
+                if new_count:
+                    logger.info(f"[{self.name}] 🔍 Discovered {new_count} additional params on {url}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
+
+        # 2.5 Resolve endpoint URLs from HTML links/forms + reasoning fallback
+        from bugtrace.agents.specialist_utils import resolve_param_endpoints, resolve_param_from_reasoning
+        if hasattr(self, '_last_discovery_html') and self._last_discovery_html:
+            for base_url in seen_urls:
+                endpoint_map = resolve_param_endpoints(self._last_discovery_html, base_url)
+                # Fallback: extract endpoints from DASTySAST reasoning text
+                reasoning_map = resolve_param_from_reasoning(expanded_wet_findings, base_url)
+                for k, v in reasoning_map.items():
+                    if k not in endpoint_map:
+                        endpoint_map[k] = v
+                if endpoint_map:
+                    resolved_count = 0
+                    for item in expanded_wet_findings:
+                        if item.get("url") == base_url:
+                            param = item.get("parameter", "")
+                            if param in endpoint_map and endpoint_map[param] != base_url:
+                                item["url"] = endpoint_map[param]
+                                resolved_count += 1
+                    if resolved_count:
+                        logger.info(f"[{self.name}] 🔗 Resolved {resolved_count} params to actual endpoint URLs")
+
+        logger.info(f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → {len(expanded_wet_findings)} testable params")
+
+        # Now deduplicate the expanded list
         try:
-            dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+            dry_list = await self._llm_analyze_and_dedup(expanded_wet_findings, self._scan_context)
         except:
-            dry_list = self._fallback_fingerprint_dedup(wet_findings)
+            dry_list = self._fallback_fingerprint_dedup(expanded_wet_findings)
         self._dry_findings = dry_list
-        logger.info(f"[{self.name}] Phase A: {len(wet_findings)} WET → {len(dry_list)} DRY ({len(wet_findings)-len(dry_list)} duplicates removed)")
+        logger.info(f"[{self.name}] Phase A: {len(expanded_wet_findings)} WET → {len(dry_list)} DRY ({len(expanded_wet_findings)-len(dry_list)} duplicates removed)")
         return dry_list
 
     async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
@@ -248,17 +460,43 @@ class RCEAgent(BaseAgent, TechContextMixin):
 - Likely OS: {os_type}
 - WAF: {waf or 'None'}
 
-WET FINDINGS:
+## WET LIST ({len(wet_findings)} potential RCE findings):
 {json.dumps(wet_findings, indent=2)}
 
-Return ONLY unique findings in JSON format:
-{{"findings": [...]}}"""
+## TASK
+1. Analyze each finding considering the parameter injection point
+2. **CRITICAL - Autonomous Discovery:**
+   - Items with "_discovered": true are DIFFERENT PARAMETERS discovered autonomously
+   - Even if they share the same "finding" object, treat them as SEPARATE based on "parameter" field
+   - Same URL + DIFFERENT param → DIFFERENT (keep all)
+   - Same URL + param + DIFFERENT command separator → technique variants (keep one representative)
+   - Different endpoints → DIFFERENT (keep both)
+   - ONLY mark as DUPLICATE if: Same URL + Same param + Same technique
+3. Prioritize parameters with command-related names (cmd, exec, run, shell, etc.)
+4. Different command separators (;, |, &, `, $()) on same param = technique variants (pick best)
 
-        system_prompt = f"""You are an expert RCE deduplication analyst.
+## OUTPUT FORMAT (JSON only, no markdown):
+{{
+  "findings": [
+    {{
+      "url": "...",
+      "parameter": "...",
+      "rationale": "why this is unique and exploitable",
+      "attack_priority": 1-5
+    }}
+  ],
+  "duplicates_removed": <count>,
+  "reasoning": "Brief explanation of deduplication strategy"
+}}"""
+
+        system_prompt = f"""You are an expert RCE deduplication analyst with deep knowledge of command injection.
 
 {rce_prime_directive}
 
-Focus on parameter+injection point deduplication. Different command separators on same param = technique variants."""
+Focus on parameter+injection point deduplication. Different command separators on same param = technique variants.
+
+**CRITICAL**: If items have "_discovered": true, they represent DIFFERENT parameters discovered autonomously on the same URL.
+Treat each parameter as a SEPARATE potential injection point - do not merge them."""
 
         response = await llm_client.generate(
             prompt=prompt,
@@ -292,14 +530,18 @@ Focus on parameter+injection point deduplication. Different command separators o
                     fp = self._generate_rce_fingerprint(f["url"], f["parameter"])
                     if fp not in self._emitted_findings:
                         self._emitted_findings.add(fp)
-                        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-                            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                        if settings.WORKER_POOL_EMIT_EVENTS:
+                            status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
+                            self._emit_rce_finding({
                                 "specialist": "rce",
-                                "finding": {"type": "RCE", "url": result.get("url"), "parameter": result.get("parameter"), "payload": result.get("payload")},
-                                "status": result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value),
-                                "validation_requires_cdp": result.get("status") == ValidationStatus.PENDING_VALIDATION.value,
-                                "scan_context": self._scan_context,
-                            })
+                                "type": "RCE",
+                                "url": result.get("url"),
+                                "parameter": result.get("parameter"),
+                                "payload": result.get("payload"),
+                                "status": status,
+                                "evidence": result.get("evidence", ""),
+                                "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
+                            }, scan_context=self._scan_context)
                         logger.info(f"[{self.name}] ✅ Emitted unique: {f['url']}?{f['parameter']}")
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: {e}")
@@ -333,6 +575,7 @@ Focus on parameter+injection point deduplication. Different command separators o
             report_specialist_start,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
 
         self._queue_mode = True
@@ -352,6 +595,7 @@ Focus on parameter+injection point deduplication. Different command separators o
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "rce")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -460,19 +704,17 @@ Focus on parameter+injection point deduplication. Different command separators o
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            self._emit_rce_finding({
                 "specialist": "rce",
-                "finding": {
-                    "type": "RCE",
-                    "url": result.get("url"),
-                    "parameter": result.get("parameter"),
-                    "payload": result.get("payload"),
-                },
+                "type": "RCE",
+                "url": result.get("url"),
+                "parameter": result.get("parameter"),
+                "payload": result.get("payload"),
                 "status": status,
+                "evidence": result.get("evidence", ""),
                 "validation_requires_cdp": needs_cdp,
-                "scan_context": self._scan_context,
-            })
+            }, scan_context=self._scan_context)
 
         logger.info(f"[{self.name}] Confirmed RCE: {result.get('url')}?{result.get('parameter')}")
 

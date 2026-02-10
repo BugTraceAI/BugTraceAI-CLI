@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import aiohttp
@@ -68,6 +68,58 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
         # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._openredirect_prime_directive: str = ""
+
+    # =========================================================================
+    # FINDING VALIDATION: Open Redirect-specific validation (Phase 1 Refactor)
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> Tuple[bool, str]:
+        """
+        Open Redirect-specific validation before emitting finding.
+
+        Validates:
+        1. Basic requirements (type, url) via parent
+        2. Has redirect evidence (Location header, JS redirect)
+        3. Payload contains redirect patterns
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # Extract from nested structure if needed
+        nested = finding.get("finding", {})
+        evidence = finding.get("evidence", nested.get("evidence", {}))
+        status = finding.get("status", nested.get("status", ""))
+
+        # Open Redirect-specific: Must have redirect evidence or confirmed status
+        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+            has_location = evidence.get("location_header") if isinstance(evidence, dict) else False
+            has_js_redirect = evidence.get("js_redirect") if isinstance(evidence, dict) else False
+            has_redirect = evidence.get("redirect_confirmed") if isinstance(evidence, dict) else False
+            if not (has_location or has_js_redirect or has_redirect):
+                return False, "Open Redirect requires proof: Location header, JS redirect, or redirect confirmed"
+
+        # Open Redirect-specific: Payload should contain redirect patterns
+        payload = finding.get("payload", nested.get("payload", ""))
+        redirect_markers = ['http://', 'https://', '//', 'javascript:', '@', '%2f%2f', '//evil.com', 'redirect=']
+        if payload and not any(m in str(payload).lower() for m in redirect_markers):
+            return False, f"Open Redirect payload missing redirect patterns: {payload[:50]}"
+
+        return True, ""
+
+    def _emit_openredirect_finding(self, finding_dict: Dict, scan_context: str = None) -> Optional[Dict]:
+        """
+        Helper to emit Open Redirect finding using BaseAgent.emit_finding() with validation.
+        """
+        if "type" not in finding_dict:
+            finding_dict["type"] = "OPEN_REDIRECT"
+
+        if scan_context:
+            finding_dict["scan_context"] = scan_context
+
+        finding_dict["agent"] = self.name
+        return self.emit_finding(finding_dict)
 
     async def run_loop(self) -> Dict:
         """Main execution loop for Open Redirect testing."""
@@ -315,6 +367,107 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
             logger.debug(f"BeautifulSoup meta parsing failed: {e}")
 
         return vectors
+
+    # =========================================================================
+    # AUTONOMOUS PARAMETER DISCOVERY (v3.3.0 - Specialist Autonomy Pattern)
+    # =========================================================================
+
+    async def _discover_openredirect_params(self, url: str) -> Dict[str, str]:
+        """
+        Open Redirect-focused parameter discovery.
+
+        Extracts ALL testable parameters from:
+        1. URL query string
+        2. HTML forms (input, textarea, select)
+        3. Meta refresh tags (open redirect specific)
+
+        Priority params: redirect, next, return_url, goto, continue, callback
+
+        Returns:
+            Dict mapping param names to default values
+            Example: {"redirect": "/dashboard", "next": "", "return_url": ""}
+
+        Architecture Note:
+            Specialists must be AUTONOMOUS - they discover their own attack surface.
+            The finding from DASTySAST is just a "signal" that the URL is interesting.
+            We IGNORE the specific parameter and test ALL discoverable redirect params.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+
+        all_params = {}
+
+        # 1. Extract URL query parameters
+        try:
+            parsed = urlparse(url)
+            url_params = parse_qs(parsed.query)
+            for param_name, values in url_params.items():
+                all_params[param_name] = values[0] if values else ""
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        # 2. Fetch HTML and extract form parameters
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+
+            if html:
+                self._last_discovery_html = html  # Cache for URL resolution
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract from <input>, <textarea>, <select>
+                for tag in soup.find_all(["input", "textarea", "select"]):
+                    param_name = tag.get("name")
+                    if param_name and param_name not in all_params:
+                        input_type = tag.get("type", "text").lower()
+
+                        # Skip non-testable input types
+                        if input_type not in ["submit", "button", "reset"]:
+                            # Include CSRF (could be tested for open redirect)
+                            # but skip obvious tokens
+                            if "token" not in param_name.lower() or "redirect" in param_name.lower():
+                                default_value = tag.get("value", "")
+                                all_params[param_name] = default_value
+
+                # 3. Check for meta refresh tags (open redirect specific)
+                meta_tags = soup.find_all('meta', attrs={'http-equiv': re.compile(r'refresh', re.I)})
+                if meta_tags:
+                    logger.debug(f"[{self.name}] Found {len(meta_tags)} meta refresh tags")
+
+                # 4. Extract internal links for DOM redirect coverage
+                from urllib.parse import urljoin
+                base_domain = urlparse(url).netloc
+                internal_urls = set()
+                for a_tag in soup.find_all("a", href=True):
+                    link = urljoin(url, a_tag["href"])
+                    parsed_link = urlparse(link)
+                    if parsed_link.netloc == base_domain and parsed_link.scheme in ("http", "https"):
+                        clean_link = f"{parsed_link.scheme}://{parsed_link.netloc}{parsed_link.path}"
+                        if clean_link != url.split("?")[0]:
+                            internal_urls.add(clean_link)
+                self._discovered_internal_urls = list(internal_urls)[:15]
+                if self._discovered_internal_urls:
+                    logger.info(f"[{self.name}] 🔗 Discovered {len(self._discovered_internal_urls)} internal URLs for DOM redirect testing")
+
+        except Exception as e:
+            logger.error(f"[{self.name}] HTML parsing failed for {url}: {e}")
+
+        # Prioritize redirect-like parameter names
+        redirect_keywords = ["redirect", "next", "return", "goto", "dest", "continue", "callback", "url", "redir"]
+        priority_params = {k: v for k, v in all_params.items() if any(kw in k.lower() for kw in redirect_keywords)}
+        other_params = {k: v for k, v in all_params.items() if k not in priority_params}
+
+        # Return priority params first (for logging clarity)
+        sorted_params = {**priority_params, **other_params}
+
+        logger.info(
+            f"[{self.name}] 🔍 Discovered {len(sorted_params)} params on {url}: "
+            f"{list(sorted_params.keys())[:10]}"
+            f"{' (+ more)' if len(sorted_params) > 10 else ''}"
+        )
+        if priority_params:
+            logger.info(f"[{self.name}]   Priority redirect params: {list(priority_params.keys())}")
+
+        return sorted_params
 
     async def _auditor_phase(self, vectors: List[Dict]) -> List[Dict]:
         """
@@ -606,6 +759,111 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
 
         return None
 
+    async def _test_dom_redirects(self) -> List[Dict]:
+        """
+        Test for DOM-based open redirects using Playwright.
+
+        Injects evil URL into each discovered param, loads page in browser,
+        intercepts navigation to external domain.
+
+        Only for DOM redirects (JavaScript: location.href, location.assign, etc.)
+        HTTP 3xx redirects are handled by _test_param_vector.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+
+        findings = []
+        evil_domain = "evil.bugtraceai.test"
+        evil_url = f"https://{evil_domain}/redirect-probe"
+
+        # Collect URLs to test: self.url + internal links
+        urls_to_test = [self.url]
+        if hasattr(self, '_discovered_internal_urls') and self._discovered_internal_urls:
+            urls_to_test.extend(self._discovered_internal_urls)
+
+        logger.info(f"[{self.name}] 🎭 DOM redirect testing on {len(urls_to_test)} URLs")
+
+        for test_url in urls_to_test:
+            # Discover params for this URL
+            parsed = urlparse(test_url)
+            url_params = list(parse_qs(parsed.query).keys())
+
+            # Also check common redirect params even if not in URL
+            redirect_keywords = ["redirect", "next", "return", "returnUrl", "goto", "dest",
+                                 "continue", "callback", "url", "redir", "returnTo", "forward",
+                                 "back", "backUrl", "ref", "target", "to", "out"]
+            params_to_test = list(set(url_params + redirect_keywords))
+
+            for param in params_to_test:
+                try:
+                    # Build test URL with evil redirect value
+                    if "?" in test_url:
+                        injected_url = f"{test_url}&{param}={evil_url}"
+                    else:
+                        injected_url = f"{test_url}?{param}={evil_url}"
+
+                    # Use Playwright to detect DOM redirect
+                    redirected_to = None
+
+                    async with browser_manager.get_page() as page:
+                        async def handle_request(route):
+                            nonlocal redirected_to
+                            # Check the HOST of the request, not the full URL string
+                            # The evil domain can appear as a query param value (FP)
+                            # but only a real redirect changes the request host
+                            try:
+                                req_host = urlparse(route.request.url).netloc
+                            except Exception:
+                                req_host = ""
+                            if req_host == evil_domain:
+                                redirected_to = route.request.url
+                                await route.abort()
+                            else:
+                                await route.continue_()
+
+                        await page.route("**/*", handle_request)
+
+                        try:
+                            await page.goto(injected_url, wait_until="networkidle", timeout=8000)
+                            # Small wait for late JS redirects
+                            await asyncio.sleep(1)
+                        except Exception:
+                            pass  # Page may error after redirect abort
+
+                    if redirected_to:
+                        logger.info(f"[{self.name}] ✅ DOM Open Redirect: {param} on {test_url} → {redirected_to}")
+                        findings.append({
+                            "exploitable": True,
+                            "validated": True,
+                            "type": "OPEN_REDIRECT",
+                            "param": param,
+                            "payload": evil_url,
+                            "url": test_url,
+                            "tier": "dom",
+                            "technique": "dom_redirect",
+                            "status_code": None,
+                            "location": redirected_to,
+                            "test_url": injected_url,
+                            "method": "DOM_REDIRECT",
+                            "severity": "LOW",
+                            "evidence": {
+                                "dom_redirect": True,
+                                "redirected_to": redirected_to,
+                                "injected_param": param,
+                            },
+                            "status": ValidationStatus.VALIDATED_CONFIRMED.value,
+                            "http_request": f"GET {injected_url}",
+                            "http_response": f"DOM redirect to: {redirected_to}",
+                        })
+                        break  # One confirmed redirect per URL is enough
+
+                except Exception as e:
+                    logger.debug(f"[{self.name}] DOM redirect test failed for {param} on {test_url}: {e}")
+
+        if findings:
+            dashboard.log(f"[{self.name}] 🎭 Found {len(findings)} DOM-based open redirects!", "SUCCESS")
+
+        return findings
+
     def _analyze_http_redirect(self, vector: Dict) -> Optional[Dict]:
         """
         Analyze an existing HTTP redirect for exploitability.
@@ -671,7 +929,7 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
     # ========================================
 
     async def analyze_and_dedup_queue(self) -> List[Dict]:
-        """Phase A: Global analysis of WET list with LLM-powered deduplication."""
+        """Phase A: Global analysis of WET list with LLM-powered deduplication + autonomous discovery."""
         import asyncio
         import time
         from bugtrace.core.queue import queue_manager
@@ -708,10 +966,10 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
             url = finding.get("url", "")
             parameter = finding.get("parameter", "")
 
-            if url and parameter:
+            if url:  # Only URL is required for discovery
                 wet_findings.append({
                     "url": url,
-                    "parameter": parameter,
+                    "parameter": parameter,  # May be empty (hint-only)
                     "finding": finding,
                     "scan_context": item.get("scan_context", self._scan_context)
                 })
@@ -721,20 +979,97 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
         if not wet_findings:
             return []
 
+        # ========== AUTONOMOUS PARAMETER DISCOVERY ==========
+        # Strategy: ALWAYS keep original WET params + ADD discovered params
+        logger.info(f"[{self.name}] Phase A: Expanding WET findings with autonomous discovery...")
+        expanded_wet_findings = []
+        seen_urls = set()
+        seen_params = set()
+
+        # 1. Always include ALL original WET params first (DASTySAST signals)
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            param = wet_item.get("parameter", "") or (wet_item.get("finding", {}) or {}).get("parameter", "")
+            if param and (url, param) not in seen_params:
+                seen_params.add((url, param))
+                expanded_wet_findings.append(wet_item)
+
+        # 2. Discover additional params per unique URL
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                all_params = await self._discover_openredirect_params(url)
+                if not all_params:
+                    continue
+
+                new_count = 0
+                for param_name, param_value in all_params.items():
+                    if (url, param_name) not in seen_params:
+                        seen_params.add((url, param_name))
+                        expanded_wet_findings.append({
+                            "url": url,
+                            "parameter": param_name,
+                            "context": wet_item.get("context", "discovered"),
+                            "finding": wet_item.get("finding", {}),
+                            "scan_context": wet_item.get("scan_context", self._scan_context),
+                            "_discovered": True
+                        })
+                        new_count += 1
+
+                if new_count:
+                    logger.info(f"[{self.name}] 🔍 Discovered {new_count} additional params on {url}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
+
+        # 2.5 Resolve endpoint URLs from HTML links/forms + reasoning fallback
+        from bugtrace.agents.specialist_utils import resolve_param_endpoints, resolve_param_from_reasoning
+        if hasattr(self, '_last_discovery_html') and self._last_discovery_html:
+            for base_url in seen_urls:
+                endpoint_map = resolve_param_endpoints(self._last_discovery_html, base_url)
+                # Fallback: extract endpoints from DASTySAST reasoning text
+                reasoning_map = resolve_param_from_reasoning(expanded_wet_findings, base_url)
+                for k, v in reasoning_map.items():
+                    if k not in endpoint_map:
+                        endpoint_map[k] = v
+                if endpoint_map:
+                    resolved_count = 0
+                    for item in expanded_wet_findings:
+                        if item.get("url") == base_url:
+                            param = item.get("parameter", "")
+                            if param in endpoint_map and endpoint_map[param] != base_url:
+                                item["url"] = endpoint_map[param]
+                                resolved_count += 1
+                    if resolved_count:
+                        logger.info(f"[{self.name}] 🔗 Resolved {resolved_count} params to actual endpoint URLs")
+
+        logger.info(
+            f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → "
+            f"{len(expanded_wet_findings)} testable params"
+        )
+
+        # ========== DEDUPLICATION ==========
         try:
-            dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+            dry_list = await self._llm_analyze_and_dedup(expanded_wet_findings, self._scan_context)
         except Exception as e:
             logger.error(f"[{self.name}] LLM dedup failed: {e}. Falling back to fingerprint dedup")
-            dry_list = self._fallback_fingerprint_dedup(wet_findings)
+            dry_list = self._fallback_fingerprint_dedup(expanded_wet_findings)
 
         self._dry_findings = dry_list
-        dup_count = len(wet_findings) - len(dry_list)
-        logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({dup_count} duplicates removed)")
+        dup_count = len(expanded_wet_findings) - len(dry_list)
+        logger.info(
+            f"[{self.name}] Phase A: Deduplication complete. "
+            f"{len(expanded_wet_findings)} WET → {len(dry_list)} DRY ({dup_count} duplicates removed)"
+        )
 
         return dry_list
 
     async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
-        """LLM-powered intelligent deduplication with tech context awareness."""
+        """LLM-powered intelligent deduplication with tech context awareness + autonomous discovery."""
         from bugtrace.core.llm_client import llm_client
         import json
 
@@ -749,27 +1084,58 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
 
 {openredirect_dedup_context}
 
-DEDUPLICATION RULES FOR OPEN REDIRECT:
-- Same URL + redirect parameter = DUPLICATE
-- Different parameter = DIFFERENT (e.g., 'url' vs 'redirect' vs 'next')
+## DEDUPLICATION RULES FOR OPEN REDIRECT
 
-WET LIST:
+1. **CRITICAL - Autonomous Discovery:**
+   - If items have "_discovered": true, they are DIFFERENT PARAMETERS discovered autonomously
+   - Even if they share the same "finding" object, treat them as SEPARATE based on "parameter" field
+   - Same URL + DIFFERENT param → DIFFERENT (keep all)
+   - Same URL + param + DIFFERENT context → DIFFERENT (keep both)
+
+2. **Standard Deduplication:**
+   - Same URL + Same parameter + Same context → DUPLICATE (keep best)
+   - Different endpoints → DIFFERENT (keep both)
+   - Example: 'redirect' vs 'next' vs 'return_url' = DIFFERENT parameters
+
+3. **Prioritization:**
+   - Rank by exploitability given the tech stack
+   - Remove findings unlikely to succeed
+
+## WET LIST ({len(wet_findings)} findings):
 {json.dumps(wet_findings, indent=2)}
 
-Return JSON array of UNIQUE findings only:
-{{"findings": [...]}}
+## OUTPUT FORMAT (JSON only):
+{{
+  "findings": [
+    {{
+      "url": "...",
+      "parameter": "...",
+      "context": "...",
+      "rationale": "why this is unique and exploitable",
+      "attack_priority": 1-5,
+      "_discovered": true/false
+    }}
+  ],
+  "duplicates_removed": <count>,
+  "reasoning": "Brief explanation"
+}}
 """
 
         response = await llm_client.generate(
             prompt=prompt,
-            system_prompt="You are an expert security analyst specializing in Open Redirect deduplication.",
+            system_prompt="You are an expert security analyst specializing in Open Redirect deduplication with autonomous parameter discovery.",
             module_name="OPENREDIRECT_DEDUP",
             temperature=0.2
         )
 
         try:
             result = json.loads(response)
-            return result.get("findings", wet_findings)
+            findings = result.get("findings", wet_findings)
+            logger.debug(
+                f"[{self.name}] LLM dedup: {result.get('duplicates_removed', 'unknown')} duplicates removed. "
+                f"Reason: {result.get('reasoning', 'N/A')}"
+            )
+            return findings
         except json.JSONDecodeError:
             logger.warning(f"[{self.name}] LLM returned invalid JSON, using fallback")
             return self._fallback_fingerprint_dedup(wet_findings)
@@ -820,21 +1186,18 @@ Return JSON array of UNIQUE findings only:
                     if fingerprint not in self._emitted_findings:
                         self._emitted_findings.add(fingerprint)
 
-                        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
+                        if settings.WORKER_POOL_EMIT_EVENTS:
                             status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
-
-                            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+                            self._emit_openredirect_finding({
                                 "specialist": "openredirect",
-                                "finding": {
-                                    "type": "OPEN_REDIRECT",
-                                    "url": result.get("url"),
-                                    "parameter": result.get("param"),
-                                    "payload": result.get("payload"),
-                                },
+                                "type": "OPEN_REDIRECT",
+                                "url": result.get("url"),
+                                "parameter": result.get("param"),
+                                "payload": result.get("payload"),
                                 "status": status,
+                                "evidence": result.get("evidence", {"redirect_confirmed": True}),
                                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
-                                "scan_context": self._scan_context,
-                            })
+                            }, scan_context=self._scan_context)
 
                         logger.info(f"[{self.name}] ✅ Emitted unique finding: {url}?{parameter}")
                     else:
@@ -843,6 +1206,31 @@ Return JSON array of UNIQUE findings only:
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Attack failed: {e}")
                 continue
+
+        # Phase B.2: DOM-based redirect testing (Playwright)
+        try:
+            dom_findings = await self._test_dom_redirects()
+            for dom_finding in dom_findings:
+                fingerprint = self._generate_openredirect_fingerprint(
+                    dom_finding["url"], dom_finding["param"]
+                )
+                if fingerprint not in self._emitted_findings:
+                    self._emitted_findings.add(fingerprint)
+                    validated_findings.append(dom_finding)
+
+                    if settings.WORKER_POOL_EMIT_EVENTS:
+                        self._emit_openredirect_finding({
+                            "specialist": "openredirect",
+                            "type": "OPEN_REDIRECT",
+                            "url": dom_finding["url"],
+                            "parameter": dom_finding["param"],
+                            "payload": dom_finding["payload"],
+                            "status": dom_finding["status"],
+                            "evidence": dom_finding["evidence"],
+                            "validation_requires_cdp": False,
+                        }, scan_context=self._scan_context)
+        except Exception as e:
+            logger.error(f"[{self.name}] DOM redirect testing failed: {e}", exc_info=True)
 
         logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
 
@@ -895,6 +1283,7 @@ Return JSON array of UNIQUE findings only:
             report_specialist_start,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
 
         self._queue_mode = True
@@ -916,6 +1305,7 @@ Return JSON array of UNIQUE findings only:
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "openredirect")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -942,6 +1332,59 @@ Return JSON array of UNIQUE findings only:
         )
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
+
+    async def _test_single_param_from_queue(self, url: str, param: str, finding: dict) -> Optional[Dict]:
+        """
+        Test a single parameter from DRY list (Phase B exploitation).
+
+        Args:
+            url: Target URL
+            param: Parameter name to test
+            finding: Original finding dict from DASTySAST
+
+        Returns:
+            Dict with validation result or None if not vulnerable
+        """
+        if not param:
+            logger.warning(f"[{self.name}] Cannot test empty parameter on {url}")
+            return None
+
+        parsed = urlparse(url)
+        trusted_domain = parsed.netloc
+
+        # Test payloads in tier order (stop on first success)
+        for tier in ["basic", "encoding", "whitelist", "advanced"]:
+            payloads = get_payloads_for_tier(tier, DEFAULT_ATTACKER_DOMAIN, trusted_domain)
+
+            for payload in payloads:
+                result = await self._test_single_payload(param, payload, tier)
+
+                if result and result.get("exploitable"):
+                    # Enrich result with validation metadata
+                    result["validated"] = True
+                    result["param"] = param  # Ensure param is set
+                    result["url"] = url
+
+                    # Determine validation status from evidence
+                    evidence = {
+                        "location_header_redirect": result.get("method") in ("HTTP_HEADER", "HTTP_HEADER_REFLECTED", "PATH_REDIRECT"),
+                        "meta_refresh_redirect": result.get("method") == "META_REFRESH",
+                        "js_redirect": result.get("method") in ("JAVASCRIPT", "JAVASCRIPT_DYNAMIC"),
+                        "status_code": result.get("status_code"),
+                        "external_redirect": True,
+                    }
+                    result["evidence"] = evidence
+                    result["status"] = self._get_validation_status(evidence)
+
+                    logger.info(
+                        f"[{self.name}] ✅ OPEN REDIRECT confirmed: {param}={payload[:50]} "
+                        f"(tier: {tier}, method: {result.get('method')})"
+                    )
+                    return result
+
+        # No exploitable redirect found
+        logger.debug(f"[{self.name}] No open redirect found in parameter '{param}' on {url}")
+        return None
 
     async def _process_queue_item(self, item: dict) -> Optional[Dict]:
         """Process a single item from the openredirect queue."""
@@ -1026,19 +1469,17 @@ Return JSON array of UNIQUE findings only:
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        if self.event_bus and settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            self._emit_openredirect_finding({
                 "specialist": "openredirect",
-                "finding": {
-                    "type": "Open Redirect",
-                    "url": result.get("url", result.get("test_url")),
-                    "parameter": result.get("param") or result.get("parameter"),
-                    "payload": result.get("payload"),
-                },
+                "type": "OPEN_REDIRECT",
+                "url": result.get("url", result.get("test_url")),
+                "parameter": result.get("param") or result.get("parameter"),
+                "payload": result.get("payload"),
                 "status": status,
+                "evidence": result.get("evidence", {"redirect_confirmed": True}),
                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
-                "scan_context": self._scan_context,
-            })
+            }, scan_context=self._scan_context)
 
         logger.info(f"[{self.name}] Confirmed Open Redirect: {result.get('url', result.get('test_url'))} [status={status}]")
 

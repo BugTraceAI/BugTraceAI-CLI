@@ -1216,17 +1216,122 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
     # Queue Consumption Mode (Phase 20) - WET→DRY Two-Phase Processing
     # =========================================================================
 
+    async def _discover_idor_params(self, url: str) -> Dict[str, str]:
+        """
+        IDOR-focused parameter discovery.
+
+        Extracts ALL testable parameters from:
+        1. URL query string
+        2. Path segments (/users/123 → {"user_id": "123"})
+        3. HTML forms (input, textarea, select)
+        4. Hidden inputs with numeric/UUID values
+
+        Priority: Numeric params, UUIDs, base64 strings, params ending in _id/Id/ID
+
+        Returns:
+            Dict mapping param names to default values
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, parse_qs
+        from bs4 import BeautifulSoup
+        import re
+
+        all_params = {}
+
+        # 1. Extract URL query parameters
+        try:
+            parsed = urlparse(url)
+            url_params = parse_qs(parsed.query)
+            for param_name, values in url_params.items():
+                all_params[param_name] = values[0] if values else ""
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        # 2. Extract path segments (RESTful IDs)
+        # Example: /users/123/profile → {"user_id": "123"}
+        # Example: /api/orders/a3f7b9c2 → {"order_id": "a3f7b9c2"}
+        try:
+            path = parsed.path
+            path_segments = [s for s in path.split('/') if s]
+
+            # Look for numeric or ID-like segments
+            for i, segment in enumerate(path_segments):
+                # Numeric IDs
+                if segment.isdigit():
+                    # Try to infer param name from previous segment
+                    param_name = f"{path_segments[i-1]}_id" if i > 0 else "id"
+                    all_params[param_name] = segment
+                # UUID-like segments
+                elif re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', segment, re.I):
+                    param_name = f"{path_segments[i-1]}_id" if i > 0 else "resource_id"
+                    all_params[param_name] = segment
+                # Hash-like segments (MD5/SHA1)
+                elif re.match(r'^[a-f0-9]{32,40}$', segment, re.I):
+                    param_name = f"{path_segments[i-1]}_hash" if i > 0 else "hash"
+                    all_params[param_name] = segment
+        except Exception as e:
+            logger.warning(f"[{self.name}] Path segment extraction failed: {e}")
+
+        # 3. Fetch HTML and extract form parameters
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+
+            if html:
+                self._last_discovery_html = html  # Cache for URL resolution
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract from <input>, <textarea>, <select>
+                for tag in soup.find_all(["input", "textarea", "select"]):
+                    param_name = tag.get("name")
+                    if param_name and param_name not in all_params:
+                        input_type = tag.get("type", "text").lower()
+
+                        # Skip non-testable input types
+                        if input_type not in ["submit", "button", "reset"]:
+                            # Skip CSRF tokens
+                            if "csrf" not in param_name.lower() and "token" not in param_name.lower():
+                                default_value = tag.get("value", "")
+
+                                # IDOR Priority: Focus on ID-like params
+                                is_id_param = (
+                                    param_name.endswith('_id') or
+                                    param_name.endswith('Id') or
+                                    param_name.endswith('ID') or
+                                    'user' in param_name.lower() or
+                                    'account' in param_name.lower() or
+                                    'order' in param_name.lower() or
+                                    'profile' in param_name.lower()
+                                )
+
+                                # Also prioritize if value looks like an ID (numeric, UUID, etc)
+                                is_id_value = (
+                                    default_value.isdigit() or
+                                    re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', default_value, re.I) or
+                                    re.match(r'^[a-f0-9]{32,40}$', default_value, re.I) or
+                                    re.match(r'^[A-Za-z0-9+/]{20,}={0,2}$', default_value)  # base64
+                                )
+
+                                if is_id_param or is_id_value or input_type == "hidden":
+                                    all_params[param_name] = default_value
+
+        except Exception as e:
+            logger.error(f"[{self.name}] HTML parsing failed: {e}")
+
+        logger.info(f"[{self.name}] 🔍 Discovered {len(all_params)} IDOR params on {url}: {list(all_params.keys())}")
+        return all_params
+
     async def analyze_and_dedup_queue(self) -> List[Dict]:
-        """Phase A: Streaming analysis of WET list with batched LLM deduplication."""
+        """Phase A: WET → DRY with autonomous parameter discovery."""
         import asyncio
         import time
         from bugtrace.core.queue import queue_manager
 
-        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list (streaming mode) =====")
+        logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list (autonomous discovery) =====")
 
         queue = queue_manager.get_queue("idor")
-        all_dry_findings = []
-        batch = []
+        wet_findings = []
+
         batch_size = settings.IDOR_QUEUE_BATCH_SIZE
         max_wait = settings.IDOR_QUEUE_MAX_WAIT
 
@@ -1236,69 +1341,126 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
         while (time.monotonic() - wait_start) < max_wait:
             depth = queue.depth() if hasattr(queue, 'depth') else 0
             if depth > 0:
-                logger.info(f"[{self.name}] Phase A: Queue has {depth} items, starting streaming drain...")
+                logger.info(f"[{self.name}] Phase A: Queue has {depth} items, draining...")
                 break
             await asyncio.sleep(0.5)
         else:
             logger.info(f"[{self.name}] Phase A: Queue timeout - no items appeared")
             return []
 
-        # Stream items in batches
+        # Drain WET queue
         empty_count = 0
         max_empty_checks = 10
-        total_wet_count = 0
 
         while empty_count < max_empty_checks:
             item = await queue.dequeue(timeout=0.5)
             if item is None:
                 empty_count += 1
                 await asyncio.sleep(0.5)
-
-                # Process remaining batch if queue appears empty
-                if empty_count >= max_empty_checks and batch:
-                    logger.info(f"[{self.name}] Phase A: Processing final batch of {len(batch)} items")
-                    dry_batch = await self._dedup_batch(batch)
-                    all_dry_findings.extend(dry_batch)
-                    batch = []
                 continue
 
             empty_count = 0
             finding = item.get("finding", {})
             url = finding.get("url", "")
-            parameter = finding.get("parameter", "")
 
-            if url and parameter:
-                batch.append({
+            if url:
+                wet_findings.append({
                     "url": url,
-                    "parameter": parameter,
+                    "parameter": finding.get("parameter", ""),
                     "original_value": finding.get("original_value", ""),
                     "finding": finding,
                     "scan_context": item.get("scan_context", self._scan_context)
                 })
-                total_wet_count += 1
 
-                # Process batch when full
-                if len(batch) >= batch_size:
-                    logger.info(f"[{self.name}] Phase A: Processing batch {len(all_dry_findings) // batch_size + 1} ({len(batch)} items)")
-                    dry_batch = await self._dedup_batch(batch)
-                    all_dry_findings.extend(dry_batch)
-                    batch = []
+        logger.info(f"[{self.name}] Phase A: Drained {len(wet_findings)} WET findings")
 
-        logger.info(f"[{self.name}] Phase A: Streaming complete. {total_wet_count} WET → {len(all_dry_findings)} DRY")
+        if not wet_findings:
+            return []
 
-        self._dry_findings = all_dry_findings
-        return all_dry_findings
+        # ========== AUTONOMOUS PARAMETER DISCOVERY ==========
+        # Strategy: ALWAYS keep original WET params + ADD discovered params
+        logger.info(f"[{self.name}] Phase A: Expanding WET findings with IDOR-focused discovery...")
+        expanded_wet_findings = []
+        seen_urls = set()
+        seen_params = set()
 
-    async def _dedup_batch(self, batch: List[Dict]) -> List[Dict]:
-        """Deduplicate a single batch using LLM with fallback."""
+        # 1. Always include ALL original WET params first (DASTySAST signals)
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            param = wet_item.get("parameter", "") or (wet_item.get("finding", {}) or {}).get("parameter", "")
+            if param and (url, param) not in seen_params:
+                seen_params.add((url, param))
+                expanded_wet_findings.append(wet_item)
+
+        # 2. Discover additional params per unique URL
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                all_params = await self._discover_idor_params(url)
+                if not all_params:
+                    continue
+
+                new_count = 0
+                for param_name, param_value in all_params.items():
+                    if (url, param_name) not in seen_params:
+                        seen_params.add((url, param_name))
+                        expanded_wet_findings.append({
+                            "url": url,
+                            "parameter": param_name,
+                            "original_value": param_value,
+                            "finding": wet_item.get("finding", {}),
+                            "scan_context": wet_item.get("scan_context", self._scan_context),
+                            "_discovered": True
+                        })
+                        new_count += 1
+
+                if new_count:
+                    logger.info(f"[{self.name}] 🔍 Discovered {new_count} additional params on {url}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
+
+        # 2.5 Resolve endpoint URLs from HTML links/forms + reasoning fallback
+        from bugtrace.agents.specialist_utils import resolve_param_endpoints, resolve_param_from_reasoning
+        if hasattr(self, '_last_discovery_html') and self._last_discovery_html:
+            for base_url in seen_urls:
+                endpoint_map = resolve_param_endpoints(self._last_discovery_html, base_url)
+                # Fallback: extract endpoints from DASTySAST reasoning text
+                reasoning_map = resolve_param_from_reasoning(expanded_wet_findings, base_url)
+                for k, v in reasoning_map.items():
+                    if k not in endpoint_map:
+                        endpoint_map[k] = v
+                if endpoint_map:
+                    resolved_count = 0
+                    for item in expanded_wet_findings:
+                        if item.get("url") == base_url:
+                            param = item.get("parameter", "")
+                            if param in endpoint_map and endpoint_map[param] != base_url:
+                                item["url"] = endpoint_map[param]
+                                resolved_count += 1
+                    if resolved_count:
+                        logger.info(f"[{self.name}] 🔗 Resolved {resolved_count} params to actual endpoint URLs")
+
+        logger.info(f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → {len(expanded_wet_findings)} testable params")
+
+        # ========== DEDUPLICATION ==========
         try:
-            return await self._llm_analyze_and_dedup(batch, self._scan_context)
-        except Exception as e:
-            logger.error(f"[{self.name}] LLM dedup failed for batch: {e}. Using fingerprint fallback")
-            return self._fallback_fingerprint_dedup(batch)
+            dry_list = await self._llm_analyze_and_dedup(expanded_wet_findings, self._scan_context)
+        except:
+            dry_list = self._fallback_fingerprint_dedup(expanded_wet_findings)
+
+        self._dry_findings = dry_list
+        logger.info(f"[{self.name}] Phase A: {len(expanded_wet_findings)} WET → {len(dry_list)} DRY ({len(expanded_wet_findings)-len(dry_list)} duplicates removed)")
+
+        return dry_list
+
 
     async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], context: str) -> List[Dict]:
-        """LLM-powered intelligent deduplication with agent-specific rules."""
+        """LLM-powered intelligent deduplication with autonomous discovery rules."""
         from bugtrace.core.llm_client import llm_client
         import json
 
@@ -1311,9 +1473,35 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
         idor_prime_directive = getattr(self, '_idor_prime_directive', '')
         idor_dedup_context = self.generate_idor_dedup_context(tech_stack) if tech_stack else ''
 
-        prompt = f"""You are analyzing {len(wet_findings)} potential IDOR findings.
+        system_prompt = f"""You are an expert security analyst specializing in IDOR deduplication.
 
-{idor_prime_directive}
+## DEDUPLICATION RULES
+
+1. **CRITICAL - Autonomous Discovery:**
+   - If items have "_discovered": true, they are DIFFERENT PARAMETERS discovered autonomously
+   - Even if they share the same "finding" object, treat them as SEPARATE based on "parameter" field
+   - Same URL + DIFFERENT param → DIFFERENT (keep all)
+   - Same URL + param + DIFFERENT original_value → DIFFERENT (keep both, e.g., /users/1 vs /users/2)
+
+2. **Standard Deduplication:**
+   - Same URL + Same parameter + Same original_value → DUPLICATE (keep best)
+   - Different endpoints → DIFFERENT (keep both)
+   - Path-based IDs vs query-based IDs with same param name → DIFFERENT (keep both)
+
+3. **IDOR-Specific:**
+   - Focus on endpoint+resource deduplication
+   - /users/123 and /users/456 → DIFFERENT (different resources)
+   - /users?id=123 and /users?id=456 → DIFFERENT (different IDs)
+   - /users?id=123 and /api/users?id=123 → DIFFERENT (different endpoints)
+
+4. **Prioritization:**
+   - Rank by exploitability: numeric IDs > UUIDs > hashes
+   - Params ending in _id, Id, ID are HIGH priority
+   - Remove findings unlikely to be IDOR (non-ID params)
+
+{idor_prime_directive}"""
+
+        prompt = f"""You are analyzing {len(wet_findings)} potential IDOR findings.
 
 {idor_dedup_context}
 
@@ -1321,18 +1509,23 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
 - Language: {lang}
 - Frameworks: {', '.join(frameworks[:3]) if frameworks else 'None detected'}
 
-WET LIST:
+## WET LIST ({len(wet_findings)} potential findings):
 {json.dumps(wet_findings, indent=2)}
 
-Return JSON array of UNIQUE findings only:
-{{"findings": [...]}}
-"""
-
-        system_prompt = f"""You are an expert security analyst specializing in IDOR deduplication.
-
-{idor_prime_directive}
-
-Focus on endpoint+resource deduplication. Same resource type = DUPLICATE."""
+## OUTPUT FORMAT (JSON only):
+{{
+  "findings": [
+    {{
+      "url": "...",
+      "parameter": "...",
+      "original_value": "...",
+      "rationale": "why this is unique and exploitable for IDOR",
+      "attack_priority": 1-5
+    }}
+  ],
+  "duplicates_removed": <count>,
+  "reasoning": "Brief explanation"
+}}"""
 
         response = await llm_client.generate(
             prompt=prompt,
@@ -1481,6 +1674,7 @@ Focus on endpoint+resource deduplication. Same resource type = DUPLICATE."""
             report_specialist_start,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
         from bugtrace.core.queue import queue_manager
 
@@ -1503,6 +1697,7 @@ Focus on endpoint+resource deduplication. Same resource type = DUPLICATE."""
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "idor")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")

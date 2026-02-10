@@ -121,15 +121,11 @@ class SkepticalAgent(BaseAgent):
             "verified_by": self.name,
             "auto_approved": True
         }
-        
-        is_valid, reason = conductor.validate_finding(enhanced_data)
-        
-        if not is_valid:
-            logger.warning(f"[{self.name}] Auto-approve BLOCKED: {reason}")
-            dashboard.log(f"[{self.name}] Auto-approve blocked: {reason}", "WARN")
-            return
-        
-        # Validation passed - proceed  
+
+        # NOTE: Conductor validation removed (2026-02-04)
+        # Specialists now self-validate via BaseAgent.emit_finding()
+
+        # Proceed with approved finding
         memory_manager.add_node("Finding", f"Verified_{finding_id}", {
             "url": url,
             "type": vuln_type,

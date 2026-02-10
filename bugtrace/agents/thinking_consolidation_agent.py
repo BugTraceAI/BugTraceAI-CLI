@@ -427,6 +427,7 @@ class ThinkingConsolidationAgent(BaseAgent):
         # Batch processing buffer (used in batch mode)
         self._batch_buffer: List[Dict[str, Any]] = []
         self._batch_lock = asyncio.Lock()
+        self._queue_write_lock = asyncio.Lock()
         self._batch_task: Optional[asyncio.Task] = None
 
         # Statistics
@@ -872,12 +873,6 @@ class ThinkingConsolidationAgent(BaseAgent):
 
         return prioritized
 
-        logger.error(
-            f"[{self.name}] Dropped finding: {prioritized.finding.get('type')} -> "
-            f"{specialist} (queue full after {settings.THINKING_BACKPRESSURE_RETRIES} retries)"
-        )
-        return False
-
     async def _persist_queue_item(self, specialist: str, finding: Dict[str, Any]) -> None:
         """
         Persist finding to a file-based queue for durability and auditing.
@@ -912,7 +907,7 @@ class ThinkingConsolidationAgent(BaseAgent):
 
             # Append to specialist queue file (JSON Lines format)
             queue_file = wet_dir / f"{specialist}.json"
-            async with asyncio.Lock():
+            async with self._queue_write_lock:
                 with open(queue_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(queue_entry, ensure_ascii=False, separators=(',', ':')) + "\n")
 
@@ -1063,13 +1058,27 @@ class ThinkingConsolidationAgent(BaseAgent):
         logger.debug(f"[{self.name}] Step 1 done: specialist={specialist}")
 
         # 2. FP confidence filter
-        # SQLi findings bypass this filter - SQLMap is the authoritative judge, not LLM confidence
-        # This ensures all potential SQLi reaches the SQLiAgent for proper testing
+        # Certain findings bypass this filter - their specialist agents are the authoritative judges:
+        # - SQLi: SQLMap is the authoritative judge, not LLM confidence
+        # - CSTI/SSTI: Template injection requires browser execution to validate
+        # - High skeptical_score: LLM already approved via skeptical review
         fp_confidence = finding.get("fp_confidence", 0.5)
-        is_sqli = specialist == "sqli"
-        is_probe_validated = finding.get("probe_validated", False)
+        skeptical_score = finding.get("skeptical_score", 5)
 
-        if not is_sqli and not is_probe_validated and fp_confidence < settings.THINKING_FP_THRESHOLD:
+        # FIX: Normalize skeptical_score if legacy 0-1 scale (convert to 0-10)
+        if isinstance(skeptical_score, (int, float)) and skeptical_score < 1.1:
+            skeptical_score = skeptical_score * 10
+            logger.debug(f"[{self.name}] Normalized legacy skeptical_score {finding.get('skeptical_score')} → {skeptical_score}")
+
+        is_sqli = specialist == "sqli"
+        is_template_injection = specialist == "csti"  # CSTI/SSTI queue
+        is_probe_validated = finding.get("probe_validated", False)
+        has_high_skeptical_score = skeptical_score >= 6  # LLM already approved
+
+        # Bypass FP filter if any bypass condition is met
+        should_bypass = is_sqli or is_template_injection or is_probe_validated or has_high_skeptical_score
+
+        if not should_bypass and fp_confidence < settings.THINKING_FP_THRESHOLD:
             logger.debug(f"[{self.name}] FP filtered: {finding.get('type')} "
                         f"(fp_confidence: {fp_confidence:.2f} < {settings.THINKING_FP_THRESHOLD})")
             self._stats["fp_filtered"] += 1
@@ -1079,6 +1088,14 @@ class ThinkingConsolidationAgent(BaseAgent):
         if is_sqli and fp_confidence < settings.THINKING_FP_THRESHOLD:
             logger.info(f"[{self.name}] SQLi bypass: {finding.get('type')} forwarded to SQLMap for validation "
                        f"(fp_confidence: {fp_confidence:.2f} < threshold, but SQLMap decides)")
+
+        if is_template_injection and fp_confidence < settings.THINKING_FP_THRESHOLD:
+            logger.info(f"[{self.name}] Template injection bypass: {finding.get('type')} forwarded to CSTIAgent "
+                       f"(fp_confidence: {fp_confidence:.2f} < threshold, but browser validation decides)")
+
+        if has_high_skeptical_score and fp_confidence < settings.THINKING_FP_THRESHOLD:
+            logger.info(f"[{self.name}] Skeptical review bypass: {finding.get('type')} forwarded "
+                       f"(skeptical_score: {skeptical_score}/10 >= 6, LLM approved)")
 
         # 3. Deduplication check
         logger.debug(f"[{self.name}] Step 3: Checking dedup cache")
@@ -1153,9 +1170,23 @@ class ThinkingConsolidationAgent(BaseAgent):
             specialist = self._classify_finding(finding) or "unknown"
             dedup_metrics.record_received(specialist)
 
-            # FP filter
+            # FP filter (with bypass conditions)
             fp_confidence = finding.get("fp_confidence", 0.5)
-            if fp_confidence < settings.THINKING_FP_THRESHOLD:
+            skeptical_score = finding.get("skeptical_score", 5)
+
+            # FIX: Normalize skeptical_score if legacy 0-1 scale (convert to 0-10)
+            if isinstance(skeptical_score, (int, float)) and skeptical_score < 1.1:
+                skeptical_score = skeptical_score * 10
+                logger.debug(f"[{self.name}] Normalized legacy skeptical_score {finding.get('skeptical_score')} → {skeptical_score}")
+
+            is_sqli = specialist == "sqli"
+            is_template_injection = specialist == "csti"
+            is_probe_validated = finding.get("probe_validated", False)
+            has_high_skeptical_score = skeptical_score >= 6
+
+            should_bypass = is_sqli or is_template_injection or is_probe_validated or has_high_skeptical_score
+
+            if not should_bypass and fp_confidence < settings.THINKING_FP_THRESHOLD:
                 self._stats["fp_filtered"] += 1
                 dedup_metrics.record_fp_filtered()
                 continue

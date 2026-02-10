@@ -10,6 +10,17 @@ logger = get_logger("tools.external")
 from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+from bugtrace.core.exceptions import (
+    ToolError,
+    DockerError,
+    DockerTimeoutError,
+    DockerNotFoundError,
+    SubprocessError,
+    FuzzerError,
+    FuzzerTimeoutError,
+    NucleiError,
+    JSONParseError,
+)
 
 # Security constants for JSON parsing
 MAX_JSON_SIZE = 10_000_000  # 10MB max
@@ -252,8 +263,8 @@ class ExternalToolManager:
         image: str,
         command: List[str],
         timeout: int = 300,
-        memory_limit: str = "512m",
-        cpu_limit: str = "1.0",
+        memory_limit: str = "2048m",
+        cpu_limit: str = "2.0",
         network_mode: str = "bridge"
     ) -> str:
         """
@@ -286,12 +297,25 @@ class ExternalToolManager:
                 return ""
 
             return _sanitize_output(stdout.decode())
-        except asyncio.TimeoutError:
-            logger.error(f"Docker container timeout after {timeout}s: {image}", exc_info=True)
-            return ""
+        except asyncio.TimeoutError as e:
+            # Transient: Container timed out - may succeed with longer timeout
+            logger.error(f"Docker container timeout after {timeout}s: {image}")
+            raise DockerTimeoutError(
+                f"Docker container timed out after {timeout}s",
+                tool_name=image,
+                context={"timeout_seconds": timeout}
+            ) from e
+        except DockerError:
+            # Re-raise typed Docker exceptions
+            raise
         except Exception as e:
+            # Unexpected error - wrap in DockerError
             logger.error(f"Docker subprocess error: {e}", exc_info=True)
-            return ""
+            raise DockerError(
+                f"Docker execution failed: {e}",
+                tool_name=image,
+                cause=e
+            ) from e
         finally:
             await self._cleanup_docker_process(proc)
 
@@ -317,7 +341,7 @@ class ExternalToolManager:
 
         tech_cmd = [
             "-u", target,
-            "-tags", "tech",
+            "-tags", "tech,misconfig,exposure,token",
             "-silent",
             "-jsonl"
         ]
@@ -637,15 +661,19 @@ class ExternalToolManager:
                 logger.info(f"GoSpider limit reached ({line_limit} lines). Terminating crawler...")
                 try:
                     process.kill()
-                except:
+                except ProcessLookupError:
                     pass
-        
+                except OSError as e:
+                    logger.debug(f"Process cleanup error: {e}")
+
         except Exception as e:
             logger.error(f"Streaming execution failed: {e}")
             try:
                 process.kill()
-            except:
+            except ProcessLookupError:
                 pass
+            except OSError as e:
+                logger.debug(f"Process cleanup error: {e}")
         
         # Ensure cleanup
         await self._cleanup_docker_process(process)

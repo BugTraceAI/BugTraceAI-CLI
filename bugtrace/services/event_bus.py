@@ -37,6 +37,31 @@ class ServiceEventBus:
     This preserves backward compatibility with all existing agent code.
     """
 
+    # Core event bus events to bridge into scan-scoped history/WebSocket streams
+    _BRIDGED_EVENTS = [
+        "pipeline_started",
+        "pipeline_complete",
+        "pipeline_error",
+        "phase_complete_reconnaissance",
+        "phase_complete_discovery",
+        "phase_complete_strategy",
+        "phase_complete_exploitation",
+        "phase_complete_validation",
+        "phase_complete_reporting",
+        "url_analyzed",
+        "vulnerability_detected",
+        "finding_validated",
+        "finding_rejected",
+        "finding_verified",
+        # Dashboard events (for WEB frontend widgets)
+        "pipeline_progress",
+        "agent_update",
+        "metrics_update",
+        "scan_complete_summary",
+        # Log bridge (conductor.notify_log -> WebSocket)
+        "scan_log",
+    ]
+
     def __init__(self):
         """Initialize the service event bus wrapper."""
         # Reference to core singleton - do not modify it
@@ -57,7 +82,24 @@ class ServiceEventBus:
         # History cap to prevent memory leaks (1000 events per scan)
         self._max_history_per_scan = 1000
 
+        # Bridge core event bus events into scan-scoped streams
+        self._install_bridge()
+
         logger.info("Service Event Bus initialized")
+
+    def _install_bridge(self):
+        """Subscribe to core event bus events and forward them to scan-scoped streams."""
+        for event_name in self._BRIDGED_EVENTS:
+            # Use closure to capture event_name for each handler
+            handler = self._make_bridge_handler(event_name)
+            self._core_bus.subscribe(event_name, handler)
+
+    def _make_bridge_handler(self, event_name: str) -> Callable:
+        """Create a bridge handler closure that captures the event name."""
+        async def handler(data: Dict[str, Any]):
+            await self._bridge_event(event_name, data)
+        handler.__name__ = f"bridge_{event_name}"
+        return handler
 
     def subscribe(self, event: str, handler: Callable) -> None:
         """
@@ -119,12 +161,25 @@ class ServiceEventBus:
     def _map_event_type(self, event: str) -> str:
         """Map internal event names to WS-02 types."""
         event_type_mapping = {
-            "scan.created": "scan_started",
+            "scan.created": "scan_created",
             "scan.started": "scan_started",
             "scan.completed": "scan_complete",
             "scan.stopped": "scan_complete",
             "scan.failed": "error",
             "scan.error": "error",
+            "scan.paused": "scan_paused",
+            "scan.resumed": "scan_resumed",
+            "vulnerability_detected": "finding_discovered",
+            "pipeline_started": "log",
+            "pipeline_complete": "log",
+            "pipeline_error": "error",
+            "url_analyzed": "log",
+            # Dashboard events (pass through as-is for WEB widgets)
+            "pipeline_progress": "pipeline_progress",
+            "agent_update": "agent_update",
+            "metrics_update": "metrics_update",
+            "scan_complete_summary": "scan_complete_summary",
+            "scan_log": "log",
         }
 
         if event in event_type_mapping:
@@ -146,6 +201,45 @@ class ServiceEventBus:
         if len(history) > self._max_history_per_scan:
             self._event_history[scan_id] = history[-self._max_history_per_scan:]
             logger.debug(f"Capped history for scan {scan_id} to {self._max_history_per_scan} events")
+
+    def _resolve_scan_id(self, data: Dict[str, Any]) -> int | None:
+        """Extract numeric scan_id from event data.
+
+        Tries multiple fields used by different layers:
+        - "scan_id": service-layer events (numeric or numeric-string)
+        - "scan_context": pipeline lifecycle/analysis events (str(scan_id) from DB)
+
+        If no parseable scan_id found, falls back to the single active stream
+        (when only one scan has WebSocket consumers).
+        """
+        for key in ("scan_id", "scan_context"):
+            raw = data.get(key)
+            if raw is not None:
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    continue
+
+        # Fallback: if exactly one scan has active stream consumers, use it
+        active = [sid for sid, queues in self._scan_queues.items() if queues]
+        if len(active) == 1:
+            return active[0]
+
+        return None
+
+    async def _bridge_event(self, event_name: str, data: Dict[str, Any]):
+        """Bridge handler: forward core event bus events to scan-scoped streams."""
+        scan_id = self._resolve_scan_id(data)
+        if scan_id is None:
+            return
+
+        # Only bridge if someone is actively streaming this scan
+        if scan_id not in self._scan_queues or not self._scan_queues[scan_id]:
+            return
+
+        # _store_event_in_history handles mapping, seq, and queue push
+        async with self._lock:
+            await self._store_event_in_history(scan_id, event_name, data)
 
     def _push_to_queues(self, scan_id: int, event: str, history_entry: Dict[str, Any]):
         """Push event to all stream queues for this scan."""

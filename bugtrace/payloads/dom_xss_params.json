@@ -1,0 +1,27 @@
+{
+    "redirect_params": [
+        "back",
+        "backUrl",
+        "returnUrl",
+        "returnPath",
+        "redirect",
+        "next",
+        "goto",
+        "dest",
+        "url",
+        "return",
+        "ref",
+        "target",
+        "redir",
+        "out"
+    ],
+    "search_params": [
+        "search",
+        "q",
+        "query",
+        "s",
+        "keyword",
+        "keywords",
+        "searchTerm"
+    ]
+}

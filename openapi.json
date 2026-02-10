@@ -1,0 +1,1459 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "BugTraceAI API",
+    "description": "REST API for security scanning and report management",
+    "contact": {
+      "name": "BugTraceAI",
+      "url": "https://github.com/BugTraceAI"
+    },
+    "license": {
+      "name": "MIT"
+    },
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Root",
+        "description": "API information endpoint.\n\nReturns:\n    Dictionary with API name, version, and documentation link",
+        "operationId": "root__get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Root  Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Health Check",
+        "description": "Health check endpoint for monitoring and deployment orchestration.\n\nReturns:\n    status: Server health status (healthy/degraded)\n    version: API version\n    docker_available: Whether Docker is available for tool execution\n    active_scans: Number of currently running scans\n    event_bus_stats: Event bus statistics\n\nSolves INF-04: Health check for container readiness probes",
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Health Check Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Readiness Check",
+        "description": "Readiness check endpoint for deployment orchestration.\n\nUnlike /health (liveness probe) which indicates the server process is running,\n/ready (readiness probe) verifies that the application can serve requests by\nchecking external dependencies like database connectivity.\n\nReturns:\n    ready: Overall readiness status (true only if database is reachable)\n    checks:\n        database: Whether SQLite database is accessible\n        docker_available: Whether Docker is available for scan execution\n\nUse /health for liveness probes (is the process alive?).\nUse /ready for readiness probes (can it handle requests?).",
+        "operationId": "readiness_check_ready_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Readiness Check Ready Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/scans": {
+      "post": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Create Scan",
+        "description": "Create and start a new scan.\n\nReturns immediately with scan_id and initial status.\nScan runs in background task.\n\nArgs:\n    request: Scan configuration\n    scan_service: Injected ScanService\n\nReturns:\n    ScanStatusResponse with scan_id and initial status\n\nRaises:\n    429: Too many concurrent scans (limit reached)\n    400: Invalid request parameters",
+        "operationId": "create_scan_api_scans_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateScanRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "List Scans",
+        "description": "List scan history with pagination.\n\nArgs:\n    scan_service: Injected ScanService\n    page: Page number (1-indexed)\n    per_page: Results per page (max 100)\n    status_filter: Filter by status (RUNNING, COMPLETED, STOPPED, FAILED)\n\nReturns:\n    ScanListResponse with paginated scan list\n\nRaises:\n    400: Invalid pagination parameters",
+        "operationId": "list_scans_api_scans_get",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "title": "Per Page"
+            }
+          },
+          {
+            "name": "status_filter",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status Filter"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/scans/{scan_id}/status": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Get Scan Status",
+        "description": "Get current status for a scan.\n\nWorks for both active and completed scans.\n\nArgs:\n    scan_id: Scan ID to query\n    scan_service: Injected ScanService\n\nReturns:\n    ScanStatusResponse with current status and progress\n\nRaises:\n    404: Scan not found",
+        "operationId": "get_scan_status_api_scans__scan_id__status_get",
+        "parameters": [
+          {
+            "name": "scan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Scan Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScanStatusResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/scans/{scan_id}/findings": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Get Scan Findings",
+        "description": "Get findings for a scan with filtering and pagination.\n\nArgs:\n    scan_id: Scan ID to get findings for\n    scan_service: Injected ScanService\n    severity: Filter by severity (CRITICAL, HIGH, MEDIUM, LOW, INFO)\n    vuln_type: Filter by vulnerability type (XSS, SQLi, etc.)\n    page: Page number (1-indexed)\n    per_page: Results per page (max 100)\n\nReturns:\n    FindingsResponse with paginated findings list\n\nRaises:\n    404: Scan not found\n    400: Invalid filter parameters",
+        "operationId": "get_scan_findings_api_scans__scan_id__findings_get",
+        "parameters": [
+          {
+            "name": "scan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Scan Id"
+            }
+          },
+          {
+            "name": "severity",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Severity"
+            }
+          },
+          {
+            "name": "vuln_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Vuln Type"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Per Page"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FindingsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/scans/{scan_id}/stop": {
+      "post": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Stop Scan",
+        "description": "Stop a running scan gracefully.\n\nArgs:\n    scan_id: Scan ID to stop\n    scan_service: Injected ScanService\n\nReturns:\n    StopScanResponse with status message\n\nRaises:\n    404: Scan not found or not running",
+        "operationId": "stop_scan_api_scans__scan_id__stop_post",
+        "parameters": [
+          {
+            "name": "scan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Scan Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StopScanResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/scans/{scan_id}": {
+      "delete": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Delete Scan",
+        "description": "Delete a scan and its associated findings.\n\nCannot delete a scan that is currently running.\n\nArgs:\n    scan_id: Scan ID to delete\n    scan_service: Injected ScanService\n\nReturns:\n    DeleteScanResponse with confirmation message\n\nRaises:\n    404: Scan not found\n    409: Scan is currently running",
+        "operationId": "delete_scan_api_scans__scan_id__delete",
+        "parameters": [
+          {
+            "name": "scan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Scan Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteScanResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/scans/{scan_id}/detailed-metrics": {
+      "get": {
+        "tags": [
+          "scans"
+        ],
+        "summary": "Get Detailed Metrics",
+        "description": "Get detailed real-time metrics for a scan.\n\nProvides rich progress information including:\n- URL discovery/analysis progress with percentages\n- Deduplication effectiveness\n- Queue depths per specialist\n- Processing throughput\n- Current phase and agent activity\n\nArgs:\n    scan_id: Scan ID to get metrics for\n    scan_service: Injected ScanService\n\nReturns:\n    Detailed metrics dict with all progress information\n\nRaises:\n    404: Scan not found",
+        "operationId": "get_detailed_metrics_api_scans__scan_id__detailed_metrics_get",
+        "parameters": [
+          {
+            "name": "scan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Scan Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/scans/{scan_id}/report/{format}": {
+      "get": {
+        "tags": [
+          "reports",
+          "reports"
+        ],
+        "summary": "Get Report",
+        "description": "Download generated report in specified format.\n\nArgs:\n    scan_id: Scan ID\n    format: Report format (html, json, markdown)\n\nReturns:\n    Report file with appropriate content type and download headers\n\nRaises:\n    400: Invalid format\n    404: Scan or report not found\n    500: Report generation failed\n\nSolves API-06: Report download endpoint",
+        "operationId": "get_report_api_scans__scan_id__report__format__get",
+        "parameters": [
+          {
+            "name": "scan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Scan Id"
+            }
+          },
+          {
+            "name": "format",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Report format: html, json, markdown",
+              "title": "Format"
+            },
+            "description": "Report format: html, json, markdown"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/scans/{scan_id}/files/{filename}": {
+      "get": {
+        "tags": [
+          "reports",
+          "reports"
+        ],
+        "summary": "Get Report File",
+        "description": "Serve an individual file from a scan's report directory.\n\nUsed by the WEB frontend to load report markdown, validated findings JSON,\nand other report deliverables.\n\nArgs:\n    scan_id: Scan ID\n    filename: File path relative to the report directory\n\nReturns:\n    File contents with appropriate content type\n\nRaises:\n    404: Report directory or file not found",
+        "operationId": "get_report_file_api_scans__scan_id__files__filename__get",
+        "parameters": [
+          {
+            "name": "scan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Scan Id"
+            }
+          },
+          {
+            "name": "filename",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "description": "Report filename (e.g. final_report.md)",
+              "title": "Filename"
+            },
+            "description": "Report filename (e.g. final_report.md)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/config": {
+      "get": {
+        "tags": [
+          "config",
+          "config"
+        ],
+        "summary": "Get Config",
+        "description": "Get current CLI configuration with secrets masked.\n\nReturns:\n    ConfigResponse with masked configuration and version\n\nExcludes:\n    - Internal fields (starting with _)\n    - Path fields (BASE_DIR, LOG_DIR_PATH, etc.)\n    - API keys (masked in output)\n    - Database URLs\n\nSolves API-07: GET /config endpoint",
+        "operationId": "get_config_api_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "config",
+          "config"
+        ],
+        "summary": "Update Config",
+        "description": "Update CLI configuration with validation.\n\nArgs:\n    request: ConfigUpdateRequest with fields to update\n\nReturns:\n    ConfigUpdateResponse with changes applied\n\nValidation rules:\n    - MAX_DEPTH, MAX_URLS, MAX_CONCURRENT_URL_AGENTS, MAX_CONCURRENT_REQUESTS: Must be positive integers\n    - DEFAULT_MODEL, CODE_MODEL, etc.: Must contain \"/\" separator (provider/model format)\n\nRaises:\n    400: No fields provided\n    422: Validation errors\n\nSolves API-08: PATCH /config with validation",
+        "operationId": "update_config_api_config_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigUpdateResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/metrics": {
+      "get": {
+        "tags": [
+          "metrics"
+        ],
+        "summary": "Get All Metrics",
+        "description": "Get all performance metrics.\n\nReturns:\n    Combined metrics from all subsystems:\n    - cdp: CDP validation reduction metrics\n    - parallelization: Worker concurrency metrics\n    - deduplication: Finding dedup metrics\n    - queues: Queue depth and throughput summary",
+        "operationId": "get_all_metrics_api_metrics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get All Metrics Api Metrics Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/metrics/queues": {
+      "get": {
+        "tags": [
+          "metrics"
+        ],
+        "summary": "Get Queue Metrics",
+        "description": "Get detailed queue metrics for all specialist queues.\n\nReturns:\n    Per-queue statistics:\n    - current_depth: Items waiting in queue\n    - total_enqueued/dequeued: Throughput counters\n    - avg_latency_ms: Processing time\n    - is_full: Backpressure status",
+        "operationId": "get_queue_metrics_api_metrics_queues_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Queue Metrics Api Metrics Queues Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/metrics/cdp": {
+      "get": {
+        "tags": [
+          "metrics"
+        ],
+        "summary": "Get Cdp Metrics",
+        "description": "Get CDP validation reduction metrics.\n\nReturns:\n    - reduction_percent: Percentage of findings that skipped CDP\n    - target_met: Whether 99% reduction target achieved\n    - by_specialist: Per-specialist breakdown",
+        "operationId": "get_cdp_metrics_api_metrics_cdp_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Cdp Metrics Api Metrics Cdp Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/metrics/parallelization": {
+      "get": {
+        "tags": [
+          "metrics"
+        ],
+        "summary": "Get Parallelization Metrics",
+        "description": "Get worker parallelization metrics.\n\nReturns:\n    - current_concurrent: Active workers now\n    - peak_concurrent: Maximum concurrent workers\n    - parallelization_factor: Average concurrency\n    - by_specialist: Per-specialist worker stats",
+        "operationId": "get_parallelization_metrics_api_metrics_parallelization_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Parallelization Metrics Api Metrics Parallelization Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/metrics/deduplication": {
+      "get": {
+        "tags": [
+          "metrics"
+        ],
+        "summary": "Get Deduplication Metrics",
+        "description": "Get deduplication effectiveness metrics.\n\nReturns:\n    - total_received: Findings before dedup\n    - total_deduplicated: Duplicates eliminated\n    - dedup_effectiveness_percent: Duplicate rate\n    - by_specialist: Per-specialist breakdown",
+        "operationId": "get_deduplication_metrics_api_metrics_deduplication_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Deduplication Metrics Api Metrics Deduplication Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/metrics/reset": {
+      "post": {
+        "tags": [
+          "metrics"
+        ],
+        "summary": "Reset Metrics",
+        "description": "Reset all performance metrics.\n\nUse at scan start for clean measurements.",
+        "operationId": "reset_metrics_api_metrics_reset_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object",
+                  "title": "Response Reset Metrics Api Metrics Reset Post"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ConfigResponse": {
+        "properties": {
+          "config": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Config"
+          },
+          "version": {
+            "type": "string",
+            "title": "Version"
+          }
+        },
+        "type": "object",
+        "required": [
+          "config",
+          "version"
+        ],
+        "title": "ConfigResponse",
+        "description": "Response model for GET /config."
+      },
+      "ConfigUpdateRequest": {
+        "properties": {
+          "SAFE_MODE": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Safe Mode"
+          },
+          "MAX_DEPTH": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Depth"
+          },
+          "MAX_URLS": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Urls"
+          },
+          "MAX_CONCURRENT_URL_AGENTS": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Concurrent Url Agents"
+          },
+          "MAX_CONCURRENT_REQUESTS": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Concurrent Requests"
+          },
+          "DEFAULT_MODEL": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Model"
+          },
+          "CODE_MODEL": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Model"
+          },
+          "ANALYSIS_MODEL": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Analysis Model"
+          },
+          "MUTATION_MODEL": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mutation Model"
+          },
+          "SKEPTICAL_MODEL": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skeptical Model"
+          },
+          "HEADLESS_BROWSER": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Headless Browser"
+          },
+          "EARLY_EXIT_ON_FINDING": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Early Exit On Finding"
+          },
+          "STOP_ON_CRITICAL": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop On Critical"
+          },
+          "REPORT_ONLY_VALIDATED": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Report Only Validated"
+          }
+        },
+        "type": "object",
+        "title": "ConfigUpdateRequest",
+        "description": "Request model for PATCH /config.\nOnly includes fields that are safe to update at runtime."
+      },
+      "ConfigUpdateResponse": {
+        "properties": {
+          "updated": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Updated"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "updated",
+          "message"
+        ],
+        "title": "ConfigUpdateResponse",
+        "description": "Response model for PATCH /config."
+      },
+      "CreateScanRequest": {
+        "properties": {
+          "target_url": {
+            "type": "string",
+            "title": "Target Url",
+            "description": "Target URL to scan"
+          },
+          "scan_type": {
+            "type": "string",
+            "title": "Scan Type",
+            "description": "Scan type: full, hunter, manager, or focused agent names",
+            "default": "full"
+          },
+          "safe_mode": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Safe Mode",
+            "description": "Override global safe mode setting"
+          },
+          "max_depth": {
+            "type": "integer",
+            "title": "Max Depth",
+            "description": "Maximum crawl depth",
+            "default": 2
+          },
+          "max_urls": {
+            "type": "integer",
+            "title": "Max Urls",
+            "description": "Maximum URLs to crawl",
+            "default": 20
+          },
+          "resume": {
+            "type": "boolean",
+            "title": "Resume",
+            "description": "Resume a previous scan",
+            "default": false
+          },
+          "use_vertical": {
+            "type": "boolean",
+            "title": "Use Vertical",
+            "description": "Use vertical specialized agents",
+            "default": true
+          },
+          "focused_agents": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Focused Agents",
+            "description": "List of focused agent names"
+          },
+          "param": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Param",
+            "description": "Specific parameter to target"
+          }
+        },
+        "type": "object",
+        "required": [
+          "target_url"
+        ],
+        "title": "CreateScanRequest",
+        "description": "Request body for POST /api/scans.\n\nMaps to ScanOptions from scan_context.py."
+      },
+      "DeleteScanResponse": {
+        "properties": {
+          "scan_id": {
+            "type": "integer",
+            "title": "Scan Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "files_cleaned": {
+            "type": "boolean",
+            "title": "Files Cleaned",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "scan_id",
+          "message"
+        ],
+        "title": "DeleteScanResponse",
+        "description": "Response for DELETE /api/scans/{scan_id}."
+      },
+      "FindingItem": {
+        "properties": {
+          "finding_id": {
+            "type": "integer",
+            "title": "Finding Id"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type"
+          },
+          "severity": {
+            "type": "string",
+            "title": "Severity"
+          },
+          "details": {
+            "type": "string",
+            "title": "Details"
+          },
+          "payload": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "parameter": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameter"
+          },
+          "validated": {
+            "type": "boolean",
+            "title": "Validated"
+          },
+          "status": {
+            "$ref": "#/components/schemas/FindingStatus"
+          },
+          "confidence": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confidence"
+          }
+        },
+        "type": "object",
+        "required": [
+          "finding_id",
+          "type",
+          "severity",
+          "details",
+          "url",
+          "validated",
+          "status"
+        ],
+        "title": "FindingItem",
+        "description": "Single finding item for findings list response."
+      },
+      "FindingStatus": {
+        "type": "string",
+        "enum": [
+          "PENDING_VALIDATION",
+          "VALIDATED_CONFIRMED",
+          "VALIDATED_FALSE_POSITIVE",
+          "MANUAL_REVIEW_RECOMMENDED",
+          "SKIPPED",
+          "ERROR"
+        ],
+        "title": "FindingStatus",
+        "description": "Status values for finding validation lifecycle."
+      },
+      "FindingsResponse": {
+        "properties": {
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/FindingItem"
+            },
+            "type": "array",
+            "title": "Findings"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "per_page": {
+            "type": "integer",
+            "title": "Per Page"
+          },
+          "scan_id": {
+            "type": "integer",
+            "title": "Scan Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "findings",
+          "total",
+          "page",
+          "per_page",
+          "scan_id"
+        ],
+        "title": "FindingsResponse",
+        "description": "Response for GET /api/scans/{scan_id}/findings.\n\nPaginated findings list with filtering support."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ScanListResponse": {
+        "properties": {
+          "scans": {
+            "items": {
+              "$ref": "#/components/schemas/ScanSummary"
+            },
+            "type": "array",
+            "title": "Scans"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "per_page": {
+            "type": "integer",
+            "title": "Per Page"
+          }
+        },
+        "type": "object",
+        "required": [
+          "scans",
+          "total",
+          "page",
+          "per_page"
+        ],
+        "title": "ScanListResponse",
+        "description": "Response for GET /api/scans.\n\nPaginated scan list."
+      },
+      "ScanStatus": {
+        "type": "string",
+        "enum": [
+          "PENDING",
+          "RUNNING",
+          "COMPLETED",
+          "STOPPED",
+          "FAILED"
+        ],
+        "title": "ScanStatus",
+        "description": "Status values for scan lifecycle."
+      },
+      "ScanStatusResponse": {
+        "properties": {
+          "scan_id": {
+            "type": "integer",
+            "title": "Scan Id"
+          },
+          "target": {
+            "type": "string",
+            "title": "Target"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ScanStatus"
+          },
+          "progress": {
+            "type": "integer",
+            "title": "Progress"
+          },
+          "uptime_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uptime Seconds"
+          },
+          "findings_count": {
+            "type": "integer",
+            "title": "Findings Count"
+          },
+          "active_agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Agent"
+          },
+          "phase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phase"
+          },
+          "origin": {
+            "type": "string",
+            "title": "Origin",
+            "default": "cli"
+          }
+        },
+        "type": "object",
+        "required": [
+          "scan_id",
+          "target",
+          "status",
+          "progress",
+          "findings_count"
+        ],
+        "title": "ScanStatusResponse",
+        "description": "Response for GET /api/scans/{scan_id}/status and POST /api/scans.\n\nProvides current scan state and progress information."
+      },
+      "ScanSummary": {
+        "properties": {
+          "scan_id": {
+            "type": "integer",
+            "title": "Scan Id"
+          },
+          "target": {
+            "type": "string",
+            "title": "Target"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ScanStatus"
+          },
+          "progress": {
+            "type": "integer",
+            "title": "Progress"
+          },
+          "timestamp": {
+            "type": "string",
+            "title": "Timestamp"
+          },
+          "origin": {
+            "type": "string",
+            "title": "Origin",
+            "default": "cli"
+          },
+          "has_report": {
+            "type": "boolean",
+            "title": "Has Report",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "scan_id",
+          "target",
+          "status",
+          "progress",
+          "timestamp"
+        ],
+        "title": "ScanSummary",
+        "description": "Summary information for a scan in list view."
+      },
+      "StopScanResponse": {
+        "properties": {
+          "scan_id": {
+            "type": "integer",
+            "title": "Scan Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "scan_id",
+          "status",
+          "message"
+        ],
+        "title": "StopScanResponse",
+        "description": "Response for POST /api/scans/{scan_id}/stop."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "scans",
+      "description": "Security scan lifecycle management - create, monitor, stop scans"
+    },
+    {
+      "name": "reports",
+      "description": "Scan report retrieval in HTML, JSON, and Markdown formats"
+    },
+    {
+      "name": "config",
+      "description": "Runtime configuration viewing and updating"
+    },
+    {
+      "name": "health",
+      "description": "Server health and readiness monitoring"
+    },
+    {
+      "name": "metrics",
+      "description": "Real-time performance metrics - queue depths, CDP reduction, parallelization"
+    }
+  ]
+}

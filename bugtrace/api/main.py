@@ -129,6 +129,7 @@ def _get_cors_origins() -> list[str]:
         default_origins = [
             "http://localhost:3000",  # React default
             "http://localhost:5173",  # Vite default
+            "http://localhost:6869",  # Docker Web UI default
         ]
         logger.info(f"Using default development CORS origins: {default_origins}")
         return default_origins

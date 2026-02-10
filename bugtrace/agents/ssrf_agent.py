@@ -376,44 +376,71 @@ class SSRFAgent(BaseAgent, TechContextMixin):
             return []
 
         # ========== AUTONOMOUS PARAMETER DISCOVERY ==========
+        # Strategy: ALWAYS keep original WET params + ADD discovered params
         logger.info(f"[{self.name}] Phase A: Expanding WET findings with SSRF-focused discovery...")
         expanded_wet_findings = []
         seen_urls = set()
+        seen_params = set()
 
+        # 1. Always include ALL original WET params first (DASTySAST signals)
         for wet_item in wet_findings:
-            url = wet_item["url"]
+            url = wet_item.get("url", "")
+            param = wet_item.get("parameter", "") or (wet_item.get("finding", {}) or {}).get("parameter", "")
+            if param and (url, param) not in seen_params:
+                seen_params.add((url, param))
+                expanded_wet_findings.append(wet_item)
 
-            # Only discover params once per unique URL (avoid redundant fetches)
+        # 2. Discover additional params per unique URL
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
             if url in seen_urls:
                 continue
             seen_urls.add(url)
 
             try:
-                # Discover ALL params on this URL
                 all_params = await self._discover_ssrf_params(url)
-
                 if not all_params:
-                    # Fallback: keep original param if discovery fails
-                    logger.warning(f"[{self.name}] No params discovered on {url}, keeping original")
-                    expanded_wet_findings.append(wet_item)
                     continue
 
-                # Create a WET item for EACH discovered parameter
+                new_count = 0
                 for param_name, param_value in all_params.items():
-                    expanded_wet_findings.append({
-                        "url": url,
-                        "parameter": param_name,
-                        "finding": wet_item.get("finding", {}),  # Copy original finding
-                        "scan_context": wet_item.get("scan_context", self._scan_context),
-                        "_discovered": True  # Mark as autonomously discovered
-                    })
+                    if (url, param_name) not in seen_params:
+                        seen_params.add((url, param_name))
+                        expanded_wet_findings.append({
+                            "url": url,
+                            "parameter": param_name,
+                            "finding": wet_item.get("finding", {}),
+                            "scan_context": wet_item.get("scan_context", self._scan_context),
+                            "_discovered": True
+                        })
+                        new_count += 1
 
-                logger.info(f"[{self.name}] 🔍 Expanded {url}: {len(all_params)} params discovered")
+                if new_count:
+                    logger.info(f"[{self.name}] 🔍 Discovered {new_count} additional params on {url}")
 
             except Exception as e:
                 logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
-                # Fallback: keep original finding
-                expanded_wet_findings.append(wet_item)
+
+        # 2.5 Resolve endpoint URLs from HTML links/forms + reasoning fallback
+        from bugtrace.agents.specialist_utils import resolve_param_endpoints, resolve_param_from_reasoning
+        if hasattr(self, '_last_discovery_html') and self._last_discovery_html:
+            for base_url in seen_urls:
+                endpoint_map = resolve_param_endpoints(self._last_discovery_html, base_url)
+                # Fallback: extract endpoints from DASTySAST reasoning text
+                reasoning_map = resolve_param_from_reasoning(expanded_wet_findings, base_url)
+                for k, v in reasoning_map.items():
+                    if k not in endpoint_map:
+                        endpoint_map[k] = v
+                if endpoint_map:
+                    resolved_count = 0
+                    for item in expanded_wet_findings:
+                        if item.get("url") == base_url:
+                            param = item.get("parameter", "")
+                            if param in endpoint_map and endpoint_map[param] != base_url:
+                                item["url"] = endpoint_map[param]
+                                resolved_count += 1
+                    if resolved_count:
+                        logger.info(f"[{self.name}] 🔗 Resolved {resolved_count} params to actual endpoint URLs")
 
         logger.info(f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → {len(expanded_wet_findings)} testable params")
 
@@ -578,6 +605,7 @@ Focus on parameter+target deduplication. Same internal target via different bypa
             report_specialist_progress,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
 
         self._queue_mode = True
@@ -597,6 +625,7 @@ Focus on parameter+target deduplication. Same internal target via different bypa
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "ssrf")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -690,6 +719,7 @@ Focus on parameter+target deduplication. Same internal target via different bypa
             html = state.get("html", "")
 
             if html:
+                self._last_discovery_html = html  # Cache for URL resolution
                 soup = BeautifulSoup(html, "html.parser")
 
                 # Extract from <input>, <textarea>, <select> with name attribute

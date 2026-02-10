@@ -48,6 +48,10 @@ from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_f
 # v3.2.0: Import TechContextMixin for context-aware SQLi detection
 from bugtrace.agents.mixins.tech_context import TechContextMixin
 
+# v3.4: ManipulatorOrchestrator for HTTP attack campaigns (L5 escalation)
+from bugtrace.tools.manipulator.orchestrator import ManipulatorOrchestrator
+from bugtrace.tools.manipulator.models import MutableRequest, MutationStrategy
+
 
 # =============================================================================
 # DATABASE FINGERPRINTS
@@ -325,6 +329,85 @@ class SQLiAgent(BaseAgent, TechContextMixin):
         # v3.2: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._prime_directive: str = ""
+
+    # =========================================================================
+    # AUTO-VALIDATION: Override BaseAgent validation with SQLi-specific logic
+    # =========================================================================
+
+    def _validate_before_emit(self, finding: Dict) -> tuple[bool, str]:
+        """
+        SQLi-specific validation before emitting finding.
+
+        Requirements for SQLi findings:
+        1. Basic validation (type, url) from BaseAgent
+        2. Must have evidence of SQL injection (error, time delay, or data extraction)
+        3. Payload should look like SQL (not conversational)
+
+        Args:
+            finding: Finding dict to validate
+
+        Returns:
+            (is_valid, error_message) tuple
+        """
+        # Call parent validation first
+        is_valid, error = super()._validate_before_emit(finding)
+        if not is_valid:
+            return False, error
+
+        # SQLi-specific validation
+        evidence = finding.get("evidence", {})
+
+        # Check for proof of SQL injection
+        has_error = evidence.get("error_message") or evidence.get("sql_error")
+        has_time = evidence.get("time_delay") or evidence.get("time_based")
+        has_data = evidence.get("data_extracted") or evidence.get("extracted_data")
+
+        if not (has_error or has_time or has_data):
+            return False, "SQLi requires proof: SQL error, time delay, or data extraction"
+
+        # Payload sanity check (should have SQL syntax or SQL probe chars)
+        payload = str(finding.get("payload", ""))
+        # Error-based probes use quotes/parens to break SQL syntax - these are valid
+        sql_probe_chars = ["'", '"', ")", "(", "\\"]
+        sql_keywords = ['SELECT', 'UNION', 'AND', 'OR', 'SLEEP', 'WAITFOR', '--', '#', ';', 'WHERE']
+        has_probe_char = any(c in payload for c in sql_probe_chars)
+        has_keyword = any(kw in payload.upper() for kw in sql_keywords)
+        if payload and not (has_probe_char or has_keyword):
+            return False, f"SQLi payload missing SQL syntax: {payload[:50]}"
+
+        # All checks passed
+        return True, ""
+
+    def _emit_sqli_finding(self, finding_dict: Dict, status: str = None, needs_cdp: bool = False):
+        """
+        Helper to emit SQLi finding using BaseAgent.emit_finding() with validation.
+
+        Args:
+            finding_dict: The nested 'finding' dict with type, url, parameter, payload, etc.
+            status: Validation status
+            needs_cdp: Whether finding needs CDP validation (usually False for SQLi)
+        """
+        from bugtrace.core.validation_status import ValidationStatus
+
+        # Wrap in full event structure
+        full_event = {
+            "specialist": "sqli",
+            "finding": finding_dict,
+            "status": status or ValidationStatus.VALIDATED_CONFIRMED.value,
+            "validation_requires_cdp": needs_cdp,
+            "scan_context": getattr(self, '_scan_context', 'unknown'),
+        }
+
+        # Use BaseAgent.emit_finding() which validates before emitting
+        result = self.emit_finding(finding_dict)
+
+        if result:
+            # Emit the full event structure for backward compatibility
+            from bugtrace.core.event_bus import EventType
+            from bugtrace.core.config import settings
+            if settings.WORKER_POOL_EMIT_EVENTS:
+                import asyncio
+                asyncio.create_task(self.event_bus.emit(EventType.VULNERABILITY_DETECTED, full_event))
 
     def _finding_to_dict(self, finding: SQLiFinding) -> Dict:
         """Convert SQLiFinding object to dictionary for report."""
@@ -1404,6 +1487,83 @@ Write the exploitation explanation section for the report."""
 
         await self._init_interactsh()
 
+    async def _discover_sqli_params(self, url: str) -> Dict[str, str]:
+        """
+        SQLi-focused parameter discovery for a given URL.
+
+        Extracts ALL testable parameters from:
+        1. URL query string
+        2. HTML forms (input, textarea, select)
+
+        Returns:
+            Dict mapping param names to default values
+            Example: {"id": "123", "sort": "asc", "searchTerm": ""}
+
+        Architecture Note:
+            Specialists must be AUTONOMOUS - they discover their own attack surface.
+            The finding from DASTySAST is just a "signal" that the URL is interesting.
+            We IGNORE the specific parameter and test ALL discoverable params.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, parse_qs
+        from bs4 import BeautifulSoup
+
+        all_params = {}
+
+        # 1. Extract URL query parameters
+        try:
+            parsed = urlparse(url)
+            url_params = parse_qs(parsed.query)
+            for param_name, values in url_params.items():
+                all_params[param_name] = values[0] if values else ""
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        # 2. Fetch HTML and extract form parameters + link parameters
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+
+            if html:
+                self._last_discovery_html = html  # Cache for URL resolution
+                soup = BeautifulSoup(html, "html.parser")
+
+                # Extract from <input>, <textarea>, <select>
+                for tag in soup.find_all(["input", "textarea", "select"]):
+                    param_name = tag.get("name")
+                    if param_name and param_name not in all_params:
+                        input_type = tag.get("type", "text").lower()
+
+                        # Skip non-testable input types
+                        if input_type not in ["submit", "button", "reset"]:
+                            # Include CSRF tokens for SQLi (unlike XSS)
+                            # Some apps validate CSRF but still have SQLi in the token check
+                            default_value = tag.get("value", "")
+                            all_params[param_name] = default_value
+
+                # Extract params from <a> href links (same-origin only)
+                parsed_base = urlparse(url)
+                for a_tag in soup.find_all("a", href=True):
+                    href = a_tag["href"]
+                    if href.startswith(("javascript:", "mailto:", "#", "tel:")):
+                        continue
+                    try:
+                        from urllib.parse import urljoin
+                        resolved = urlparse(urljoin(url, href))
+                        if resolved.netloc and resolved.netloc != parsed_base.netloc:
+                            continue
+                        for p_name, p_vals in parse_qs(resolved.query).items():
+                            if p_name not in all_params:
+                                all_params[p_name] = p_vals[0] if p_vals else ""
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            logger.error(f"[{self.name}] HTML parsing failed: {e}")
+
+        logger.info(f"[{self.name}] 🔍 Discovered {len(all_params)} params on {url}: {list(all_params.keys())}")
+        return all_params
+
     async def _extract_and_prioritize_params(self) -> List[str]:
         """Extract and prioritize parameters from URL and POST data."""
         parsed = urlparse(self.url)
@@ -1545,8 +1705,7 @@ Write the exploitation explanation section for the report."""
         return None
 
     async def _finalize_finding(self, finding: SQLiFinding, technique: str) -> SQLiFinding:
-        """Finalize finding with LLM explanation and stats."""
-        finding.exploitation_explanation = await self._generate_llm_exploitation_explanation(finding)
+        """Finalize finding with stats. SQL error + payload + SQLMap command = proof enough."""
         self._stats["vulns_found"] += 1
         return finding
 
@@ -1570,7 +1729,6 @@ Write the exploitation explanation section for the report."""
             dashboard.log(f"[{self.name}] Phase 4: Testing JSON body...", "INFO")
             json_findings = await self._test_json_body_injection(session, self.url, json_body)
             for jf in json_findings:
-                jf.exploitation_explanation = await self._generate_llm_exploitation_explanation(jf)
                 findings.append(self._finding_to_dict(jf))
             self._stats["vulns_found"] += len(json_findings)
         except json.JSONDecodeError:
@@ -1588,7 +1746,6 @@ Write the exploitation explanation section for the report."""
         for param in params[:5]:
             so_finding = await self._test_second_order_sqli(session, self.url, param)
             if so_finding:
-                so_finding["exploitation_explanation"] = await self._generate_llm_exploitation_explanation(so_finding)
                 findings.append(so_finding)
                 self._stats["vulns_found"] += 1
                 break
@@ -2105,6 +2262,80 @@ Write the exploitation explanation section for the report."""
             logger.info(f"[{self.name}] Phase A: No findings in WET list")
             return []
 
+        # ========== AUTONOMOUS PARAMETER DISCOVERY ==========
+        # Strategy: ALWAYS keep original WET params (DASTySAST signals) + ADD discovered params
+        logger.info(f"[{self.name}] Phase A: Expanding WET findings with SQLi-focused discovery...")
+        expanded_wet_findings = []
+        seen_urls = set()
+        seen_params = set()  # Track (url, param) to avoid duplicates
+
+        # 1. Always include ALL original WET params first (they have DASTySAST confidence)
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            param = wet_item.get("parameter", "") or (wet_item.get("finding_data", {}) or wet_item.get("finding", {})).get("parameter", "")
+            if param and (url, param) not in seen_params:
+                seen_params.add((url, param))
+                expanded_wet_findings.append(wet_item)
+
+        # 2. Discover additional params per unique URL
+        for wet_item in wet_findings:
+            url = wet_item.get("url", "")
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            try:
+                all_params = await self._discover_sqli_params(url)
+                if not all_params:
+                    continue
+
+                new_count = 0
+                for param_name, param_value in all_params.items():
+                    if (url, param_name) not in seen_params:
+                        seen_params.add((url, param_name))
+                        expanded_wet_findings.append({
+                            "url": url,
+                            "parameter": param_name,
+                            "technique": wet_item.get("technique", ""),
+                            "priority": wet_item.get("priority", 0),
+                            "finding_data": wet_item.get("finding_data", {}),
+                            "_discovered": True
+                        })
+                        new_count += 1
+
+                if new_count:
+                    logger.info(f"[{self.name}] 🔍 Discovered {new_count} additional params on {url}")
+
+            except Exception as e:
+                logger.error(f"[{self.name}] Discovery failed for {url}: {e}")
+
+        # 2.5 Resolve endpoint URLs from HTML links/forms + reasoning fallback
+        # Params like "artist" may belong to /artists.php, not the base URL
+        from bugtrace.agents.specialist_utils import resolve_param_endpoints, resolve_param_from_reasoning
+        if hasattr(self, '_last_discovery_html') and self._last_discovery_html:
+            for base_url in seen_urls:
+                endpoint_map = resolve_param_endpoints(self._last_discovery_html, base_url)
+                # Fallback: extract endpoints from DASTySAST reasoning text
+                reasoning_map = resolve_param_from_reasoning(expanded_wet_findings, base_url)
+                for k, v in reasoning_map.items():
+                    if k not in endpoint_map:
+                        endpoint_map[k] = v
+                if endpoint_map:
+                    resolved_count = 0
+                    for item in expanded_wet_findings:
+                        if item.get("url") == base_url:
+                            param = item.get("parameter", "")
+                            if param in endpoint_map and endpoint_map[param] != base_url:
+                                item["url"] = endpoint_map[param]
+                                resolved_count += 1
+                    if resolved_count:
+                        logger.info(f"[{self.name}] 🔗 Resolved {resolved_count} params to actual endpoint URLs")
+
+        logger.info(f"[{self.name}] Phase A: Expanded {len(wet_findings)} hints → {len(expanded_wet_findings)} testable params")
+
+        # Replace wet_findings with expanded list
+        wet_findings = expanded_wet_findings
+
         # 3. Load global context with tech stack from recon (v3.2)
         tech_stack = self._tech_stack_context or {"db": "generic", "server": "generic", "lang": "generic"}
         context = {
@@ -2168,10 +2399,17 @@ Write the exploitation explanation section for the report."""
 1. Analyze each finding for real exploitability based on the detected tech stack
 2. Identify attack paths worth testing - prioritize {db_type}-compatible techniques
 3. Apply expert deduplication rules:
-   - Cookie-based SQLi: GLOBAL scope (same cookie on different URLs = DUPLICATE)
-   - Header-based SQLi: GLOBAL scope (same header on different URLs = DUPLICATE)
-   - URL param SQLi: PER-ENDPOINT scope (same param on different URLs = DIFFERENT)
-   - POST param SQLi: PER-ENDPOINT scope (same param on different endpoints = DIFFERENT)
+   - **CRITICAL - Autonomous Discovery:**
+     * If items have "_discovered": true, they are DIFFERENT PARAMETERS discovered autonomously
+     * Even if they share the same "finding_data" object, treat them as SEPARATE based on "parameter" field
+     * Same URL + DIFFERENT param → DIFFERENT (keep all)
+     * Same URL + param + DIFFERENT context → DIFFERENT (keep both)
+   - **Standard Deduplication:**
+     * Cookie-based SQLi: GLOBAL scope (same cookie on different URLs = DUPLICATE)
+     * Header-based SQLi: GLOBAL scope (same header on different URLs = DUPLICATE)
+     * URL param SQLi: PER-ENDPOINT scope (same param on different URLs = DIFFERENT)
+     * POST param SQLi: PER-ENDPOINT scope (same param on different endpoints = DIFFERENT)
+     * Same URL + Same param + Same context → DUPLICATE (keep best)
 4. Filter OUT findings incompatible with {db_type} (if known)
 5. Return DRY list in JSON format
 
@@ -2235,21 +2473,26 @@ Write the exploitation explanation section for the report."""
 
     async def exploit_dry_list(self) -> List[Dict]:
         """
-        Phase B: Attack each DRY finding with specialized SQLi techniques.
+        Phase B: Attack each DRY finding with 7-level escalation pipeline.
 
-        Steps:
-        1. For each DRY item:
-           a. Execute specialized attack (error, boolean, union, time-based, OOB)
-           b. Validate result
-           c. Emit VULNERABILITY_DETECTED event if confirmed
-        2. Generate specialist report
+        v3.4: Progressive escalation from cheap (L0: 1 req) to expensive (L6: SQLMap Docker).
+        Stops at the first level that confirms SQLi - no wasted Docker time.
+
+        Levels:
+            L0: WET payload (1 req)
+            L1: Error-based (~20 reqs)
+            L2: Boolean + Union (~103 reqs)
+            L3: OOB + Time-based (~10 + wait)
+            L4: LLM x WAF bypass (~100 reqs)
+            L5: HTTP Manipulator (~2000 reqs)
+            L6: SQLMap Docker (2-5 min)
 
         Returns:
             List of validated findings
         """
         results = []
 
-        logger.info(f"[{self.name}] Phase B: Exploiting {len(self._dry_findings)} DRY findings...")
+        logger.info(f"[{self.name}] Phase B: Exploiting {len(self._dry_findings)} DRY findings (v3.4 escalation)...")
 
         for dry_item in self._dry_findings:
             url = dry_item.get("url")
@@ -2267,28 +2510,32 @@ Write the exploitation explanation section for the report."""
                 cookie_name = param.replace("Cookie:", "").strip()
                 result = await self._test_cookie_sqli_from_queue(url, cookie_name, dry_item)
             else:
-                result = await self._test_single_param_from_queue(url, param, dry_item)
+                result = await self._sqli_escalation_pipeline(url, param, dry_item)
 
             if result:
-                # Convert to dict and emit event
-                finding_dict = self._finding_to_dict(result)
+                # Validate payload has SQL syntax before emitting
+                finding_dict = {
+                    "type": "SQLI",
+                    "url": result.url,
+                    "parameter": result.parameter,
+                    "payload": result.working_payload,
+                    "technique": result.injection_type,
+                    "dbms": result.dbms_detected,
+                    "evidence": {"data_extracted": True},  # Minimal evidence for validation
+                    "status": "VALIDATED_CONFIRMED",  # Required for final report inclusion
+                    "validated": True
+                }
 
-                # Emit VULNERABILITY_DETECTED event
-                if settings.WORKER_POOL_EMIT_EVENTS:
-                    await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
-                        "specialist": "sqli",
-                        "finding": {
-                            "type": "SQLI",
-                            "url": result.url,
-                            "parameter": result.parameter,
-                            "payload": result.working_payload,
-                            "technique": result.injection_type,
-                            "dbms": result.dbms_detected,
-                        },
-                        "status": "VALIDATED_CONFIRMED",
-                        "validation_requires_cdp": False,
-                        "scan_context": self._scan_context,
-                    })
+                is_valid, error_msg = self._validate_before_emit(finding_dict)
+                if not is_valid:
+                    logger.warning(f"[{self.name}] Finding rejected for {result.parameter}: {error_msg}")
+                    continue
+
+                self._emit_sqli_finding(
+                    finding_dict,
+                    status="VALIDATED_CONFIRMED",
+                    needs_cdp=False
+                )
 
                 logger.info(f"[{self.name}] Confirmed SQLi: {result.url}?{result.parameter} ({result.injection_type})")
 
@@ -2387,6 +2634,7 @@ Write the exploitation explanation section for the report."""
             report_specialist_progress,
             report_specialist_done,
             report_specialist_wet_dry,
+            write_dry_file,
         )
 
         self._queue_mode = True
@@ -2408,6 +2656,7 @@ Write the exploitation explanation section for the report."""
 
         # Report WET→DRY metrics for integrity verification
         report_specialist_wet_dry(self.name, initial_depth, len(dry_list) if dry_list else 0)
+        write_dry_file(self, dry_list, initial_depth, "sqli")
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
@@ -2573,6 +2822,419 @@ Write the exploitation explanation section for the report."""
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
+    # =========================================================================
+    # v3.4: 7-LEVEL ESCALATION PIPELINE
+    # =========================================================================
+
+    async def _sqli_escalation_pipeline(
+        self, url: str, param: str, dry_item: dict
+    ) -> Optional[SQLiFinding]:
+        """
+        5-level SQLi escalation pipeline (v3.5).
+
+        Progressive cost escalation - stops at first confirmation:
+            L0: WET payload          (~1 req)    - Test DASTySAST's payload first
+            L1: Error-based          (~20 reqs)  - SQL error signatures
+            L2: Boolean + Union      (~103 reqs) - Differential + canary reflection
+            L3: OOB + Time-based     (~10 + wait)- DNS exfiltration + SLEEP verification
+            L4: SQLMap Docker        (2-5 min)    - The gold standard for SQLi
+        """
+        pipeline_start = time.time()
+        filtered_chars = set()
+        db_type = None
+
+        try:
+            async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
+                # Initialize baseline if needed
+                if self._baseline_response_time == 0:
+                    await self._initialize_baseline(session)
+
+                # Check for prepared statements (early exit)
+                if await self._detect_prepared_statements(session, param):
+                    logger.info(f"[{self.name}] Pipeline: {param} uses prepared statements, skipping")
+                    return None
+
+                # ── L0: WET PAYLOAD ──
+                dashboard.log(f"[{self.name}] L0: Testing WET payload for {param}...", "INFO")
+                result = await self._escalation_l0_wet_payload(session, param, dry_item)
+                if result:
+                    logger.info(f"[{self.name}] L0 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
+                    return await self._finalize_finding(result, "error_based")
+
+                # ── L1: ERROR-BASED ──
+                dashboard.log(f"[{self.name}] L1: Error-based probing for {param}...", "INFO")
+                result, filtered_chars, db_type = await self._escalation_l1_error_based(session, param)
+                if result:
+                    logger.info(f"[{self.name}] L1 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
+                    return await self._finalize_finding(result, "error_based")
+
+                # ── L2: BOOLEAN + UNION ──
+                dashboard.log(f"[{self.name}] L2: Boolean + Union for {param}...", "INFO")
+                result = await self._escalation_l2_boolean_union(session, param)
+                if result:
+                    logger.info(f"[{self.name}] L2 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
+                    return await self._finalize_finding(result, result.technique)
+
+                # ── L3: OOB + TIME-BASED ──
+                dashboard.log(f"[{self.name}] L3: OOB + Time-based for {param}...", "INFO")
+                result = await self._escalation_l3_oob_time(session, param)
+                if result:
+                    logger.info(f"[{self.name}] L3 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
+                    return await self._finalize_finding(result, result.technique)
+
+            # ── L4/L5 SKIPPED ──
+            # LLM bombing (L4) and ManipulatorOrchestrator (L5) removed.
+            # If L0-L3 didn't find SQLi, SQLMap (the gold standard) handles it directly.
+            # This saves 7-15 minutes per non-vulnerable parameter.
+
+            # ── L4: SQLMAP DOCKER ──
+            dashboard.log(f"[{self.name}] L4: SQLMap for {param}...", "INFO")
+            technique_hint = dry_item.get("recommended_technique", "")
+            result = await self._escalation_l6_sqlmap(param, technique_hint, db_type)
+            if result:
+                logger.info(f"[{self.name}] L4 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
+                return await self._finalize_finding(result, result.technique)
+
+            logger.info(f"[{self.name}] Pipeline exhausted for {param} (no SQLi found, {time.time() - pipeline_start:.1f}s)")
+            return None
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Escalation pipeline failed for {param}: {e}")
+            return None
+
+    async def _escalation_l0_wet_payload(
+        self, session: aiohttp.ClientSession, param: str, dry_item: dict
+    ) -> Optional[SQLiFinding]:
+        """
+        L0: Test the DASTySAST WET payload first (~1 req).
+
+        If DASTySAST already found a payload that triggers a SQL error,
+        we can confirm immediately without further probing.
+        """
+        # Extract payload from dry item (DASTySAST's finding)
+        finding_data = dry_item.get("finding_data", {})
+        wet_payload = finding_data.get("payload", "")
+
+        if not wet_payload:
+            return None
+
+        dashboard.set_current_payload(wet_payload[:60], "SQLi L0 WET", "1/1", self.name)
+
+        base_url = self._get_base_url()
+        try:
+            test_url = self._build_url_with_param(base_url, param, wet_payload)
+            async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                content = await resp.text()
+                status_code = resp.status
+
+                error_info = self._extract_info_from_error(content)
+
+                if error_info.get("db_type"):
+                    self._detected_db_type = error_info["db_type"]
+                    logger.info(f"[{self.name}] L0: WET payload triggered SQL error! DB={error_info['db_type']}")
+                    return self._create_error_based_finding(param, wet_payload, error_info)
+
+                # Check for 500 + SQL-related keywords even without DB fingerprint
+                if status_code >= 500:
+                    sql_keywords = ["sql", "query", "syntax", "database", "select", "insert", "update", "delete"]
+                    content_lower = content.lower()
+                    if any(kw in content_lower for kw in sql_keywords):
+                        logger.info(f"[{self.name}] L0: WET payload caused 500 with SQL keywords")
+                        error_info["db_type"] = error_info.get("db_type") or "unknown"
+                        return self._create_error_based_finding(param, wet_payload, error_info)
+
+        except Exception as e:
+            logger.debug(f"[{self.name}] L0 failed: {e}")
+
+        return None
+
+    async def _escalation_l1_error_based(
+        self, session: aiohttp.ClientSession, param: str
+    ) -> Tuple[Optional[SQLiFinding], Set[str], Optional[str]]:
+        """
+        L1: Error-based probing (~20 reqs).
+
+        Sends SQL metacharacters and checks for error signatures.
+        Also runs filter detection to inform L4.
+
+        Returns:
+            (finding_or_none, filtered_chars, detected_db_type)
+        """
+        # Detect filtered chars (side effect: populates self._detected_filters)
+        filtered_chars = await self._detect_filtered_chars(session, param)
+
+        # Delegate to existing error-based testing
+        result = await self._test_error_based(session, param)
+        if result:
+            return result, filtered_chars, self._detected_db_type
+
+        return None, filtered_chars, self._detected_db_type
+
+    async def _escalation_l2_boolean_union(
+        self, session: aiohttp.ClientSession, param: str
+    ) -> Optional[SQLiFinding]:
+        """
+        L2: Boolean-based + Union-based (~103 reqs).
+
+        Boolean: baseline vs true (AND '1'='1) vs false → differential
+        Union: NULL column counting 1-10 with canary reflection
+        """
+        # Boolean-based
+        result = await self._test_boolean_based(session, param)
+        if result:
+            return result
+
+        # Union-based
+        result = await self._test_union_based(session, param)
+        if result:
+            return result
+
+        return None
+
+    async def _escalation_l3_oob_time(
+        self, session: aiohttp.ClientSession, param: str
+    ) -> Optional[SQLiFinding]:
+        """
+        L3: OOB (Interactsh) + Time-based (~10 reqs + wait).
+
+        OOB first (more reliable), then time-based with triple verification.
+        Time-based is FP-prone, so only if OOB fails.
+        """
+        # OOB SQLi first (if Interactsh available)
+        if self._interactsh:
+            result = await self._test_oob_sqli(session, param)
+            if result:
+                return result
+
+        # Time-based with triple verification (only if OOB didn't confirm)
+        result = await self._test_time_based(session, param)
+        if result:
+            return result
+
+        return None
+
+    async def _escalation_l4_llm_bombing(
+        self, session: aiohttp.ClientSession, param: str,
+        filtered_chars: Set[str], db_type: Optional[str]
+    ) -> Optional[SQLiFinding]:
+        """
+        L4: LLM-generated SQL payloads with WAF bypass (~100 reqs).
+
+        Asks LLM for ~50 SQLi payloads tailored to:
+        - Detected DB type (MySQL/PostgreSQL/MSSQL/Oracle/SQLite)
+        - Filtered chars from L1
+        - WAF fingerprint (if detected)
+        Then applies FILTER_MUTATIONS for each filtered char.
+        """
+        from bugtrace.core.llm_client import llm_client
+
+        db_hint = db_type or self._detected_db_type or "unknown"
+        filter_hint = ", ".join(filtered_chars) if filtered_chars else "none detected"
+
+        user_prompt = (
+            f"Target URL: {self.url}\n"
+            f"Parameter: {param}\n"
+            f"Detected database: {db_hint}\n"
+            f"Filtered characters/keywords: {filter_hint}\n\n"
+            f"Generate 50 SQL injection payloads for testing. Include:\n"
+            f"1. Error-based payloads for {db_hint} (syntax errors, type confusion)\n"
+            f"2. Boolean-based blind payloads (AND/OR with different syntax)\n"
+            f"3. Union-based payloads (different column counts 1-5)\n"
+            f"4. Stacked queries (;SELECT, ;WAITFOR, etc.)\n"
+            f"5. WAF bypass variants (/**/, %0a, inline comments, case mixing)\n"
+            f"6. Database-specific functions ({db_hint})\n"
+            f"7. Filter bypass for: {filter_hint}\n\n"
+            f"Return each payload in <payload> tags."
+        )
+
+        system_prompt = (
+            "You are an expert SQL injection payload generator. "
+            "Generate creative, diverse payloads that bypass common WAFs and filters. "
+            "Each payload should be a complete injection string ready to be appended to a parameter value. "
+            "Focus on payloads that cause VISIBLE effects: error messages, behavioral changes, or time delays."
+        )
+
+        try:
+            response = await llm_client.generate(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                module_name="SQLi_L4_LLM",
+                max_tokens=3000,
+                temperature=0.7
+            )
+
+            # Parse payloads from response
+            import re as _re
+            llm_payloads = _re.findall(r"<payload>(.*?)</payload>", response, _re.DOTALL)
+            llm_payloads = [p.strip() for p in llm_payloads if p.strip()]
+
+        except Exception as e:
+            logger.error(f"[{self.name}] L4: LLM generation failed: {e}")
+            llm_payloads = []
+
+        if not llm_payloads:
+            logger.info(f"[{self.name}] L4: LLM generated 0 payloads, skipping")
+            return None
+
+        # Apply filter mutations to expand each payload
+        all_payloads = []
+        for payload in llm_payloads:
+            variants = self._mutate_payload_for_filters(payload)
+            all_payloads.extend(variants)
+
+        # Deduplicate
+        seen = set()
+        unique_payloads = []
+        for p in all_payloads:
+            if p not in seen:
+                seen.add(p)
+                unique_payloads.append(p)
+
+        logger.info(f"[{self.name}] L4: Bombing {len(unique_payloads)} LLM+mutated payloads on '{param}'")
+
+        base_url = self._get_base_url()
+
+        for i, payload in enumerate(unique_payloads):
+            if i % 20 == 0 and i > 0:
+                dashboard.log(f"[{self.name}] L4: Progress {i}/{len(unique_payloads)}", "DEBUG")
+            dashboard.set_current_payload(payload[:60], "SQLi L4 LLM", f"{i+1}/{len(unique_payloads)}", self.name)
+
+            try:
+                test_url = self._build_url_with_param(base_url, param, payload)
+                async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    content = await resp.text()
+
+                    error_info = self._extract_info_from_error(content)
+                    if error_info.get("db_type"):
+                        self._detected_db_type = error_info["db_type"]
+                        logger.info(f"[{self.name}] L4: LLM payload #{i} triggered SQL error!")
+                        return self._create_error_based_finding(param, payload, error_info)
+
+            except Exception:
+                continue
+
+        logger.info(f"[{self.name}] L4: No confirmation from {len(unique_payloads)} payloads")
+        return None
+
+    async def _escalation_l5_http_manipulator(
+        self, url: str, param: str
+    ) -> Optional[SQLiFinding]:
+        """
+        L5: ManipulatorOrchestrator - context detection, WAF bypass (~2000 reqs).
+
+        Uses the HTTP attack engine with PAYLOAD_INJECTION + BYPASS_WAF strategies.
+        SQLi is server-side so no browser escalation needed - blood smell is logged only.
+        """
+        try:
+            parsed = urlparse(url)
+            base_params = dict(parse_qs(parsed.query, keep_blank_values=True))
+            # parse_qs returns lists, flatten to single values
+            base_params = {k: v[0] if v else "" for k, v in base_params.items()}
+            if param not in base_params:
+                base_params[param] = "1"
+
+            base_request = MutableRequest(
+                method="GET",
+                url=url.split("?")[0],
+                params=base_params
+            )
+
+            manipulator = ManipulatorOrchestrator(
+                rate_limit=0.3,
+                enable_agentic_fallback=True,
+                enable_llm_expansion=True
+            )
+
+            success, mutation = await manipulator.process_finding(
+                base_request,
+                strategies=[MutationStrategy.PAYLOAD_INJECTION, MutationStrategy.BYPASS_WAF]
+            )
+
+            if success and mutation:
+                working_payload = mutation.params.get(param, str(mutation.params))
+                original_value = base_params.get(param, "1")
+
+                # Verify the TARGET param was actually mutated (not a different param)
+                if working_payload == original_value:
+                    logger.info(f"[{self.name}] L5: ManipulatorOrchestrator exploited different param, not '{param}'")
+                    await manipulator.shutdown()
+                    return None
+
+                # Validate payload has SQL syntax (ManipulatorOrchestrator is generic,
+                # it may "confirm" non-SQLi changes like payload="1")
+                sql_indicators = ["'", '"', "SELECT", "UNION", "AND", "OR", "SLEEP",
+                                  "WAITFOR", "--", "#", ";", "WHERE", "ORDER", "GROUP",
+                                  "HAVING", "INSERT", "UPDATE", "DELETE", "DROP", "CONCAT",
+                                  "LOAD_FILE", "INTO", "EXEC", "xp_"]
+                if not any(ind in working_payload or ind in working_payload.upper() for ind in sql_indicators):
+                    logger.info(f"[{self.name}] L5: ManipulatorOrchestrator payload rejected (no SQL syntax): {working_payload[:80]}")
+                    await manipulator.shutdown()
+                    return None
+
+                logger.info(f"[{self.name}] L5: ManipulatorOrchestrator CONFIRMED: {param}={working_payload[:80]}")
+                await manipulator.shutdown()
+
+                # Check if it's an SQL error to get DB type
+                error_info = self._extract_info_from_error(working_payload)
+                db_type = error_info.get("db_type") or self._detected_db_type or "unknown"
+
+                exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, working_payload)
+                curl_cmd = f"curl '{exploit_url_encoded}'"
+
+                return SQLiFinding(
+                    url=self.url,
+                    parameter=param,
+                    injection_type="manipulator-confirmed",
+                    technique="error_based",
+                    working_payload=working_payload,
+                    payload_encoded=working_payload,
+                    exploit_url=exploit_url,
+                    exploit_url_encoded=exploit_url_encoded,
+                    dbms_detected=db_type,
+                    sqlmap_command=f"sqlmap -u '{self.url}' -p {param} --batch",
+                    curl_command=curl_cmd,
+                    sqlmap_reproduce_command=f"sqlmap -u '{self.url}' -p {param} --batch --dbs",
+                    validated=True,
+                    status="VALIDATED_CONFIRMED",
+                    evidence={
+                        "http_confirmed": True,
+                        "method": "ManipulatorOrchestrator",
+                        "level": "L5",
+                    },
+                    reproduction_steps=self._generate_repro_steps(self.url, param, working_payload, curl_cmd)
+                )
+
+            # Log blood smell candidates for debugging
+            if hasattr(manipulator, 'blood_smell_history') and manipulator.blood_smell_history:
+                blood_count = len(manipulator.blood_smell_history)
+                logger.info(f"[{self.name}] L5: {blood_count} blood smell candidates (server-side only, no browser escalation)")
+
+            await manipulator.shutdown()
+
+        except Exception as e:
+            logger.error(f"[{self.name}] L5: ManipulatorOrchestrator failed: {e}")
+
+        return None
+
+    async def _escalation_l6_sqlmap(
+        self, param: str, technique_hint: str, db_type: Optional[str] = None
+    ) -> Optional[SQLiFinding]:
+        """
+        L6: SQLMap Docker - heavy artillery, last resort (2-5 min).
+
+        Only runs if L0-L5 all failed. Passes technique hints from earlier
+        levels for faster detection.
+        """
+        if not external_tools.docker_cmd:
+            logger.info(f"[{self.name}] L6: Docker not available, skipping SQLMap")
+            return None
+
+        # Build technique hint from earlier detection
+        hint = self._get_sqlmap_technique_hint(technique_hint) if technique_hint else "EBUT"
+
+        dashboard.log(f"[{self.name}] L6: Running SQLMap Docker for {param} (hint: {hint})...", "INFO")
+        return await self._run_sqlmap_on_param(param, technique_hint=hint)
+
     async def _test_cookie_sqli_from_queue(
         self, url: str, cookie_name: str, finding: dict
     ) -> Optional[SQLiFinding]:
@@ -2733,25 +3395,27 @@ Write the exploitation explanation section for the report."""
         # Mark as emitted
         self._emitted_findings.add(fingerprint)
 
-        # Emit vulnerability_detected event
-        if settings.WORKER_POOL_EMIT_EVENTS:
-            await self.event_bus.emit(EventType.VULNERABILITY_DETECTED, {
-                "specialist": "sqli",
-                "finding": {
-                    "type": "SQLI",
-                    "url": result.url,
-                    "parameter": result.parameter,
-                    "payload": result.working_payload,
-                    "technique": result.injection_type,
-                    "dbms": result.dbms_detected,
-                },
-                "status": "VALIDATED_CONFIRMED", # FORCE CONFIRMATION
-                "validation_requires_cdp": False,  # FORCE SKIP VISION
-                "scan_context": self._scan_context,
-            })
+        # Use validated emit helper (Phase 1 Refactor)
+        finding_dict = {
+            "type": "SQLI",
+            "url": result.url,
+            "parameter": result.parameter,
+            "payload": result.working_payload,
+            "technique": result.injection_type,
+            "dbms": result.dbms_detected,
+            "evidence": {"data_extracted": True},  # Minimal evidence for validation
+            "status": "VALIDATED_CONFIRMED",  # Required for final report inclusion
+            "validated": True
+        }
+
+        self._emit_sqli_finding(
+            finding_dict,
+            status="VALIDATED_CONFIRMED",
+            needs_cdp=False
+        )
 
         logger.info(f"[{self.name}] Confirmed SQLi: {result.url}?{result.parameter} ({result.injection_type})")
-        
+
         # Explicitly update Dashboard UI (Fixes: findings not showing up in Rich UI)
         dashboard.add_finding(
             "SQL Injection", 

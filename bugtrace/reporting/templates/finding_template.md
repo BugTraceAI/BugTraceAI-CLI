@@ -12,7 +12,7 @@
 **URL:** `{url}`
 **Parameter:** `{parameter}`
 **Payload:** `{payload}`
-
+{alternative_payloads_section}
 #### Description
 
 {description}

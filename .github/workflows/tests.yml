@@ -34,7 +34,9 @@ jobs:
       run: |
         python -m bugtrace --help
         
-    # NOTE: Full integration tests require a target, skipping for basic CI
-    # - name: Run Unit Tests
-    #   run: |
-    #     pytest tests/
+    - name: Run Unit Tests
+      run: |
+        pytest tests/unit/ -x -q --tb=short
+
+    # NOTE: Integration tests require a live target, run manually
+    # pytest tests/integration/

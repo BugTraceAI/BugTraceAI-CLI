@@ -216,6 +216,20 @@ class DASTySASTAgent(BaseAgent):
 
         # Use orchestrator for lifecycle-tracked connections
         async with orchestrator.session(DestinationType.TARGET) as session:
+            # Cookie Fix: Make initial request to base URL to capture real Set-Cookie headers
+            # aiohttp probes with markers won't trigger the same Set-Cookie behavior
+            # The server sets cookies (TrackingId, session, etc.) on clean first visits
+            try:
+                base_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path,
+                                       parsed.params, parsed.query, parsed.fragment))
+                async with session.get(base_url, ssl=False, timeout=aiohttp.ClientTimeout(total=10)) as initial_resp:
+                    await initial_resp.text()  # consume body
+                    self._extract_cookies_from_http_headers(initial_resp)
+                    if getattr(self, '_http_cookies', {}):
+                        logger.info(f"[{self.name}] 🍪 Captured {len(self._http_cookies)} cookies from initial request")
+            except Exception as e:
+                logger.debug(f"[{self.name}] Initial cookie capture failed: {e}")
+
             for param_name in all_param_names:
                 try:
                     # Build probe URL with marker
@@ -229,9 +243,19 @@ class DASTySASTAgent(BaseAgent):
                     async with session.get(probe_url, ssl=False, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         html = await resp.text()
                         status = resp.status
+                        # Gap 1: Capture Set-Cookie headers to find HttpOnly cookies
+                        self._extract_cookies_from_http_headers(resp)
+                        # Gap 2: Check for probe marker reflection in response headers
+                        header_reflection = self._check_header_reflection(param_name, marker, resp)
 
                     # Analyze reflection
                     probe_result = self._analyze_reflection(param_name, marker, html, status)
+                    # Merge header reflection data if found
+                    if header_reflection:
+                        probe_result["header_reflection"] = header_reflection
+                        if not probe_result["reflects"]:
+                            probe_result["reflects"] = True
+                            probe_result["context"] = "response_header"
                     probes.append(probe_result)
 
                     if probe_result["reflects"]:
@@ -312,6 +336,80 @@ class DASTySASTAgent(BaseAgent):
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to extract HTML params: {e}")
             return []
+
+    def _extract_cookies_from_http_headers(self, response) -> None:
+        """
+        Gap 1 Fix: Extract cookies from HTTP Set-Cookie headers.
+
+        HttpOnly cookies are invisible to JavaScript (document.cookie) but
+        are sent in HTTP Set-Cookie headers. These are the highest-value
+        targets for Cookie SQLi because they often contain session/tracking data.
+
+        Stores extracted cookies in self._http_cookies for use by _check_cookie_sqli_probes().
+        """
+        if not hasattr(self, '_http_cookies'):
+            self._http_cookies = {}
+
+        try:
+            # response.headers is a CIMultiDictProxy; getall returns all Set-Cookie values
+            set_cookie_headers = response.headers.getall('Set-Cookie', [])
+            for header_val in set_cookie_headers:
+                # Parse "name=value; HttpOnly; Secure; Path=/"
+                parts = header_val.split(';')
+                if not parts:
+                    continue
+                name_value = parts[0].strip()
+                if '=' not in name_value:
+                    continue
+                name, value = name_value.split('=', 1)
+                name = name.strip()
+                value = value.strip()
+                if not name:
+                    continue
+
+                # Check flags
+                flags_lower = header_val.lower()
+                is_httponly = 'httponly' in flags_lower
+
+                # Store with metadata — HttpOnly cookies are the high-value targets
+                if name not in self._http_cookies:
+                    self._http_cookies[name] = {
+                        "name": name,
+                        "value": value,
+                        "httponly": is_httponly,
+                        "_source": "http_header"
+                    }
+                    if is_httponly:
+                        logger.info(f"[{self.name}] 🍪 Captured HttpOnly cookie from headers: {name}")
+                    else:
+                        logger.debug(f"[{self.name}] Captured cookie from headers: {name}")
+        except Exception as e:
+            logger.debug(f"[{self.name}] Failed to extract cookies from headers: {e}")
+
+    def _check_header_reflection(self, param_name: str, marker: str, response) -> Optional[Dict]:
+        """
+        Gap 2 Fix: Check if the probe marker reflects in response headers.
+
+        If the marker appears in any response header value, this indicates
+        potential CRLF / Header Injection. Records the header name for
+        auto-dispatch to HeaderInjectionAgent.
+
+        Returns:
+            Dict with header reflection details, or None if no reflection found.
+        """
+        try:
+            for header_name, header_value in response.headers.items():
+                if marker in header_value:
+                    logger.info(f"[{self.name}] ⚠️ Probe marker reflects in response header '{header_name}' for param {param_name}")
+                    return {
+                        "header_name": header_name,
+                        "header_value": header_value[:200],
+                        "parameter": param_name,
+                        "reflection_context": "response_header"
+                    }
+        except Exception as e:
+            logger.debug(f"[{self.name}] Header reflection check failed: {e}")
+        return None
 
     async def _detect_auth_artifacts(self, html_content: str):
         """
@@ -942,11 +1040,23 @@ class DASTySASTAgent(BaseAgent):
         findings = []
 
         try:
-            # Get cookies from browser session
+            # Get cookies from browser session (JavaScript document.cookie — misses HttpOnly!)
             from bugtrace.tools.visual.browser import browser_manager
             session_data = await browser_manager.get_session_data()
             cookies = session_data.get("cookies", [])
             logger.debug(f"[Cookie SQLi Probe] Got {len(cookies)} cookies from browser session")
+
+            # Gap 1 Fix: Merge HttpOnly cookies captured from HTTP Set-Cookie headers
+            # These are invisible to document.cookie but are the highest-value SQLi targets
+            http_cookies = getattr(self, '_http_cookies', {})
+            if http_cookies:
+                existing_names = {c.get("name", "").lower() for c in cookies}
+                for name, cookie_data in http_cookies.items():
+                    if name.lower() not in existing_names:
+                        cookies.append(cookie_data)
+                        existing_names.add(name.lower())
+                httponly_count = sum(1 for c in http_cookies.values() if c.get("httponly"))
+                logger.info(f"[Cookie SQLi Probe] Merged {len(http_cookies)} HTTP header cookies ({httponly_count} HttpOnly)")
 
             # Add synthetic cookies for common vulnerable patterns
             # These are tested even if not present in the session
@@ -999,81 +1109,85 @@ class DASTySASTAgent(BaseAgent):
                         if any(f.get("parameter") == f"Cookie: {cookie_name}" for f in findings):
                             continue
 
-                        # Prepare test values
+                        # === Multi-strategy error-based SQLi detection ===
+                        # Strategy: get baseline status, then test multiple injection chars.
+                        # If ANY injection char causes 500 while baseline is <400 → SQLi.
+                        # This catches diverse SQL dialects and encoding schemes.
+                        injection_chars = ["'", '"', "\\", ")", ";"]
+
+                        # Build injection test values: list of (label, injected_cookie_value, injection_char)
                         test_values = []
 
-                        # Test 1: Direct injection
-                        test_values.append(("direct", f"{cookie_value}'", f"{cookie_value}''"))
+                        # Direct injection: append char to raw cookie value
+                        for ic in injection_chars:
+                            test_values.append((f"direct_{ic}", f"{cookie_value}{ic}", ic))
 
-                        # Test 2: Try Base64 decode and inject inside
+                        # Base64 decode and inject inside
                         try:
-                            # Pad Base64 if needed
                             padded = cookie_value + "=" * (4 - len(cookie_value) % 4) if len(cookie_value) % 4 else cookie_value
                             decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
 
-                            # Check if it's JSON
                             if decoded.strip().startswith('{'):
                                 try:
                                     json_data = json.loads(decoded)
-                                    # Inject in each JSON field
                                     for key in json_data:
                                         if isinstance(json_data[key], str):
-                                            # Create modified JSON with injection
-                                            json_single = json_data.copy()
-                                            json_single[key] = "'"
-                                            json_double = json_data.copy()
-                                            json_double[key] = "''"
-
-                                            val_single = base64.b64encode(json.dumps(json_single).encode()).decode()
-                                            val_double = base64.b64encode(json.dumps(json_double).encode()).decode()
-                                            test_values.append((f"base64_json_{key}", val_single, val_double))
+                                            for ic in injection_chars:
+                                                injected = json_data.copy()
+                                                injected[key] = json_data[key] + ic
+                                                val = base64.b64encode(json.dumps(injected).encode()).decode()
+                                                test_values.append((f"b64_json_{key}_{ic}", val, ic))
                                 except json.JSONDecodeError:
                                     pass
                             else:
-                                # Plain Base64, inject in decoded value
-                                val_single = base64.b64encode(f"{decoded}'".encode()).decode()
-                                val_double = base64.b64encode(f"{decoded}''".encode()).decode()
-                                test_values.append(("base64_plain", val_single, val_double))
+                                for ic in injection_chars:
+                                    val = base64.b64encode(f"{decoded}{ic}".encode()).decode()
+                                    test_values.append((f"b64_plain_{ic}", val, ic))
                         except Exception:
                             pass  # Not Base64, skip
 
-                        # Run tests
-                        for test_type, val_single, val_double in test_values:
+                        # Get baseline status (original cookie value)
+                        other_cookies = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
+                        baseline_cookie_str = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={cookie_value}"])
+                        try:
+                            async with session.get(test_url, headers={"Cookie": baseline_cookie_str}, ssl=False) as resp_baseline:
+                                status_baseline = resp_baseline.status
+                        except Exception:
+                            status_baseline = 0  # Can't get baseline, skip
+
+                        if status_baseline >= 500:
+                            # Baseline already errors, can't do differential detection
+                            logger.debug(f"[Cookie SQLi Probe] {cookie_name} @ {test_path}: baseline={status_baseline}, skipping (already erroring)")
+                            continue
+
+                        # Test each injection
+                        for test_type, val_injected, inj_char in test_values:
                             try:
-                                # Build cookie strings
-                                other_cookies = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
+                                cookies_injected = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={val_injected}"])
 
-                                cookies_single = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={val_single}"])
-                                cookies_double = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={val_double}"])
+                                async with session.get(test_url, headers={"Cookie": cookies_injected}, ssl=False) as resp_injected:
+                                    status_injected = resp_injected.status
 
-                                headers_single = {"Cookie": cookies_single}
-                                headers_double = {"Cookie": cookies_double}
+                                logger.debug(f"[Cookie SQLi Probe] {cookie_name} @ {test_path} ({test_type}): injected={status_injected}, baseline={status_baseline}")
 
-                                async with session.get(test_url, headers=headers_single, ssl=False) as resp_single:
-                                    status_single = resp_single.status
-
-                                async with session.get(test_url, headers=headers_double, ssl=False) as resp_double:
-                                    status_double = resp_double.status
-
-                                logger.debug(f"[Cookie SQLi Probe] {cookie_name} @ {test_path} ({test_type}): '={status_single}, ''={status_double}")
-
-                                # Detection: Status code differential
-                                if status_single >= 500 and status_double < 400:
-                                    logger.info(f"[Cookie SQLi Probe] DETECTED SQLi in cookie {cookie_name} @ {test_path} ({test_type}): {status_single} vs {status_double}")
+                                # Detection: injection causes 500, baseline was OK
+                                if status_injected >= 500 and status_baseline < 400:
+                                    logger.info(f"[Cookie SQLi Probe] DETECTED SQLi in cookie {cookie_name} @ {test_path} ({test_type}): {status_injected} vs baseline {status_baseline}")
                                     findings.append({
                                         "type": "SQLi",
                                         "vulnerability": "SQL Injection in Cookie (Error-based)",
                                         "parameter": f"Cookie: {cookie_name}",
-                                        "payload": "'" if "base64" not in test_type else f"Base64-encoded ' in {test_type}",
+                                        "url": self.url,
+                                        "payload": inj_char if "b64" not in test_type else f"Base64-encoded {repr(inj_char)} in {test_type}",
                                         "confidence": 0.9,
                                         "severity": "Critical",
-                                        "probe_validated": True,  # Active test confirmed - don't override scores
+                                        "probe_validated": True,
                                         "fp_confidence": 0.85,
                                         "skeptical_score": 8,
-                                        "votes": 5,  # Boost votes for probe findings (counts as expert validation)
-                                        "evidence": f"Status code differential: single quote returns {status_single}, escaped quote returns {status_double}",
-                                        "description": f"Error-based SQL injection detected in cookie '{cookie_name}' at {test_url} ({test_type}). Single quote causes server error while escaped quote works normally.",
-                                        "reproduction": f"[PROBE-VALIDATED] curl -b '{cookie_name}={val_single}' '{test_url}' # Returns {status_single}"
+                                        "votes": 5,
+                                        "evidence": f"Status code differential: {repr(inj_char)} injection returns {status_injected}, original cookie returns {status_baseline}",
+                                        "description": f"Error-based SQL injection detected in cookie '{cookie_name}' at {test_url} ({test_type}). Injecting {repr(inj_char)} causes server error while original value works normally.",
+                                        "reproduction": f"[PROBE-VALIDATED] curl -b '{cookie_name}={val_injected}' '{test_url}' # Returns {status_injected}"
                                     })
                                     break  # Found SQLi in this cookie, move on
 
@@ -1112,6 +1226,7 @@ class DASTySASTAgent(BaseAgent):
                                             "type": "SQLi",
                                             "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type})",
                                             "parameter": f"Cookie: {cookie_name}",
+                                            "url": self.url,
                                             "payload": sleep_payload,
                                             "confidence": 0.85,
                                             "severity": "Critical",
@@ -1132,6 +1247,7 @@ class DASTySASTAgent(BaseAgent):
                                         "type": "SQLi",
                                         "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type}, Timeout)",
                                         "parameter": f"Cookie: {cookie_name}",
+                                        "url": self.url,
                                         "payload": sleep_payload,
                                         "confidence": 0.75,
                                         "severity": "Critical",

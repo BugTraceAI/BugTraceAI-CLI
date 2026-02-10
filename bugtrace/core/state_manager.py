@@ -101,20 +101,10 @@ class StateManager:
                 logger.error(f"Failed to process finding: {e}", exc_info=True)
 
     def load_state(self) -> Dict[str, Any]:
-        """Loads state from DB (preferred) or File."""
-        if self.scan_id:
-            try:
-                state_json = self.db.get_checkpoint(self.scan_id)
-                if state_json:
-                    logger.info(f"Loaded active state from DB for scan {self.scan_id}")
-                    return json.loads(state_json)
-            except Exception as e:
-                logger.error(f"Failed to load state from DB: {e}", exc_info=True)
-        
-        # Fallback to file
+        """Loads state from file (DB = write-only from CLI)."""
         if not self.state_file.exists():
             return {}
-            
+
         try:
             with open(self.state_file, 'r') as f:
                 content = json.load(f)
@@ -222,6 +212,29 @@ class StateManager:
 
         # Try JSON Lines first (one object per line)
         if content.startswith("{"):
+            # v3.3: Check for wrapper format (specialist DRY files with "findings" array)
+            try:
+                wrapper = json.loads(content)
+                if isinstance(wrapper, dict) and "findings" in wrapper and isinstance(wrapper["findings"], list):
+                    for finding in wrapper["findings"]:
+                        if not isinstance(finding, dict):
+                            continue
+                        normalized = {
+                            "type": finding.get("type", "Unknown"),
+                            "url": finding.get("url", ""),
+                            "parameter": finding.get("parameter", ""),
+                            "payload": finding.get("payload", ""),
+                            "evidence": finding.get("evidence") or finding.get("description", ""),
+                            "severity": finding.get("severity", "HIGH"),
+                            "status": finding.get("status", "PENDING_VALIDATION"),
+                            "screenshot": finding.get("screenshot"),
+                            "_source": source_dir,
+                        }
+                        findings.append(normalized)
+                    return findings
+            except json.JSONDecodeError:
+                pass  # Fall through to JSON Lines parsing
+
             lines = content.split("\n")
             valid_count = 0
             corrupt_count = 0
