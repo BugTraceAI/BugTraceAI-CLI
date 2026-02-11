@@ -1,0 +1,1131 @@
+openapi: 3.1.0
+info:
+  title: BugTraceAI CLI API
+  description: |
+    REST API for the BugTraceAI autonomous security scanning platform.
+
+    BugTraceAI CLI is a headless, AI-powered vulnerability scanner that discovers and validates
+    security issues using specialized agents (XSS, SQLi, SSRF, IDOR, LFI, RCE, XXE, JWT, and more).
+    This API provides full scan lifecycle management, real-time WebSocket streaming, report generation,
+    and runtime configuration.
+
+    ## Authentication
+
+    No authentication is required. Access is controlled via CORS origins configured in the
+    `BUGTRACE_CORS_ORIGINS` environment variable.
+
+    ## Real-time Events
+
+    Use the WebSocket endpoints (`/ws/scans/{scan_id}` or `/ws/global`) to receive live scan events
+    including progress updates, phase transitions, and new findings as they are discovered.
+  version: 2.0.0
+  contact:
+    name: BugTraceAI
+    url: https://bugtraceai.com
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8000
+    description: Local development
+  - url: http://{host}:8000
+    description: Custom deployment
+    variables:
+      host:
+        default: localhost
+
+tags:
+  - name: health
+    description: Liveness and readiness probes
+  - name: scans
+    description: Scan lifecycle management
+  - name: reports
+    description: Report generation and download
+  - name: config
+    description: Runtime configuration
+  - name: metrics
+    description: Performance and queue metrics
+  - name: websocket
+    description: Real-time event streaming via WebSocket
+
+paths:
+  /:
+    get:
+      summary: API information
+      description: Returns API name, version, and documentation links.
+      operationId: root
+      responses:
+        "200":
+          description: API info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    example: BugTraceAI API
+                  version:
+                    type: string
+                    example: "2.0.0"
+                  docs:
+                    type: string
+                    example: /docs
+                  health:
+                    type: string
+                    example: /health
+                  ready:
+                    type: string
+                    example: /ready
+
+  /health:
+    get:
+      tags: [health]
+      summary: Health check
+      description: |
+        Liveness probe. Returns server health status, Docker availability, and active scan count.
+        Use this for container orchestration health checks.
+      operationId: healthCheck
+      responses:
+        "200":
+          description: Server health status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /ready:
+    get:
+      tags: [health]
+      summary: Readiness check
+      description: |
+        Readiness probe. Verifies database connectivity and Docker availability.
+        Use this for deployment readiness gates.
+      operationId: readinessCheck
+      responses:
+        "200":
+          description: Readiness status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadinessResponse"
+
+  /api/scans:
+    post:
+      tags: [scans]
+      summary: Create scan
+      description: |
+        Create and start a new security scan against a target URL.
+        The scan runs asynchronously — use the status endpoint or WebSocket to track progress.
+      operationId: createScan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateScanRequest"
+      responses:
+        "201":
+          description: Scan created and started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScanStatusResponse"
+        "400":
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Too many concurrent scans
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    get:
+      tags: [scans]
+      summary: List scans
+      description: List scan history with pagination and optional status filtering.
+      operationId: listScans
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+          description: Page number (1-indexed)
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+          description: Items per page
+        - name: status_filter
+          in: query
+          schema:
+            $ref: "#/components/schemas/ScanStatus"
+          description: Filter by scan status
+      responses:
+        "200":
+          description: Paginated scan list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScanListResponse"
+        "400":
+          description: Invalid pagination parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/scans/{scan_id}/status:
+    get:
+      tags: [scans]
+      summary: Get scan status
+      description: Get current status, progress, and active agent for a scan.
+      operationId: getScanStatus
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: Current scan status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScanStatusResponse"
+        "404":
+          description: Scan not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/scans/{scan_id}/findings:
+    get:
+      tags: [scans]
+      summary: Get scan findings
+      description: Get vulnerability findings for a scan with severity/type filtering and pagination.
+      operationId: getScanFindings
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+        - name: severity
+          in: query
+          schema:
+            $ref: "#/components/schemas/Severity"
+          description: Filter by severity level
+        - name: vuln_type
+          in: query
+          schema:
+            type: string
+            example: XSS
+          description: "Filter by vulnerability type (e.g. XSS, SQLi, SSRF, IDOR, LFI, RCE, XXE, JWT)"
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          description: Paginated findings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FindingsResponse"
+        "400":
+          description: Invalid filter or pagination parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Scan not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/scans/{scan_id}/stop:
+    post:
+      tags: [scans]
+      summary: Stop scan
+      description: Gracefully stop a running scan.
+      operationId: stopScan
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: Scan stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StopScanResponse"
+        "404":
+          description: Scan not found or not running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/scans/{scan_id}/pause:
+    post:
+      tags: [scans]
+      summary: Pause scan
+      description: Pause a running scan. Can be resumed later.
+      operationId: pauseScan
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: Scan paused
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StopScanResponse"
+        "404":
+          description: Scan not found or not running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/scans/{scan_id}/resume:
+    post:
+      tags: [scans]
+      summary: Resume scan
+      description: Resume a previously paused scan.
+      operationId: resumeScan
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: Scan resumed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StopScanResponse"
+        "404":
+          description: Scan not found or not paused
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/scans/{scan_id}:
+    delete:
+      tags: [scans]
+      summary: Delete scan
+      description: |
+        Delete a scan and its associated findings and report files.
+        Cannot delete a currently running scan.
+      operationId: deleteScan
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: Scan deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteScanResponse"
+        "404":
+          description: Scan not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Scan is currently running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/scans/{scan_id}/detailed-metrics:
+    get:
+      tags: [scans]
+      summary: Get detailed scan metrics
+      description: |
+        Get rich real-time metrics for a scan including URL progress, queue depths,
+        deduplication stats, and batch processing metrics.
+      operationId: getDetailedMetrics
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+      responses:
+        "200":
+          description: Detailed scan metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DetailedMetricsResponse"
+        "404":
+          description: Scan not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/scans/{scan_id}/report/{format}:
+    get:
+      tags: [reports]
+      summary: Download report
+      description: Download the scan report in the specified format.
+      operationId: downloadReport
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+        - name: format
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [html, json, markdown]
+          description: Report output format
+      responses:
+        "200":
+          description: Report file
+          content:
+            text/html:
+              schema:
+                type: string
+            application/json:
+              schema:
+                type: object
+            text/markdown:
+              schema:
+                type: string
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: "attachment; filename=bugtrace_report_{scan_id}.{ext}"
+        "400":
+          description: Invalid format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Scan or report not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/scans/{scan_id}/files/{filename}:
+    get:
+      tags: [reports]
+      summary: Get report file
+      description: |
+        Serve individual files from a scan's report directory.
+        Path traversal is prevented — the file must be within the report directory.
+      operationId: getReportFile
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+        - name: filename
+          in: path
+          required: true
+          schema:
+            type: string
+          description: "Filename within the report directory (e.g. final_report.md)"
+      responses:
+        "200":
+          description: File contents with auto-detected content type
+        "400":
+          description: Invalid filename (path traversal attempt)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Report directory or file not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/config:
+    get:
+      tags: [config]
+      summary: Get configuration
+      description: |
+        Get current CLI configuration with API keys masked.
+        Excludes internal fields and filesystem paths.
+      operationId: getConfig
+      responses:
+        "200":
+          description: Current configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigResponse"
+    patch:
+      tags: [config]
+      summary: Update configuration
+      description: |
+        Update CLI configuration at runtime with validation.
+
+        **Validation rules:**
+        - Integer fields (MAX_DEPTH, MAX_URLS, etc.) must be positive
+        - Model fields must be in `provider/model` format (e.g. `moonshotai/kimi-k2-thinking`)
+      operationId: updateConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ConfigUpdateRequest"
+      responses:
+        "200":
+          description: Configuration updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigUpdateResponse"
+        "400":
+          description: No fields to update
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: Validation errors
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/metrics:
+    get:
+      tags: [metrics]
+      summary: Get all metrics
+      description: Get performance metrics from all subsystems (CDP, parallelization, deduplication, queues).
+      operationId: getAllMetrics
+      responses:
+        "200":
+          description: All metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AllMetricsResponse"
+
+  /api/metrics/queues:
+    get:
+      tags: [metrics]
+      summary: Get queue metrics
+      description: Get depth, throughput, and latency metrics for all specialist queues.
+      operationId: getQueueMetrics
+      responses:
+        "200":
+          description: Queue metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueueMetricsResponse"
+
+  /api/metrics/cdp:
+    get:
+      tags: [metrics]
+      summary: Get CDP metrics
+      description: Get Context-Driven Pruning validation reduction metrics per specialist.
+      operationId: getCdpMetrics
+      responses:
+        "200":
+          description: CDP metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CdpMetricsResponse"
+
+  /api/metrics/parallelization:
+    get:
+      tags: [metrics]
+      summary: Get parallelization metrics
+      description: Get current and peak worker concurrency metrics per specialist.
+      operationId: getParallelizationMetrics
+      responses:
+        "200":
+          description: Parallelization metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ParallelizationMetricsResponse"
+
+  /api/metrics/deduplication:
+    get:
+      tags: [metrics]
+      summary: Get deduplication metrics
+      description: Get finding deduplication effectiveness metrics per specialist.
+      operationId: getDeduplicationMetrics
+      responses:
+        "200":
+          description: Deduplication metrics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeduplicationMetricsResponse"
+
+  /api/metrics/reset:
+    post:
+      tags: [metrics]
+      summary: Reset metrics
+      description: Reset all performance metrics counters for clean measurements.
+      operationId: resetMetrics
+      responses:
+        "200":
+          description: Metrics reset
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: reset
+                  message:
+                    type: string
+                    example: All metrics reset successfully
+
+  /ws/scans/{scan_id}:
+    get:
+      tags: [websocket]
+      summary: Scan events (WebSocket)
+      description: |
+        **WebSocket endpoint** — stream real-time events for a specific scan.
+
+        Connect with `?last_seq=N` to replay missed events on reconnection.
+
+        **Event types:** `progress_update`, `phase_update`, `finding_discovered`, `log`, `scan_complete`, `error`
+      operationId: scanWebSocket
+      parameters:
+        - $ref: "#/components/parameters/ScanId"
+        - name: last_seq
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Last received sequence number for reconnection replay
+      responses:
+        "101":
+          description: WebSocket upgrade
+        "400":
+          description: Invalid scan ID
+
+  /ws/global:
+    get:
+      tags: [websocket]
+      summary: Global events (WebSocket)
+      description: |
+        **WebSocket endpoint** — stream events from ALL active scans.
+        Useful for dashboards and monitoring.
+
+        Each message includes a `scan_id` field to identify which scan the event belongs to.
+      operationId: globalWebSocket
+      responses:
+        "101":
+          description: WebSocket upgrade
+
+components:
+  parameters:
+    ScanId:
+      name: scan_id
+      in: path
+      required: true
+      schema:
+        type: integer
+      description: Unique scan identifier
+
+  schemas:
+    ScanStatus:
+      type: string
+      enum: [PENDING, INITIALIZING, RUNNING, PAUSED, COMPLETED, STOPPED, FAILED]
+      description: Scan lifecycle status
+
+    FindingStatus:
+      type: string
+      enum: [PENDING_VALIDATION, VALIDATED_CONFIRMED, VALIDATED_FALSE_POSITIVE, MANUAL_REVIEW_RECOMMENDED, SKIPPED, ERROR]
+      description: Finding validation status
+
+    Severity:
+      type: string
+      enum: [CRITICAL, HIGH, MEDIUM, LOW, INFO]
+      description: Vulnerability severity level
+
+    ErrorResponse:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: string
+          description: Human-readable error message
+        error_code:
+          type: string
+          description: Machine-readable error code
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded]
+        version:
+          type: string
+          example: "2.0.0"
+        docker_available:
+          type: boolean
+        active_scans:
+          type: integer
+        event_bus_stats:
+          type: object
+
+    ReadinessResponse:
+      type: object
+      properties:
+        ready:
+          type: boolean
+        checks:
+          type: object
+          properties:
+            database:
+              type: boolean
+            docker_available:
+              type: boolean
+
+    CreateScanRequest:
+      type: object
+      required: [target_url]
+      properties:
+        target_url:
+          type: string
+          format: uri
+          description: Target URL to scan
+          example: https://example.com
+        scan_type:
+          type: string
+          default: full
+          description: "Scan type: full, hunter, manager, or focused agent names"
+          example: full
+        scan_depth:
+          type: string
+          default: ""
+          description: "Exploitation depth: quick, standard, thorough"
+          enum: ["", quick, standard, thorough]
+        safe_mode:
+          type: boolean
+          nullable: true
+          description: Override global safe mode setting
+        max_depth:
+          type: integer
+          default: 2
+          description: Maximum crawl depth
+        max_urls:
+          type: integer
+          default: 20
+          description: Maximum URLs to crawl
+        resume:
+          type: boolean
+          default: false
+          description: Resume a previous scan
+        use_vertical:
+          type: boolean
+          default: true
+          description: Use vertical specialized agents
+        focused_agents:
+          type: array
+          items:
+            type: string
+          default: []
+          description: List of focused agent names
+        param:
+          type: string
+          nullable: true
+          description: Specific parameter to target
+
+    ScanStatusResponse:
+      type: object
+      properties:
+        scan_id:
+          type: integer
+        target:
+          type: string
+        status:
+          $ref: "#/components/schemas/ScanStatus"
+        progress:
+          type: integer
+          minimum: 0
+          maximum: 100
+        uptime_seconds:
+          type: number
+          nullable: true
+        findings_count:
+          type: integer
+        active_agent:
+          type: string
+          nullable: true
+        phase:
+          type: string
+          nullable: true
+        origin:
+          type: string
+          enum: [cli, web, unknown]
+          description: Where the scan was launched from
+
+    FindingItem:
+      type: object
+      properties:
+        finding_id:
+          type: integer
+        type:
+          type: string
+          description: Vulnerability type (XSS, SQLi, SSRF, etc.)
+        severity:
+          $ref: "#/components/schemas/Severity"
+        details:
+          type: string
+        payload:
+          type: string
+          nullable: true
+        url:
+          type: string
+        parameter:
+          type: string
+          nullable: true
+        validated:
+          type: boolean
+        status:
+          $ref: "#/components/schemas/FindingStatus"
+        confidence:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+
+    FindingsResponse:
+      type: object
+      properties:
+        findings:
+          type: array
+          items:
+            $ref: "#/components/schemas/FindingItem"
+        total:
+          type: integer
+        page:
+          type: integer
+        per_page:
+          type: integer
+        scan_id:
+          type: integer
+
+    ScanSummary:
+      type: object
+      properties:
+        scan_id:
+          type: integer
+        target:
+          type: string
+        status:
+          $ref: "#/components/schemas/ScanStatus"
+        progress:
+          type: integer
+        timestamp:
+          type: string
+          format: date-time
+        origin:
+          type: string
+          enum: [cli, web, unknown]
+        has_report:
+          type: boolean
+
+    ScanListResponse:
+      type: object
+      properties:
+        scans:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScanSummary"
+        total:
+          type: integer
+        page:
+          type: integer
+        per_page:
+          type: integer
+
+    StopScanResponse:
+      type: object
+      properties:
+        scan_id:
+          type: integer
+        status:
+          type: string
+        message:
+          type: string
+
+    DeleteScanResponse:
+      type: object
+      properties:
+        scan_id:
+          type: integer
+        message:
+          type: string
+        files_cleaned:
+          type: boolean
+
+    DetailedMetricsResponse:
+      type: object
+      properties:
+        scan_id:
+          type: integer
+        status:
+          type: string
+        phase:
+          type: string
+        active_agent:
+          type: string
+        progress:
+          type: object
+          properties:
+            urls_discovered:
+              type: integer
+            urls_analyzed:
+              type: integer
+            urls_total:
+              type: integer
+            findings_before_dedup:
+              type: integer
+            findings_after_dedup:
+              type: integer
+            findings_distributed:
+              type: integer
+            dedup_effectiveness:
+              type: number
+        queues:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/QueueStats"
+        batch_metrics:
+          type: object
+          properties:
+            urls_discovered:
+              type: integer
+            urls_analyzed:
+              type: integer
+            findings_before_dedup:
+              type: integer
+            findings_after_dedup:
+              type: integer
+            findings_distributed:
+              type: integer
+            time_saved_percent:
+              type: number
+            dedup_effectiveness:
+              type: number
+        uptime_seconds:
+          type: number
+        findings_count:
+          type: integer
+
+    QueueStats:
+      type: object
+      properties:
+        depth:
+          type: integer
+        total_enqueued:
+          type: integer
+        total_dequeued:
+          type: integer
+        avg_latency_ms:
+          type: number
+
+    ConfigResponse:
+      type: object
+      properties:
+        config:
+          type: object
+          description: Configuration key-value pairs (API keys masked)
+        version:
+          type: string
+
+    ConfigUpdateRequest:
+      type: object
+      properties:
+        SAFE_MODE:
+          type: boolean
+        MAX_DEPTH:
+          type: integer
+          minimum: 1
+        MAX_URLS:
+          type: integer
+          minimum: 1
+        MAX_CONCURRENT_URL_AGENTS:
+          type: integer
+          minimum: 1
+        MAX_CONCURRENT_REQUESTS:
+          type: integer
+          minimum: 1
+        DEFAULT_MODEL:
+          type: string
+          description: "Format: provider/model"
+          example: moonshotai/kimi-k2-thinking
+        CODE_MODEL:
+          type: string
+          description: "Format: provider/model"
+        ANALYSIS_MODEL:
+          type: string
+          description: "Format: provider/model"
+        MUTATION_MODEL:
+          type: string
+          description: "Format: provider/model"
+        SKEPTICAL_MODEL:
+          type: string
+          description: "Format: provider/model"
+        HEADLESS_BROWSER:
+          type: boolean
+        EARLY_EXIT_ON_FINDING:
+          type: boolean
+        STOP_ON_CRITICAL:
+          type: boolean
+        REPORT_ONLY_VALIDATED:
+          type: boolean
+
+    ConfigUpdateResponse:
+      type: object
+      properties:
+        updated:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              from:
+                description: Previous value
+              to:
+                description: New value
+        message:
+          type: string
+
+    AllMetricsResponse:
+      type: object
+      properties:
+        cdp:
+          $ref: "#/components/schemas/CdpMetricsResponse"
+        parallelization:
+          $ref: "#/components/schemas/ParallelizationMetricsResponse"
+        deduplication:
+          $ref: "#/components/schemas/DeduplicationMetricsResponse"
+        queues:
+          $ref: "#/components/schemas/QueueMetricsResponse"
+
+    QueueMetricsResponse:
+      type: object
+      properties:
+        aggregate:
+          type: object
+          properties:
+            total_depth:
+              type: integer
+            total_enqueued:
+              type: integer
+            total_dequeued:
+              type: integer
+        by_queue:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              current_depth:
+                type: integer
+              total_enqueued:
+                type: integer
+              total_dequeued:
+                type: integer
+              avg_latency_ms:
+                type: number
+              is_full:
+                type: boolean
+
+    CdpMetricsResponse:
+      type: object
+      properties:
+        reduction_percent:
+          type: number
+        target_met:
+          type: boolean
+        by_specialist:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              skipped:
+                type: integer
+              total:
+                type: integer
+              reduction_percent:
+                type: number
+
+    ParallelizationMetricsResponse:
+      type: object
+      properties:
+        current_concurrent:
+          type: integer
+        peak_concurrent:
+          type: integer
+        parallelization_factor:
+          type: number
+        by_specialist:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              current_workers:
+                type: integer
+              peak_workers:
+                type: integer
+
+    DeduplicationMetricsResponse:
+      type: object
+      properties:
+        total_received:
+          type: integer
+        total_deduplicated:
+          type: integer
+        dedup_effectiveness_percent:
+          type: number
+        by_specialist:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              received:
+                type: integer
+              deduplicated:
+                type: integer
+              effectiveness_percent:
+                type: number
+
+    WebSocketEvent:
+      type: object
+      description: Real-time event streamed via WebSocket
+      properties:
+        event_type:
+          type: string
+          enum: [progress_update, phase_update, finding_discovered, log, scan_complete, error]
+        seq:
+          type: integer
+          description: Sequence number for reconnection replay
+        timestamp:
+          type: string
+          format: date-time
+        data:
+          type: object
+          description: Event-specific payload
