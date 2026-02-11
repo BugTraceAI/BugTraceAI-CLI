@@ -95,11 +95,13 @@ class TestCookieSQLiUrlField:
     @pytest.fixture
     def agent(self):
         from bugtrace.agents.analysis_agent import DASTySASTAgent
-        return DASTySASTAgent(
+        agent = DASTySASTAgent(
             url="https://example.com/catalog",
             tech_profile={},
             report_dir=Path("/tmp/test"),
         )
+        agent._v = Mock()
+        return agent
 
     @pytest.mark.asyncio
     async def test_error_based_finding_has_url(self, agent):
@@ -502,7 +504,9 @@ class TestXSSInternalLinkExtraction:
     @pytest.fixture
     def agent(self):
         from bugtrace.agents.xss_agent import XSSAgent
-        return XSSAgent(url="https://example.com/catalog?category=Juice", event_bus=Mock())
+        agent = XSSAgent(url="https://example.com/catalog?category=Juice", event_bus=Mock())
+        agent._v = Mock()
+        return agent
 
     def _make_browser_mock(self, html):
         return AsyncMock(return_value={
@@ -611,7 +615,9 @@ class TestOpenRedirectInternalLinks:
     @pytest.fixture
     def agent(self):
         from bugtrace.agents.openredirect_agent import OpenRedirectAgent
-        return OpenRedirectAgent(url="https://example.com/login", event_bus=Mock())
+        agent = OpenRedirectAgent(url="https://example.com/login", event_bus=Mock())
+        agent._v = Mock()
+        return agent
 
     def _make_browser_mock(self, html):
         return AsyncMock(return_value={

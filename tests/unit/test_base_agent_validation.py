@@ -5,11 +5,11 @@ Tests that specialists can self-validate findings before emitting them,
 replacing Conductor's validation logic.
 """
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, AsyncMock
 from bugtrace.agents.base import BaseAgent
 
 
-class TestAgent(BaseAgent):
+class MockAgent(BaseAgent):
     """Concrete test implementation of BaseAgent"""
     async def run_loop(self):
         pass
@@ -21,7 +21,7 @@ class TestBaseAgentValidation:
     def setup_method(self):
         """Create a test agent instance"""
         with patch('bugtrace.core.conductor.ConductorV2'):
-            self.agent = TestAgent(name="TestAgent", role="test", event_bus=Mock())
+            self.agent = MockAgent(name="MockAgent", role="test", event_bus=Mock())
 
     def test_validate_accepts_valid_finding(self):
         """Valid findings should pass validation"""
@@ -106,7 +106,7 @@ class TestConversationalDetection:
 
     def setup_method(self):
         with patch('bugtrace.core.conductor.ConductorV2'):
-            self.agent = TestAgent(name="TestAgent", role="test", event_bus=Mock())
+            self.agent = MockAgent(name="MockAgent", role="test", event_bus=Mock())
 
     def test_detects_navigate_prefix(self):
         """Should detect 'Navigate to' as conversational"""
@@ -157,8 +157,8 @@ class TestEmitFinding:
 
     def setup_method(self):
         with patch('bugtrace.core.conductor.ConductorV2'):
-            self.mock_event_bus = Mock()
-            self.agent = TestAgent(name="TestAgent", role="test", event_bus=self.mock_event_bus)
+            self.mock_event_bus = AsyncMock()
+            self.agent = MockAgent(name="MockAgent", role="test", event_bus=self.mock_event_bus)
 
     def test_emits_valid_finding(self):
         """Valid findings should be emitted to event bus"""
