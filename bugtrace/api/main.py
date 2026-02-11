@@ -232,8 +232,8 @@ async def health_check(
     # Check Docker availability
     docker_available = False
     try:
-        from bugtrace.tools.external import docker_cmd
-        docker_available = docker_cmd is not None
+        import shutil
+        docker_available = shutil.which("docker") is not None
     except Exception as e:
         logger.warning(f"Docker check failed: {e}")
 
@@ -290,8 +290,8 @@ async def readiness_check() -> Dict[str, Any]:
     # Check Docker availability
     docker_available = False
     try:
-        from bugtrace.tools.external import docker_cmd
-        docker_available = docker_cmd is not None
+        import shutil
+        docker_available = shutil.which("docker") is not None
     except Exception as e:
         logger.warning(f"Docker readiness check failed: {e}")
 
