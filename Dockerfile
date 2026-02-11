@@ -17,7 +17,12 @@ COPY tools/build_fuzzers.sh build_fuzzers.sh
 RUN chmod +x build_fuzzers.sh && bash build_fuzzers.sh
 
 # ============================================================
-# Stage 2: Runtime - Python + Playwright + Docker CLI
+# Stage 2: Docker CLI - Get static binary from official image
+# ============================================================
+FROM docker:cli AS docker-cli
+
+# ============================================================
+# Stage 3: Runtime - Python + Playwright + Docker CLI
 # ============================================================
 FROM python:3.10-slim
 
@@ -27,16 +32,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Docker CLI binary from official image (avoids broken docker.io on slim)
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+
 # System dependencies:
-#   gcc        - build some Python C extensions
-#   nmap       - network scanning
-#   curl       - health checks + utilities
-#   docker.io  - Docker CLI to run GoSpider/Nuclei/SQLMap
+#   gcc   - build some Python C extensions
+#   nmap  - network scanning
+#   curl  - health checks + utilities
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     nmap \
     curl \
-    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # Python dependencies (includes PyTorch CPU, sentence_transformers, FastAPI, etc.)
