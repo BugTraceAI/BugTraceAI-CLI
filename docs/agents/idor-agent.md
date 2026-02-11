@@ -9,7 +9,7 @@ The IDOR Agent (Insecure Direct Object Reference) is a specialist agent in BugTr
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  PHASE A: WET → DRY (Deduplication)                             │
-│  • Go fuzzer generates findings (WET)                            │
+│  • Go fuzzer generates findings (WET)                           │
 │  • LLM deduplicates using semantic analysis                     │
 │  • Output: DRY list (unique findings only)                      │
 └────────────────────────────┬────────────────────────────────────┘

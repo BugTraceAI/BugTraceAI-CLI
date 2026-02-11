@@ -24,6 +24,7 @@ class CreateScanRequest(BaseModel):
     """
     target_url: str = Field(..., description="Target URL to scan")
     scan_type: str = Field(default="full", description="Scan type: full, hunter, manager, or focused agent names")
+    scan_depth: str = Field(default="", description="Exploitation depth: quick, standard, thorough. Empty = use config default.")
     safe_mode: Optional[bool] = Field(default=None, description="Override global safe mode setting")
     max_depth: int = Field(default=2, description="Maximum crawl depth")
     max_urls: int = Field(default=20, description="Maximum URLs to crawl")
@@ -47,7 +48,7 @@ class ScanStatusResponse(BaseModel):
     findings_count: int
     active_agent: Optional[str] = None
     phase: Optional[str] = None
-    origin: str = "cli"  # "cli" or "web" — where scan was launched
+    origin: str = "unknown"  # "cli", "web", or "unknown" — where scan was launched
 
 
 class FindingItem(BaseModel):
@@ -88,7 +89,7 @@ class ScanSummary(BaseModel):
     status: ScanStatus  # Type-safe enum
     progress: int
     timestamp: str  # ISO format
-    origin: str = "cli"  # "cli" or "web"
+    origin: str = "unknown"  # "cli", "web", or "unknown"
     has_report: bool = True  # Whether report files exist on disk
 
 

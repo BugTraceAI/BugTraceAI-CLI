@@ -654,6 +654,14 @@ class ReportingAgent(BaseAgent):
                     }
                 continue
 
+            # Skip security misconfig findings — these are NOT technologies
+            _MISCONFIG_PREFIXES = (
+                "http-missing-", "missing-", "cookies-without-",
+                "cookies-", "security-headers-", "cors-", "cluster-",
+            )
+            if any(template_id.startswith(p) for p in _MISCONFIG_PREFIXES):
+                continue
+
             # Version/EOL detections → extract product + version
             raw_product = metadata.get("product", "")
             product = _display_name(raw_product) if raw_product else ""
@@ -1092,18 +1100,33 @@ class ReportingAgent(BaseAgent):
         source = f.get("source", "database")
         validation_source = "event_bus" if source == "event_bus" else "database"
 
+        # Sanitize FUZZ template markers from gospider URLs
+        url = f.get("url", "")
+        if "FUZZ" in url:
+            url = url.replace("=FUZZ", "").replace("FUZZ", "")
+
+        # Fallback description when specialists don't provide one
+        description = f.get("description", "")
+        if not description:
+            vuln_type = f.get("type", "Unknown")
+            param = f.get("parameter", "")
+            description = f"{vuln_type} vulnerability detected on {url}"
+            if param:
+                description += f" via parameter '{param}'"
+            description += "."
+
         entry = {
             "id": finding_id,
             "type": f.get("type", "Unknown"),
             "severity": f.get("severity", "MEDIUM" if status == "VALIDATED_CONFIRMED" else "HIGH"),
             "confidence": confidence,
             "status": status,
-            "url": f.get("url", ""),
+            "url": url,
             "parameter": f.get("parameter", ""),
             "payload": f.get("payload", ""),
             "validation": self._build_validation_section(f, status),
             "reproduction": self._build_reproduction_section(f),
-            "description": f.get("description", ""),
+            "description": description,
             "impact": self._get_impact_for_type(f.get("type", "")),
             "remediation": self._get_remediation_for_type(f.get("type", "")),
             "cvss_score": f.get("cvss_score"),
@@ -1306,9 +1329,32 @@ class ReportingAgent(BaseAgent):
         }
         # Add parsed technology stack
         tech_data = self._parse_nuclei_tech_for_report()
-        if tech_data["technologies"] or tech_data["waf_details"]:
+        technologies = list(tech_data["technologies"])
+
+        # Merge frameworks/servers/cms/cdn from tech_profile (HTML parsing fallback)
+        if self.tech_profile:
+            existing = {t["name"].lower() for t in technologies}
+            _CATEGORY_MAP = {
+                "frameworks": "Framework",
+                "servers": "Web Server",
+                "cms": "CMS",
+                "cdn": "CDN",
+                "languages": "Language / Runtime",
+            }
+            for field, category in _CATEGORY_MAP.items():
+                for name in self.tech_profile.get(field, []):
+                    if name.lower() not in existing:
+                        existing.add(name.lower())
+                        technologies.append({
+                            "name": name,
+                            "version": None,
+                            "eol": False,
+                            "category": category,
+                        })
+
+        if technologies or tech_data["waf_details"]:
             result["tech_stack"] = {
-                "technologies": tech_data["technologies"],
+                "technologies": technologies,
                 "waf": tech_data["waf_details"],
             }
         return result

@@ -17,6 +17,7 @@ from bugtrace.reporting.standards import (
     normalize_severity,
 )
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
+from bugtrace.core.verbose_events import create_emitter
 
 # v3.2.0: Import TechContextMixin for context-aware detection
 from bugtrace.agents.mixins.tech_context import TechContextMixin
@@ -172,9 +173,13 @@ class RCEAgent(BaseAgent, TechContextMixin):
 
     async def _test_parameter(self, session, param: str, payloads: List[str]) -> Optional[Dict]:
         """Test a single parameter with all payloads."""
-        for p in payloads:
+        for payload_idx, p in enumerate(payloads, 1):
+            if hasattr(self, '_v'):
+                self._v.progress("exploit.specialist.progress", {"agent": "RCE", "param": param, "payload": p[:60]}, every=50)
             finding = await self._test_single_payload(session, param, p)
             if finding:
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.signature_match", {"agent": "RCE", "param": param, "payload": p[:60], "severity": finding.get("severity")})
                 return finding
         return None
 
@@ -522,12 +527,19 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting {len(self._dry_findings)} DRY findings =====")
         validated = []
         for idx, f in enumerate(self._dry_findings, 1):
+            param = f.get("parameter", "")
+            url = f.get("url", "")
+
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.started", {"agent": "RCE", "param": param, "url": url, "idx": idx, "total": len(self._dry_findings)})
+                self._v.reset("exploit.specialist.progress")
+
             try:
-                self.url = f["url"]
-                result = await self._test_single_param_from_queue(f["url"], f["parameter"], f.get("finding",{}))
+                self.url = url
+                result = await self._test_single_param_from_queue(url, param, f.get("finding",{}))
                 if result and result.get("validated"):
                     validated.append(result)
-                    fp = self._generate_rce_fingerprint(f["url"], f["parameter"])
+                    fp = self._generate_rce_fingerprint(url, param)
                     if fp not in self._emitted_findings:
                         self._emitted_findings.add(fp)
                         if settings.WORKER_POOL_EMIT_EVENTS:
@@ -542,9 +554,15 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
                                 "evidence": result.get("evidence", ""),
                                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
                             }, scan_context=self._scan_context)
-                        logger.info(f"[{self.name}] ✅ Emitted unique: {f['url']}?{f['parameter']}")
+                        logger.info(f"[{self.name}] ✅ Emitted unique: {url}?{param}")
+
+                        if hasattr(self, '_v'):
+                            self._v.emit("exploit.specialist.confirmed", {"agent": "RCE", "param": param, "url": url, "severity": result.get("severity")})
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: {e}")
+            finally:
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.param.completed", {"agent": "RCE", "param": param, "url": url, "idx": idx})
         logger.info(f"[{self.name}] Phase B complete: {len(validated)} validated")
         return validated
 
@@ -580,6 +598,7 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("RCEAgent", self._scan_context)
 
         # v3.2: Load context-aware tech stack for intelligent deduplication
         await self._load_rce_tech_context()
@@ -591,6 +610,8 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
         initial_depth = queue.depth()
         report_specialist_start(self.name, queue_depth=initial_depth)
 
+        self._v.emit("exploit.specialist.started", {"agent": "RCE", "queue_depth": initial_depth})
+
         dry_list = await self.analyze_and_dedup_queue()
 
         # Report WET→DRY metrics for integrity verification
@@ -600,6 +621,7 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
             report_specialist_done(self.name, processed=0, vulns=0)
+            self._v.emit("exploit.specialist.completed", {"agent": "RCE", "dry_count": 0, "vulns": 0})
             return
 
         results = await self.exploit_dry_list()
@@ -617,6 +639,9 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
             processed=len(dry_list),
             vulns=vulns_count
         )
+
+        self._v.emit("exploit.specialist.completed", {"agent": "RCE", "dry_count": len(dry_list), "vulns": vulns_count})
+
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
     async def _process_queue_item(self, item: dict) -> Optional[Dict]:

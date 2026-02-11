@@ -30,8 +30,6 @@ from bugtrace.services.event_bus import service_event_bus
 from bugtrace.utils.logger import get_logger, set_correlation_id
 
 logger = get_logger("api.main")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """

@@ -1,44 +1,65 @@
-# Use official Python runtime as a parent image
-# Slim version for smaller footprint
+# ============================================================
+# Stage 1: Go Builder - Compile Go fuzzers (XSS, SSRF, IDOR, LFI)
+# ============================================================
+FROM golang:1.24-alpine AS go-builder
+
+RUN apk add --no-cache bash
+
+WORKDIR /build/tools
+
+# Copy all Go fuzzer source directories
+COPY tools/go-xss-fuzzer/ go-xss-fuzzer/
+COPY tools/go-ssrf-fuzzer/ go-ssrf-fuzzer/
+COPY tools/go-idor-fuzzer/ go-idor-fuzzer/
+COPY tools/go-lfi-fuzzer/ go-lfi-fuzzer/
+COPY tools/build_fuzzers.sh build_fuzzers.sh
+
+RUN chmod +x build_fuzzers.sh && bash build_fuzzers.sh
+
+# ============================================================
+# Stage 2: Runtime - Python + Playwright + Docker CLI
+# ============================================================
 FROM python:3.10-slim
 
-# Set environment variables
-# PYTHONDONTWRITEBYTECODE: Prevents Python from writing pyc files to disc
-# PYTHONUNBUFFERED: Prevents Python from buffering stdout and stderr
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# Set work directory
 WORKDIR /app
 
-# Install system dependencies required for building python packages and Playwright
-# nmap is included as a core tool
-RUN apt-get update && apt-get install -y \
+# System dependencies:
+#   gcc        - build some Python C extensions
+#   nmap       - network scanning
+#   curl       - health checks + utilities
+#   docker.io  - Docker CLI to run GoSpider/Nuclei/SQLMap
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     nmap \
     curl \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
-# Install python dependencies
+# Python dependencies (includes PyTorch CPU, sentence_transformers, FastAPI, etc.)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers (Chromium only to save space)
-RUN playwright install chromium
-RUN playwright install-deps chromium
+# Playwright Chromium (headless browser for DOM XSS testing)
+RUN playwright install chromium && playwright install-deps chromium
 
-# Copy project files
+# Copy Go fuzzer binaries from builder stage
+COPY --from=go-builder /build/tools/bin/ /app/tools/bin/
+
+# Copy project source code
 COPY . .
 
-# Create a non-root user for security (optional but recommended)
-# However, Playwright sometimes has issues with root, relying on correct args.
-# We'll run as root for simplicity in this pentest container, 
-# ensuring the user passes --no-sandbox to chrome if needed.
+# Create directories for persistent data
+RUN mkdir -p /app/reports /app/logs /app/data
 
-# Expose any necessary ports (e.g. if we add a web server later)
-# EXPOSE 8000
+# Entrypoint script
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
 
-# Entrypoint
-ENTRYPOINT ["python", "-m", "bugtrace"]
-CMD ["--help"]
+EXPOSE 8000
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]

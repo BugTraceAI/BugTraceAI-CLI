@@ -41,6 +41,7 @@ from bugtrace.reporting.standards import (
     normalize_severity,
 )
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
+from bugtrace.core.verbose_events import create_emitter
 
 # v2.1.0: Import specialist utilities for payload loading from JSON (if needed)
 from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_full_finding_data
@@ -687,6 +688,12 @@ class SQLiAgent(BaseAgent, TechContextMixin):
             self._detected_filters = filtered
             self._stats["filters_detected"] = len(filtered)
             logger.info(f"[{self.name}] 🛡️ Filtered chars detected: {filtered}")
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.sqli.filters_detected", {
+                    "param": param,
+                    "filtered": list(filtered),
+                    "count": len(filtered),
+                })
 
         return filtered
 
@@ -882,6 +889,13 @@ class SQLiAgent(BaseAgent, TechContextMixin):
                                 param: str, variant: str, db_type: str) -> Optional[SQLiFinding]:
         """Test a single OOB payload variant."""
         try:
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.sqli.oob.sent", {
+                    "param": param,
+                    "db_type": db_type,
+                    "payload_preview": variant[:80],
+                })
+
             test_url = self._build_url_with_param(base_url, param, f"1{variant}")
 
             async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -910,6 +924,12 @@ class SQLiAgent(BaseAgent, TechContextMixin):
         """Create finding for OOB SQL injection."""
         self._stats["oob_callbacks"] += 1
         logger.info(f"[{self.name}] 🎯 OOB SQLi callback received!")
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.sqli.oob.callback", {
+                "param": param,
+                "db_type": db_type,
+                "interaction_type": interaction.get("protocol", "dns"),
+            })
 
         exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, variant)
         curl_cmd = f"curl '{exploit_url_encoded}'"
@@ -1680,6 +1700,13 @@ Write the exploitation explanation section for the report."""
         for payload in time_payloads:
             verified, evidence = await self._verify_time_based_triple(session, param, payload)
             if verified:
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.time_delay", {
+                        "param": param,
+                        "payload": payload[:80],
+                        "baseline_time": evidence.get("baseline_time"),
+                        "delay_time": evidence.get("long_sleep_time"),
+                    })
                 exploit_url, exploit_url_encoded = self._build_exploit_url(self.url, param, payload)
                 curl_cmd = f"curl '{exploit_url_encoded}'"
 
@@ -1726,6 +1753,11 @@ Write the exploitation explanation section for the report."""
 
         try:
             json_body = json.loads(self.post_data)
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.sqli.json_testing", {
+                    "url": self.url,
+                    "keys": list(json_body.keys()) if isinstance(json_body, dict) else [],
+                })
             dashboard.log(f"[{self.name}] Phase 4: Testing JSON body...", "INFO")
             json_findings = await self._test_json_body_injection(session, self.url, json_body)
             for jf in json_findings:
@@ -1778,6 +1810,12 @@ Write the exploitation explanation section for the report."""
             technique_hint: Optional hint from internal checks (E/B/U/T or combination).
                            If None, SQLMap tries all techniques (BEUSTQ).
         """
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.sqli.sqlmap.started", {
+                "param": param,
+                "technique_hint": technique_hint or "BEUSTQ",
+            })
+
         docker_url = self.url.replace("127.0.0.1", "172.17.0.1").replace("localhost", "172.17.0.1")
 
         # Use hint if provided, otherwise try common techniques
@@ -1791,7 +1829,20 @@ Write the exploitation explanation section for the report."""
         )
 
         if not sqlmap_result or not sqlmap_result.get("vulnerable"):
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.sqli.sqlmap.completed", {
+                    "param": param,
+                    "vulnerable": False,
+                })
             return None
+
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.sqli.sqlmap.completed", {
+                "param": param,
+                "vulnerable": True,
+                "dbms": sqlmap_result.get("dbms", "unknown"),
+                "type": sqlmap_result.get("type", "unknown"),
+            })
 
         return self._create_sqlmap_finding(sqlmap_result, param)
 
@@ -1929,6 +1980,12 @@ Write the exploitation explanation section for the report."""
 
                 if error_info.get("db_type"):
                     self._detected_db_type = error_info["db_type"]
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.sqli.error_found", {
+                            "param": param,
+                            "payload": variant[:80],
+                            "db_type": error_info["db_type"],
+                        })
                     return self._create_error_based_finding(param, variant, error_info)
         except Exception as e:
             logger.debug(f"Error-based test failed: {e}")
@@ -1984,6 +2041,13 @@ Write the exploitation explanation section for the report."""
             logger.debug(f"[{self.name}] Boolean test: true_sim={true_sim:.2f}, false_sim={false_sim:.2f}, diff={diff_ratio:.2f}")
 
             if self._is_boolean_vulnerable(true_sim, false_sim, diff_ratio):
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.boolean_diff", {
+                        "param": param,
+                        "true_sim": round(true_sim, 3),
+                        "false_sim": round(false_sim, 3),
+                        "diff_ratio": round(diff_ratio, 3),
+                    })
                 return self._create_boolean_finding(param, "1' AND '1'='1", diff_ratio, true_sim, false_sim)
         except Exception as e:
             logger.debug(f"Boolean-based test failed: {e}")
@@ -2065,6 +2129,12 @@ Write the exploitation explanation section for the report."""
             async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 content = await resp.text()
                 if canary in content:
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.sqli.union_found", {
+                            "param": param,
+                            "payload": payload[:80],
+                            "canary": canary,
+                        })
                     return True
         except Exception:
             pass
@@ -2537,6 +2607,15 @@ Write the exploitation explanation section for the report."""
                     needs_cdp=False
                 )
 
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.confirmed", {
+                        "param": result.parameter,
+                        "url": result.url,
+                        "technique": result.injection_type,
+                        "dbms": result.dbms_detected,
+                        "payload_preview": result.working_payload[:80] if result.working_payload else "",
+                    })
+
                 logger.info(f"[{self.name}] Confirmed SQLi: {result.url}?{result.parameter} ({result.injection_type})")
 
                 # Update Dashboard UI
@@ -2639,8 +2718,10 @@ Write the exploitation explanation section for the report."""
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("SQLiAgent", self._scan_context)
 
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+        self._v.emit("exploit.sqli.started", {"url": self.url})
 
         # v3.2: Load context-aware tech stack for intelligent deduplication
         await self._load_tech_context()
@@ -2660,6 +2741,8 @@ Write the exploitation explanation section for the report."""
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.sqli.completed", {"dry_count": 0, "vulns": 0})
             report_specialist_done(self.name, processed=0, vulns=0)
             return
 
@@ -2678,6 +2761,12 @@ Write the exploitation explanation section for the report."""
             processed=len(dry_list),
             vulns=vulns_count
         )
+
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.sqli.completed", {
+                "dry_count": len(dry_list),
+                "vulns": vulns_count,
+            })
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
         logger.info(f"[{self.name}] Specialist report saved to: {self._scan_context}/specialists/sqli_report.json")
@@ -2843,11 +2932,22 @@ Write the exploitation explanation section for the report."""
         filtered_chars = set()
         db_type = None
 
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.sqli.param.started", {"param": param, "url": url})
+            self._v.reset("exploit.sqli.level.progress")
+
         try:
             async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
                 # Initialize baseline if needed
                 if self._baseline_response_time == 0:
                     await self._initialize_baseline(session)
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.sqli.baseline", {
+                            "param": param,
+                            "response_time": self._baseline_response_time,
+                            "content_length": self._baseline_content_length,
+                            "db_type": self._detected_db_type,
+                        })
 
                 # Check for prepared statements (early exit)
                 if await self._detect_prepared_statements(session, param):
@@ -2855,29 +2955,51 @@ Write the exploitation explanation section for the report."""
                     return None
 
                 # ── L0: WET PAYLOAD ──
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.level.started", {"level": 0, "name": "wet_payload", "param": param})
                 dashboard.log(f"[{self.name}] L0: Testing WET payload for {param}...", "INFO")
                 result = await self._escalation_l0_wet_payload(session, param, dry_item)
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.level.completed", {"level": 0, "param": param, "found": result is not None})
                 if result:
                     logger.info(f"[{self.name}] L0 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
                     return await self._finalize_finding(result, "error_based")
 
                 # ── L1: ERROR-BASED ──
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.level.started", {"level": 1, "name": "error_based", "param": param})
                 dashboard.log(f"[{self.name}] L1: Error-based probing for {param}...", "INFO")
                 result, filtered_chars, db_type = await self._escalation_l1_error_based(session, param)
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.level.completed", {"level": 1, "param": param, "found": result is not None})
                 if result:
                     logger.info(f"[{self.name}] L1 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
                     return await self._finalize_finding(result, "error_based")
 
+                # ── DEPTH GATE: quick stops after L1 ──
+                _depth = getattr(self, '_scan_depth', '') or settings.SCAN_DEPTH
+                if _depth == "quick":
+                    logger.info(f"[{self.name}] Quick depth: stopping at L1 for {param}")
+                    return None
+
                 # ── L2: BOOLEAN + UNION ──
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.level.started", {"level": 2, "name": "boolean_union", "param": param})
                 dashboard.log(f"[{self.name}] L2: Boolean + Union for {param}...", "INFO")
                 result = await self._escalation_l2_boolean_union(session, param)
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.level.completed", {"level": 2, "param": param, "found": result is not None})
                 if result:
                     logger.info(f"[{self.name}] L2 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
                     return await self._finalize_finding(result, result.technique)
 
                 # ── L3: OOB + TIME-BASED ──
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.level.started", {"level": 3, "name": "oob_time", "param": param})
                 dashboard.log(f"[{self.name}] L3: OOB + Time-based for {param}...", "INFO")
                 result = await self._escalation_l3_oob_time(session, param)
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.sqli.level.completed", {"level": 3, "param": param, "found": result is not None})
                 if result:
                     logger.info(f"[{self.name}] L3 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
                     return await self._finalize_finding(result, result.technique)
@@ -2887,10 +3009,20 @@ Write the exploitation explanation section for the report."""
             # If L0-L3 didn't find SQLi, SQLMap (the gold standard) handles it directly.
             # This saves 7-15 minutes per non-vulnerable parameter.
 
+            # ── DEPTH GATE: only thorough runs SQLMap ──
+            _depth = getattr(self, '_scan_depth', '') or settings.SCAN_DEPTH
+            if _depth != "thorough":
+                logger.info(f"[{self.name}] {_depth.title()} depth: skipping SQLMap for {param}")
+                return None
+
             # ── L4: SQLMAP DOCKER ──
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.sqli.level.started", {"level": 4, "name": "sqlmap", "param": param})
             dashboard.log(f"[{self.name}] L4: SQLMap for {param}...", "INFO")
             technique_hint = dry_item.get("recommended_technique", "")
             result = await self._escalation_l6_sqlmap(param, technique_hint, db_type)
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.sqli.level.completed", {"level": 4, "param": param, "found": result is not None})
             if result:
                 logger.info(f"[{self.name}] L4 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
                 return await self._finalize_finding(result, result.technique)
@@ -3097,6 +3229,12 @@ Write the exploitation explanation section for the report."""
         for i, payload in enumerate(unique_payloads):
             if i % 20 == 0 and i > 0:
                 dashboard.log(f"[{self.name}] L4: Progress {i}/{len(unique_payloads)}", "DEBUG")
+            if hasattr(self, '_v'):
+                self._v.progress("exploit.sqli.level.progress", {
+                    "level": 4, "param": param,
+                    "index": i + 1, "total": len(unique_payloads),
+                    "payload_preview": payload[:60],
+                }, every=50)
             dashboard.set_current_payload(payload[:60], "SQLi L4 LLM", f"{i+1}/{len(unique_payloads)}", self.name)
 
             try:

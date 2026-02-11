@@ -1,7 +1,7 @@
 {
   "version": "2.0",
   "description": "Curated high-impact breakout prefixes - optimized for speed and coverage",
-  "last_updated": "2026-02-10T10:33:05.447938",
+  "last_updated": "2026-02-10T23:08:18.485377",
   "breakouts": [
     {
       "prefix": "",
@@ -26,9 +26,9 @@
       "description": "Double quote (universal)",
       "category": "xss,sqli",
       "priority": 1,
-      "success_count": 2,
+      "success_count": 3,
       "enabled": true,
-      "last_success": "2026-02-09T12:26:35.373639"
+      "last_success": "2026-02-10T23:08:18.481847"
     },
     {
       "prefix": "'>",
@@ -143,9 +143,9 @@
       "description": "Template syntax (Jinja/Twig)",
       "category": "ssti",
       "priority": 2,
-      "success_count": 2,
+      "success_count": 3,
       "enabled": true,
-      "last_success": "2026-02-10T10:33:05.443582"
+      "last_success": "2026-02-10T12:05:08.712813"
     },
     {
       "prefix": "${",

@@ -11,6 +11,7 @@ from bugtrace.core.ui import dashboard
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 from bugtrace.utils.parsers import XmlParser
 from bugtrace.core.event_bus import event_bus, EventType
+from bugtrace.core.verbose_events import create_emitter
 
 from bugtrace.agents.base import BaseAgent
 
@@ -41,6 +42,10 @@ class DASTySASTAgent(BaseAgent):
 
     async def run(self) -> Dict:
         """Performs 6-approach analysis on the URL (DAST+SAST) with event emission."""
+        import time as _time
+        self._v = create_emitter("DASTySAST", self.scan_context)
+        self._run_start = _time.time()
+        self._v.emit("discovery.url.started", {"url": self.url, "index": self.url_index})
         dashboard.current_agent = self.name
         dashboard.log(f"[{self.name}] Running DAST+SAST Analysis on {self.url[:50]}...", "INFO")
 
@@ -75,6 +80,11 @@ class DASTySASTAgent(BaseAgent):
             await self._run_save_results(vulnerabilities)
 
             # 5. Emit url_analyzed event (Phase 17: DISC-04)
+            import time as _time2
+            self._v.emit("discovery.url.completed", {
+                "url": self.url, "findings_count": len(vulnerabilities),
+                "duration_ms": int((_time2.time() - self._run_start) * 1000),
+            })
             await self._emit_url_analyzed(vulnerabilities)
 
             # Determine base filename based on url_index
@@ -149,10 +159,13 @@ class DASTySASTAgent(BaseAgent):
                     context["html_content"] = html_full
 
                 logger.info(f"[{self.name}] Fetched HTML content ({len(context['html_content'])} chars) for analysis.")
+                self._v.emit("discovery.url.html_captured", {"url": self.url, "html_length": len(context['html_content'])})
 
                 # FIX (2026-02-04): Detect frontend frameworks from HTML
                 # This ensures CSTI detection even when Nuclei misses Angular/Vue
                 self._detect_frontend_frameworks_from_html(html_full)
+                if self.tech_profile.get('frameworks'):
+                    self._v.emit("discovery.url.frameworks_detected", {"url": self.url, "frameworks": self.tech_profile['frameworks'][:5]})
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to fetch HTML content: {e}")
 
@@ -169,6 +182,12 @@ class DASTySASTAgent(BaseAgent):
             try:
                 probes = await self._run_reflection_probes(context.get("html_content", ""))
                 context["reflection_probes"] = probes
+                reflecting = [p for p in probes if p.get("reflects")]
+                self._v.emit("discovery.probe.completed", {
+                    "url": self.url, "total": len(probes),
+                    "reflecting": len(reflecting),
+                    "non_reflecting": len(probes) - len(reflecting),
+                })
                 logger.info(f"[{self.name}] Active recon: {len(probes)} parameters probed")
             except Exception as e:
                 logger.warning(f"[{self.name}] Active recon probes failed: {e}")
@@ -212,6 +231,8 @@ class DASTySASTAgent(BaseAgent):
         if not all_param_names:
             return probes
 
+        self._v.emit("discovery.url.params_found", {"url": self.url, "params": list(all_param_names), "count": len(all_param_names)})
+        self._v.emit("discovery.probe.started", {"url": self.url, "total_params": len(all_param_names)})
         logger.info(f"[{self.name}] Probing {len(all_param_names)} params: {list(all_param_names)}")
 
         # Use orchestrator for lifecycle-tracked connections
@@ -253,11 +274,18 @@ class DASTySASTAgent(BaseAgent):
                     # Merge header reflection data if found
                     if header_reflection:
                         probe_result["header_reflection"] = header_reflection
+                        self._v.emit("discovery.probe.header_reflection", {"url": self.url, "param": param_name, "header": header_reflection.get("header", "")})
                         if not probe_result["reflects"]:
                             probe_result["reflects"] = True
                             probe_result["context"] = "response_header"
                     probes.append(probe_result)
 
+                    self._v.emit("discovery.probe.result", {
+                        "url": self.url, "param": param_name,
+                        "reflects": probe_result["reflects"],
+                        "context": probe_result.get("context", ""),
+                        "chars": probe_result.get("chars_survive", ""),
+                    })
                     if probe_result["reflects"]:
                         logger.info(f"[{self.name}] 🔍 {param_name}: {probe_result['context']} (chars survive: {probe_result['chars_survive']})")
                         dashboard.log(f"[{self.name}] Probe: {param_name} → {probe_result['context']}", "INFO")
@@ -634,6 +662,7 @@ class DASTySASTAgent(BaseAgent):
         """Execute parallel analyses with all approaches."""
         # Run 5 core approaches in parallel first
         core_approaches = [a for a in self.approaches if a != "skeptical_agent"]
+        self._v.emit("discovery.llm.started", {"url": self.url, "approaches": core_approaches})
         tasks = [
             self._analyze_with_approach(context, approach)
             for approach in core_approaches
@@ -647,6 +676,7 @@ class DASTySASTAgent(BaseAgent):
 
         analyses = await asyncio.gather(*tasks, return_exceptions=True)
         valid_analyses = [a for a in analyses if isinstance(a, dict) and not a.get("error")]
+        self._v.emit("discovery.llm.completed", {"url": self.url, "valid_analyses": len(valid_analyses), "total": len(analyses)})
 
         # Run skeptical_agent AFTER to review findings from core approaches
         if "skeptical_agent" in self.approaches:
@@ -844,6 +874,7 @@ class DASTySASTAgent(BaseAgent):
         1. SQL error messages in response body
         2. Status code differential (500 on ' but 200 on '' = classic SQLi)
         """
+        self._v.emit("discovery.sqli_probe.started", {"url": self.url})
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
         # SQL error patterns for major databases
@@ -1020,6 +1051,7 @@ class DASTySASTAgent(BaseAgent):
                         logger.debug(f"[SQLi Probe] Network error testing {param_name}: {e}")
                         continue
 
+            self._v.emit("discovery.sqli_probe.completed", {"url": self.url, "findings_count": len(findings)})
             return {"vulnerabilities": findings}
 
         except Exception as e:
@@ -1032,6 +1064,7 @@ class DASTySASTAgent(BaseAgent):
         Handles Base64-encoded values (like TrackingId with JSON inside).
         Also tests synthetic cookies for common vulnerable patterns.
         """
+        self._v.emit("discovery.cookie_sqli.started", {"url": self.url})
         import base64
         import json
         from urllib.parse import urlparse
@@ -1264,6 +1297,7 @@ class DASTySASTAgent(BaseAgent):
                                     logger.debug(f"[Cookie SQLi Probe] Time-based test error for {cookie_name}: {e}")
                                     continue
 
+            self._v.emit("discovery.cookie_sqli.completed", {"url": self.url, "findings_count": len(findings)})
             logger.info(f"[Cookie SQLi Probe] Completed: {len(findings)} findings")
             return {"vulnerabilities": findings}
 
@@ -1331,18 +1365,32 @@ class DASTySASTAgent(BaseAgent):
         logger.info(f"[Cookie SQLi Probe] Generated {len(synthetic)} synthetic cookies for testing")
         return synthetic
 
+    # Per-approach model mapping — splits personas across providers for resilience
+    _APPROACH_MODEL_MAP = {
+        "pentester": "ANALYSIS_PENTESTER_MODEL",
+        "bug_bounty": "ANALYSIS_BUG_BOUNTY_MODEL",
+        "code_auditor": "ANALYSIS_AUDITOR_MODEL",
+        "red_team": "ANALYSIS_RED_TEAM_MODEL",
+        "researcher": "ANALYSIS_RESEARCHER_MODEL",
+    }
+
     async def _analyze_with_approach(self, context: Dict, approach: str) -> Dict:
         """Analyze with a specific persona."""
         skill_context = self._approach_get_skill_context()
         system_prompt = self._get_system_prompt(approach)
         user_prompt = self._approach_build_prompt(context, skill_context)
 
+        # Resolve per-approach model from config (None = use default PRIMARY_MODELS)
+        model_attr = self._APPROACH_MODEL_MAP.get(approach)
+        model_override = getattr(settings, model_attr, None) if model_attr else None
+
         try:
             response = await llm_client.generate(
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 module_name="DASTySASTAgent",
-                max_tokens=8000
+                max_tokens=8000,
+                model_override=model_override
             )
 
             if not response:
@@ -1891,6 +1939,11 @@ Be RUTHLESS. False positives waste resources."""
         min_votes = getattr(settings, "ANALYSIS_CONSENSUS_VOTES", 4)
         filtered = [v for v in merged.values() if v.get("votes", 1) >= min_votes]
 
+        self._v.emit("discovery.consolidation.completed", {
+            "url": self.url, "raw": sum(len(a.get("vulnerabilities", [])) for a in analyses),
+            "dedup": len(merged), "passing": len(filtered),
+        })
+
         # Log skeptical filtering stats
         low_skeptical = [v for v in filtered if v.get("skeptical_score", 5) <= 3]
         if low_skeptical:
@@ -1908,6 +1961,7 @@ Be RUTHLESS. False positives waste resources."""
 
         Phase 27: Probe-validated findings bypass LLM review (active testing > LLM analysis).
         """
+        self._v.emit("discovery.skeptical.started", {"url": self.url, "findings_to_review": len(vulnerabilities)})
         # 0. Separate probe-validated findings (they bypass LLM review)
         probe_validated = []
         llm_findings = []

@@ -1,6 +1,8 @@
 import asyncio
 import json
 import hashlib
+import re
+from collections import defaultdict
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from loguru import logger
@@ -41,6 +43,7 @@ from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
 
 # Event Bus integration
 from bugtrace.core.event_bus import event_bus
+from bugtrace.core.verbose_events import create_emitter, install_ui_bridge
 
 # Pipeline orchestration (v2.3, simplified in Sprint 5)
 from bugtrace.core.pipeline import (
@@ -76,12 +79,14 @@ async def run_agent_with_semaphore(semaphore: asyncio.Semaphore, agent, process_
 
 class TeamOrchestrator:
 
-    def __init__(self, target: str, resume: bool = False, max_depth: int = 2, max_urls: int = 15, use_vertical_agents: bool = False, output_dir: Optional[Path] = None, scan_id: Optional[int] = None, url_list: Optional[List[str]] = None):
+    def __init__(self, target: str, resume: bool = False, max_depth: int = 2, max_urls: int = 15, use_vertical_agents: bool = False, output_dir: Optional[Path] = None, scan_id: Optional[int] = None, url_list: Optional[List[str]] = None, scan_depth: str = "standard"):
         self.target = target
         self.resume = resume
         self.max_depth = max_depth
         self.max_urls = max_urls
+        self._scan_depth = scan_depth
         self.url_list_provided = url_list  # Store provided URL list for Phase 1
+        self.urls_to_scan: List[str] = []  # Set by _phase_1_reconnaissance
         self.agents: List[BaseAgent] = []
         self._stop_event = asyncio.Event()
         self.auth_creds: Optional[str] = None
@@ -205,11 +210,17 @@ class TeamOrchestrator:
             "header_injection": self.header_injection_worker_agent,
         }
 
+        # Set scan depth on exploitation agents before dispatch
+        self.sqli_worker_agent._scan_depth = self._scan_depth
+        self.xss_worker_agent._scan_depth = self._scan_depth
+
         # Dispatch specialists with concurrency control (dispatcher handles queue checks and specialist startup)
         max_concurrent = settings.MAX_CONCURRENT_SPECIALISTS  # From bugtraceaicli.conf [PARALLELIZATION]
         dispatch_result = await dispatch_specialists(specialist_map, scan_ctx, max_concurrent=max_concurrent)
 
         if dispatch_result["specialists_dispatched"] > 0:
+            for spec_name in dispatch_result['activated']:
+                self._v.emit("exploit.specialist.activated", {"specialist": spec_name})
             logger.info(
                 f"[PHASE 4] Specialists completed: {', '.join(dispatch_result['activated'])}"
             )
@@ -259,6 +270,7 @@ class TeamOrchestrator:
             self.prototype_pollution_worker_agent.stop_queue_consumer(),
         ]
         await asyncio.gather(*shutdown_tasks, return_exceptions=True)
+        self._v.emit("exploit.specialist.deactivated", {"specialists": "all"})
         logger.info("All specialist worker pools shutdown complete")
 
         # Shutdown HTTP client manager (v2.4)
@@ -299,7 +311,10 @@ class TeamOrchestrator:
         else:
             # Always create new scan (DB = write-only, no reads)
             # Resume state comes from files, not DB
-            self.scan_id = self.db.create_new_scan(self.target)
+            self.scan_id = self.db.create_new_scan(self.target, origin="cli")
+
+        # Persist the report_dir to DB so the API can find it reliably
+        self.db.update_scan_report_dir(self.scan_id, str(self.report_dir))
 
         logger.info(f"TeamOrchestrator initialized for Scan ID: {self.scan_id}")
 
@@ -524,6 +539,12 @@ class TeamOrchestrator:
         """Core Hunter logic separated from UI lifecycle."""
         # Register scan context with conductor for EventBus routing
         conductor.set_scan_context(self.scan_id)
+
+        # Verbose event emitter for pipeline-level narration
+        self._v = create_emitter("pipeline", str(self.scan_id))
+
+        # Bridge verbose events to CLI TUI (conductor → LogPanel)
+        install_ui_bridge()
 
         dashboard.set_target(self.target)
         dashboard.set_status("Running", "Pipeline starting...")
@@ -1355,8 +1376,10 @@ class TeamOrchestrator:
     async def _run_gospider(self, recon_dir) -> list:
         """Run GoSpider agent for URL discovery."""
         logger.info(f"Triggering GoSpiderAgent for {self.target}")
+        self._v.emit("recon.gospider.started", {"target": self.target})
         gospider = GoSpiderAgent(self.target, recon_dir, max_depth=self.max_depth, max_urls=self.max_urls)
         urls_to_scan = await gospider.run()
+        self._v.emit("recon.gospider.completed", {"urls_found": len(urls_to_scan)})
         logger.info(f"GoSpiderAgent finished. Found {len(urls_to_scan)} URLs")
         return urls_to_scan
 
@@ -1364,8 +1387,13 @@ class TeamOrchestrator:
         """Run Nuclei for technology detection.
         Returns tech_profile dict with frameworks, infrastructure, etc."""
         try:
+            self._v.emit("recon.nuclei.started", {"target": self.target})
             nuclei_agent = NucleiAgent(self.target, recon_dir)
             tech_profile = await nuclei_agent.run()
+            self._v.emit("recon.nuclei.completed", {
+                "frameworks": tech_profile.get('frameworks', []),
+                "infrastructure_count": len(tech_profile.get('infrastructure', [])),
+            })
             logger.info(
                 f"[Recon] Tech Profile: {len(tech_profile.get('frameworks', []))} frameworks, "
                 f"{len(tech_profile.get('infrastructure', []))} infrastructure components"
@@ -1383,6 +1411,7 @@ class TeamOrchestrator:
         auth_discovery_dir = recon_dir / "auth_discovery"
         auth_discovery_dir.mkdir(exist_ok=True)
 
+        self._v.emit("recon.auth.started", {"urls_count": len(urls_to_scan)})
         auth_agent = AuthDiscoveryAgent(
             target=self.target,
             report_dir=auth_discovery_dir,
@@ -1390,6 +1419,10 @@ class TeamOrchestrator:
         )
         auth_results = await auth_agent.run()
 
+        self._v.emit("recon.auth.completed", {
+            "jwts_found": len(auth_results['jwts']),
+            "cookies_found": len(auth_results['cookies']),
+        })
         logger.info(
             f"[AuthDiscovery] Found {len(auth_results['jwts'])} JWTs, "
             f"{len(auth_results['cookies'])} cookies"
@@ -1417,44 +1450,185 @@ class TeamOrchestrator:
                     "location": "recon_discovery"
                 })
 
+    # Compiled regex for path canonicalization (class-level, compiled once)
+    _PATH_NUMERIC_RE = re.compile(r'^[0-9]+$')
+    _PATH_UUID_RE = re.compile(
+        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE
+    )
+    _PATH_HEX_RE = re.compile(r'^[0-9a-f]{16,}$', re.IGNORECASE)
+
+    @staticmethod
+    def _canonicalize_path(path: str) -> str:
+        """Canonicalize URL path by replacing dynamic segments with placeholders.
+
+        Conservative — only replaces:
+        - Pure numeric segments: /blog/post/123 → /blog/post/{N}
+        - UUID segments: /user/a1b2c3d4-e5f6-... → /user/{UUID}
+        - Long hex strings (16+ chars): /item/5f3e... → /item/{HEX}
+
+        Alphabetic and short mixed segments (v2, api, Juice) are kept as-is.
+        """
+        segments = path.split('/')
+        canonical = []
+        for seg in segments:
+            if not seg:
+                canonical.append(seg)
+            elif TeamOrchestrator._PATH_NUMERIC_RE.match(seg):
+                canonical.append('{N}')
+            elif TeamOrchestrator._PATH_UUID_RE.match(seg):
+                canonical.append('{UUID}')
+            elif TeamOrchestrator._PATH_HEX_RE.match(seg):
+                canonical.append('{HEX}')
+            else:
+                canonical.append(seg)
+        return '/'.join(canonical)
+
     @staticmethod
     def _url_fingerprint(url: str) -> str:
-        """Generate a fingerprint for dedup: scheme+host+path+sorted_param_names.
+        """Generate a fingerprint for dedup: scheme+host+canonical_path+sorted_param_names.
 
-        URLs with same path and same parameter names but different values
-        are considered duplicates. E.g.:
+        URLs with same canonical path and same parameter names but different values
+        are considered duplicates. Path segments that are pure numbers, UUIDs, or
+        long hex strings are replaced with placeholders before fingerprinting.
+
+        Examples:
           /art.php?id=1  and  /art.php?id=UNION+SELECT...  → same fingerprint
           /?cmd=ls       and  /?cmd=whoami                  → same fingerprint
+          /blog/post/1   and  /blog/post/2                  → same fingerprint (path canonical)
           /search?q=foo  and  /search?q=bar&page=1          → different (different params)
         """
         parsed = urlparse(url)
+        canonical_path = TeamOrchestrator._canonicalize_path(parsed.path)
         param_names = sorted(parse_qs(parsed.query, keep_blank_values=True).keys())
-        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{'&'.join(param_names)}"
+        return f"{parsed.scheme}://{parsed.netloc}{canonical_path}?{'&'.join(param_names)}"
+
+    @staticmethod
+    def _superset_param_dedup(urls: list) -> tuple:
+        """Collapse URLs where one has a superset of another's param names on the same path.
+
+        Groups by scheme+host+canonical_path (ignoring params entirely).
+        Within each group, if URL A's param names are a superset of URL B's, B is dropped.
+        Disjoint param sets are both kept.
+
+        Returns:
+            (deduplicated_urls: list, superset_log: dict)
+        """
+        groups = defaultdict(list)
+        for url in urls:
+            parsed = urlparse(url)
+            canonical_path = TeamOrchestrator._canonicalize_path(parsed.path)
+            base_key = f"{parsed.scheme}://{parsed.netloc}{canonical_path}"
+            param_names = frozenset(parse_qs(parsed.query, keep_blank_values=True).keys())
+            groups[base_key].append((url, param_names))
+
+        result = []
+        superset_log = {}
+
+        for base_key, url_entries in groups.items():
+            if len(url_entries) == 1:
+                result.append(url_entries[0][0])
+                continue
+
+            # Sort by param count descending (most params first = more attack surface)
+            url_entries.sort(key=lambda x: len(x[1]), reverse=True)
+
+            kept = []
+            collapsed = []
+
+            for url, params in url_entries:
+                is_subset = False
+                for _kept_url, kept_params in kept:
+                    if params <= kept_params:  # subset or equal
+                        is_subset = True
+                        collapsed.append(url)
+                        break
+                if not is_subset:
+                    kept.append((url, params))
+
+            for url, _ in kept:
+                result.append(url)
+
+            if collapsed:
+                superset_log[base_key] = {
+                    "kept": [u for u, _ in kept],
+                    "collapsed": collapsed,
+                    "collapsed_count": len(collapsed),
+                }
+
+        return result, superset_log
 
     def _normalize_urls(self, urls_to_scan: list) -> list:
         """Deduplicate, normalize, and prioritize URLs.
 
-        Deduplicates by path+param_names (ignoring param values) so that
-        URLs like ?id=1 and ?id=UNION_PAYLOAD count as the same endpoint.
+        Two-layer deduplication:
+        1. Fingerprint dedup: canonical path + sorted param_names (ignoring values)
+        2. Superset param grouping: collapse URLs where one has a superset of params
+
+        Outputs two files:
+        - recon/urls.txt       → raw GoSpider output (audit trail)
+        - recon/urls_clean.txt → post-dedup URLs (what DASTySAST processes)
+
         Always ensures self.target is first in the list.
         """
-        # Step 1: Ensure target URL is first (before dedup)
+        from bugtrace.core.batch_metrics import batch_metrics
+
+        raw_count = len(urls_to_scan)
+
+        # Save raw URLs FIRST (before any dedup) — audit trail
+        urls_file_raw = self.scan_dir / "recon" / "urls.txt"
+        if urls_file_raw.parent.exists():
+            with open(urls_file_raw, "w") as f:
+                f.write("\n".join(urls_to_scan))
+            logger.info(f"[URL Dedup] Saved {raw_count} raw URLs to urls.txt")
+
+        # === Layer 1: Fingerprint Dedup (canonical path + param names) ===
         target_fp = self._url_fingerprint(self.target)
         seen_fingerprints = {target_fp}
         normalized_list = [self.target]
         has_parameterized = '?' in self.target or '=' in self.target
+        fingerprint_groups = defaultdict(list)
+        fingerprint_groups[target_fp].append(self.target)
 
         for u in urls_to_scan:
             if '?' in u or '=' in u:
                 has_parameterized = True
 
             fp = self._url_fingerprint(u)
+            fingerprint_groups[fp].append(u)
             if fp not in seen_fingerprints:
                 seen_fingerprints.add(fp)
                 normalized_list.append(u)
 
-        urls_to_scan = normalized_list
-        logger.info(f"Deduplicated URLs to scan: {len(urls_to_scan)}")
+        layer1_count = len(normalized_list)
+        logger.info(f"[URL Dedup] Layer 1 (fingerprint): {raw_count} → {layer1_count} URLs")
+
+        # Log significant groups (3+ URLs collapsed into 1)
+        for fp, group in fingerprint_groups.items():
+            if len(group) >= 3:
+                logger.info(f"[URL Dedup]   Group ({len(group)} URLs): {fp[:80]}")
+
+        # === Layer 2: Superset Param Grouping ===
+        deduplicated_list, superset_log = self._superset_param_dedup(normalized_list)
+        layer2_count = len(deduplicated_list)
+
+        if layer1_count != layer2_count:
+            logger.info(f"[URL Dedup] Layer 2 (superset): {layer1_count} → {layer2_count} URLs")
+            for base_key, info in superset_log.items():
+                logger.info(f"[URL Dedup]   {base_key[:60]}: kept {len(info['kept'])}, collapsed {info['collapsed_count']}")
+
+        # === Dedup Summary ===
+        total_collapsed = raw_count - layer2_count
+        reduction_pct = (total_collapsed / raw_count * 100) if raw_count > 0 else 0.0
+        logger.info(
+            f"[URL Dedup] TOTAL: {raw_count} raw → {layer2_count} unique "
+            f"({reduction_pct:.0f}% reduction, {total_collapsed} collapsed)"
+        )
+
+        # Record in batch_metrics
+        largest_group = max((len(g) for g in fingerprint_groups.values()), default=0)
+        batch_metrics.record_url_dedup(raw_count, layer1_count, layer2_count, reduction_pct, largest_group)
+
+        urls_to_scan = deduplicated_list
 
         # Prioritize URLs (high-value targets first)
         if settings.URL_PRIORITIZATION_ENABLED:
@@ -1468,24 +1642,29 @@ class TeamOrchestrator:
             logger.info(f"Enforcing MAX_URLS={self.max_urls}: Trimming {len(urls_to_scan)} -> {self.max_urls} URLs")
             urls_to_scan = urls_to_scan[:self.max_urls]
 
-        # Always ensure user-provided target is first (may have been reordered by prioritization)
+        # Always ensure user-provided target is first (may have been removed by superset dedup)
         target_norm = self.target.rstrip('/')
+        found = False
         for i, u in enumerate(urls_to_scan):
             if u.rstrip('/') == target_norm:
                 if i > 0:
                     urls_to_scan.insert(0, urls_to_scan.pop(i))
                     logger.info(f"[Priority] Moved user target to position 1: {self.target}")
+                found = True
                 break
+        if not found:
+            urls_to_scan.insert(0, self.target)
+            logger.info(f"[Priority] Re-inserted user target at position 1: {self.target}")
 
         self.url_queue = urls_to_scan
         self._save_checkpoint()
 
-        # Overwrite urls.txt with the final deduplicated list (source of truth)
-        urls_file = self.scan_dir / "recon" / "urls.txt"
-        if urls_file.parent.exists():
-            with open(urls_file, "w") as f:
+        # Save deduplicated URLs to urls_clean.txt — source of truth for Phase 2
+        urls_file_clean = self.scan_dir / "recon" / "urls_clean.txt"
+        if urls_file_clean.parent.exists():
+            with open(urls_file_clean, "w") as f:
                 f.write("\n".join(urls_to_scan))
-            logger.info(f"Updated urls.txt with {len(urls_to_scan)} deduplicated URLs")
+            logger.info(f"[URL Dedup] Saved {len(urls_to_scan)} clean URLs to urls_clean.txt")
 
         return urls_to_scan
 
@@ -1903,6 +2082,7 @@ class TeamOrchestrator:
         # Initialize and start pipeline
         self._init_pipeline()
         await self._start_pipeline()
+        self._v.emit("pipeline.initializing", {"target": self.target, "scan_id": self.scan_id})
         conductor.notify_phase_change("reconnaissance", 0.0, "Pipeline started")
 
         # Setup directories
@@ -1917,6 +2097,8 @@ class TeamOrchestrator:
 
         # ========== PHASE 1: DISCOVERY ==========
         # GoSpider crawls target, discovers URLs
+        self._v.emit("pipeline.phase_transition", {"phase": "reconnaissance", "target": self.target})
+        self._v.emit("recon.started", {"target": self.target})
         await self._phase_1_reconnaissance(dashboard, recon_dir)
 
         # Update dashboard with discovery metrics
@@ -1925,6 +2107,7 @@ class TeamOrchestrator:
             urls_total=len(self.urls_to_scan),
             scan_id=self.scan_id
         )
+        self._v.emit("recon.completed", {"urls_found": len(self.urls_to_scan)})
         conductor.notify_phase_change("reconnaissance", 1.0, f"{len(self.urls_to_scan)} URLs discovered")
         conductor.notify_metrics(urls_discovered=len(self.urls_to_scan))
 
@@ -1934,6 +2117,11 @@ class TeamOrchestrator:
         )
 
         if await self._check_stop_requested(dashboard):
+            return
+
+        if not self.urls_to_scan:
+            logger.warning("[Pipeline] Recon found 0 URLs — aborting pipeline")
+            self._v.emit("pipeline.error", {"error": "Recon found 0 URLs to scan"})
             return
 
         # ========== LONEWOLF: Fire and forget ==========
@@ -1947,6 +2135,8 @@ class TeamOrchestrator:
         # DASTySASTAgent analyzes ALL URLs in parallel
         # ThinkingConsolidationAgent deduplicates and distributes to queues
         logger.info("=== PHASE 2: DISCOVERY (Batch DAST) ===")
+        self._v.emit("pipeline.phase_transition", {"phase": "discovery", "urls_count": len(self.urls_to_scan)})
+        self._v.emit("discovery.started", {"urls_count": len(self.urls_to_scan)})
         dashboard.log(f"🔬 Running batch DAST on {len(self.urls_to_scan)} URLs", "INFO")
         dashboard.set_phase("🔬 HUNTING VULNS")
         dashboard.set_status("Running", "Analysis in progress...")
@@ -1961,6 +2151,7 @@ class TeamOrchestrator:
         reports_generated = len(list(dastysast_dir.glob("*.json"))) if dastysast_dir.exists() else 0
         errors_count = urls_count - reports_generated  # FIX: count by actual JSON files, not in-memory dict
 
+        self._v.emit("pipeline.checkpoint", {"phase": "discovery", "urls": urls_count, "reports": reports_generated, "errors": errors_count})
         conductor.verify_integrity("discovery",
             {'urls_count': urls_count},
             {'dast_reports_count': reports_generated, 'errors': errors_count})
@@ -1984,6 +2175,7 @@ class TeamOrchestrator:
             return
 
         # Signal DISCOVERY complete AFTER batch DAST finishes
+        self._v.emit("discovery.completed", {"urls_analyzed": reports_generated, "urls_total": urls_count})
         conductor.notify_phase_change("discovery", 1.0, f"{reports_generated} URLs analyzed")
         conductor.notify_metrics(urls_discovered=len(self.urls_to_scan), urls_analyzed=reports_generated)
         await self._lifecycle.signal_phase_complete(
@@ -1997,6 +2189,8 @@ class TeamOrchestrator:
         # ========== PHASE 3: STRATEGY (Batch Processing) ==========
         # ThinkingAgent reads JSON files, deduplicates, and distributes to queues
         logger.info("=== PHASE 3: STRATEGY (Deduplication & Queue Distribution) ===")
+        self._v.emit("pipeline.phase_transition", {"phase": "strategy"})
+        self._v.emit("strategy.started", {})
         dashboard.log("🧠 ThinkingAgent processing findings batch", "INFO")
         dashboard.set_phase("🧠 STRATEGY")
         dashboard.set_status("Running", "Deduplication in progress...")
@@ -2032,6 +2226,7 @@ class TeamOrchestrator:
             )
 
         # Signal STRATEGY complete
+        self._v.emit("strategy.completed", {"findings_distributed": findings_count})
         conductor.notify_phase_change("strategy", 1.0, f"{findings_count} findings distributed")
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.STRATEGY,
@@ -2044,6 +2239,7 @@ class TeamOrchestrator:
         # ========== PHASE 4: EXPLOITATION (Queue Consumption) ==========
         # Specialists consume from queues in true parallel
         logger.info("=== PHASE 4: EXPLOITATION (Specialist Queue Processing) ===")
+        self._v.emit("pipeline.phase_transition", {"phase": "exploitation"})
         dashboard.log(f"⚡ Specialists processing findings from queues", "INFO")
         conductor.notify_phase_change("exploitation", 0.0, "Specialists attacking")
 
@@ -2083,6 +2279,10 @@ class TeamOrchestrator:
         await self._checkpoint("Batch Analysis & Queue-based Exploitation")
 
         # Signal EXPLOITATION complete AFTER queue drain finishes
+        self._v.emit("exploit.phase_stats", {
+            "items_distributed": queue_results.get('items_distributed', 0),
+            "by_specialist": queue_results.get('by_specialist', {}),
+        })
         conductor.notify_phase_change("exploitation", 1.0, f"{queue_results.get('items_distributed', 0)} items processed")
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.EXPLOITATION,
@@ -2095,9 +2295,12 @@ class TeamOrchestrator:
         # ========== PHASE 5: VALIDATION ==========
         all_findings_for_review = self.state_manager.get_findings()
         logger.info("=== PHASE 5: VALIDATION (Global Review) ===")
+        self._v.emit("pipeline.phase_transition", {"phase": "validation", "findings_count": len(all_findings_for_review)})
+        self._v.emit("validation.started", {"findings_to_review": len(all_findings_for_review)})
         conductor.notify_phase_change("validation", 0.0, f"Reviewing {len(all_findings_for_review)} findings")
         conductor.notify_log("INFO", f"[VALIDATION] Reviewing {len(all_findings_for_review)} findings")
         await self._phase_3_global_review(dashboard, scan_dir)
+        self._v.emit("validation.completed", {"findings_reviewed": len(all_findings_for_review)})
         conductor.notify_phase_change("validation", 1.0, "Review complete")
         conductor.notify_log("INFO", "[VALIDATION] Global review complete")
         await self._lifecycle.signal_phase_complete(
@@ -2110,9 +2313,12 @@ class TeamOrchestrator:
 
         # ========== PHASE 6: REPORTING ==========
         logger.info("=== PHASE 6: REPORTING ===")
+        self._v.emit("pipeline.phase_transition", {"phase": "reporting"})
+        self._v.emit("reporting.started", {})
         conductor.notify_phase_change("reporting", 0.0, "Generating reports")
         conductor.notify_log("INFO", "[REPORTING] Generating final reports")
         await self._phase_4_reporting(dashboard, scan_dir)
+        self._v.emit("reporting.completed", {})
         conductor.notify_phase_change("reporting", 1.0, "Reports generated")
         conductor.notify_log("INFO", "[REPORTING] Reports generated")
         await self._lifecycle.signal_phase_complete(
@@ -2130,6 +2336,10 @@ class TeamOrchestrator:
         batch_metrics.log_summary()
 
         duration = (datetime.now() - start_time).total_seconds()
+        self._v.emit("pipeline.completed", {
+            "duration_s": round(duration, 1),
+            "total_findings": len(all_findings),
+        })
         conductor.notify_complete(len(all_findings), duration)
         logger.info(f"=== V3 BATCH PIPELINE COMPLETE in {duration:.1f}s ===")
         logger.info(f"V3 Batch Pipeline: {batch_metrics.time_saved_percent:.1f}% faster than sequential")
@@ -2189,6 +2399,9 @@ class TeamOrchestrator:
                     queue_stats[specialist] = {'depth': 0, 'processed': 0}
 
             # Update dashboard with queue stats in real-time
+            self._v.emit("exploit.specialist.queue_progress", {
+                "total_pending": total_pending, "queue_stats": queue_stats,
+            })
             dashboard.set_progress_metrics(queue_stats=queue_stats, scan_id=self.scan_id)
 
             # Emit agent updates for WEB dashboard
@@ -2623,6 +2836,10 @@ class TeamOrchestrator:
                 injected_count = 1
 
             if injected_count > 0:
+                self._v.emit("strategy.auto_dispatch", {
+                    "specialist": "CSTI", "count": injected_count,
+                    "framework": detected_csti_framework,
+                })
                 logger.info(f"[Auto-Dispatch] Injected {injected_count} synthetic CSTI findings with real params (detected: {detected_csti_framework})")
                 dashboard.log(f"Auto-dispatch: {injected_count} CSTI findings injected ({detected_csti_framework.upper()} detected)", "INFO")
 
@@ -2668,6 +2885,7 @@ class TeamOrchestrator:
                 "_auto_dispatched": True
             }
             all_findings.append(synthetic_sqli)
+            self._v.emit("strategy.auto_dispatch", {"specialist": "SQLi", "param": sqli_param})
             logger.info(f"[Auto-Dispatch] Added synthetic SQLi finding: param='{sqli_param}' (reflecting params detected)")
             dashboard.log(f"Auto-dispatch: SQLi finding injected for param='{sqli_param}'", "INFO")
 
@@ -2770,6 +2988,7 @@ class TeamOrchestrator:
                     "_source_file": "nuclei_misconfiguration",
                     "_scan_context": self.scan_context,
                 })
+            self._v.emit("strategy.nuclei_injected", {"count": len(misconfigs)})
             logger.info(f"[Nuclei] Injected {len(misconfigs)} misconfiguration findings")
             dashboard.log(f"🔒 Nuclei: {len(misconfigs)} security misconfigurations detected", "INFO")
 

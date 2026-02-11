@@ -11,6 +11,7 @@ from bugtrace.core.config import settings
 from bugtrace.core.job_manager import JobStatus
 from bugtrace.core.ui import dashboard
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
+from bugtrace.core.verbose_events import create_emitter
 from bugtrace.utils.logger import get_logger
 from bugtrace.tools.external import external_tools
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
@@ -115,10 +116,14 @@ class SSRFAgent(BaseAgent, TechContextMixin):
         """Test parameter with Go SSRF fuzzer."""
         findings = []
         dashboard.log(f"[{self.name}] 🚀 Launching Go SSRF Fuzzer on '{param}'...", "INFO")
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.specialist.go_fuzzer", {"agent": "SSRF", "param": param, "url": self.url})
         go_result = await external_tools.run_go_ssrf_fuzzer(self.url, param)
 
         if go_result and go_result.get("hits"):
             for hit in go_result["hits"]:
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.signature_match", {"agent": "SSRF", "param": param, "payload": hit["payload"][:100], "method": "go_fuzzer"})
                 dashboard.log(f"[{self.name}] 🚨 SSRF HIT: {hit['payload']} ({hit['severity']})", "CRITICAL")
                 findings.append({
                     "type": "SSRF",
@@ -154,8 +159,13 @@ class SSRFAgent(BaseAgent, TechContextMixin):
             if not payload:
                 continue
 
+            if hasattr(self, '_v'):
+                self._v.progress("exploit.specialist.progress", {"agent": "SSRF", "param": param, "payload": payload[:80]}, every=50)
+
             res = await self._test_payload(param, payload)
             if res and self._determine_validation_status(res):
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.signature_match", {"agent": "SSRF", "param": param, "payload": payload[:100], "method": "llm_strategy"})
                 findings.append({
                     "type": "SSRF",
                     "param": param,
@@ -551,6 +561,9 @@ Focus on parameter+target deduplication. Same internal target via different bypa
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting {len(self._dry_findings)} DRY findings =====")
         validated = []
         for idx, f in enumerate(self._dry_findings, 1):
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.started", {"agent": "SSRF", "param": f["parameter"], "url": f["url"], "idx": idx, "total": len(self._dry_findings)})
+                self._v.reset("exploit.specialist.progress")
             try:
                 self.url = f["url"]
                 result = await self._test_single_param_from_queue(f["url"], f["parameter"], f.get("finding",{}))
@@ -559,6 +572,10 @@ Focus on parameter+target deduplication. Same internal target via different bypa
                     fp = self._generate_ssrf_fingerprint(f["url"], f["parameter"], result.get("payload",""))
                     if fp not in self._emitted_findings:
                         self._emitted_findings.add(fp)
+
+                        if hasattr(self, '_v'):
+                            self._v.emit("exploit.specialist.confirmed", {"agent": "SSRF", "param": f["parameter"], "url": f["url"], "payload": result.get("payload", "")[:100], "status": result.get("status", "")})
+
                         if settings.WORKER_POOL_EMIT_EVENTS:
                             status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
                             self._emit_ssrf_finding({
@@ -574,6 +591,9 @@ Focus on parameter+target deduplication. Same internal target via different bypa
                         logger.info(f"[{self.name}] ✅ Emitted unique: {f['url']}?{f['parameter']}")
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: {e}")
+            finally:
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.param.completed", {"agent": "SSRF", "param": f["parameter"], "url": f["url"], "idx": idx})
         logger.info(f"[{self.name}] Phase B complete: {len(validated)} validated")
         return validated
 
@@ -610,6 +630,7 @@ Focus on parameter+target deduplication. Same internal target via different bypa
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("SSRF", self._scan_context)
 
         # v3.2: Load context-aware tech stack for intelligent deduplication
         await self._load_ssrf_tech_context()
@@ -621,6 +642,8 @@ Focus on parameter+target deduplication. Same internal target via different bypa
         initial_depth = queue.depth()
         report_specialist_start(self.name, queue_depth=initial_depth)
 
+        self._v.emit("exploit.specialist.started", {"agent": "SSRF", "queue_depth": initial_depth})
+
         dry_list = await self.analyze_and_dedup_queue()
 
         # Report WET→DRY metrics for integrity verification
@@ -630,6 +653,7 @@ Focus on parameter+target deduplication. Same internal target via different bypa
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
             report_specialist_done(self.name, processed=0, vulns=0)
+            self._v.emit("exploit.specialist.completed", {"agent": "SSRF", "processed": 0, "vulns": 0})
             return
 
         results = await self.exploit_dry_list()
@@ -647,6 +671,9 @@ Focus on parameter+target deduplication. Same internal target via different bypa
             processed=len(dry_list),
             vulns=vulns_count
         )
+
+        self._v.emit("exploit.specialist.completed", {"agent": "SSRF", "processed": len(dry_list), "vulns": vulns_count})
+
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
     async def _process_queue_item(self, item: dict) -> Optional[Dict]:

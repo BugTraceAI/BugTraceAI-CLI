@@ -8,6 +8,7 @@ from bugtrace.core.event_bus import EventType
 from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
+from bugtrace.core.verbose_events import create_emitter
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -185,9 +186,13 @@ class XXEAgent(BaseAgent, TechContextMixin):
     async def _test_heuristic_payloads(self, session) -> tuple:
         """Test initial payloads and return (successful_payloads, best_payload)."""
         successful_payloads, best_payload = [], None
-        for p in self._get_initial_xxe_payloads():
+        for payload_idx, p in enumerate(self._get_initial_xxe_payloads(), 1):
+            if hasattr(self, '_v'):
+                self._v.progress("exploit.specialist.progress", {"agent": "XXE", "payload": p[:60]}, every=50)
             if await self._test_xml(session, p):
                 successful_payloads.append(p)
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.signature_match", {"agent": "XXE", "payload": p[:60], "url": self.url})
                 if not best_payload or ("passwd" in p and "passwd" not in best_payload):
                     best_payload = p
         return successful_payloads, best_payload
@@ -592,6 +597,10 @@ Respect the "_discovered": true flag - these are autonomously discovered endpoin
 
             logger.info(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Testing {endpoint_type} on {url}")
 
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.started", {"agent": "XXE", "endpoint_type": endpoint_type, "url": url, "idx": idx, "total": len(self._dry_findings)})
+                self._v.reset("exploit.specialist.progress")
+
             try:
                 # Execute XXE attack using existing method
                 self.url = url
@@ -634,12 +643,18 @@ Respect the "_discovered": true flag - these are autonomously discovered endpoin
                             }, scan_context=self._scan_context)
 
                         logger.info(f"[{self.name}] ✅ Emitted unique XXE finding: {url} (type={endpoint_type})")
+
+                        if hasattr(self, '_v'):
+                            self._v.emit("exploit.specialist.confirmed", {"agent": "XXE", "endpoint_type": endpoint_type, "url": url, "severity": result.get("severity")})
                     else:
                         logger.debug(f"[{self.name}] ⏭️  Skipped duplicate: {fingerprint}")
 
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Attack failed: {e}")
                 continue
+            finally:
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.param.completed", {"agent": "XXE", "endpoint_type": endpoint_type, "url": url, "idx": idx})
 
         logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
 
@@ -717,6 +732,7 @@ Respect the "_discovered": true flag - these are autonomously discovered endpoin
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("XXEAgent", self._scan_context)
 
         # v3.2: Load context-aware tech stack for intelligent deduplication
         await self._load_xxe_tech_context()
@@ -727,6 +743,8 @@ Respect the "_discovered": true flag - these are autonomously discovered endpoin
         queue = queue_manager.get_queue("xxe")
         initial_depth = queue.depth()
         report_specialist_start(self.name, queue_depth=initial_depth)
+
+        self._v.emit("exploit.specialist.started", {"agent": "XXE", "queue_depth": initial_depth})
 
         # PHASE A: ANALYSIS & DEDUPLICATION
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
@@ -739,6 +757,7 @@ Respect the "_discovered": true flag - these are autonomously discovered endpoin
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
             report_specialist_done(self.name, processed=0, vulns=0)
+            self._v.emit("exploit.specialist.completed", {"agent": "XXE", "dry_count": 0, "vulns": 0})
             return  # ✅ Terminate (no loop)
 
         # PHASE B: EXPLOITATION
@@ -759,6 +778,8 @@ Respect the "_discovered": true flag - these are autonomously discovered endpoin
             processed=len(dry_list),
             vulns=vulns_count
         )
+
+        self._v.emit("exploit.specialist.completed", {"agent": "XXE", "dry_count": len(dry_list), "vulns": vulns_count})
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
         # Method ends - agent terminates ✅

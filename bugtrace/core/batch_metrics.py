@@ -34,6 +34,13 @@ class BatchMetrics:
     findings_distributed: int = 0
     findings_exploited: int = 0
 
+    # URL deduplication tracking
+    urls_raw: int = 0                    # URLs before any dedup
+    urls_after_fingerprint: int = 0      # After Layer 1 (fingerprint dedup)
+    urls_after_superset: int = 0         # After Layer 2 (superset grouping)
+    url_dedup_reduction_pct: float = 0.0 # Overall reduction percentage
+    url_dedup_largest_group: int = 0     # Largest fingerprint group size
+
     # Finding sources (for integrity verification)
     findings_dast: int = 0          # DASTySAST findings only
     findings_auth: int = 0          # AuthDiscovery findings only
@@ -54,6 +61,15 @@ class BatchMetrics:
     def start_dast(self):
         """Mark DAST batch start."""
         self.dast_start_time = time.monotonic()
+
+    def record_url_dedup(self, raw: int, after_fingerprint: int, after_superset: int,
+                         reduction_pct: float, largest_group: int):
+        """Record URL deduplication results."""
+        self.urls_raw = raw
+        self.urls_after_fingerprint = after_fingerprint
+        self.urls_after_superset = after_superset
+        self.url_dedup_reduction_pct = reduction_pct
+        self.url_dedup_largest_group = largest_group
 
     def end_dast(self, urls_analyzed: int, findings_count: int):
         """Mark DAST batch end."""
@@ -146,6 +162,9 @@ class BatchMetrics:
         logger.info("=" * 60)
         logger.info("BATCH PROCESSING PERFORMANCE SUMMARY")
         logger.info("=" * 60)
+        if self.urls_raw > 0:
+            logger.info(f"URL dedup: {self.urls_raw} raw → {self.urls_after_superset} clean "
+                        f"({self.url_dedup_reduction_pct:.0f}% reduction, largest group: {self.url_dedup_largest_group})")
         logger.info(f"URLs analyzed: {self.urls_analyzed}")
         logger.info(f"DAST batch duration: {self.dast_duration:.1f}s")
         logger.info(f"Queue drain duration: {self.queue_drain_duration:.1f}s")

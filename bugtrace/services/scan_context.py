@@ -31,6 +31,7 @@ class ScanOptions(BaseModel):
     use_vertical: bool = True
     focused_agents: List[str] = []  # for --xss, --sqli etc.
     param: Optional[str] = None  # for focused mode parameter targeting
+    scan_depth: str = ""  # empty = use settings.SCAN_DEPTH default
 
 
 class ScanContext:

@@ -25,6 +25,7 @@ from loguru import logger
 
 from bugtrace.agents.base import BaseAgent
 from bugtrace.core.event_bus import event_bus, EventType
+from bugtrace.core.verbose_events import create_emitter
 from bugtrace.core.queue import queue_manager, SPECIALIST_QUEUES
 from bugtrace.core.config import settings
 from bugtrace.core.dedup_metrics import dedup_metrics, get_dedup_summary
@@ -962,6 +963,12 @@ class ThinkingConsolidationAgent(BaseAgent):
                 self._stats["by_specialist"][specialist] = \
                     self._stats["by_specialist"].get(specialist, 0) + 1
 
+                if hasattr(self, '_v'):
+                    self._v.emit("strategy.finding.queued", {
+                        "specialist": specialist,
+                        "priority": round(prioritized.priority, 1),
+                        "queue_depth": queue.depth() if hasattr(queue, 'depth') else -1,
+                    })
                 logger.debug(
                     f"[{self.name}] Queued: {prioritized.finding.get('type')} -> "
                     f"{specialist} (priority: {prioritized.priority:.1f})"
@@ -970,6 +977,10 @@ class ThinkingConsolidationAgent(BaseAgent):
 
             # Backpressure - wait and retry
             delay = settings.THINKING_BACKPRESSURE_DELAY * (2 ** attempt)
+            if hasattr(self, '_v'):
+                self._v.emit("strategy.finding.backpressure", {
+                    "specialist": specialist, "retry": attempt + 1, "delay_ms": int(delay * 1000),
+                })
             logger.warning(
                 f"[{self.name}] Queue {specialist} full, retry {attempt + 1}/"
                 f"{settings.THINKING_BACKPRESSURE_RETRIES} in {delay:.1f}s"
@@ -1055,6 +1066,10 @@ class ThinkingConsolidationAgent(BaseAgent):
         logger.debug(f"[{self.name}] Step 1: Classifying finding type={finding.get('type')}")
         specialist = self._classify_finding(finding) or "unknown"
         dedup_metrics.record_received(specialist)
+        if hasattr(self, '_v'):
+            self._v.progress("strategy.finding.received", {
+                "type": finding.get("type"), "param": finding.get("parameter"), "specialist": specialist,
+            }, every=10)
         logger.debug(f"[{self.name}] Step 1 done: specialist={specialist}")
 
         # 2. FP confidence filter
@@ -1079,6 +1094,11 @@ class ThinkingConsolidationAgent(BaseAgent):
         should_bypass = is_sqli or is_template_injection or is_probe_validated or has_high_skeptical_score
 
         if not should_bypass and fp_confidence < settings.THINKING_FP_THRESHOLD:
+            if hasattr(self, '_v'):
+                self._v.emit("strategy.finding.fp_filtered", {
+                    "type": finding.get("type"), "param": finding.get("parameter"),
+                    "fp_confidence": fp_confidence,
+                })
             logger.debug(f"[{self.name}] FP filtered: {finding.get('type')} "
                         f"(fp_confidence: {fp_confidence:.2f} < {settings.THINKING_FP_THRESHOLD})")
             self._stats["fp_filtered"] += 1
@@ -1102,6 +1122,10 @@ class ThinkingConsolidationAgent(BaseAgent):
         is_duplicate, key = await self._dedup_cache.check_and_add(finding, scan_context)
         logger.debug(f"[{self.name}] Step 3 done: duplicate={is_duplicate}")
         if is_duplicate:
+            if hasattr(self, '_v'):
+                self._v.emit("strategy.finding.duplicate", {
+                    "type": finding.get("type"), "param": finding.get("parameter"), "dedup_key": key,
+                })
             self._stats["duplicates_filtered"] += 1
             dedup_metrics.record_duplicate(specialist, key)
             return
@@ -1114,6 +1138,11 @@ class ThinkingConsolidationAgent(BaseAgent):
             self._stats["unclassified"] += 1
             logger.debug(f"[{self.name}] Step 4: Unclassified, returning")
             return
+        if hasattr(self, '_v'):
+            self._v.emit("strategy.finding.classified", {
+                "type": finding.get("type"), "specialist": prioritized.specialist,
+                "priority": round(prioritized.priority, 1),
+            })
         logger.debug(f"[{self.name}] Step 4 done: specialist={prioritized.specialist}, priority={prioritized.priority}")
 
         # 5. Distribute to specialist queue
@@ -1268,6 +1297,8 @@ class ThinkingConsolidationAgent(BaseAgent):
             return 0
 
         scan_ctx = scan_context or self.scan_context
+        self._v = create_emitter("ThinkingAgent", scan_ctx)
+        self._v.emit("strategy.thinking.batch_started", {"batch_size": len(findings)})
         logger.info(f"[{self.name}] Processing batch of {len(findings)} findings from list")
 
         # Add scan_context to each finding if missing
@@ -1286,6 +1317,16 @@ class ThinkingConsolidationAgent(BaseAgent):
 
         # Return count of distributed items
         distributed = self._stats.get("distributed", 0)
+        self._v.emit("strategy.thinking.batch_completed", {
+            "processed": len(findings), "distributed": distributed,
+        })
+        self._v.emit("strategy.distribution_summary", {
+            "received": self._stats.get("total_received", len(findings)),
+            "fp_filtered": self._stats.get("fp_filtered", 0),
+            "duplicates": self._stats.get("duplicates_filtered", 0),
+            "distributed": distributed,
+            "by_specialist": self._stats.get("by_specialist", {}),
+        })
         logger.info(f"[{self.name}] Distributed {distributed} findings to specialist queues")
         return distributed
 

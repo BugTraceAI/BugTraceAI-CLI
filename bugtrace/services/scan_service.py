@@ -67,7 +67,7 @@ class ScanService:
 
         logger.info(f"ScanService initialized (max_concurrent={max_concurrent})")
 
-    async def create_scan(self, options: ScanOptions, origin: str = "cli") -> int:
+    async def create_scan(self, options: ScanOptions, origin: str = "unknown") -> int:
         """
         Create and start a new scan.
 
@@ -91,14 +91,24 @@ class ScanService:
         async with self._lock:
             self._check_concurrent_limit()
 
-            scan_id = self._create_scan_record(options, origin)
-            ctx = self._build_scan_context(scan_id, options)
+            try:
+                scan_id = self._create_scan_record(options, origin)
+            except Exception as e:
+                logger.error(f"Failed to create scan record: {e}", exc_info=True)
+                raise RuntimeError(f"Failed to create scan in database: {e}")
 
-            self._active_scans[scan_id] = ctx
-            ctx._task = asyncio.create_task(self._run_scan(ctx))
+            try:
+                ctx = self._build_scan_context(scan_id, options)
+                self._active_scans[scan_id] = ctx
 
-            await self._emit_scan_created_event(scan_id, options)
-            logger.info(f"Scan {scan_id} task started (active: {len(self._active_scans)})")
+                await self._emit_scan_created_event(scan_id, options)
+                ctx._task = asyncio.create_task(self._run_scan(ctx))
+                logger.info(f"Scan {scan_id} task started (active: {len(self._active_scans)})")
+            except Exception as e:
+                logger.error(f"Scan {scan_id} created in DB but failed to start: {e}", exc_info=True)
+                self._active_scans.pop(scan_id, None)
+                self.db.update_scan_progress(scan_id, 0, ScanStatus.FAILED)
+                raise
 
             return scan_id
 
@@ -211,6 +221,7 @@ class ScanService:
             use_vertical_agents=ctx.options.use_vertical,
             output_dir=output_dir,
             scan_id=ctx.scan_id,  # Pass existing scan_id to avoid duplicate creation
+            scan_depth=ctx.options.scan_depth or settings.SCAN_DEPTH,
         )
 
         # CRITICAL: Monkey-patch stop_event for graceful shutdown
@@ -724,6 +735,14 @@ class ScanService:
         Returns:
             Dictionary with findings, total, page, per_page
         """
+        # Verify scan exists before loading findings
+        with self.db.get_session() as session:
+            from sqlmodel import select
+            from bugtrace.schemas.db_models import ScanTable
+            scan = session.exec(select(ScanTable).where(ScanTable.id == scan_id)).first()
+            if not scan:
+                raise ValueError(f"Scan {scan_id} not found")
+
         # Load all findings from files (source of truth)
         all_findings = self._load_findings_from_files(scan_id)
 

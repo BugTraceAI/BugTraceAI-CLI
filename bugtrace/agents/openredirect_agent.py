@@ -15,6 +15,7 @@ from bugtrace.core.config import settings
 from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+from bugtrace.core.verbose_events import create_emitter
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -1174,6 +1175,10 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
 
             logger.info(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Testing {url}?{parameter}")
 
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.started", {"agent": "OpenRedirect", "param": parameter, "url": url, "idx": idx, "total": len(self._dry_findings)})
+                self._v.reset("exploit.specialist.progress")
+
             try:
                 self.url = url
                 result = await self._test_single_param_from_queue(url, parameter, finding)
@@ -1199,6 +1204,9 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
                             }, scan_context=self._scan_context)
 
+                        if hasattr(self, '_v'):
+                            self._v.emit("exploit.specialist.confirmed", {"agent": "OpenRedirect", "param": parameter, "url": url, "payload": result.get("payload", "")[:80]})
+
                         logger.info(f"[{self.name}] ✅ Emitted unique finding: {url}?{parameter}")
                     else:
                         logger.debug(f"[{self.name}] ⏭️  Skipped duplicate: {fingerprint}")
@@ -1206,6 +1214,9 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Attack failed: {e}")
                 continue
+
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.completed", {"agent": "OpenRedirect", "param": parameter, "url": url, "found": result is not None and result.get("validated", False)})
 
         # Phase B.2: DOM-based redirect testing (Playwright)
         try:
@@ -1288,11 +1299,13 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("OpenRedirect", self._scan_context)
 
         # v3.2.0: Load tech context for context-aware detection
         await self._load_openredirect_tech_context()
 
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+        self._v.emit("exploit.specialist.started", {"agent": "OpenRedirect", "url": self.url})
 
         # Get initial queue depth for telemetry
         queue = queue_manager.get_queue("openredirect")
@@ -1309,6 +1322,8 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.completed", {"agent": "OpenRedirect", "dry_count": 0, "vulns": 0})
             report_specialist_done(self.name, processed=0, vulns=0)
             return
 
@@ -1331,7 +1346,58 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
             vulns=vulns_count
         )
 
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.specialist.completed", {
+                "agent": "OpenRedirect",
+                "dry_count": len(dry_list),
+                "vulns": vulns_count,
+            })
+
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
+
+    async def _smart_probe_redirect(self, url: str, param: str) -> bool:
+        """
+        Smart probe: 1 request to test if param influences redirects at all.
+
+        Sends simplest possible redirect payload. If no redirect signal
+        (3xx status, Location header, URL in body) → skip all tiers.
+
+        Returns:
+            True if param shows redirect behavior (continue testing),
+            False if param doesn't influence redirects (skip).
+        """
+        evil_url = "https://btprobe.example.com"
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        params[param] = [evil_url]
+        test_url = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+
+        try:
+            async with orchestrator.session(DestinationType.TARGET) as session:
+                async with session.get(
+                    test_url,
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    # Check 1: Redirect status with external Location
+                    if response.status in REDIRECT_STATUS_CODES:
+                        location = response.headers.get('Location', '')
+                        if 'btprobe.example.com' in location:
+                            dashboard.log(f"[{self.name}] Smart probe: {param} redirects to external URL", "INFO")
+                            return True
+
+                    # Check 2: URL appears in body (meta refresh / JS redirect)
+                    body = await response.text()
+                    if 'btprobe.example.com' in body:
+                        dashboard.log(f"[{self.name}] Smart probe: {param} reflects URL in body", "INFO")
+                        return True
+
+                    dashboard.log(f"[{self.name}] Smart probe: {param} doesn't influence redirects, skipping", "INFO")
+                    return False
+
+        except Exception as e:
+            logger.debug(f"[{self.name}] Smart probe error for {param}: {e}")
+            return True  # On error, continue testing (be safe)
 
     async def _test_single_param_from_queue(self, url: str, param: str, finding: dict) -> Optional[Dict]:
         """
@@ -1349,6 +1415,10 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
             logger.warning(f"[{self.name}] Cannot test empty parameter on {url}")
             return None
 
+        # Smart probe: skip if param doesn't influence redirects
+        if not await self._smart_probe_redirect(url, param):
+            return None
+
         parsed = urlparse(url)
         trusted_domain = parsed.netloc
 
@@ -1357,6 +1427,9 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
             payloads = get_payloads_for_tier(tier, DEFAULT_ATTACKER_DOMAIN, trusted_domain)
 
             for payload in payloads:
+                if hasattr(self, '_v'):
+                    self._v.progress("exploit.specialist.progress", {"agent": "OpenRedirect", "param": param, "tier": tier, "payload": payload[:60]}, every=50)
+
                 result = await self._test_single_payload(param, payload, tier)
 
                 if result and result.get("exploitable"):
@@ -1375,6 +1448,9 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                     }
                     result["evidence"] = evidence
                     result["status"] = self._get_validation_status(evidence)
+
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.specialist.signature_match", {"agent": "OpenRedirect", "param": param, "tier": tier, "method": result.get("method"), "payload": payload[:80]})
 
                     logger.info(
                         f"[{self.name}] ✅ OPEN REDIRECT confirmed: {param}={payload[:50]} "

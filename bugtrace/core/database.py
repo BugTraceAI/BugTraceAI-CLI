@@ -239,6 +239,8 @@ class DatabaseManager:
         with self.get_session() as session:
             # Migration: Add 'origin' column to scan table (v2.1)
             self._migrate_origin_column(session)
+            # Migration: Add 'report_dir' column to scan table (v5.1)
+            self._migrate_report_dir_column(session)
 
     def _migrate_origin_column(self, session):
         """Migrate 'origin' column to scan table."""
@@ -257,6 +259,24 @@ class DatabaseManager:
         except Exception as e:
             session.rollback()
             logger.warning(f"Migration 'origin' column skipped: {e}")
+
+    def _migrate_report_dir_column(self, session):
+        """Migrate 'report_dir' column to scan table."""
+        try:
+            session.exec(text("SELECT report_dir FROM scan LIMIT 1"))
+        except Exception:
+            session.rollback()
+            self._add_report_dir_column(session)
+
+    def _add_report_dir_column(self, session):
+        """Add report_dir column to scan table."""
+        try:
+            session.exec(text("ALTER TABLE scan ADD COLUMN report_dir VARCHAR"))
+            session.commit()
+            logger.info("Migration: Added 'report_dir' column to scan table")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"Migration 'report_dir' column skipped: {e}")
 
     def _init_vector_store(self):
         try:
@@ -389,13 +409,16 @@ class DatabaseManager:
             target_url: Target URL to scan
             origin: Where the scan was launched from ('cli' or 'web')
         """
+        target = self.get_or_create_target(target_url)
+        target_id = target.id  # Extract ID while target is still valid
         with self.get_session() as session:
-            target = self.get_or_create_target(target_url)
-            scan = ScanTable(target_id=target.id, status=ScanStatus.RUNNING, progress_percent=0, origin=origin)
+            scan = ScanTable(target_id=target_id, status=ScanStatus.RUNNING, progress_percent=0, origin=origin)
             session.add(scan)
             session.commit()
             session.refresh(scan)
-            return scan.id
+            scan_id = scan.id
+        logger.info(f"Created scan {scan_id} in database (target_id={target_id}, origin={origin})")
+        return scan_id
 
     def update_scan_progress(self, scan_id: int, progress: int, status: Optional[ScanStatus] = None):
         """Update scan progress and optionally status."""
@@ -429,6 +452,16 @@ class DatabaseManager:
                     finding.visual_validated = True
                 session.add(finding)
                 session.commit()
+
+    def update_scan_report_dir(self, scan_id: int, report_dir: str):
+        """Update scan report directory."""
+        with self.get_session() as session:
+            scan = session.get(ScanTable, scan_id)
+            if scan:
+                scan.report_dir = report_dir
+                session.add(scan)
+                session.commit()
+                logger.info(f"Updated scan {scan_id} report_dir to {report_dir}")
 
     def get_pending_findings(self, scan_id: Optional[int] = None) -> List[FindingTable]:
         """Get all findings waiting for validation."""

@@ -63,8 +63,6 @@ def _build_report_response(
     content_type, extension = _get_content_type_and_extension(format)
     filename = f"bugtrace_report_{scan_id}.{extension}"
 
-    logger.info(f"Serving {format} report for scan {scan_id}: {len(report_bytes)} bytes")
-
     return Response(
         content=report_bytes,
         media_type=content_type,
@@ -101,7 +99,7 @@ async def get_report(
     _validate_report_format(format)
 
     try:
-        report_bytes = await report_service.get_report(scan_id, format)
+        report_bytes = report_service.get_report(scan_id, format)
 
         if report_bytes is None:
             raise HTTPException(
@@ -152,11 +150,29 @@ def _find_report_dir(scan_id: int) -> FilePath | None:
             if not target:
                 return None
 
-            # Extract domain from URL
+            # Pattern 0: Direct DB match (new v5.1 architecture)
+            if hasattr(scan, 'report_dir') and scan.report_dir:
+                db_dir = FilePath(scan.report_dir)
+                if db_dir.is_dir():
+                    return db_dir
+
+            # Pattern 1: API-generated reports (legacy/standard)
+            api_dir = report_base / f"scan_{scan_id}"
+            if api_dir.is_dir():
+                return api_dir
+
+            # Pattern 2: Pipeline-generated reports ({domain}_{timestamp})
+            # Extract domain and timestamp from scan
             from urllib.parse import urlparse
             domain = urlparse(target.url).hostname or ""
+            scan_ts = scan.timestamp.strftime("%Y%m%d_%H%M%S")
 
-            # Find matching report directories, sorted newest first
+            # Priority 1: Exact timestamp match
+            exact_match = report_base / f"{domain}_{scan_ts}"
+            if exact_match.is_dir():
+                return exact_match
+
+            # Priority 2: Fuzzy match (latest for domain) - fallback
             matches = sorted(
                 report_base.glob(f"{domain}_*"),
                 key=lambda p: p.stat().st_mtime,

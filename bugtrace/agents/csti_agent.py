@@ -17,6 +17,7 @@ from bugtrace.core.config import settings
 from dataclasses import dataclass, field
 from bugtrace.schemas.validation_feedback import ValidationFeedback, FailureReason
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
+from bugtrace.core.verbose_events import create_emitter
 
 # v2.1.0: Import specialist utilities for payload loading from JSON (if needed)
 from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_full_finding_data
@@ -1384,12 +1385,16 @@ Response format (XML):
             return True
 
         if self._check_engine_signatures(response_html, payload):
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.signature_match", {"agent": "CSTI", "payload": payload[:100], "method": "engine_signature"})
             evidence["method"] = "L1: Engine Signature"
             evidence["level"] = 1
             evidence["status"] = "VALIDATED_CONFIRMED"
             return True
 
         if self._check_error_signatures(response_html):
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.signature_match", {"agent": "CSTI", "payload": payload[:100], "method": "error_signature"})
             evidence["method"] = "L1: Error Signature"
             evidence["level"] = 1
             evidence["status"] = "VALIDATED_CONFIRMED"
@@ -1756,8 +1761,17 @@ Response format (XML):
         if '${' in payload or '%>' in payload:
             return 'mako'
 
+        # Check tech_profile from fingerprinting before defaulting
+        if hasattr(self, 'tech_profile') and self.tech_profile:
+            frameworks = self.tech_profile.get('frameworks', [])
+            for fw in frameworks:
+                fw_lower = fw.lower()
+                if 'angular' in fw_lower:
+                    return 'angular'
+                if 'vue' in fw_lower:
+                    return 'vue'
+
         # Default to twig for unidentified {{ }} syntax (server-side)
-        # Note: This is a fallback - we should verify engine via fingerprinting ideally
         return 'twig'
 
     def _try_alternative_engine(self, current_engine: str) -> str:
@@ -2095,10 +2109,16 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
             logger.info(f"[{self.name}] Phase B: [{idx}/{len(self._dry_findings)}] Testing {url} param={parameter} engine={template_engine}")
 
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.started", {"agent": "CSTI", "param": parameter, "url": url, "engine": template_engine, "idx": idx, "total": len(self._dry_findings)})
+                self._v.reset("exploit.specialist.progress")
+
             # Check fingerprint to avoid re-emitting
             fingerprint = self._generate_csti_fingerprint(url, parameter, template_engine)
             if fingerprint in self._emitted_findings:
                 logger.debug(f"[{self.name}] Phase B: Skipping already emitted finding")
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.param.completed", {"agent": "CSTI", "param": parameter, "url": url, "idx": idx, "skipped": True})
                 continue
 
             # Execute 6-Level CSTI Escalation Pipeline
@@ -2108,6 +2128,9 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
                 if result and result.validated:
                     self._emitted_findings.add(fingerprint)
+
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.specialist.confirmed", {"agent": "CSTI", "param": parameter, "url": url, "engine": result.template_engine, "payload": result.payload[:100], "status": "VALIDATED_CONFIRMED"})
 
                     finding_dict = {
                         "url": result.url,
@@ -2147,6 +2170,9 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B: Escalation pipeline failed: {e}")
+            finally:
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.param.completed", {"agent": "CSTI", "param": parameter, "url": url, "idx": idx})
 
         logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
         return validated_findings
@@ -2289,6 +2315,8 @@ Different template engines represent different attack surfaces - NEVER merge fin
             # Check if template evaluation happened (7*7 = 49)
             # "49" in response AND "7*7" NOT in response AND not in baseline
             if "49" in response and "7*7" not in response and "49" not in baseline_html:
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.signature_match", {"agent": "CSTI", "param": param, "payload": probe[:100], "method": "smart_probe"})
                 dashboard.log(
                     f"[{self.name}] Smart probe: CONFIRMED CSTI on '{param}' ({{{{7*7}}}}=49)",
                     "INFO",
@@ -2582,6 +2610,8 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
         async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
             for i, payload in enumerate(all_payloads):
+                if hasattr(self, '_v'):
+                    self._v.progress("exploit.specialist.progress", {"agent": "CSTI", "param": param, "payload": payload[:80], "i": i, "total": len(all_payloads)}, every=50)
                 if i % 20 == 0 and i > 0:
                     dashboard.log(f"[{self.name}] L2: Progress {i}/{len(all_payloads)}", "DEBUG")
                 dashboard.set_current_payload(payload[:60], "CSTI L2", f"{i+1}/{len(all_payloads)}", self.name)
@@ -2593,6 +2623,8 @@ Different template engines represent different attack surfaces - NEVER merge fin
                 # Check for CSTI confirmation
                 confirmed, evidence = self._check_csti_confirmed(payload, response, baseline_html)
                 if confirmed:
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.specialist.signature_match", {"agent": "CSTI", "param": param, "payload": payload[:100], "method": "L2_static_bombing"})
                     confirmed_payloads.append(payload)
                     if not first_finding:
                         evidence["level"] = "L2"
@@ -2917,6 +2949,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("CSTI", self._scan_context)
 
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
 
@@ -2927,6 +2960,8 @@ Different template engines represent different attack surfaces - NEVER merge fin
         queue = queue_manager.get_queue("csti")
         initial_depth = queue.depth()
         report_specialist_start(self.name, queue_depth=initial_depth)
+
+        self._v.emit("exploit.specialist.started", {"agent": "CSTI", "queue_depth": initial_depth})
 
         # PHASE A: Analyze and deduplicate
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
@@ -2939,6 +2974,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
             report_specialist_done(self.name, processed=0, vulns=0)
+            self._v.emit("exploit.specialist.completed", {"agent": "CSTI", "processed": 0, "vulns": 0})
             return  # Terminate agent
 
         # PHASE B: Exploit DRY findings
@@ -2959,6 +2995,8 @@ Different template engines represent different attack surfaces - NEVER merge fin
             processed=len(dry_list),
             vulns=vulns_count
         )
+
+        self._v.emit("exploit.specialist.completed", {"agent": "CSTI", "processed": len(dry_list), "vulns": vulns_count})
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 

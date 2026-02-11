@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 *.so
 
+# Trash folder for temporary cleanup
+.trash/
+
 # Environment files (sensitive)
 .env
 .env.local
@@ -46,6 +49,12 @@ htmlcov/
 .tox/
 .ralph/
 
+# Build artifacts
+*.egg-info/
+
+# Go compiled binaries (recompile from tools/go-*-fuzzer/ source)
+bin/
+
 # Logs
 *.log
 logs/
@@ -79,7 +88,7 @@ PROJECT_REVIEW_SESSION_*.md
 # Alembic (exclude from public release)
 alembic.ini
 
-# Keep .agent/ and alembic/versions to preserve framework logic and DB schema
+# Keep alembic/versions to preserve DB schema
 
 # Internal testing/training tools (dojos, benchmarks)
 testing/

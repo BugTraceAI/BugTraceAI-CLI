@@ -16,6 +16,7 @@ from bugtrace.reporting.standards import (
     normalize_severity,
 )
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
+from bugtrace.core.verbose_events import create_emitter
 
 # v3.2.0: Import TechContextMixin for context-aware detection
 from bugtrace.agents.mixins.tech_context import TechContextMixin
@@ -272,6 +273,9 @@ class LFIAgent(BaseAgent, TechContextMixin):
                 ]
 
                 if any(sig in text for sig in signatures):
+                    if hasattr(self, '_v'):
+                        matched = next((s for s in signatures if s in text), "")
+                        self._v.emit("exploit.specialist.signature_match", {"agent": "LFI", "param": param, "payload": payload[:100], "signature": matched, "method": "payload_test"})
                     return True
 
         except Exception as e:
@@ -513,6 +517,10 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
 
             logger.info(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Testing {url}?{parameter}")
 
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.started", {"agent": "LFI", "param": parameter, "url": url, "idx": idx, "total": len(self._dry_findings)})
+                self._v.reset("exploit.specialist.progress")
+
             try:
                 self.url = url
                 result = await self._test_single_param_from_queue(url, parameter, finding)
@@ -524,6 +532,9 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
 
                     if fingerprint not in self._emitted_findings:
                         self._emitted_findings.add(fingerprint)
+
+                        if hasattr(self, '_v'):
+                            self._v.emit("exploit.specialist.confirmed", {"agent": "LFI", "param": parameter, "url": url, "payload": result.get("payload", "")[:100], "status": result.get("status", "")})
 
                         if settings.WORKER_POOL_EMIT_EVENTS:
                             status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
@@ -545,6 +556,9 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Attack failed: {e}")
                 continue
+            finally:
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.param.completed", {"agent": "LFI", "param": parameter, "url": url, "idx": idx})
 
         logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
 
@@ -603,6 +617,7 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("LFI", self._scan_context)
 
         # v3.2: Load context-aware tech stack for intelligent deduplication
         await self._load_lfi_tech_context()
@@ -613,6 +628,8 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
         queue = queue_manager.get_queue("lfi")
         initial_depth = queue.depth()
         report_specialist_start(self.name, queue_depth=initial_depth)
+
+        self._v.emit("exploit.specialist.started", {"agent": "LFI", "queue_depth": initial_depth})
 
         # PHASE A
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
@@ -625,6 +642,7 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
             report_specialist_done(self.name, processed=0, vulns=0)
+            self._v.emit("exploit.specialist.completed", {"agent": "LFI", "processed": 0, "vulns": 0})
             return
 
         # PHASE B
@@ -645,6 +663,8 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
             processed=len(dry_list),
             vulns=vulns_count
         )
+
+        self._v.emit("exploit.specialist.completed", {"agent": "LFI", "processed": len(dry_list), "vulns": vulns_count})
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
@@ -697,6 +717,86 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
         # Run validation using existing LFI testing logic
         return await self._test_single_param_from_queue(url, param, finding)
 
+    async def _smart_probe_lfi(self, url: str, param: str) -> Tuple[bool, Optional[Dict]]:
+        """
+        Smart probe: 1-2 requests to test if path traversal causes any behavioral change.
+
+        Sends basic traversal probes and compares against a baseline response.
+        - If file content signature found → direct confirmation (return finding)
+        - If behavioral change (status/length) → worth investigating (continue)
+        - If identical to baseline → skip all heavy testing
+
+        Returns:
+            (should_continue, finding_or_none)
+        """
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+
+        try:
+            async with orchestrator.session(DestinationType.TARGET) as session:
+                # Step 1: Get baseline (param with harmless value)
+                params[param] = ["btprobe_baseline"]
+                baseline_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path,
+                                           parsed.params, urlencode(params, doseq=True), parsed.fragment))
+                async with session.get(baseline_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    baseline_text = await resp.text()
+                    baseline_status = resp.status
+                    baseline_len = len(baseline_text)
+
+                # Step 2: Send traversal probes
+                lfi_signatures = ["root:x:0:0", "root:*:0:0", "[extensions]", "[fonts]",
+                                  "127.0.0.1 localhost", "PD9waH"]
+                probes = ["../../etc/passwd", "....//....//etc/passwd"]
+
+                for probe in probes:
+                    if hasattr(self, '_v'):
+                        self._v.progress("exploit.specialist.progress", {"agent": "LFI", "param": param, "payload": probe[:80]}, every=50)
+                    params[param] = [probe]
+                    probe_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path,
+                                            parsed.params, urlencode(params, doseq=True), parsed.fragment))
+
+                    async with session.get(probe_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        probe_text = await resp.text()
+                        probe_status = resp.status
+
+                        # Direct confirmation: file content signature
+                        if any(sig in probe_text for sig in lfi_signatures):
+                            if hasattr(self, '_v'):
+                                self._v.emit("exploit.specialist.signature_match", {"agent": "LFI", "param": param, "payload": probe[:100], "method": "smart_probe"})
+                            dashboard.log(f"[{self.name}] Smart probe: {param} confirmed LFI directly!", "SUCCESS")
+                            return True, {
+                                "validated": True,
+                                "url": url,
+                                "parameter": param,
+                                "type": "LFI",
+                                "payload": probe,
+                                "severity": "CRITICAL",
+                                "status": ValidationStatus.VALIDATED_CONFIRMED.value,
+                                "evidence": {
+                                    "method": "smart_probe",
+                                    "signature_found": True,
+                                    "file_content": probe_text[:500],
+                                },
+                                "http_request": f"GET {probe_url}",
+                            }
+
+                        # Behavioral change: different status or significant length diff
+                        if probe_status != baseline_status:
+                            dashboard.log(f"[{self.name}] Smart probe: {param} status change ({baseline_status}→{probe_status}), investigating", "INFO")
+                            return True, None
+
+                        if abs(len(probe_text) - baseline_len) > 50:
+                            dashboard.log(f"[{self.name}] Smart probe: {param} length change ({baseline_len}→{len(probe_text)}), investigating", "INFO")
+                            return True, None
+
+                # No change at all
+                dashboard.log(f"[{self.name}] Smart probe: {param} no traversal behavior, skipping", "INFO")
+                return False, None
+
+        except Exception as e:
+            logger.debug(f"[{self.name}] Smart probe error for {param}: {e}")
+            return True, None  # On error, continue testing (be safe)
+
     async def _test_single_param_from_queue(
         self, url: str, param: str, finding: dict
     ) -> Optional[Dict]:
@@ -706,10 +806,21 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
         Uses existing validation pipeline optimized for queue processing.
         """
         try:
+            # Smart probe: skip if no traversal behavior detected
+            should_continue, direct_finding = await self._smart_probe_lfi(url, param)
+            if direct_finding:
+                return direct_finding
+            if not should_continue:
+                return None
+
             # High-Performance Go Fuzzer first
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.go_fuzzer", {"agent": "LFI", "param": param, "url": url})
             go_result = await external_tools.run_go_lfi_fuzzer(url, param)
             if go_result and go_result.get("hits"):
                 hit = go_result["hits"][0]
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.signature_match", {"agent": "LFI", "param": param, "payload": hit.get("payload", "")[:100], "method": "go_fuzzer"})
                 return self._create_lfi_finding_from_hit(hit, param)
 
             # Fallback to PHP wrappers

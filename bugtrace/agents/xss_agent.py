@@ -38,6 +38,7 @@ from bugtrace.tools.headless import detect_dom_xss
 from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
 from bugtrace.core.queue import queue_manager
 from bugtrace.core.event_bus import EventType
+from bugtrace.core.verbose_events import create_emitter
 
 # Import framework's WAF intelligence (Q-Learning based)
 from bugtrace.tools.waf import waf_fingerprinter, strategy_router, encoding_techniques
@@ -2712,6 +2713,8 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
             if self._detected_waf:
                 logger.info(f"[{self.name}] 🛡️ WAF Detected: {waf_name} ({confidence:.0%} confidence)")
                 dashboard.log(f"[{self.name}] 🛡️ WAF Detected: {waf_name} ({confidence:.0%})", "INFO")
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.xss.waf_detected", {"waf": waf_name, "confidence": round(confidence, 2)})
 
             return waf_name, confidence
         except Exception as e:
@@ -2934,6 +2937,8 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
             urls_to_test = [self.url]
             if hasattr(self, '_discovered_internal_urls') and self._discovered_internal_urls:
                 urls_to_test.extend(self._discovered_internal_urls)
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.dom.started", {"url": self.url, "urls_count": len(urls_to_test)})
             logger.info(f"[{self.name}] DOM XSS scanning {len(urls_to_test)} URLs")
 
             # Gap 3 Fix: Pass discovered param names so DOM XSS tests each param individually
@@ -3000,6 +3005,9 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
                     f"[{self.name}] ✅ DOM XSS CONFIRMED via hook: {sink} (param: {param_name})",
                     "SUCCESS"
                 )
+
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.dom.result", {"url": self.url, "candidates": len(dom_findings), "confirmed": confirmed_count})
 
             if confirmed_count > 0:
                 dashboard.log(
@@ -3631,6 +3639,9 @@ Return ONLY the payloads, one per line, no explanations."""
                     logger.info(f"[{self.name}] LLM strategy for '{param_name}': {attack_strategy}")
 
                 logger.info(f"[{self.name}] [{idx}/{len(self._dry_findings)}] Testing '{param_name}' on {self.url} (method: {http_method}, context: {finding_context})")
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.xss.param.started", {"param": param_name, "url": self.url, "index": idx, "total": len(self._dry_findings), "context": finding_context, "method": http_method})
+                    self._v.reset("exploit.xss.level.progress")
 
                 # v3.4: 6-Level Escalation Pipeline
                 result = await self._xss_escalation_pipeline(
@@ -3659,6 +3670,10 @@ Return ONLY the payloads, one per line, no explanations."""
                             needs_cdp=needs_cdp
                         )
                         logger.info(f"[{self.name}] ✅ Emitted XSS: {self.url}?{param_name} (level: {result.evidence.get('level', '?')}, context: {result.context or 'html'})")
+                        if hasattr(self, '_v'):
+                            self._v.emit("exploit.xss.confirmed", {"param": param_name, "url": self.url, "level": result.evidence.get("level", "unknown"), "context": result.context or "html", "payload": result.payload[:80]})
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.xss.param.completed", {"param": param_name, "url": self.url, "confirmed": bool(result and result.validated)})
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: {e}")
         logger.info(f"[{self.name}] Phase B complete: {len(validated)} validated")
@@ -3724,7 +3739,12 @@ Return ONLY the payloads, one per line, no explanations."""
 
         # ===== L0.5: SMART PROBE =====
         dashboard.log(f"[{self.name}] L0.5: Smart probe on '{param}' (context: {context})", "INFO")
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.xss.level.started", {"level": "L0.5", "param": param, "context": context})
         smart_result, reflects, smart_ctx = await self._escalation_l05_smart_probe(url, param, context)
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.xss.probe.result", {"param": param, "reflects": reflects, "context": smart_ctx or context})
+            self._v.emit("exploit.xss.level.completed", {"level": "L0.5", "param": param, "confirmed": bool(smart_result and smart_result.validated)})
         if smart_result and smart_result.validated:
             return _tag_method(smart_result)
         if not reflects:
@@ -3735,7 +3755,11 @@ Return ONLY the payloads, one per line, no explanations."""
 
         # ===== L1: POLYGLOT PROBE =====
         dashboard.log(f"[{self.name}] L1: Polyglot probe on '{param}' (context: {context})", "INFO")
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.xss.level.started", {"level": "L1", "param": param, "context": context})
         result, detected_context, l1_snippet = await self._escalation_l1_polyglot(url, param, interactsh_url, context)
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.xss.level.completed", {"level": "L1", "param": param, "confirmed": bool(result and result.validated)})
         if result and result.validated:
             return _tag_method(result)
         # L1 may refine the context from live response analysis
@@ -3746,10 +3770,20 @@ Return ONLY the payloads, one per line, no explanations."""
 
         # ===== L2: BOMBING 1 - STATIC PAYLOADS =====
         dashboard.log(f"[{self.name}] L2: Static bombardment on '{param}' (context: {context})", "INFO")
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.xss.level.started", {"level": "L2", "param": param, "context": context})
         result, l2_reflecting = await self._escalation_l2_static_bombing(url, param, interactsh_url, context)
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.xss.level.completed", {"level": "L2", "param": param, "confirmed": bool(result and result.validated), "reflecting": len(l2_reflecting)})
         if result and result.validated:
             return _tag_method(result)
         reflecting_payloads.extend(l2_reflecting)
+
+        # ── DEPTH GATE: quick stops after L2 ──
+        _depth = getattr(self, '_scan_depth', '') or settings.SCAN_DEPTH
+        if _depth == "quick":
+            logger.info(f"[{self.name}] Quick depth: stopping at L2 for '{param}'")
+            return None
 
         # ===== SKIP L3+L4 if L2 found 0 reflecting payloads =====
         if not reflecting_payloads:
@@ -3757,26 +3791,44 @@ Return ONLY the payloads, one per line, no explanations."""
         else:
             # ===== L3: BOMBING 2 - LLM PAYLOADS × BREAKOUTS =====
             dashboard.log(f"[{self.name}] L3: LLM bombardment on '{param}' (context: {context})", "INFO")
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.level.started", {"level": "L3", "param": param, "context": context})
             result, l3_reflecting = await self._escalation_l3_llm_bombing(
                 url, param, interactsh_url, reflecting_payloads,
                 context=context, probe_snippet=probe_snippet
             )
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.level.completed", {"level": "L3", "param": param, "confirmed": bool(result and result.validated), "reflecting": len(l3_reflecting)})
             if result and result.validated:
                 return _tag_method(result)
             reflecting_payloads.extend(l3_reflecting)
 
             # ===== L4: HTTP MANIPULATOR =====
             dashboard.log(f"[{self.name}] L4: HTTP Manipulator on '{param}'", "INFO")
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.level.started", {"level": "L4", "param": param})
             result, l4_reflecting = await self._escalation_l4_http_manipulator(url, param)
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.level.completed", {"level": "L4", "param": param, "confirmed": bool(result and result.validated), "reflecting": len(l4_reflecting)})
             if result and result.validated:
                 return _tag_method(result)
             reflecting_payloads.extend(l4_reflecting)
+
+        # ── DEPTH GATE: only thorough runs browser validation ──
+        _depth = getattr(self, '_scan_depth', '') or settings.SCAN_DEPTH
+        if _depth != "thorough":
+            logger.info(f"[{self.name}] {_depth.title()} depth: skipping browser validation for '{param}'")
+            return None
 
         # ===== L5: BROWSER TESTING (Playwright) =====
         # Skip for POST params (Playwright form submission not supported yet)
         if reflecting_payloads and http_method == "GET":
             dashboard.log(f"[{self.name}] L5: Browser testing {len(reflecting_payloads)} candidates on '{param}'", "INFO")
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.level.started", {"level": "L5", "param": param, "candidates": len(reflecting_payloads)})
             result = await self._escalation_l5_browser(url, param, reflecting_payloads, screenshots_dir)
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.level.completed", {"level": "L5", "param": param, "confirmed": bool(result and result.validated)})
             if result and result.validated:
                 return _tag_method(result)
         elif reflecting_payloads and http_method == "POST":
@@ -3785,7 +3837,11 @@ Return ONLY the payloads, one per line, no explanations."""
         # ===== L6: CDP VALIDATION (AgenticValidator) =====
         if reflecting_payloads:
             dashboard.log(f"[{self.name}] L6: Flagging for CDP AgenticValidator on '{param}'", "INFO")
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.level.started", {"level": "L6", "param": param, "candidates": len(reflecting_payloads)})
             result = await self._escalation_l6_cdp(url, param, reflecting_payloads)
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.level.completed", {"level": "L6", "param": param, "flagged": bool(result)})
             if result:
                 return _tag_method(result)
 
@@ -3939,6 +3995,8 @@ Return ONLY the payloads, one per line, no explanations."""
             try:
                 interactions = await self.interactsh.poll()
                 if interactions:
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.xss.interactsh.callback", {"param": param, "level": "L1", "interactions": len(interactions)})
                     return XSSFinding(
                         url=url, parameter=param, payload=probe, context="oob",
                         validation_method="L1_interactsh", evidence={"oob": True, "level": "L1"},
@@ -4053,6 +4111,9 @@ Return ONLY the payloads, one per line, no explanations."""
         import time
         start = time.time()
 
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.xss.go_fuzzer.started", {"param": param, "payload_count": len(payloads)})
+
         # Step 1: Go mass fuzzing (all payloads in parallel)
         go_result = await self._go_bridge.run(
             url=url, param=param, payloads=payloads
@@ -4060,6 +4121,9 @@ Return ONLY the payloads, one per line, no explanations."""
 
         go_duration = time.time() - start
         reflecting_payloads = [r.payload for r in (go_result.reflections or [])]
+
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.xss.go_fuzzer.completed", {"param": param, "total_requests": go_result.total_requests, "reflecting": len(reflecting_payloads), "duration_s": round(go_duration, 1), "rps": round(go_result.requests_per_second)})
 
         logger.info(
             f"[{self.name}] L2-Go: {go_result.total_requests} payloads tested in "
@@ -4145,6 +4209,8 @@ Return ONLY the payloads, one per line, no explanations."""
         for i, payload in enumerate(payloads):
             if i % 50 == 0 and i > 0:
                 dashboard.log(f"[{self.name}] L2: Progress {i}/{len(payloads)}", "DEBUG")
+            if hasattr(self, '_v'):
+                self._v.progress("exploit.xss.level.progress", {"level": "L2", "param": param, "total": len(payloads)}, every=50)
             dashboard.set_current_payload(payload[:60], "XSS L2", f"{i+1}/{len(payloads)}", self.name)
 
             response = await self._send_payload(param, payload)
@@ -4181,6 +4247,8 @@ Return ONLY the payloads, one per line, no explanations."""
             try:
                 interactions = await self.interactsh.poll()
                 if interactions:
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.xss.interactsh.callback", {"param": param, "level": "L2", "interactions": len(interactions)})
                     for rp in reflecting:
                         if "interactsh" in rp.lower():
                             return XSSFinding(
@@ -4217,6 +4285,9 @@ Return ONLY the payloads, one per line, no explanations."""
             html_snippet=html_snippet
         )
 
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.xss.llm_payloads", {"param": param, "count": len(visual_payloads) if visual_payloads else 0, "context": sample_context})
+
         if not visual_payloads:
             logger.info(f"[{self.name}] L3: LLM generated 0 payloads, skipping")
             return None, []
@@ -4238,6 +4309,8 @@ Return ONLY the payloads, one per line, no explanations."""
         for i, payload in enumerate(amplified):
             if i % 100 == 0 and i > 0:
                 dashboard.log(f"[{self.name}] L3: Progress {i}/{len(amplified)}", "DEBUG")
+            if hasattr(self, '_v'):
+                self._v.progress("exploit.xss.level.progress", {"level": "L3", "param": param, "total": len(amplified)}, every=50)
             dashboard.set_current_payload(payload[:60], "XSS L3", f"{i+1}/{len(amplified)}", self.name)
 
             response = await self._send_payload(param, payload)
@@ -4289,6 +4362,9 @@ Return ONLY the payloads, one per line, no explanations."""
                 enable_agentic_fallback=True,
                 enable_llm_expansion=True
             )
+
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.manipulator.phase", {"param": param, "phase": "process_finding", "strategies": ["PAYLOAD_INJECTION", "BYPASS_WAF"]})
 
             success, mutation = await manipulator.process_finding(
                 base_request,
@@ -4356,9 +4432,13 @@ Return ONLY the payloads, one per line, no explanations."""
 
         for i, payload in enumerate(candidates):
             dashboard.set_current_payload(payload[:60], "XSS L5 Browser", f"{i+1}/{len(candidates)}", self.name)
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.browser.testing", {"param": param, "index": i + 1, "total": len(candidates), "payload": payload[:80]})
             try:
                 browser_result = await self._validate_via_browser(url, param, payload)
                 if browser_result:
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.xss.browser.result", {"param": param, "confirmed": True, "method": browser_result.get("method", "playwright")})
                     return XSSFinding(
                         url=url, parameter=param, payload=payload, context="dom",
                         validation_method="L5_browser", evidence={**browser_result, "level": "L5"},
@@ -4367,6 +4447,8 @@ Return ONLY the payloads, one per line, no explanations."""
             except Exception as e:
                 logger.debug(f"[{self.name}] L5: Browser test {i+1} failed: {e}")
 
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.xss.browser.result", {"param": param, "confirmed": False, "tested": len(candidates)})
         logger.info(f"[{self.name}] L5: 0/{len(candidates)} confirmed in browser for '{param}'")
         return None
 
@@ -4428,6 +4510,7 @@ Return ONLY the payloads, one per line, no explanations."""
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("XSSAgent", self._scan_context)
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
 
         # v3.2: Load context-aware tech stack for intelligent deduplication
@@ -4437,6 +4520,7 @@ Return ONLY the payloads, one per line, no explanations."""
         queue = queue_manager.get_queue("xss")
         initial_depth = queue.depth()
         report_specialist_start(self.name, queue_depth=initial_depth)
+        self._v.emit("exploit.xss.started", {"queue_depth": initial_depth})
 
         dry_list = await self.analyze_and_dedup_queue()
 
@@ -4447,6 +4531,7 @@ Return ONLY the payloads, one per line, no explanations."""
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
             report_specialist_done(self.name, processed=0, vulns=0)
+            self._v.emit("exploit.xss.completed", {"processed": 0, "vulns": 0, "reason": "empty_dry_list"})
             return
 
         results = await self.exploit_dry_list()
@@ -4466,6 +4551,7 @@ Return ONLY the payloads, one per line, no explanations."""
             processed=len(dry_list),
             vulns=vulns_count
         )
+        self._v.emit("exploit.xss.completed", {"processed": len(dry_list), "vulns": vulns_count})
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
     async def _load_xss_tech_context(self) -> None:
@@ -6869,6 +6955,8 @@ Response Format (XML-Like):
         if hit_data:
             evidence["interactsh_hit"] = True
             evidence["interactions"] = [hit_data]
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.xss.interactsh.callback", {"param": param, "level": "oob_check"})
             dashboard.log(f"[{self.name}] 🚨 OOB INTERACTION DETECTED!", "CRITICAL")
             return True
 

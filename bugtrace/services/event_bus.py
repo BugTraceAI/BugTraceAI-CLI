@@ -79,26 +79,46 @@ class ServiceEventBus:
         # Lock for thread-safe history/queue operations
         self._lock = asyncio.Lock()
 
-        # History cap to prevent memory leaks (1000 events per scan)
-        self._max_history_per_scan = 1000
+        # History cap to prevent memory leaks (5000 events per scan for verbose mode)
+        self._max_history_per_scan = 5000
 
         # Bridge core event bus events into scan-scoped streams
         self._install_bridge()
 
         logger.info("Service Event Bus initialized")
 
+    # Verbose event prefixes bridged via wildcard pattern matching
+    _VERBOSE_PREFIXES = [
+        "pipeline.*", "recon.*", "discovery.*", "strategy.*",
+        "exploit.*", "validation.*", "reporting.*",
+    ]
+
     def _install_bridge(self):
         """Subscribe to core event bus events and forward them to scan-scoped streams."""
+        # Explicit subscriptions for existing events (backward compat)
         for event_name in self._BRIDGED_EVENTS:
-            # Use closure to capture event_name for each handler
             handler = self._make_bridge_handler(event_name)
             self._core_bus.subscribe(event_name, handler)
+
+        # Wildcard bridge for verbose events (e.g., "exploit.*" matches "exploit.xss.level.started")
+        for prefix in self._VERBOSE_PREFIXES:
+            handler = self._make_pattern_bridge_handler(prefix)
+            self._core_bus.subscribe_pattern(prefix, handler)
 
     def _make_bridge_handler(self, event_name: str) -> Callable:
         """Create a bridge handler closure that captures the event name."""
         async def handler(data: Dict[str, Any]):
             await self._bridge_event(event_name, data)
         handler.__name__ = f"bridge_{event_name}"
+        return handler
+
+    def _make_pattern_bridge_handler(self, prefix: str) -> Callable:
+        """Create a pattern bridge handler that reads _event from data payload."""
+        async def handler(data: Dict[str, Any]):
+            # VerboseEventEmitter always includes _event in payload
+            event_name = data.get("_event", prefix)
+            await self._bridge_event(event_name, data)
+        handler.__name__ = f"bridge_{prefix.replace('*', 'all').replace('.', '_')}"
         return handler
 
     def subscribe(self, event: str, handler: Callable) -> None:
@@ -184,6 +204,14 @@ class ServiceEventBus:
 
         if event in event_type_mapping:
             return event_type_mapping[event]
+
+        # Verbose events (dotted names) pass through as their own type
+        if "." in event:
+            prefix = event.split(".")[0]
+            if prefix in ("pipeline", "recon", "discovery", "strategy",
+                          "exploit", "validation", "reporting"):
+                return event
+
         if "agent" in event:
             return "agent_active"
         if "finding" in event:

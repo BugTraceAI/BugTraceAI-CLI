@@ -18,7 +18,8 @@ logger = get_logger("core.config")
 VALID_PROVIDERS = [
     'google', 'openai', 'anthropic', 'meta', 'mistral',
     'qwen', 'deepseek', 'x-ai', 'cohere', 'perplexity',
-    'nvidia', 'ai21', 'together', 'fireworks', 'groq'
+    'nvidia', 'ai21', 'together', 'fireworks', 'groq',
+    'moonshotai',
 ]
 
 # Placeholder values that should be rejected
@@ -204,7 +205,9 @@ class Settings(BaseSettings):
 
     @field_validator('DEFAULT_MODEL', 'CODE_MODEL', 'ANALYSIS_MODEL', 'MUTATION_MODEL',
                      'SKEPTICAL_MODEL', 'VISION_MODEL', 'ANALYSIS_PENTESTER_MODEL',
-                     'ANALYSIS_BUG_BOUNTY_MODEL', 'ANALYSIS_AUDITOR_MODEL', 'VALIDATION_VISION_MODEL')
+                     'ANALYSIS_BUG_BOUNTY_MODEL', 'ANALYSIS_AUDITOR_MODEL',
+                     'ANALYSIS_RED_TEAM_MODEL', 'ANALYSIS_RESEARCHER_MODEL',
+                     'VALIDATION_VISION_MODEL')
     @classmethod
     def validate_model_name(cls, v, info):
         """Validate model name format (TASK-119)."""
@@ -293,12 +296,15 @@ class Settings(BaseSettings):
     CRITICAL_TYPES: str = "SQLi,RCE,XXE"
     MANDATORY_SQLMAP_VALIDATION: bool = True
     SKIP_VALIDATED_PARAMS: bool = True
-    
+    SCAN_DEPTH: str = "standard"  # quick, standard, thorough
+
     # --- ANALYSIS Configuration (Multi-Model URL Analysis) ---
     ANALYSIS_ENABLE: bool = True
     ANALYSIS_PENTESTER_MODEL: str = "moonshotai/kimi-k2-thinking"
     ANALYSIS_BUG_BOUNTY_MODEL: str = "moonshotai/kimi-k2-thinking"
     ANALYSIS_AUDITOR_MODEL: str = "moonshotai/kimi-k2-thinking"
+    ANALYSIS_RED_TEAM_MODEL: str = "google/gemini-3-flash-preview"
+    ANALYSIS_RESEARCHER_MODEL: str = "google/gemini-3-flash-preview"
     ANALYSIS_CONFIDENCE_THRESHOLD: float = 0.7
     ANALYSIS_SKIP_THRESHOLD: float = 0.3
     ANALYSIS_CONSENSUS_VOTES: int = 2
@@ -373,14 +379,29 @@ class Settings(BaseSettings):
 
 
 
+    def _load_core_config(self, config):
+        """Load CORE section config (DEBUG, SAFE_MODE)."""
+        if "CORE" not in config:
+            return
+        section = config["CORE"]
+        if "DEBUG" in section:
+            self.DEBUG = section.getboolean("DEBUG")
+        if "SAFE_MODE" in section:
+            self.SAFE_MODE = section.getboolean("SAFE_MODE")
+
     def _load_crawler_config(self, config):
         """Load CRAWLER section config."""
         if "CRAWLER" not in config:
             return
-        if "EXCLUDE_EXTENSIONS" in config["CRAWLER"]:
-            self.CRAWLER_EXCLUDE_EXTENSIONS = config["CRAWLER"]["EXCLUDE_EXTENSIONS"]
-        if "INCLUDE_EXTENSIONS" in config["CRAWLER"]:
-            self.CRAWLER_INCLUDE_EXTENSIONS = config["CRAWLER"]["INCLUDE_EXTENSIONS"]
+        section = config["CRAWLER"]
+        if "EXCLUDE_EXTENSIONS" in section:
+            self.CRAWLER_EXCLUDE_EXTENSIONS = section["EXCLUDE_EXTENSIONS"]
+        if "INCLUDE_EXTENSIONS" in section:
+            self.CRAWLER_INCLUDE_EXTENSIONS = section["INCLUDE_EXTENSIONS"]
+        if "SPA_WAIT_MS" in section:
+            self.SPA_WAIT_MS = section.getint("SPA_WAIT_MS")
+        if "MAX_QUEUE_SIZE" in section:
+            self.MAX_QUEUE_SIZE = section.getint("MAX_QUEUE_SIZE")
 
     def _load_scan_config(self, config):
         """Load SCAN section config."""
@@ -463,6 +484,9 @@ class Settings(BaseSettings):
         if "MUTATION_MODEL" in section: self.MUTATION_MODEL = section["MUTATION_MODEL"]
         if "ANALYSIS_MODEL" in section: self.ANALYSIS_MODEL = section["ANALYSIS_MODEL"]
         if "SKEPTICAL_MODEL" in section: self.SKEPTICAL_MODEL = section["SKEPTICAL_MODEL"]
+        if "REPORTING_MODEL" in section: self.REPORTING_MODEL = section["REPORTING_MODEL"]
+        if "MIN_CREDITS" in section:
+            self.MIN_CREDITS = section.getfloat("MIN_CREDITS")
         if "MAX_CONCURRENT_REQUESTS" in section:
             self.MAX_CONCURRENT_REQUESTS = section.getint("MAX_CONCURRENT_REQUESTS")
 
@@ -492,6 +516,10 @@ class Settings(BaseSettings):
                 self.MANDATORY_SQLMAP_VALIDATION = section.getboolean("MANDATORY_SQLMAP_VALIDATION")
             if "SKIP_VALIDATED_PARAMS" in section:
                 self.SKIP_VALIDATED_PARAMS = section.getboolean("SKIP_VALIDATED_PARAMS")
+            if "SCAN_DEPTH" in section:
+                val = section["SCAN_DEPTH"].strip().lower()
+                if val in ("quick", "standard", "thorough"):
+                    self.SCAN_DEPTH = val
 
     def _load_authority_config(self, config):
         """Load AUTHORITY section config."""
@@ -533,6 +561,88 @@ class Settings(BaseSettings):
         if "TOKEN_FILE" in section:
             self.ANTHROPIC_TOKEN_FILE = section["TOKEN_FILE"].strip()
 
+    def _load_browser_advanced_config(self, config):
+        """Load BROWSER_ADVANCED section config."""
+        if "BROWSER_ADVANCED" not in config:
+            return
+        section = config["BROWSER_ADVANCED"]
+        if "USER_AGENT" in section:
+            self.USER_AGENT = section["USER_AGENT"]
+        if "VIEWPORT_WIDTH" in section:
+            self.VIEWPORT_WIDTH = section.getint("VIEWPORT_WIDTH")
+        if "VIEWPORT_HEIGHT" in section:
+            self.VIEWPORT_HEIGHT = section.getint("VIEWPORT_HEIGHT")
+        if "TIMEOUT_MS" in section:
+            self.TIMEOUT_MS = section.getint("TIMEOUT_MS")
+
+    def _load_validation_config(self, config):
+        """Load VALIDATION section config for Vision-Based XSS Validation."""
+        if "VALIDATION" not in config:
+            return
+        section = config["VALIDATION"]
+        if "VISION_MODEL" in section:
+            self.VALIDATION_VISION_MODEL = section["VISION_MODEL"]
+        if "VISION_ENABLED" in section:
+            self.VALIDATION_VISION_ENABLED = section.getboolean("VISION_ENABLED")
+        if "VISION_ONLY_FOR_XSS" in section:
+            self.VALIDATION_VISION_ONLY_FOR_XSS = section.getboolean("VISION_ONLY_FOR_XSS")
+        if "MAX_VISION_CALLS_PER_URL" in section:
+            self.VALIDATION_MAX_VISION_CALLS_PER_URL = section.getint("MAX_VISION_CALLS_PER_URL")
+
+    def _load_qlearning_config(self, config):
+        """Load QLEARNING section config for WAF bypass system."""
+        if "QLEARNING" not in config:
+            return
+        section = config["QLEARNING"]
+        if "INITIAL_EPSILON" in section:
+            self.WAF_QLEARNING_INITIAL_EPSILON = section.getfloat("INITIAL_EPSILON")
+        if "MIN_EPSILON" in section:
+            self.WAF_QLEARNING_MIN_EPSILON = section.getfloat("MIN_EPSILON")
+        if "DECAY_RATE" in section:
+            self.WAF_QLEARNING_DECAY_RATE = section.getfloat("DECAY_RATE")
+        if "UCB_CONSTANT" in section:
+            self.WAF_QLEARNING_UCB_CONSTANT = section.getfloat("UCB_CONSTANT")
+        if "MAX_BACKUPS" in section:
+            self.WAF_QLEARNING_MAX_BACKUPS = section.getint("MAX_BACKUPS")
+
+    def _load_manipulator_config(self, config):
+        """Load MANIPULATOR section config for HTTP Exploitation Tool."""
+        if "MANIPULATOR" not in config:
+            return
+        section = config["MANIPULATOR"]
+        if "GLOBAL_RATE_LIMIT" in section:
+            self.MANIPULATOR_GLOBAL_RATE_LIMIT = section.getfloat("GLOBAL_RATE_LIMIT")
+        if "USE_GLOBAL_RATE_LIMITER" in section:
+            self.MANIPULATOR_USE_GLOBAL_RATE_LIMITER = section.getboolean("USE_GLOBAL_RATE_LIMITER")
+        if "ENABLE_LLM_EXPANSION" in section:
+            self.MANIPULATOR_ENABLE_LLM_EXPANSION = section.getboolean("ENABLE_LLM_EXPANSION")
+        if "ENABLE_AGENTIC_FALLBACK" in section:
+            self.MANIPULATOR_ENABLE_AGENTIC_FALLBACK = section.getboolean("ENABLE_AGENTIC_FALLBACK")
+        if "BREAKOUT_PRIORITY_LEVEL" in section:
+            self.MANIPULATOR_BREAKOUT_PRIORITY_LEVEL = section.getint("BREAKOUT_PRIORITY_LEVEL")
+        if "MAX_LLM_PAYLOADS" in section:
+            self.MANIPULATOR_MAX_LLM_PAYLOADS = section.getint("MAX_LLM_PAYLOADS")
+
+    def _load_asset_discovery_config(self, config):
+        """Load ASSET_DISCOVERY section config."""
+        if "ASSET_DISCOVERY" not in config:
+            return
+        section = config["ASSET_DISCOVERY"]
+        if "ENABLE_ASSET_DISCOVERY" in section:
+            self.ENABLE_ASSET_DISCOVERY = section.getboolean("ENABLE_ASSET_DISCOVERY")
+        if "ENABLE_DNS_ENUMERATION" in section:
+            self.ENABLE_DNS_ENUMERATION = section.getboolean("ENABLE_DNS_ENUMERATION")
+        if "ENABLE_CERTIFICATE_TRANSPARENCY" in section:
+            self.ENABLE_CERTIFICATE_TRANSPARENCY = section.getboolean("ENABLE_CERTIFICATE_TRANSPARENCY")
+        if "ENABLE_WAYBACK_DISCOVERY" in section:
+            self.ENABLE_WAYBACK_DISCOVERY = section.getboolean("ENABLE_WAYBACK_DISCOVERY")
+        if "ENABLE_CLOUD_STORAGE_ENUM" in section:
+            self.ENABLE_CLOUD_STORAGE_ENUM = section.getboolean("ENABLE_CLOUD_STORAGE_ENUM")
+        if "ENABLE_COMMON_PATHS" in section:
+            self.ENABLE_COMMON_PATHS = section.getboolean("ENABLE_COMMON_PATHS")
+        if "MAX_SUBDOMAINS" in section:
+            self.MAX_SUBDOMAINS = section.getint("MAX_SUBDOMAINS")
+
     def _load_paths_config(self, config):
         """Load PATHS section config for LOG_DIR and REPORT_DIR.
 
@@ -559,6 +669,10 @@ class Settings(BaseSettings):
                 self.ANALYSIS_BUG_BOUNTY_MODEL = section["BUG_BOUNTY_MODEL"]
             if "AUDITOR_MODEL" in section:
                 self.ANALYSIS_AUDITOR_MODEL = section["AUDITOR_MODEL"]
+            if "RED_TEAM_MODEL" in section:
+                self.ANALYSIS_RED_TEAM_MODEL = section["RED_TEAM_MODEL"]
+            if "RESEARCHER_MODEL" in section:
+                self.ANALYSIS_RESEARCHER_MODEL = section["RESEARCHER_MODEL"]
             if "CONFIDENCE_THRESHOLD" in section:
                 self.ANALYSIS_CONFIDENCE_THRESHOLD = section.getfloat("CONFIDENCE_THRESHOLD")
             if "SKIP_THRESHOLD" in section:
@@ -598,7 +712,9 @@ class Settings(BaseSettings):
             return
 
         config.read(conf_path)
-        # Load paths FIRST - other sections may depend on LOG_DIR/REPORT_DIR
+        # Load CORE first (DEBUG, SAFE_MODE)
+        self._load_core_config(config)
+        # Load paths early - other sections may depend on LOG_DIR/REPORT_DIR
         self._load_paths_config(config)
         self._load_crawler_config(config)
         self._load_scan_config(config)
@@ -611,6 +727,11 @@ class Settings(BaseSettings):
         self._load_authority_config(config)
         self._load_lonewolf_config(config)
         self._load_anthropic_config(config)
+        self._load_browser_advanced_config(config)
+        self._load_validation_config(config)
+        self._load_qlearning_config(config)
+        self._load_manipulator_config(config)
+        self._load_asset_discovery_config(config)
 
     # --- Configuration Validation (TASK-120) ---
     def validate_config(self) -> List[str]:
@@ -831,6 +952,15 @@ class Settings(BaseSettings):
     # HARDCODED: CDP client only supports 1 concurrent session (crashes with more)
     # Playwright can handle multiple, but AgenticValidator uses CDP exclusively
     MAX_CONCURRENT_VALIDATION: int = 1     # DO NOT CHANGE - CDP limitation
+
+    # --- Asset Discovery Configuration ---
+    ENABLE_ASSET_DISCOVERY: bool = False
+    ENABLE_DNS_ENUMERATION: bool = True
+    ENABLE_CERTIFICATE_TRANSPARENCY: bool = True
+    ENABLE_WAYBACK_DISCOVERY: bool = True
+    ENABLE_CLOUD_STORAGE_ENUM: bool = True
+    ENABLE_COMMON_PATHS: bool = True
+    MAX_SUBDOMAINS: int = 50
 
     # --- URL Prioritization (Phase 38: v3.0) ---
     URL_PRIORITIZATION_ENABLED: bool = True   # Enable/disable URL prioritization

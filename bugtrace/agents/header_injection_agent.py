@@ -27,6 +27,7 @@ from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
 from bugtrace.core.event_bus import EventType
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+from bugtrace.core.verbose_events import create_emitter
 
 # v3.2.0: Import TechContextMixin for context-aware detection
 from bugtrace.agents.mixins.tech_context import TechContextMixin
@@ -788,6 +789,10 @@ Focus on header name-only deduplication UNLESS parameters are different."""
 
             logger.info(f"[{self.name}] Phase B: [{idx}/{len(self._dry_findings)}] Testing {url} header={header_name}")
 
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.started", {"agent": "HeaderInjection", "param": parameter, "url": url, "idx": idx, "total": len(self._dry_findings)})
+                self._v.reset("exploit.specialist.progress")
+
             # Check fingerprint to avoid re-emitting
             fingerprint = self._generate_headerinjection_fingerprint(header_name)
             if fingerprint in self._emitted_findings:
@@ -815,6 +820,9 @@ Focus on header name-only deduplication UNLESS parameters are different."""
 
                     validated_findings.append(result)
 
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.specialist.signature_match", {"agent": "HeaderInjection", "param": parameter, "url": url, "header_name": result.get("header_name", header_name)})
+
                     # Emit event with validation
                     self._emit_header_injection_finding({
                         "type": "HEADER_INJECTION",
@@ -826,12 +834,18 @@ Focus on header name-only deduplication UNLESS parameters are different."""
                         "evidence": {"header_reflected": True},
                     }, scan_context=self._scan_context)
 
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.specialist.confirmed", {"agent": "HeaderInjection", "param": parameter, "url": url, "payload": result.get("payload", "")[:80]})
+
                     logger.info(f"[{self.name}] ✓ Header Injection confirmed: header={header_name}")
                 else:
                     logger.debug(f"[{self.name}] ✗ Header Injection not confirmed")
 
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B: Exploitation failed: {e}")
+
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.completed", {"agent": "HeaderInjection", "param": parameter, "url": url})
 
         logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
         return validated_findings
@@ -908,11 +922,13 @@ Focus on header name-only deduplication UNLESS parameters are different."""
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("HeaderInjection", self._scan_context)
 
         # v3.2: Load context-aware tech stack for intelligent deduplication
         await self._load_header_injection_tech_context()
 
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+        self._v.emit("exploit.specialist.started", {"agent": "HeaderInjection", "url": self.url})
 
         # Get initial queue depth for telemetry
         queue = queue_manager.get_queue("header_injection")
@@ -929,6 +945,8 @@ Focus on header name-only deduplication UNLESS parameters are different."""
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.completed", {"agent": "HeaderInjection", "dry_count": 0, "vulns": 0})
             report_specialist_done(self.name, processed=0, vulns=0)
             return  # Terminate agent
 
@@ -950,6 +968,13 @@ Focus on header name-only deduplication UNLESS parameters are different."""
             processed=len(dry_list),
             vulns=vulns_count
         )
+
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.specialist.completed", {
+                "agent": "HeaderInjection",
+                "dry_count": len(dry_list),
+                "vulns": vulns_count,
+            })
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
@@ -1003,11 +1028,77 @@ Focus on header name-only deduplication UNLESS parameters are different."""
         # Test parameter for CRLF injection
         return await self._test_parameter_from_queue(param)
 
+    async def _smart_probe_crlf(self, session: aiohttp.ClientSession, param: str) -> Tuple[bool, Optional[Dict]]:
+        """
+        Smart probe: 1 request to test if CRLF chars survive in response.
+
+        Sends a basic %0d%0a probe with a unique header marker.
+        - If marker appears in response headers → direct confirmation
+        - If marker appears in body → response splitting potential (continue)
+        - If neither → server sanitizes CRLF (skip all 11 payloads)
+
+        Returns:
+            (should_continue, finding_or_none)
+        """
+        probe_payload = f"%0d%0aBT-Probe:1"
+        test_url = self._build_test_url(param, probe_payload)
+
+        try:
+            req_headers = {"User-Agent": getattr(settings, 'USER_AGENT', 'BugTraceAI/2.4')}
+            req_headers.update(self.headers)
+
+            if self.cookies:
+                cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
+                req_headers["Cookie"] = cookie_str
+
+            async with session.get(
+                test_url,
+                headers=req_headers,
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=10),
+                ssl=False
+            ) as response:
+                resp_headers = dict(response.headers)
+                body = await response.text()
+
+                # Check 1: Marker in response headers (injection confirmed)
+                for header_name, header_value in resp_headers.items():
+                    if "bt-probe" in header_name.lower() or "bt-probe" in header_value.lower():
+                        dashboard.log(f"[{self.name}] Smart probe: {param} CRLF injection confirmed directly!", "SUCCESS")
+                        finding = self._create_finding(param, probe_payload, "BT-Probe", "header", header_name, header_value)
+                        return True, finding
+
+                # Check 2: Marker in body (response splitting)
+                if "bt-probe" in body.lower():
+                    dashboard.log(f"[{self.name}] Smart probe: {param} CRLF reflects in body, investigating", "INFO")
+                    return True, None
+
+                # No CRLF survival
+                dashboard.log(f"[{self.name}] Smart probe: {param} sanitizes CRLF, skipping", "INFO")
+                return False, None
+
+        except asyncio.TimeoutError:
+            logger.debug(f"[{self.name}] Smart probe timeout for {param}")
+            return True, None  # On timeout, continue testing
+        except Exception as e:
+            logger.debug(f"[{self.name}] Smart probe error for {param}: {e}")
+            return True, None  # On error, continue testing
+
     async def _test_parameter_from_queue(self, param: str) -> Optional[Dict]:
         """Test a single parameter from queue for CRLF injection."""
         try:
             async with orchestrator.session(DestinationType.TARGET) as session:
+                # Smart probe: skip if CRLF is sanitized
+                should_continue, direct_finding = await self._smart_probe_crlf(session, param)
+                if direct_finding:
+                    return direct_finding
+                if not should_continue:
+                    return None
+
                 for payload in self.CRLF_PAYLOADS:
+                    if hasattr(self, '_v'):
+                        self._v.progress("exploit.specialist.progress", {"agent": "HeaderInjection", "param": param, "payload": payload[:60]}, every=50)
+
                     test_url = self._build_test_url(param, payload)
                     finding = await self._check_injection(session, test_url, param, payload)
 

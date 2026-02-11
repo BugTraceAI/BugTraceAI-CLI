@@ -998,7 +998,7 @@ class DOMXSSDetector:
                     logger.info(f"[DOMXSSDetector] Static analysis: {src_name} → {sink_name} pattern on {url}")
                     findings.append(DOMXSSFinding(
                         url=url,
-                        payload="(static analysis - no runtime payload)",
+                        payload="(source-to-sink pattern detected via code analysis)",
                         sink=sink_name,
                         source=src_name,
                         evidence=f"Static analysis detected {src_name} → {sink_name} pattern in JavaScript. Manual verification recommended.",

@@ -17,6 +17,7 @@ from bugtrace.reporting.standards import (
     normalize_severity,
 )
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
+from bugtrace.core.verbose_events import create_emitter
 
 # v3.2.0: Import TechContextMixin for context-aware detection
 from bugtrace.agents.mixins.tech_context import TechContextMixin
@@ -364,7 +365,9 @@ Return ONLY a JSON object with an "ids" array:
                 return None
 
         # Test each candidate ID
-        for test_id in candidate_ids:
+        for payload_idx, test_id in enumerate(candidate_ids, 1):
+            if hasattr(self, '_v'):
+                self._v.progress("exploit.specialist.progress", {"agent": "IDOR", "param": param, "payload": str(test_id)[:60]}, every=50)
             test_url = self._inject(str(test_id), param, original_value)
 
             try:
@@ -382,6 +385,8 @@ Return ONLY a JSON object with an "ids" array:
                 )
 
                 if is_idor:
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.specialist.signature_match", {"agent": "IDOR", "param": param, "test_id": test_id, "severity": severity, "indicators": indicators})
                     # LLM validation for MEDIUM severity (if enabled)
                     if severity == "MEDIUM" and settings.IDOR_ENABLE_LLM_VALIDATION:
                         logger.info(f"[{self.name}] 🧠 MEDIUM severity detected, using LLM for validation...")
@@ -1179,6 +1184,8 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
         # ===== PHASE 4: High-Performance Go IDOR Fuzzer (numeric range fallback) =====
         id_range = settings.IDOR_ID_RANGE
         dashboard.log(f"[{self.name}] 🚀 Launching Go IDOR Fuzzer on '{param}' (Range {id_range})...", "INFO")
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.specialist.go_fuzzer", {"agent": "IDOR", "param": param, "id_range": id_range})
         go_result = await external_tools.run_go_idor_fuzzer(self.url, param, id_range=id_range, baseline_id=original_value)
 
         self._tested_params.add(key)
@@ -1575,6 +1582,10 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
 
             logger.info(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Testing {url}?{parameter}")
 
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.started", {"agent": "IDOR", "param": parameter, "url": url, "idx": idx, "total": len(self._dry_findings)})
+                self._v.reset("exploit.specialist.progress")
+
             try:
                 self.url = url
                 result = await self._test_single_param_from_queue(url, parameter, original_value, finding_data.get("finding", {}))
@@ -1616,12 +1627,18 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
                             }, scan_context=self._scan_context)
 
                         logger.info(f"[{self.name}] ✅ Emitted unique IDOR finding: {url}?{parameter}")
+
+                        if hasattr(self, '_v'):
+                            self._v.emit("exploit.specialist.confirmed", {"agent": "IDOR", "param": parameter, "url": url, "severity": result.get("severity")})
                     else:
                         logger.debug(f"[{self.name}] ⏭️  Skipped duplicate: {fingerprint}")
 
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Attack failed: {e}")
                 continue
+            finally:
+                if hasattr(self, '_v'):
+                    self._v.emit("exploit.specialist.param.completed", {"agent": "IDOR", "param": parameter, "url": url, "idx": idx})
 
         logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
 
@@ -1680,6 +1697,7 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("IDORAgent", self._scan_context)
 
         # v3.2: Load context-aware tech stack for intelligent deduplication
         await self._load_idor_tech_context()
@@ -1690,6 +1708,8 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
         queue = queue_manager.get_queue("idor")
         initial_depth = queue.depth()
         report_specialist_start(self.name, queue_depth=initial_depth)
+
+        self._v.emit("exploit.specialist.started", {"agent": "IDOR", "queue_depth": initial_depth})
 
         # PHASE A: ANALYSIS & DEDUPLICATION
         logger.info(f"[{self.name}] ===== PHASE A: Analyzing WET list =====")
@@ -1702,6 +1722,7 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
             report_specialist_done(self.name, processed=0, vulns=0)
+            self._v.emit("exploit.specialist.completed", {"agent": "IDOR", "dry_count": 0, "vulns": 0})
             return
 
         # PHASE B: EXPLOITATION
@@ -1722,6 +1743,8 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
             processed=len(dry_list),
             vulns=vulns_count
         )
+
+        self._v.emit("exploit.specialist.completed", {"agent": "IDOR", "dry_count": len(dry_list), "vulns": vulns_count})
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 

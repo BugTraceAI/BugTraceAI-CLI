@@ -16,6 +16,7 @@ from bugtrace.core.config import settings
 from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+from bugtrace.core.verbose_events import create_emitter
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -468,6 +469,9 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
                 if payload_info.get("method") not in ("JSON_BODY", None):
                     continue
 
+                if hasattr(self, '_v'):
+                    self._v.progress("exploit.specialist.progress", {"agent": "PrototypePollution", "tier": tier, "technique": payload_info.get("technique", "")}, every=50)
+
                 result = await self._test_json_payload(payload_info, tier)
 
                 if result and result.get("exploitable"):
@@ -629,6 +633,9 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
         query_payloads = get_query_param_payloads(POLLUTION_MARKER)
 
         for query in query_payloads:
+            if hasattr(self, '_v'):
+                self._v.progress("exploit.specialist.progress", {"agent": "PrototypePollution", "tier": "query_param", "payload": query[:60]}, every=50)
+
             test_url = f"{self.url}{'&' if '?' in self.url else '?'}{query}"
 
             try:
@@ -1065,6 +1072,10 @@ Return ONLY unique findings in JSON format:
 
             logger.info(f"[{self.name}] Phase B: [{idx}/{len(self._dry_findings)}] Testing {url} param={parameter}")
 
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.started", {"agent": "PrototypePollution", "param": parameter, "url": url, "idx": idx, "total": len(self._dry_findings)})
+                self._v.reset("exploit.specialist.progress")
+
             # Check fingerprint to avoid re-emitting
             fingerprint = self._generate_protopollution_fingerprint(url, parameter)
             if fingerprint in self._emitted_findings:
@@ -1091,6 +1102,9 @@ Return ONLY unique findings in JSON format:
 
                     validated_findings.append(result)
 
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.specialist.signature_match", {"agent": "PrototypePollution", "param": parameter, "url": url, "tier": result.get("tier", ""), "technique": result.get("technique", "")})
+
                     # Emit event with validation
                     self._emit_prototype_pollution_finding({
                         "type": "PROTOTYPE_POLLUTION",
@@ -1102,12 +1116,18 @@ Return ONLY unique findings in JSON format:
                         "evidence": result.get("evidence", {"pollution_confirmed": True}),
                     }, scan_context=self._scan_context)
 
+                    if hasattr(self, '_v'):
+                        self._v.emit("exploit.specialist.confirmed", {"agent": "PrototypePollution", "param": parameter, "url": url, "payload": result.get("payload", "")[:80]})
+
                     logger.info(f"[{self.name}] ✓ Prototype Pollution confirmed: {url} param={parameter}")
                 else:
                     logger.debug(f"[{self.name}] ✗ Prototype Pollution not confirmed")
 
             except Exception as e:
                 logger.error(f"[{self.name}] Phase B: Exploitation failed: {e}")
+
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.param.completed", {"agent": "PrototypePollution", "param": parameter, "url": url})
 
         logger.info(f"[{self.name}] Phase B: Exploitation complete. {len(validated_findings)} validated findings")
         return validated_findings
@@ -1182,11 +1202,13 @@ Return ONLY unique findings in JSON format:
 
         self._queue_mode = True
         self._scan_context = scan_context
+        self._v = create_emitter("PrototypePollution", self._scan_context)
 
         # v3.2.0: Load tech context for context-aware detection
         await self._load_prototype_pollution_tech_context()
 
         logger.info(f"[{self.name}] Starting TWO-PHASE queue consumer (WET → DRY)")
+        self._v.emit("exploit.specialist.started", {"agent": "PrototypePollution", "url": self.url})
 
         # Get initial queue depth for telemetry
         queue = queue_manager.get_queue("prototype_pollution")
@@ -1203,6 +1225,8 @@ Return ONLY unique findings in JSON format:
 
         if not dry_list:
             logger.info(f"[{self.name}] No findings to exploit after deduplication")
+            if hasattr(self, '_v'):
+                self._v.emit("exploit.specialist.completed", {"agent": "PrototypePollution", "dry_count": 0, "vulns": 0})
             report_specialist_done(self.name, processed=0, vulns=0)
             return  # Terminate agent
 
@@ -1225,6 +1249,13 @@ Return ONLY unique findings in JSON format:
             vulns=vulns_count
         )
 
+        if hasattr(self, '_v'):
+            self._v.emit("exploit.specialist.completed", {
+                "agent": "PrototypePollution",
+                "dry_count": len(dry_list),
+                "vulns": vulns_count,
+            })
+
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 
         # Method ends - agent terminates ✅
@@ -1244,9 +1275,92 @@ Return ONLY unique findings in JSON format:
             self.params = [param]
         return await self._test_single_item_from_queue(url, param, finding)
 
+    async def _smart_probe_pollution(self, url: str) -> bool:
+        """
+        Smart probe: 1-2 requests to test if endpoint processes __proto__ at all.
+
+        Tests both query param and JSON body vectors with a harmless __proto__ probe.
+        If response is identical to baseline (no status/length/error change) → skip
+        heavy hunter+auditor phases.
+
+        Returns:
+            True if endpoint shows any reaction to __proto__ (continue testing),
+            False if no reaction (skip).
+        """
+        try:
+            async with orchestrator.session(DestinationType.TARGET) as session:
+                # Step 1: Get baseline
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    baseline_text = await resp.text()
+                    baseline_status = resp.status
+                    baseline_len = len(baseline_text)
+
+                # Step 2: Query param probe
+                separator = "&" if "?" in url else "?"
+                probe_url = f"{url}{separator}__proto__[btprobe]=1"
+
+                async with session.get(probe_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    probe_text = await resp.text()
+                    probe_status = resp.status
+
+                    # Check for behavioral change
+                    if probe_status != baseline_status:
+                        dashboard.log(f"[{self.name}] Smart probe: __proto__ query causes status change ({baseline_status}→{probe_status})", "INFO")
+                        return True
+
+                    if abs(len(probe_text) - baseline_len) > 50:
+                        dashboard.log(f"[{self.name}] Smart probe: __proto__ query causes length change", "INFO")
+                        return True
+
+                    # Check for error messages indicating processing
+                    error_signals = ["prototype", "__proto__", "polluted", "cannot set property",
+                                     "cannot read property", "TypeError", "RangeError"]
+                    if any(sig in probe_text.lower() for sig in error_signals):
+                        dashboard.log(f"[{self.name}] Smart probe: __proto__ error signal detected", "INFO")
+                        return True
+
+                # Step 3: JSON body probe (test if endpoint accepts JSON)
+                try:
+                    json_payload = {"__proto__": {"btprobe": "1"}}
+                    async with session.post(
+                        url,
+                        json=json_payload,
+                        headers={"Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as resp:
+                        json_probe_text = await resp.text()
+                        json_probe_status = resp.status
+
+                        if json_probe_status != baseline_status:
+                            dashboard.log(f"[{self.name}] Smart probe: JSON __proto__ causes status change", "INFO")
+                            return True
+
+                        if abs(len(json_probe_text) - baseline_len) > 50:
+                            dashboard.log(f"[{self.name}] Smart probe: JSON __proto__ causes length change", "INFO")
+                            return True
+
+                        if any(sig in json_probe_text.lower() for sig in error_signals):
+                            dashboard.log(f"[{self.name}] Smart probe: JSON __proto__ error signal detected", "INFO")
+                            return True
+
+                except Exception:
+                    pass  # JSON POST may not be accepted, that's fine
+
+                # No reaction at all
+                dashboard.log(f"[{self.name}] Smart probe: endpoint ignores __proto__, skipping", "INFO")
+                return False
+
+        except Exception as e:
+            logger.debug(f"[{self.name}] Smart probe error: {e}")
+            return True  # On error, continue testing (be safe)
+
     async def _test_single_item_from_queue(self, url: str, param: str, finding: dict) -> Optional[Dict]:
         """Test a single item from queue for Prototype Pollution."""
         try:
+            # Smart probe: skip if endpoint ignores __proto__
+            if not await self._smart_probe_pollution(url):
+                return None
+
             # Run hunter phase to discover vectors
             vectors = await self._hunter_phase()
 

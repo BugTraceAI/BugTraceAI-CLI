@@ -39,6 +39,7 @@ from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.core.validation_metrics import validation_metrics
 # Import specialist utilities for full payload loading (v2.1.0+)
 from bugtrace.agents.specialist_utils import load_full_payload_from_json, load_full_finding_data
+from bugtrace.core.verbose_events import create_emitter
 # NOTE: ValidationFeedback imports removed - feedback loop eliminated for simplicity
 # AgenticValidator is now a linear CDP specialist (no loopback to specialist agents)
 
@@ -224,6 +225,9 @@ class AgenticValidator(BaseAgent):
                 self.handle_vulnerability_detected
             )
             logger.info(f"[{self.name}] Subscribed to vulnerability_detected events")
+
+        # Verbose event emitter (lazy init — created when scan_context arrives)
+        self._v = None
 
         # Validation queue for PENDING_VALIDATION findings
         self._pending_queue: asyncio.Queue = asyncio.Queue()
@@ -414,7 +418,21 @@ Respond in JSON format:
         specialist = data.get("specialist", "unknown")
         finding = data.get("finding", {})
 
+        # Lazy init verbose emitter when scan_context first arrives
+        if not self._v:
+            sc = data.get("scan_context", "")
+            if sc:
+                self._v = create_emitter("AgenticValidator", sc)
+
         self._stats["total_received"] = self._stats.get("total_received", 0) + 1
+
+        if self._v:
+            self._v.emit("validation.finding.received", {
+                "specialist": specialist,
+                "status": status,
+                "type": finding.get("type", "unknown"),
+                "param": finding.get("parameter", ""),
+            })
 
         # Filter: Only process PENDING_VALIDATION
         if status != ValidationStatus.PENDING_VALIDATION.value:
@@ -433,6 +451,10 @@ Respond in JSON format:
         async with self._structural_lock:
             if struct_key in self._structural_keys:
                 self._stats["cdp_skipped_duplicate"] += 1
+                if self._v:
+                    self._v.emit("validation.finding.dedup_skipped", {
+                        "type": vuln_type, "param": param, "struct_key": struct_key,
+                    })
                 logger.info(f"[{self.name}] 🛡️ STRUCTURAL DEDUPLICATION: Skiping redundant {vuln_type} on {param} (path already validates/validating)")
                 return
             
@@ -448,10 +470,18 @@ Respond in JSON format:
             "scan_context": data.get("scan_context", ""),
         })
 
+        if self._v:
+            self._v.emit("validation.finding.queued", {
+                "specialist": specialist, "type": vuln_type, "param": param,
+                "queue_depth": self._pending_queue.qsize(),
+            })
+
     async def start_queue_processor(self) -> None:
         """Start the background queue processor for CDP validation."""
         if self._queue_processor_task is None or self._queue_processor_task.done():
             self._queue_processor_task = asyncio.create_task(self._process_pending_queue())
+            if self._v:
+                self._v.emit("validation.started", {"queue_size": self._pending_queue.qsize()})
             logger.info(f"[{self.name}] Started queue processor")
 
     async def stop_queue_processor(self) -> None:
@@ -464,6 +494,16 @@ Respond in JSON format:
             except asyncio.CancelledError:
                 pass
             logger.info(f"[{self.name}] Stopped queue processor")
+
+        if self._v:
+            self._v.emit("validation.completed", {
+                "total_received": self._stats.get("total_received", 0),
+                "queued_for_cdp": self._stats.get("queued_for_cdp", 0),
+                "cdp_confirmed": self._stats.get("cdp_confirmed", 0),
+                "cdp_rejected": self._stats.get("cdp_rejected", 0),
+                "cache_hits": self._stats.get("cache_hits", 0),
+                "vision_analyzed": self._stats.get("vision_analyzed", 0),
+            })
 
         # Log CDP reduction summary on scan completion
         validation_metrics.log_reduction_summary()
@@ -524,6 +564,14 @@ Respond in JSON format:
         finding = item.get("finding", {})
         scan_context = item.get("scan_context", "")
 
+        if self._v:
+            self._v.emit("validation.finding.started", {
+                "specialist": specialist,
+                "type": finding.get("type", specialist).upper(),
+                "param": finding.get("parameter", ""),
+                "url": finding.get("url", "")[:100],
+            })
+
         # CRITICAL: Load full payload from JSON if truncated (v2.1.0+)
         # The finding dict from queue may have truncated payload (200 chars)
         # We need the complete payload for accurate CDP validation
@@ -544,6 +592,10 @@ Respond in JSON format:
         # OPTIMIZATION: Check for static XSS reflection first to skip browser overhead
         static_result = await self._validate_static_xss(finding_for_validation)
         if static_result:
+             if self._v:
+                 self._v.emit("validation.static.result", {
+                     "validated": True, "specialist": specialist,
+                 })
              logger.info(f"[{self.name}] ⚡ Static XSS validated (CSP Safe + Reflected). Skipping browser.")
              result = static_result
         else:
@@ -554,10 +606,24 @@ Respond in JSON format:
             event_type = EventType.FINDING_VALIDATED
             status = "VALIDATED"
             self._stats["cdp_confirmed"] += 1
+            if self._v:
+                self._v.emit("validation.finding.confirmed", {
+                    "specialist": specialist,
+                    "type": finding.get("type", specialist).upper(),
+                    "param": finding.get("parameter", ""),
+                    "confidence": result.get("confidence", 0.0),
+                })
         else:
             event_type = EventType.FINDING_REJECTED
             status = "REJECTED_FP"
             self._stats["cdp_rejected"] = self._stats.get("cdp_rejected", 0) + 1
+            if self._v:
+                self._v.emit("validation.finding.rejected", {
+                    "specialist": specialist,
+                    "type": finding.get("type", specialist).upper(),
+                    "param": finding.get("parameter", ""),
+                    "reason": result.get("reasoning", "")[:100],
+                })
 
         # Emit result event
         if self._event_bus:
@@ -648,6 +714,10 @@ Respond in JSON format:
             full_len = len(full_payload)
 
             if full_len > original_len:
+                if self._v:
+                    self._v.emit("validation.payload_loaded", {
+                        "original_len": original_len, "full_len": full_len,
+                    })
                 logger.info(
                     f"[AgenticValidator] ✅ Loaded FULL payload from JSON: "
                     f"{full_len} chars (was {original_len} chars truncated)"
@@ -746,9 +816,22 @@ Respond in JSON format:
         self.think("CDP silent. Invoking Vision Analysis...")
         self._stats["vision_analyzed"] += 1
 
+        if self._v:
+            self._v.emit("validation.vision.started", {
+                "type": finding.get("type", "unknown"),
+                "url": finding.get("url", "")[:100],
+            })
+
         vision_result = await self.validate_with_vision(finding, screenshot_path)
         confidence = vision_result.get("confidence", 0.0)
         validated = vision_result.get("validated", False)
+
+        if self._v:
+            self._v.emit("validation.vision.result", {
+                "validated": validated,
+                "confidence": confidence,
+                "type": finding.get("type", "unknown"),
+            })
 
         result = {"validated": False, "screenshot_path": screenshot_path, "logs": logs}
 
@@ -774,7 +857,12 @@ Respond in JSON format:
         cached = self._cache.get(url, payload)
         if cached:
             self._stats["cache_hits"] += 1
+            if self._v:
+                self._v.emit("validation.cache.hit", {"url": url[:80]})
             logger.info(f"🚀 Cache hit for {url[:50]}... (skipping validation)")
+        else:
+            if self._v:
+                self._v.emit("validation.cache.miss", {"url": url[:80]})
         return cached
 
     async def _agentic_process_validation_result(
@@ -791,6 +879,13 @@ Respond in JSON format:
 
         # Step 2: Triggered event (L4 CDP confirmed)
         if basic_triggered:
+            if self._v:
+                self._v.emit("validation.cdp.confirmed", {
+                    "url": url[:100],
+                    "events": len(logs),
+                    "alert": alert_message[:50] if alert_message else None,
+                    "impact": impact_analysis.get("impact") if impact_analysis else None,
+                })
             result = self._agentic_build_cdp_result(logs, url, payload, start_time)
             if impact_analysis:
                 result["impact"] = impact_analysis["impact"]
@@ -798,6 +893,12 @@ Respond in JSON format:
             return result
 
         # Step 3: Vision fallback (L1-L4 silent)
+        if self._v:
+            self._v.emit("validation.cdp.silent", {
+                "url": url[:100],
+                "has_screenshot": bool(screenshot_path and Path(screenshot_path).exists()),
+                "console_events": len(logs),
+            })
         if screenshot_path and Path(screenshot_path).exists():
             return await self._agentic_analyze_with_vision(finding, screenshot_path, logs)
 
@@ -889,6 +990,12 @@ Respond in JSON format:
 
         self.think(f"Auditing {vuln_type} on {url}")
         self._stats["queued_for_cdp"] = self._stats.get("queued_for_cdp", 0) + 1
+
+        if self._v:
+            self._v.emit("validation.browser.launching", {
+                "vuln_type": vuln_type, "url": url[:100], "param": param or "",
+            })
+
         # Execute validation with semaphore
         # 1. Execute payload (L4 CDP)
         start_time = time.time()
@@ -960,12 +1067,23 @@ Respond in JSON format:
             verifier = await _verifier_pool.get_verifier()
             try:
                 target_url = self._construct_payload_url(url, payload, param)
+                if self._v:
+                    self._v.emit("validation.browser.navigating", {
+                        "vuln_type": vuln_type, "url": target_url[:100],
+                    })
                 result = await verifier.verify_xss(
                     target_url,
                     screenshot_dir=str(settings.LOG_DIR),
                     timeout=self.FAST_VALIDATION_TIMEOUT - 5,  # Leave margin
                     max_level=4  # Explicitly allow L4 CDP
                 )
+                if self._v:
+                    self._v.emit("validation.browser.loaded", {
+                        "success": result.success,
+                        "has_screenshot": bool(result.screenshot_path),
+                        "console_events": len(result.console_logs or []),
+                        "alert": result.alert_message[:50] if result.alert_message else None,
+                    })
                 return result.screenshot_path, result.console_logs or [], result.success, result.alert_message
             finally:
                 _verifier_pool.release()

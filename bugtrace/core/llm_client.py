@@ -499,12 +499,13 @@ class LLMClient:
             return None
 
     def _build_anthropic_headers(self, token: str, module_name: str) -> Dict[str, str]:
-        """Build headers for direct Anthropic API calls."""
+        """Build headers for direct Anthropic API calls (OAuth compatible)."""
         return {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
             "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14",
+            "User-Agent": "claude-cli/2.1.2 (external, cli)",
         }
 
     def _build_anthropic_payload(
@@ -514,12 +515,13 @@ class LLMClient:
         temperature: float,
         max_tokens: int
     ) -> Dict[str, Any]:
-        """Build Anthropic Messages API payload.
+        """Build Anthropic Messages API payload (Claude Code compatible).
 
         Key differences from OpenAI format:
         - Model name without 'anthropic/' prefix
         - System prompt as top-level 'system' field, not in messages
         - Only 'user' and 'assistant' roles in messages array
+        - Claude Code identity prefix required for OAuth tokens
         """
         # Strip anthropic/ prefix
         anthropic_model = model.replace("anthropic/", "", 1)
@@ -533,14 +535,20 @@ class LLMClient:
             else:
                 filtered_messages.append(msg)
 
+        # Claude Code identity prefix (required for OAuth token acceptance)
+        cc_prefix = "You are Claude Code, Anthropic's official CLI for Claude."
+        if system_text:
+            system_text = f"{cc_prefix}\n\n{system_text}"
+        else:
+            system_text = cc_prefix
+
         payload = {
             "model": anthropic_model,
             "messages": filtered_messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "system": system_text,
         }
-        if system_text:
-            payload["system"] = system_text
 
         return payload
 
@@ -870,7 +878,7 @@ class LLMClient:
             if not token:
                 logger.warning(f"Anthropic OAuth token unavailable, skipping {current_model}")
                 return None  # Triggers model shifting to next (OpenRouter) model
-            api_url = "https://api.anthropic.com/v1/messages"
+            api_url = "https://api.anthropic.com/v1/messages?beta=true"
             api_headers = self._build_anthropic_headers(token, module_name)
             api_payload = self._build_anthropic_payload(current_model, messages, temperature, max_tokens)
         else:
