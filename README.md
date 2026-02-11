@@ -183,18 +183,42 @@ Each phase runs with independent concurrency:
 ## 🚀 Getting Started
 
 ### Prerequisites
-- Python 3.10+
-- Docker & Docker Compose
-- Chrome/Chromium browser
-- OpenRouter API key
+- **For Docker**: Docker & Docker Compose
+- **For Local**: Python 3.10+, Docker (for some agents), nmap (optional)
+- OpenRouter API key ([get one here](https://openrouter.ai/keys))
 
-### Installation
+### 🎯 Quick Installation (Recommended)
+
+Use the **interactive installation wizard** for automatic setup:
 
 ```bash
 # Clone the repository
 git clone https://github.com/BugTraceAI/BugTraceAI-CLI
 cd BugTraceAI-CLI
 
+# Run the installation wizard
+./install.sh
+```
+
+The wizard will:
+- ✅ Check system requirements automatically
+- 🔍 Detect and use free ports for Docker (no conflicts!)
+- ⚙️ Set up environment configuration
+- 🐳 Build and start Docker containers OR configure local Python environment
+- 🎨 Provide beautiful, interactive terminal UI
+
+**Installation Options:**
+1. **Local Installation** - Python virtual environment (best for development)
+2. **Docker Installation** - Containerized deployment (best for production)
+
+### 📖 Manual Installation
+
+<details>
+<summary>Click to expand manual installation instructions</summary>
+
+#### Local Installation
+
+```bash
 # Create virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
@@ -205,22 +229,50 @@ pip install -r requirements.txt
 # Install browser
 playwright install chromium
 
-# Configure
-cp bugtraceaicli.conf.example bugtraceaicli.conf
-# Edit and add your OPENROUTER_API_KEY
+# Configure environment
+cp .env.example .env
+# Edit .env and add your OPENROUTER_API_KEY
 ```
+
+#### Docker Installation
+
+```bash
+# Configure environment
+cp .env.example .env
+# Edit .env and add your OPENROUTER_API_KEY
+
+# Build and start
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+```
+
+</details>
 
 ### Quick Start
 
 ```bash
 # Full scan
-./bugtraceai-cli https://target.com
+./bugtraceai-cli scan https://target.com
 
 # Clean scan (reset database)
-./bugtraceai-cli https://target.com --clean
+./bugtraceai-cli scan https://target.com --clean
 
 # Resume interrupted scan
-./bugtraceai-cli https://target.com --resume
+./bugtraceai-cli scan https://target.com --resume
+
+# Start API server (for Web UI)
+./bugtraceai-cli serve --port 8000
+```
+
+**Docker Users:**
+```bash
+# API is already running at http://localhost:8000
+# (or whatever port was auto-selected during installation)
+
+# Execute scans via API or Web UI
+curl http://localhost:8000/health
 ```
 
 ## ⚙️ Configuration
