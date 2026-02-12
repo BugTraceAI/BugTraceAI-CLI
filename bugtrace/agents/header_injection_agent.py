@@ -350,7 +350,17 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
         param: str,
         payload: str
     ) -> Optional[Dict]:
-        """Check if CRLF injection was successful by examining response."""
+        """Check if CRLF injection was successful by examining response.
+
+        Detection strategy (priority order):
+        1. Raw header inspection: Check response.raw_headers for literal \\r/\\n
+           bytes in header values. This is how Burp Suite detects CRLF — if a
+           payload causes newline bytes to appear in the raw HTTP headers, it
+           confirms the server did not strip CRLF sequences.
+        2. Marker-based detection (fallback): Check for known injection markers
+           like 'X-Injected' in parsed headers — catches cases where the injected
+           content forms a recognizable header name.
+        """
         try:
             req_headers = {"User-Agent": getattr(settings, 'USER_AGENT', 'BugTraceAI/2.4')}
             req_headers.update(self.headers)
@@ -366,7 +376,51 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
                 timeout=aiohttp.ClientTimeout(total=10),
                 ssl=False
             ) as response:
-                # Check response headers for injection evidence
+                # ── Phase 1: Raw header CRLF detection (Burp-style) ──
+                # aiohttp's response.raw_headers is a tuple of (name_bytes, value_bytes)
+                # tuples representing the headers exactly as received over the wire.
+                # If the server reflects CRLF from our payload, literal \r or \n
+                # bytes will appear inside a header value.
+                try:
+                    for raw_name, raw_value in response.raw_headers:
+                        # Decode with latin-1 (ISO-8859-1) — the HTTP header encoding
+                        header_name_str = raw_name.decode("latin-1")
+                        header_value_str = raw_value.decode("latin-1")
+
+                        # Check if the header VALUE contains literal newline bytes
+                        if "\r" in header_value_str or "\n" in header_value_str:
+                            evidence = f"{header_name_str}: {header_value_str[:200]}"
+                            logger.info(
+                                f"[{self.name}] CRLF detected via raw headers in "
+                                f"'{header_name_str}' for param '{param}'"
+                            )
+                            return self._create_finding(
+                                param, payload, "CRLF_NEWLINE",
+                                "header", header_name_str, evidence
+                            )
+
+                        # Secondary check: if our payload contained a split marker
+                        # (e.g. "prefix%0d%0asuffix"), verify that the prefix appears
+                        # in one header and the suffix after the injected newline.
+                        # This catches partial CRLF where the newline splits a value
+                        # into what looks like two headers.
+                        if "\r" in header_name_str or "\n" in header_name_str:
+                            evidence = f"Injected header name: {header_name_str[:200]}"
+                            logger.info(
+                                f"[{self.name}] CRLF detected via raw header NAME "
+                                f"containing newline for param '{param}'"
+                            )
+                            return self._create_finding(
+                                param, payload, "CRLF_NEWLINE",
+                                "header", header_name_str, evidence
+                            )
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Raw header inspection error: {e}")
+
+                # ── Phase 2: Marker-based detection (fallback) ──
+                # Check parsed headers for known injection marker strings.
+                # This catches CRLF that results in new well-formed headers
+                # (e.g. "X-Injected: header" appearing as a separate header).
                 resp_headers = dict(response.headers)
                 body = await response.text()
 
