@@ -1581,6 +1581,35 @@ Write the exploitation explanation section for the report."""
         except Exception as e:
             logger.error(f"[{self.name}] HTML parsing failed: {e}")
 
+        # 3. Extract cookies from HTTP response (Set-Cookie headers)
+        # Cookies are a major SQLi attack surface (e.g., TrackingId on ginandjuice.shop)
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as cookie_session:
+                async with cookie_session.get(url, ssl=False, allow_redirects=True) as resp:
+                    for cookie_header in resp.headers.getall("Set-Cookie", []):
+                        # Parse cookie name from "name=value; Path=/; HttpOnly"
+                        cookie_name = cookie_header.split("=", 1)[0].strip()
+                        if cookie_name:
+                            cookie_key = f"Cookie: {cookie_name}"
+                            if cookie_key not in all_params:
+                                all_params[cookie_key] = ""
+                                logger.info(f"[{self.name}] 🍪 Discovered cookie param: {cookie_name}")
+        except Exception as e:
+            logger.warning(f"[{self.name}] Cookie extraction failed: {e}")
+
+        # 4. Add common injectable headers for testing
+        # These headers are often passed to backend queries (logging, analytics, auth)
+        injectable_headers = [
+            "X-Forwarded-For",
+            "Referer",
+            "User-Agent",
+        ]
+        for header_name in injectable_headers:
+            header_key = f"Header: {header_name}"
+            if header_key not in all_params:
+                all_params[header_key] = ""
+
         logger.info(f"[{self.name}] 🔍 Discovered {len(all_params)} params on {url}: {list(all_params.keys())}")
         return all_params
 
@@ -2575,10 +2604,13 @@ Write the exploitation explanation section for the report."""
             self.url = url
             self.param = param
 
-            # Check if cookie-based or regular param
+            # Route by param type: Cookie, Header, or URL param
             if param.startswith("Cookie:"):
                 cookie_name = param.replace("Cookie:", "").strip()
                 result = await self._test_cookie_sqli_from_queue(url, cookie_name, dry_item)
+            elif param.startswith("Header:"):
+                header_name = param.replace("Header:", "").strip()
+                result = await self._test_header_sqli(url, header_name, dry_item)
             else:
                 result = await self._sqli_escalation_pipeline(url, param, dry_item)
 
@@ -2837,10 +2869,13 @@ Write the exploitation explanation section for the report."""
         self.url = url
         self.param = param
 
-        # Check if this is a cookie-based SQLi finding
+        # Route by param type: Cookie, Header, or URL param
         if param.startswith("Cookie:"):
             cookie_name = param.replace("Cookie:", "").strip()
             result = await self._test_cookie_sqli_from_queue(url, cookie_name, finding)
+        elif param.startswith("Header:"):
+            header_name = param.replace("Header:", "").strip()
+            result = await self._test_header_sqli(url, header_name, finding)
         else:
             # Run validation using existing SQLi testing logic
             result = await self._test_single_param_from_queue(url, param, finding)
@@ -3414,10 +3449,10 @@ Write the exploitation explanation section for the report."""
                     injection_type=sqlmap_result.get("type", "error_based"),
                     technique="cookie_injection",
                     working_payload=finding.get("payload", "'"),
-                    evidence=f"SQLMap confirmed cookie SQLi: {sqlmap_result.get('output_snippet', '')[:500]}",
+                    evidence={"sqlmap_confirmed": True, "output": sqlmap_result.get("output_snippet", "")[:500]},
                     dbms_detected=self._detect_dbms_from_output(sqlmap_result.get("output_snippet", "")),
-                    sqlmap_confirmation=True,
-                    reproduction_steps=sqlmap_result.get("reproduction_command", ""),
+                    validated=True,
+                    reproduction_steps=[sqlmap_result.get("reproduction_command", "")],
                 )
 
             # If SQLMap didn't confirm, still return finding based on probe detection
@@ -3429,16 +3464,118 @@ Write the exploitation explanation section for the report."""
                     injection_type="error_based",
                     technique="cookie_injection",
                     working_payload=finding.get("payload", "'"),
-                    evidence=finding.get("evidence", "Status code differential detected"),
+                    evidence={"probe_detection": finding.get("evidence", "Status code differential detected")},
                     dbms_detected="Unknown",
-                    sqlmap_confirmation=False,
-                    reproduction_steps=finding.get("reproduction", ""),
+                    validated=False,
+                    reproduction_steps=[finding.get("reproduction", "")],
                 )
 
             return None
 
         except Exception as e:
             logger.error(f"[{self.name}] Cookie SQLi test failed: {e}")
+            return None
+
+    async def _test_header_sqli(
+        self, url: str, header_name: str, finding: dict
+    ) -> Optional[SQLiFinding]:
+        """
+        Test an HTTP header for SQL injection via error-based detection.
+
+        Headers like X-Forwarded-For, Referer, User-Agent are sometimes
+        passed to backend SQL queries for logging, analytics, or auth.
+
+        Strategy:
+        1. Send baseline request with normal header value
+        2. Send request with SQL injection payload in target header
+        3. Detect DB error fingerprints in response (error-based)
+        4. If detected, escalate to SQLMap --level=3 for confirmation
+        """
+        try:
+            logger.info(f"[{self.name}] Testing header '{header_name}' for SQLi")
+
+            error_payloads = ["'", "''", '"', "' OR '1'='1", "1'"]
+
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # Baseline request
+                try:
+                    async with session.get(url, ssl=False) as resp:
+                        baseline_status = resp.status
+                        baseline_body = await resp.text()
+                except Exception:
+                    return None
+
+                for payload in error_payloads:
+                    try:
+                        test_headers = {header_name: payload}
+                        async with session.get(
+                            url, ssl=False, headers=test_headers
+                        ) as resp:
+                            test_status = resp.status
+                            test_body = await resp.text()
+
+                        # Check for DB error fingerprints
+                        error_info = self._extract_info_from_error(test_body)
+                        if error_info.get("db_type"):
+                            logger.info(
+                                f"[{self.name}] 💉 Header SQLi detected! "
+                                f"{header_name}: {payload} → {error_info['db_type']}"
+                            )
+                            return SQLiFinding(
+                                url=url,
+                                parameter=f"Header: {header_name}",
+                                injection_type="error_based",
+                                technique="header_injection",
+                                working_payload=payload,
+                                evidence={
+                                    "header": header_name,
+                                    "sql_error_visible": True,
+                                    **error_info,
+                                },
+                                dbms_detected=error_info["db_type"],
+                                sqlmap_command=(
+                                    f"sqlmap -u '{url}' --level=3 "
+                                    f"--headers='{header_name}: *' --batch"
+                                ),
+                                reproduction_steps=[
+                                    f"curl -H '{header_name}: {payload}' '{url}'"
+                                ],
+                            )
+
+                        # Status code differential (500 vs baseline < 400)
+                        if test_status >= 500 and baseline_status < 400:
+                            logger.info(
+                                f"[{self.name}] ⚠️ Header SQLi candidate: "
+                                f"{header_name}: {payload} → HTTP {test_status}"
+                            )
+                            return SQLiFinding(
+                                url=url,
+                                parameter=f"Header: {header_name}",
+                                injection_type="error_based",
+                                technique="header_injection",
+                                working_payload=payload,
+                                evidence={
+                                    "header": header_name,
+                                    "baseline_status": baseline_status,
+                                    "injected_status": test_status,
+                                },
+                                dbms_detected="Unknown",
+                                sqlmap_command=(
+                                    f"sqlmap -u '{url}' --level=3 "
+                                    f"--headers='{header_name}: *' --batch"
+                                ),
+                                reproduction_steps=[
+                                    f"curl -H '{header_name}: {payload}' '{url}'"
+                                ],
+                            )
+                    except Exception:
+                        continue
+
+            return None
+
+        except Exception as e:
+            logger.error(f"[{self.name}] Header SQLi test failed: {e}")
             return None
 
     def _detect_dbms_from_output(self, output: str) -> str:

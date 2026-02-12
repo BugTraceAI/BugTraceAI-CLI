@@ -1281,6 +1281,11 @@ class TeamOrchestrator:
         if not settings.DEBUG:
             return
 
+        import sys
+        if not sys.stdin.isatty():
+            logger.debug(f"[V4 DEBUG] Checkpoint '{phase_name}' skipped (no TTY)")
+            return
+
         print(f"\n✋ [V4 DEBUG] Phase '{phase_name}' Complete. System PAUSED.")
         print(f"👉 Press ENTER to continue to next phase... (or Ctrl+C to abort)")
         try:
@@ -2810,9 +2815,46 @@ class TeamOrchestrator:
                 all_findings.append(synthetic_csti)
                 injected_count += 1
 
+            # FIX (2026-02-12): Also dispatch CSTI for params from recon URLs.
+            # DASTySAST may analyze a URL and find 0 vulns (LLM miss), but the param
+            # still reflects input. CSTIAgent's smart probe is safe — it skips non-reflecting params.
+            from urllib.parse import urlparse, parse_qs
+            urls_file = getattr(self, 'report_dir', None)
+            if urls_file:
+                urls_file = urls_file / "recon" / "urls.txt"
+            if urls_file and urls_file.exists():
+                skip_params = {'ref', 'trk', 'productId', 'postId', 'storeId'}  # Non-injectable params
+                for line in urls_file.read_text().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parsed_url = urlparse(line)
+                    for param in parse_qs(parsed_url.query).keys():
+                        if param in seen_params or param in existing_csti_params or param in skip_params:
+                            continue
+                        seen_params.add(param)
+                        synthetic_csti = {
+                            "type": "CSTI",
+                            "parameter": param,
+                            "url": line,
+                            "severity": "High",
+                            "fp_confidence": 0.9,
+                            "confidence_score": 0.9,
+                            "votes": 5,
+                            "skeptical_score": 8,
+                            "reasoning": f"Auto-dispatch: {detected_csti_framework.upper()} framework detected. Testing recon param '{param}' for CSTI.",
+                            "payload": "",
+                            "evidence": f"tech_profile.frameworks contains: {detected_frameworks}",
+                            "_source_file": "auto_dispatch_recon",
+                            "_scan_context": self.scan_context,
+                            "_auto_dispatched": True
+                        }
+                        all_findings.append(synthetic_csti)
+                        injected_count += 1
+                        logger.debug(f"[Auto-Dispatch] CSTI recon param: {param} on {line}")
+
             if injected_count == 0 and not existing_csti_params:
-                # No reflecting params AND no existing CSTI — fallback to target URL params
-                from urllib.parse import urlparse, parse_qs
+                # No reflecting params AND no recon params — fallback to target URL params
                 parsed_target = urlparse(self.target)
                 target_params = parse_qs(parsed_target.query)
                 synth_param = list(target_params.keys())[0] if target_params else "_auto_dispatch"

@@ -14,9 +14,10 @@ Burp Scanner finds these as "HTTP Response Header Injection" which allows:
 import asyncio
 import aiohttp
 import json
+import re
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
 
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.config import settings
@@ -306,14 +307,37 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
                 break
 
     def _build_test_url(self, param: str, payload: str) -> str:
-        """Build URL with CRLF payload in specified parameter."""
+        """Build URL with CRLF payload in specified parameter.
+
+        FIX (2026-02-12): Build URL manually to avoid double-encoding.
+        CRLF payloads are already URL-encoded (e.g., %0d%0a). Using urlencode()
+        would re-encode the '%' to '%25', making %0d%0a into %250d%250a which
+        the server decodes to literal '%0d%0a' instead of CR LF characters.
+
+        Literal control chars (e.g. \\r\\n from payload #8) are URL-encoded here
+        so they travel safely in the URL while pre-encoded sequences like %0d%0a
+        are preserved as-is.
+        """
         parsed = urlparse(self.url)
         query_params = parse_qs(parsed.query)
 
-        # Set or replace parameter with payload
-        query_params[param] = [payload]
+        # URL-encode any literal control characters in the payload (bytes 0x00-0x1F, 0x7F)
+        # but preserve already-encoded sequences like %0d%0a
+        safe_payload = re.sub(
+            r'[\x00-\x1f\x7f]',
+            lambda m: f'%{ord(m.group()):02X}',
+            payload
+        )
 
-        new_query = urlencode(query_params, doseq=True)
+        # Build query string manually to preserve pre-encoded payloads
+        parts = []
+        for k, v in query_params.items():
+            if k == param:
+                continue  # Skip — we'll add our payload version
+            parts.append(f"{k}={quote(v[0], safe='')}")
+        parts.append(f"{param}={safe_payload}")
+
+        new_query = "&".join(parts)
         return urlunparse((
             parsed.scheme, parsed.netloc, parsed.path,
             parsed.params, new_query, parsed.fragment

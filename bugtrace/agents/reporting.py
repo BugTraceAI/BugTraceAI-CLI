@@ -902,7 +902,7 @@ class ReportingAgent(BaseAgent):
                 "id": None,
                 "type": f"NUCLEI:{info.get('name', 'Unknown')}",
                 "severity": severity,
-                "url": finding.get("matched_at", ""),
+                "url": finding.get("matched-at", finding.get("matched_at", "")),
                 "parameter": info.get("name", ""),  # Template name as "parameter"
                 "payload": finding.get("template_id", ""),  # Template ID
                 "description": info.get("description", f"Detected by Nuclei template: {finding.get('template_id', 'unknown')}"),

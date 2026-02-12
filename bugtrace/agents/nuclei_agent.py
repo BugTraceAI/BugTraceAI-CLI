@@ -188,6 +188,20 @@ class NucleiAgent(BaseAgent):
                         "INFO"
                     )
 
+            # Security headers check (passive — one HEAD request)
+            # Nuclei templates sometimes miss these, so we check directly
+            existing_template_ids = {
+                mc.get("template_id", "").lower()
+                for mc in tech_profile["misconfigurations"]
+            }
+            header_findings = await self._check_security_headers(existing_template_ids)
+            if header_findings:
+                tech_profile["misconfigurations"].extend(header_findings)
+                dashboard.log(
+                    f"[{self.name}] 🔒 {len(header_findings)} missing security headers detected",
+                    "INFO"
+                )
+
             # Save comprehensive tech profile
             profile_path = self.report_dir / "tech_profile.json"
             with open(profile_path, "w") as f:
@@ -403,7 +417,9 @@ class NucleiAgent(BaseAgent):
         for src in script_srcs:
             src_lower = src.lower()
             for lib_key, lib_info in KNOWN_VULNERABLE_JS.items():
-                if lib_key in src_lower or lib_info["name"].lower().replace(".", "") in src_lower.replace(".", ""):
+                # Also check base name without trailing "js" (e.g., "angular" from "angularjs")
+                lib_base = re.sub(r'js$', '', lib_key)  # "angularjs" → "angular"
+                if lib_key in src_lower or lib_base in src_lower or lib_info["name"].lower().replace(".", "") in src_lower.replace(".", ""):
                     # Extract version: digits separated by . _ or -
                     version_match = re.search(r'(\d+)[\._-](\d+)[\._-](\d+)', src)
                     if version_match:
@@ -446,6 +462,101 @@ class NucleiAgent(BaseAgent):
                     "matched_at": self.target,
                 })
                 logger.info(f"[{self.name}] Vulnerable JS: {lib_info['name']} {v_str} < {threshold_str} ({cve_str})")
+
+        return findings
+
+    # =========================================================================
+    # Security Headers Check (passive — single HTTP request)
+    # =========================================================================
+
+    # Headers to check and their descriptions
+    SECURITY_HEADERS = {
+        "strict-transport-security": {
+            "name": "Strict-Transport-Security (HSTS)",
+            "description": "Missing HSTS header — site vulnerable to protocol downgrade and man-in-the-middle attacks",
+            "template_id": "security-headers-hsts",
+        },
+        "x-content-type-options": {
+            "name": "X-Content-Type-Options",
+            "description": "Missing X-Content-Type-Options header — browser may MIME-sniff responses, enabling XSS via content type confusion",
+            "template_id": "security-headers-xcto",
+        },
+        "x-frame-options": {
+            "name": "X-Frame-Options",
+            "description": "Missing X-Frame-Options header — site may be vulnerable to clickjacking attacks",
+            "template_id": "security-headers-xfo",
+        },
+        "content-security-policy": {
+            "name": "Content-Security-Policy (CSP)",
+            "description": "Missing Content-Security-Policy header — no restrictions on resource loading, increasing XSS impact",
+            "template_id": "security-headers-csp",
+        },
+        "x-xss-protection": {
+            "name": "X-XSS-Protection",
+            "description": "Missing X-XSS-Protection header — legacy browsers lack reflected XSS filter",
+            "template_id": "security-headers-xxp",
+        },
+        "referrer-policy": {
+            "name": "Referrer-Policy",
+            "description": "Missing Referrer-Policy header — sensitive URL paths may leak to third parties via Referer header",
+            "template_id": "security-headers-rp",
+        },
+        "permissions-policy": {
+            "name": "Permissions-Policy",
+            "description": "Missing Permissions-Policy header — browser features (camera, microphone, geolocation) unrestricted",
+            "template_id": "security-headers-pp",
+        },
+    }
+
+    async def _check_security_headers(self, existing_template_ids: set) -> List[Dict]:
+        """
+        Check for missing security headers via a single HEAD request.
+
+        Runs AFTER Nuclei to catch headers that Nuclei templates missed.
+        Skips headers already detected by Nuclei (via template_id dedup).
+
+        Args:
+            existing_template_ids: Set of template IDs already found by Nuclei
+                (lowercased). Used to avoid duplicate findings.
+
+        Returns:
+            List of misconfiguration dicts for missing headers.
+        """
+        findings = []
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.head(self.target, ssl=False, allow_redirects=True) as response:
+                    response_headers = {k.lower(): v for k, v in response.headers.items()}
+        except Exception as e:
+            logger.warning(f"[{self.name}] Security headers check failed: {e}")
+            return findings
+
+        for header_key, header_info in self.SECURITY_HEADERS.items():
+            # Skip if Nuclei already detected this
+            if header_info["template_id"].lower() in existing_template_ids:
+                continue
+
+            # Also skip if a Nuclei template with similar name caught it
+            # (e.g. "hsts-detect" covers "strict-transport-security")
+            short_name = header_key.replace("-", "")
+            if any(short_name in tid for tid in existing_template_ids):
+                continue
+
+            if header_key not in response_headers:
+                findings.append({
+                    "name": f"Missing: {header_info['name']}",
+                    "severity": "low",
+                    "description": header_info["description"],
+                    "tags": ["misconfig", "headers", "security"],
+                    "template_id": header_info["template_id"],
+                    "matched_at": self.target,
+                })
+                logger.info(f"[{self.name}] Missing security header: {header_info['name']}")
+
+        if not findings:
+            logger.info(f"[{self.name}] All security headers present")
 
         return findings
 

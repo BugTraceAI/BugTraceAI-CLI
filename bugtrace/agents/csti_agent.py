@@ -1771,6 +1771,15 @@ Response format (XML):
                 if 'vue' in fw_lower:
                     return 'vue'
 
+        # Also check _tech_stack_context (set by queue consumer)
+        tech_stack = getattr(self, '_tech_stack_context', {}) or {}
+        for fw in tech_stack.get('frameworks', []):
+            fw_lower = fw.lower()
+            if 'angular' in fw_lower:
+                return 'angular'
+            if 'vue' in fw_lower:
+                return 'vue'
+
         # Default to twig for unidentified {{ }} syntax (server-side)
         return 'twig'
 
@@ -2019,6 +2028,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
 2. Distinguish CSTI (client-side: Angular, Vue) from SSTI (server-side: Jinja2, Twig)
 3. Prioritize findings for detected engines: {detected_engines or ['generic']}
 4. Remove true duplicates (same URL + param + engine)
+5. IMPORTANT: For client-side engines (Angular, Vue), multiple params on the SAME PAGE share the same scope. Merge them into ONE finding per page per engine (keep the first param as representative)
 
 ## OUTPUT FORMAT (JSON only, no markdown):
 {{
@@ -2981,9 +2991,8 @@ Different template engines represent different attack surfaces - NEVER merge fin
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
-        # Count confirmed vulnerabilities
+        # Count confirmed vulnerabilities (only validated results, not all dry findings)
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         # REPORTING: Generate specialist report
         if results or self._dry_findings:
@@ -3230,6 +3239,10 @@ Different template engines represent different attack surfaces - NEVER merge fin
         """
         Generate CSTI finding fingerprint for expert deduplication.
 
+        Client-side engines (angular, vue) share a page-level scope,
+        so multiple params on the same page = one vulnerability.
+        Server-side engines are param-specific.
+
         Returns:
             Tuple fingerprint for deduplication
         """
@@ -3238,8 +3251,15 @@ Different template engines represent different attack surfaces - NEVER merge fin
         parsed = urlparse(url)
         normalized_path = parsed.path.rstrip('/')
 
-        # CSTI signature: URL + parameter + template engine
-        fingerprint = ("CSTI", parsed.netloc, normalized_path, parameter.lower(), template_engine)
+        client_side_engines = {"angular", "vue", "knockout", "ember", "react"}
+        is_client_side = template_engine.lower() in client_side_engines
+
+        if is_client_side:
+            # Same page + same engine = same Angular/Vue scope = one finding
+            fingerprint = ("CSTI", parsed.netloc, normalized_path, template_engine)
+        else:
+            # Server-side: each parameter is a separate injection point
+            fingerprint = ("CSTI", parsed.netloc, normalized_path, parameter.lower(), template_engine)
 
         return fingerprint
 

@@ -2933,10 +2933,24 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
         logger.info(f"[{self.name}] Phase 3.5: DOM XSS Headless Scan")
 
         try:
-            # Collect URLs to test: self.url + internal links from discovery
+            # Collect URLs to test: self.url + internal links + recon URLs with params
             urls_to_test = [self.url]
             if hasattr(self, '_discovered_internal_urls') and self._discovered_internal_urls:
                 urls_to_test.extend(self._discovered_internal_urls)
+
+            # SPRINT-2 (2026-02-12): Expand to recon URLs from GoSpider
+            # Only add URLs with query params (they have injectable surfaces)
+            recon_urls = self._load_recon_urls_with_params()
+            if recon_urls:
+                existing = set(urls_to_test)
+                added = 0
+                for rurl in recon_urls:
+                    if rurl not in existing:
+                        urls_to_test.append(rurl)
+                        existing.add(rurl)
+                        added += 1
+                if added:
+                    logger.info(f"[{self.name}] 🔍 Added {added} recon URLs for DOM XSS testing")
             if hasattr(self, '_v'):
                 self._v.emit("exploit.xss.dom.started", {"url": self.url, "urls_count": len(urls_to_test)})
             logger.info(f"[{self.name}] DOM XSS scanning {len(urls_to_test)} URLs")
@@ -3504,6 +3518,47 @@ Return ONLY the payloads, one per line, no explanations."""
                 seen.add(fp)
                 dry_list.append(f)
         return dry_list
+
+    def _load_recon_urls_with_params(self, max_urls: int = 10) -> List[str]:
+        """
+        Load recon URLs that have query parameters from GoSpider output.
+
+        SPRINT-2 (2026-02-12): XSS Agent only tested the assigned URL.
+        This expands testing to recon URLs discovered during reconnaissance.
+
+        Only includes URLs with ?param=value (they have injectable surfaces).
+        Capped to avoid excessive testing.
+        """
+        if not hasattr(self, 'report_dir') or not self.report_dir:
+            return []
+
+        urls_file = Path(self.report_dir) / "recon" / "urls.txt"
+        if not urls_file.exists():
+            return []
+
+        try:
+            from urllib.parse import urlparse
+            base_domain = urlparse(self.url).netloc
+            recon_urls = []
+
+            for line in urls_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parsed = urlparse(line)
+                # Only same-domain URLs with query params
+                if parsed.netloc == base_domain and parsed.query:
+                    recon_urls.append(line)
+                    if len(recon_urls) >= max_urls:
+                        break
+
+            if recon_urls:
+                logger.info(f"[{self.name}] Loaded {len(recon_urls)} recon URLs with params")
+            return recon_urls
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to load recon URLs: {e}")
+            return []
 
     async def _discover_xss_params(self, url: str) -> Dict[str, str]:
         """

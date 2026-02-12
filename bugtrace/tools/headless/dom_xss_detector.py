@@ -464,6 +464,11 @@ class DOMXSSDetector:
             {"payload": f"{{{{constructor.constructor('alert(\"{canary}\")')()}}}}", "type": "angular_constructor"},
             {"payload": f"{{{{$on.constructor('alert(\"{canary}\")')()}}}}", "type": "angular_on"},
             {"payload": f"{{{{['a]'constructor.prototype.charAt=[].join;$eval('x={canary}');'x'}}}}", "type": "angular_sandbox_bypass"},
+            # ADDED (2026-02-12): Vue.js template injection payloads
+            {"payload": f"{{{{_openBlock.constructor('alert(\"{canary}\")')()}}}}", "type": "vue_constructor"},
+            {"payload": f"{{{{this.constructor.constructor('alert(\"{canary}\")')()}}}}", "type": "vue_this_constructor"},
+            # ADDED (2026-02-12): React dangerouslySetInnerHTML context
+            {"payload": f"<div dangerouslySetInnerHTML={{{{__html: '<img src=x onerror=alert(\"{canary}\")>'}}}}></div>", "type": "react_dangerously"},
         ]
 
     async def scan(self, url: str, discovered_params: Optional[List[str]] = None) -> List[DOMXSSFinding]:
@@ -724,6 +729,71 @@ class DOMXSSDetector:
             sep = "&" if "?" in url else "?"
             return f"{url}{sep}xss={payload}"
 
+    async def _wait_for_spa_render(self, page) -> None:
+        """
+        Wait for SPA framework to finish rendering before checking for XSS.
+
+        Fixed-sleep misses late renders on Angular/React/Vue apps.
+        This method detects which framework is present and waits for its
+        render lifecycle to complete (up to 3s), falling back to 1.5s sleep.
+        """
+        try:
+            framework = await page.evaluate("""() => {
+                if (window.angular) return 'angular';
+                if (document.querySelector('[data-reactroot],[data-reactid],#__next,[id="root"] > *'))
+                    return 'react';
+                if (window.__VUE__ || document.querySelector('[data-v-]'))
+                    return 'vue';
+                return 'none';
+            }""")
+
+            if framework == "angular":
+                # Wait for Angular to bootstrap and compile templates
+                try:
+                    await page.wait_for_function(
+                        "window.angular && angular.element(document.body).injector()",
+                        timeout=3000,
+                    )
+                    # Extra wait for digest cycle to process bindings
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    await asyncio.sleep(1.5)  # Fallback
+
+            elif framework == "react":
+                # Wait for React root to have rendered children
+                try:
+                    await page.wait_for_function(
+                        """() => {
+                            const root = document.querySelector(
+                                '[data-reactroot],[data-reactid],#root,#__next,#app'
+                            );
+                            return root && root.childElementCount > 0;
+                        }""",
+                        timeout=3000,
+                    )
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    await asyncio.sleep(1.5)
+
+            elif framework == "vue":
+                # Wait for Vue to mount
+                try:
+                    await page.wait_for_function(
+                        "document.querySelector('[data-v-]') !== null",
+                        timeout=3000,
+                    )
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    await asyncio.sleep(1.5)
+
+            else:
+                # No framework detected — use original fixed sleep
+                await asyncio.sleep(1.5)
+
+        except Exception:
+            # Any error in framework detection — safe fallback
+            await asyncio.sleep(1.5)
+
     async def _test_payload(self, test_url: str, payload: str, source: str, page) -> Optional[DOMXSSFinding]:
         """Test a single payload and check for XSS execution."""
         dialog_messages = []
@@ -750,7 +820,10 @@ class DOMXSSDetector:
 
         try:
             await page.goto(test_url, wait_until="networkidle", timeout=self.timeout)
-            await asyncio.sleep(1.5)  # Gap 3 Fix: Increased from 0.5s for deferred JS execution
+
+            # SPA framework-aware wait: Angular/React/Vue need time to render templates
+            # before user input reaches sinks. Fixed sleep misses late renders.
+            await self._wait_for_spa_render(page)
 
             # Check hook findings before clicking
             # Primary: window.__domxss_findings (may be destroyed by document.write)
