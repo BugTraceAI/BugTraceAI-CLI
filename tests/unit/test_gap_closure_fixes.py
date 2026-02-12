@@ -298,6 +298,7 @@ class TestNucleiMisconfigSeparation:
 
         with patch.object(agent, '_verify_waf_detections', new_callable=AsyncMock, return_value=[]), \
              patch.object(agent, '_fetch_html', new_callable=AsyncMock, return_value=None), \
+             patch.object(agent, '_check_security_headers', new_callable=AsyncMock, return_value=[]), \
              patch("bugtrace.tools.external.external_tools.run_nuclei",
                    AsyncMock(return_value=mock_nuclei_results)), \
              patch("bugtrace.core.ui.dashboard"), \
@@ -305,7 +306,7 @@ class TestNucleiMisconfigSeparation:
 
             result = await agent.run()
 
-        # Misconfigs should be in separate list
+        # Misconfigs should be in separate list (from nuclei results only, security headers mocked out)
         misconfigs = result["misconfigurations"]
         assert len(misconfigs) == 3, f"Expected 3 misconfigs, got {len(misconfigs)}: {misconfigs}"
 
@@ -340,6 +341,7 @@ class TestNucleiMisconfigSeparation:
 
         with patch.object(agent, '_verify_waf_detections', new_callable=AsyncMock, return_value=[]), \
              patch.object(agent, '_fetch_html', new_callable=AsyncMock, return_value=None), \
+             patch.object(agent, '_check_security_headers', new_callable=AsyncMock, return_value=[]), \
              patch("bugtrace.tools.external.external_tools.run_nuclei",
                    AsyncMock(return_value=mock_nuclei_results)), \
              patch("bugtrace.core.ui.dashboard"), \
@@ -375,6 +377,7 @@ class TestNucleiMisconfigSeparation:
 
         with patch.object(agent, '_verify_waf_detections', new_callable=AsyncMock, return_value=[]), \
              patch.object(agent, '_fetch_html', new_callable=AsyncMock, return_value=None), \
+             patch.object(agent, '_check_security_headers', new_callable=AsyncMock, return_value=[]), \
              patch("bugtrace.tools.external.external_tools.run_nuclei",
                    AsyncMock(return_value=mock_nuclei_results)), \
              patch("bugtrace.core.ui.dashboard"), \
@@ -409,9 +412,9 @@ class TestJSVersionDetection:
         html = '<script src="/js/angular-1.7.7.min.js"></script>'
         findings = agent._detect_js_versions(html)
         assert len(findings) == 1
-        assert "AngularJS" in findings[0]["name"]
-        assert "1.7.7" in findings[0]["name"]
-        assert "END OF LIFE" in findings[0]["name"]
+        assert "AngularJS" in findings[0]["display_name"]
+        assert "1.7.7" in findings[0]["display_name"]
+        assert "END OF LIFE" in findings[0]["display_name"]
         assert "CVE-2022-25869" in findings[0]["description"]
 
     def test_detects_vulnerable_jquery(self, agent):
@@ -419,8 +422,8 @@ class TestJSVersionDetection:
         html = '<script src="/js/jquery-3.4.1.min.js"></script>'
         findings = agent._detect_js_versions(html)
         assert len(findings) == 1
-        assert "jQuery" in findings[0]["name"]
-        assert "3.4.1" in findings[0]["name"]
+        assert "jQuery" in findings[0]["display_name"]
+        assert "3.4.1" in findings[0]["display_name"]
 
     def test_detects_vulnerable_lodash(self, agent):
         """Lodash 4.17.20 < 4.17.21 → vulnerable."""
@@ -471,7 +474,7 @@ class TestJSVersionDetection:
         assert "severity" in f
         assert "description" in f
         assert "tags" in f
-        assert "misconfiguration" in f["tags"]
+        assert "js-dependency" in f["tags"]
         assert "template_id" in f
         assert f["template_id"] == "js-vulnerable-angularjs"
         assert "matched_at" in f
