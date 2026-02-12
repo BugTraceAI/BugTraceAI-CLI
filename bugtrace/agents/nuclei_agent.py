@@ -9,46 +9,29 @@ from bugtrace.agents.base import BaseAgent
 import re
 import aiohttp
 
-# Known vulnerable JS library versions (version < threshold = vulnerable)
-KNOWN_VULNERABLE_JS = {
-    "angularjs": {
-        "below": (1, 8, 0),
-        "name": "AngularJS",
-        "cves": ["CVE-2022-25869"],
-        "eol": True,
-        "severity": "low",
-    },
-    "jquery": {
-        "below": (3, 5, 0),
-        "name": "jQuery",
-        "cves": ["CVE-2020-11022", "CVE-2020-11023"],
-        "severity": "low",
-    },
-    "vue": {
-        "below": (2, 7, 0),
-        "name": "Vue.js",
-        "cves": ["CVE-2024-6783"],
-        "severity": "low",
-    },
-    "react": {
-        "below": (16, 13, 0),
-        "name": "React",
-        "cves": ["CVE-2020-7919"],
-        "severity": "info",
-    },
-    "bootstrap": {
-        "below": (4, 3, 1),
-        "name": "Bootstrap",
-        "cves": ["CVE-2019-8331"],
-        "severity": "info",
-    },
-    "lodash": {
-        "below": (4, 17, 21),
-        "name": "Lodash",
-        "cves": ["CVE-2021-23337", "CVE-2020-28500"],
-        "severity": "low",
-    },
-}
+# Known vulnerable JS library versions — loaded from data file for easy maintenance
+def _load_vulnerable_js_libs() -> dict:
+    """Load vulnerable JS library database from JSON data file."""
+    data_path = Path(__file__).parent.parent / "config" / "vulnerable_js_libs.json"
+    try:
+        with open(data_path, "r") as f:
+            data = json.load(f)
+        libs = {}
+        for key, info in data.get("libraries", {}).items():
+            libs[key] = {
+                "below": tuple(info["below"]),
+                "name": info["name"],
+                "cves": info.get("cves", []),
+                "eol": info.get("eol", False),
+                "severity": info.get("severity", "low"),
+            }
+        logger.debug(f"Loaded {len(libs)} vulnerable JS libraries from {data_path.name}")
+        return libs
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.warning(f"Failed to load vulnerable_js_libs.json: {e}. Using empty defaults.")
+        return {}
+
+KNOWN_VULNERABLE_JS = _load_vulnerable_js_libs()
 
 
 class NucleiAgent(BaseAgent):

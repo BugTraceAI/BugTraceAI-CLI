@@ -266,27 +266,24 @@ class SQLiConfidenceTier:
 # INFRASTRUCTURE COOKIE FILTER
 # =============================================================================
 # Load balancer, CDN, and WAF cookies that produce SQLi false positives.
-# These cookies contain routing/session data that changes on every request,
-# causing time-based and boolean-based SQLi checks to trigger incorrectly.
+# Loaded from bugtrace/config/infrastructure_cookies.json for easy maintenance.
 # Legitimate application cookies (session, TrackingId, etc.) are NOT filtered.
 
-INFRASTRUCTURE_COOKIES = {
-    # AWS Elastic Load Balancer
-    "awsalb", "awsalbcors", "awsalbtg", "awsalbtgcors",
-    # Cloudflare
-    "__cfduid", "__cf_bm", "cf_clearance", "cf_chl_prog", "cf_chl_seq",
-    # Akamai
-    "rt", "aka_a2", "bm_sz", "bm_sv", "ak_bmsc",
-    # Google Cloud Load Balancer
-    "gclb",
-    # Azure
-    "arraffinity", "arraffinitysamesite",
-    # Generic load balancers
-    "_lb", "_lb_id", "lb-cookie", "serverid", "server-id",
-}
+def _load_infrastructure_cookies() -> tuple:
+    """Load infrastructure cookie list and prefixes from JSON data file."""
+    data_path = Path(__file__).parent.parent / "config" / "infrastructure_cookies.json"
+    try:
+        with open(data_path, "r") as f:
+            data = json.load(f)
+        cookies = set(data.get("cookies", []))
+        prefixes = tuple(data.get("prefixes", []))
+        logger.debug(f"Loaded {len(cookies)} infrastructure cookies, {len(prefixes)} prefixes from {data_path.name}")
+        return cookies, prefixes
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.warning(f"Failed to load infrastructure_cookies.json: {e}. Using empty defaults.")
+        return set(), ()
 
-# Prefixes that identify infrastructure cookies even if exact name varies
-_INFRASTRUCTURE_COOKIE_PREFIXES = ("aws", "__cf", "aka_")
+INFRASTRUCTURE_COOKIES, _INFRASTRUCTURE_COOKIE_PREFIXES = _load_infrastructure_cookies()
 
 
 # =============================================================================

@@ -574,6 +574,14 @@ class Settings(BaseSettings):
             self.VIEWPORT_HEIGHT = section.getint("VIEWPORT_HEIGHT")
         if "TIMEOUT_MS" in section:
             self.TIMEOUT_MS = section.getint("TIMEOUT_MS")
+        if "DOM_CLICK_MAX_LINKS" in section:
+            self.DOM_CLICK_MAX_LINKS = section.getint("DOM_CLICK_MAX_LINKS")
+        if "DOM_CLICK_MAX_TEXT_LINKS" in section:
+            self.DOM_CLICK_MAX_TEXT_LINKS = section.getint("DOM_CLICK_MAX_TEXT_LINKS")
+        if "DOM_CLICK_WAIT_SEC" in section:
+            self.DOM_CLICK_WAIT_SEC = section.getfloat("DOM_CLICK_WAIT_SEC")
+        if "DOM_CLICK_INITIAL_WAIT_SEC" in section:
+            self.DOM_CLICK_INITIAL_WAIT_SEC = section.getfloat("DOM_CLICK_INITIAL_WAIT_SEC")
 
     def _load_validation_config(self, config):
         """Load VALIDATION section config for Vision-Based XSS Validation."""
@@ -1020,7 +1028,13 @@ class Settings(BaseSettings):
     VIEWPORT_WIDTH: int = 1280
     VIEWPORT_HEIGHT: int = 720
     TIMEOUT_MS: int = 15000
-    
+
+    # --- DOM Click Strategy (Open Redirect Phase B.2) ---
+    DOM_CLICK_MAX_LINKS: int = 5       # Max onclick/hash links to click per strategy
+    DOM_CLICK_MAX_TEXT_LINKS: int = 10  # Max text-based navigation links to click
+    DOM_CLICK_WAIT_SEC: float = 2.0     # Seconds to wait after each click for JS redirect
+    DOM_CLICK_INITIAL_WAIT_SEC: float = 1.0  # Seconds to wait after page load before clicking
+
     # Crawler
     SPA_WAIT_MS: int = 1000
     MAX_QUEUE_SIZE: int = 100

@@ -826,9 +826,9 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                         await page.route("**/*", handle_request)
 
                         try:
-                            await page.goto(injected_url, wait_until="networkidle", timeout=15000)
+                            await page.goto(injected_url, wait_until="networkidle", timeout=settings.TIMEOUT_MS)
                             # Small wait for late JS redirects
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(settings.DOM_CLICK_INITIAL_WAIT_SEC)
                         except Exception:
                             pass  # Page may error after redirect abort
 
@@ -837,14 +837,18 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                         # ginandjuice.shop uses: <a href="#" onclick="location = ...">
                         # The page.goto() loads the page with ?back=evil_url but the
                         # redirect only fires when the user CLICKS the link.
+                        # Limits configured via [BROWSER_ADVANCED] in bugtraceaicli.conf.
                         # ============================================================
+                        max_links = settings.DOM_CLICK_MAX_LINKS
+                        max_text_links = settings.DOM_CLICK_MAX_TEXT_LINKS
+                        click_wait = settings.DOM_CLICK_WAIT_SEC
                         try:
                             # Strategy 1: Click all anchor links with onclick handlers
                             onclick_links = await page.query_selector_all('a[onclick]')
-                            for link in onclick_links[:5]:  # Cap at 5 to avoid infinite loops
+                            for link in onclick_links[:max_links]:
                                 try:
                                     await link.click()
-                                    await asyncio.sleep(2)  # Wait for JS redirect
+                                    await asyncio.sleep(click_wait)
                                     if redirected_to:
                                         break
                                 except Exception:
@@ -853,10 +857,10 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                             # Strategy 2: Click links with href="#" (common pattern for JS-only links)
                             if not redirected_to:
                                 hash_links = await page.query_selector_all('a[href="#"]')
-                                for link in hash_links[:5]:
+                                for link in hash_links[:max_links]:
                                     try:
                                         await link.click()
-                                        await asyncio.sleep(2)
+                                        await asyncio.sleep(click_wait)
                                         if redirected_to:
                                             break
                                     except Exception:
@@ -865,12 +869,12 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                             # Strategy 3: Click links whose text suggests navigation (Back, Return, Go back)
                             if not redirected_to:
                                 all_links = await page.query_selector_all('a')
-                                for link in all_links[:10]:
+                                for link in all_links[:max_text_links]:
                                     try:
                                         text = await link.text_content()
                                         if text and any(kw in text.lower() for kw in ["back", "return", "go back", "redirect", "continue"]):
                                             await link.click()
-                                            await asyncio.sleep(2)
+                                            await asyncio.sleep(click_wait)
                                             if redirected_to:
                                                 break
                                     except Exception:
