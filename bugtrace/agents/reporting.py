@@ -490,11 +490,14 @@ class ReportingAgent(BaseAgent):
                 f for f in all_findings
                 if f.get("status") in validated_statuses
                 and self._has_minimum_evidence(f)
+                and self._meets_report_quality(f)
             ],
             "manual_review": [
                 f for f in all_findings
                 if f.get("status") == "MANUAL_REVIEW_RECOMMENDED"
-                or (f.get("status") in validated_statuses and not self._has_minimum_evidence(f))
+                or (f.get("status") in validated_statuses
+                    and (not self._has_minimum_evidence(f)
+                         or not self._meets_report_quality(f)))
             ],
             "false_positives": [f for f in all_findings if f.get("status") == "VALIDATED_FALSE_POSITIVE"],
             "pending": [f for f in all_findings if f.get("status") == "PENDING_VALIDATION"]
@@ -526,6 +529,52 @@ class ReportingAgent(BaseAgent):
             f"lacks minimum evidence, routing to manual_review"
         )
         return False
+
+    # -- Patterns that indicate static analysis, not real exploits --
+    _STATIC_ANALYSIS_PATTERNS = (
+        "source-to-sink pattern detected",
+        "detected via code analysis",
+        "pattern detected via",
+    )
+
+    # -- XSS validation levels that lack browser-confirmed execution --
+    _XSS_UNCONFIRMED_LEVELS = {"L0.5", "L1"}
+
+    def _meets_report_quality(self, finding: Dict) -> bool:
+        """
+        Quality gate for the final report. Ensures findings meet pentest-grade
+        standards. Weak findings are routed to manual_review instead.
+
+        Filters:
+        - XSS/DOM-XSS with static-analysis payloads (no real exploit)
+        - XSS validated only via HTTP response analysis (no browser execution)
+        """
+        vuln_type = (finding.get("type") or "").upper()
+        payload = (finding.get("payload") or "").lower()
+        evidence = finding.get("evidence") or {}
+        level = ""
+        if isinstance(evidence, dict):
+            level = evidence.get("level", "") or ""
+        validation_method = (finding.get("validation_method") or "").lower()
+
+        # --- Filter 1: Static analysis payloads are not real exploits ---
+        for pattern in self._STATIC_ANALYSIS_PATTERNS:
+            if pattern in payload:
+                logger.info(
+                    f"[{self.name}] Report quality gate: {vuln_type}/{finding.get('parameter')} "
+                    f"has static-analysis payload, routing to manual_review"
+                )
+                return False
+
+        # --- Filter 2: XSS without browser-confirmed execution ---
+        if vuln_type == "XSS" and level in self._XSS_UNCONFIRMED_LEVELS:
+            logger.info(
+                f"[{self.name}] Report quality gate: XSS/{finding.get('parameter')} "
+                f"validated at {level} (HTTP-only), routing to manual_review"
+            )
+            return False
+
+        return True
 
     def _calculate_scan_stats(self, all_findings: List[Dict]) -> Dict:
         """Calculate scan statistics (duration, URLs scanned, token usage)."""
