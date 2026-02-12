@@ -794,6 +794,8 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                                  "back", "backUrl", "ref", "target", "to", "out"]
             params_to_test = list(set(url_params + redirect_keywords))
 
+            logger.info(f"[{self.name}] _test_dom_redirects: Testing {len(params_to_test)} params on {test_url}")
+
             for param in params_to_test:
                 try:
                     # Build test URL with evil redirect value
@@ -824,11 +826,57 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                         await page.route("**/*", handle_request)
 
                         try:
-                            await page.goto(injected_url, wait_until="networkidle", timeout=8000)
+                            await page.goto(injected_url, wait_until="networkidle", timeout=15000)
                             # Small wait for late JS redirects
                             await asyncio.sleep(1)
                         except Exception:
                             pass  # Page may error after redirect abort
+
+                        # ============================================================
+                        # Click trigger: activate onclick handlers that perform redirects
+                        # ginandjuice.shop uses: <a href="#" onclick="location = ...">
+                        # The page.goto() loads the page with ?back=evil_url but the
+                        # redirect only fires when the user CLICKS the link.
+                        # ============================================================
+                        try:
+                            # Strategy 1: Click all anchor links with onclick handlers
+                            onclick_links = await page.query_selector_all('a[onclick]')
+                            for link in onclick_links[:5]:  # Cap at 5 to avoid infinite loops
+                                try:
+                                    await link.click()
+                                    await asyncio.sleep(2)  # Wait for JS redirect
+                                    if redirected_to:
+                                        break
+                                except Exception:
+                                    pass
+
+                            # Strategy 2: Click links with href="#" (common pattern for JS-only links)
+                            if not redirected_to:
+                                hash_links = await page.query_selector_all('a[href="#"]')
+                                for link in hash_links[:5]:
+                                    try:
+                                        await link.click()
+                                        await asyncio.sleep(2)
+                                        if redirected_to:
+                                            break
+                                    except Exception:
+                                        pass
+
+                            # Strategy 3: Click links whose text suggests navigation (Back, Return, Go back)
+                            if not redirected_to:
+                                all_links = await page.query_selector_all('a')
+                                for link in all_links[:10]:
+                                    try:
+                                        text = await link.text_content()
+                                        if text and any(kw in text.lower() for kw in ["back", "return", "go back", "redirect", "continue"]):
+                                            await link.click()
+                                            await asyncio.sleep(2)
+                                            if redirected_to:
+                                                break
+                                    except Exception:
+                                        pass
+                        except Exception as click_err:
+                            logger.debug(f"[{self.name}] Click trigger error: {click_err}")
 
                     if redirected_to:
                         logger.info(f"[{self.name}] ✅ DOM Open Redirect: {param} on {test_url} → {redirected_to}")
@@ -1219,6 +1267,7 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                 self._v.emit("exploit.specialist.param.completed", {"agent": "OpenRedirect", "param": parameter, "url": url, "found": result is not None and result.get("validated", False)})
 
         # Phase B.2: DOM-based redirect testing (Playwright)
+        logger.info(f"[{self.name}] Phase B.2: Starting DOM redirect tests (dry_findings: {len(self._dry_findings)} URLs)")
         try:
             dom_findings = await self._test_dom_redirects()
             for dom_finding in dom_findings:
@@ -1240,6 +1289,7 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                             "evidence": dom_finding["evidence"],
                             "validation_requires_cdp": False,
                         }, scan_context=self._scan_context)
+            logger.info(f"[{self.name}] Phase B.2: DOM redirect testing complete — {len(dom_findings)} findings")
         except Exception as e:
             logger.error(f"[{self.name}] DOM redirect testing failed: {e}", exc_info=True)
 
