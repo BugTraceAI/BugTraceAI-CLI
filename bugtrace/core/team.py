@@ -2530,6 +2530,81 @@ class TeamOrchestrator:
             tech_profile = await self._run_nuclei_tech_profile(recon_dir)
             self.tech_profile = tech_profile
             dashboard.log(f"✓ Nuclei: {len(tech_profile.get('frameworks', []))} frameworks", "INFO")
+
+            # Emit misconfigurations as findings (HSTS, cookie flags, etc.)
+            from bugtrace.core.event_bus import EventType
+            misconfigs = tech_profile.get("misconfigurations", [])
+            if misconfigs:
+                dashboard.log(f"Misconfigurations: {len(misconfigs)} detected (HSTS, cookies, etc.)", "INFO")
+                for misconfig in misconfigs:
+                    finding_data = {
+                        "type": "MISCONFIGURATION",
+                        "category": misconfig.get("tags", ["SECURITY_HEADER"])[0] if misconfig.get("tags") else "SECURITY_HEADER",
+                        "severity": misconfig.get("severity", "low").upper(),
+                        "url": misconfig.get("matched_at", self.target),
+                        "parameter": misconfig.get("name", ""),
+                        "description": misconfig.get("description", ""),
+                        "remediation": "",
+                        "cwe_id": "",
+                        "validated": True,
+                        "status": "VALIDATED_CONFIRMED",
+                        "scan_context": self.scan_context,
+                        "evidence": {
+                            "nuclei_template": misconfig.get("template_id", ""),
+                            "detection_method": "nuclei_passive",
+                            "tags": misconfig.get("tags", [])
+                        }
+                    }
+                    await self.event_bus.emit(
+                        EventType.VULNERABILITY_DETECTED,
+                        finding_data
+                    )
+                    logger.info(f"[Nuclei] Emitted misconfiguration: {misconfig.get('name', '')[:60]}")
+
+            # Emit JS vulnerabilities as findings
+            js_vulns = tech_profile.get("js_vulnerabilities", [])
+            if js_vulns:
+                dashboard.log(f"Vulnerable JS: {len(js_vulns)} libraries detected", "WARN")
+                for vuln in js_vulns:
+                    # Build fix version string from 'below' threshold
+                    below = vuln.get("below", [0, 0, 0])
+                    fix_version = f"{below[0]}.{below[1]}.{below[2]}" if isinstance(below, (list, tuple)) and len(below) >= 3 else "latest"
+
+                    cves = vuln.get("cves", [])
+                    finding_data = {
+                        "type": "VULNERABLE_DEPENDENCY",
+                        "category": "JS_LIBRARY",
+                        "severity": vuln.get("severity", "low").upper(),
+                        "url": self.target,
+                        "library": vuln.get("name", "unknown"),
+                        "version": vuln.get("version", "unknown"),
+                        "cves": cves,
+                        "description": (
+                            f"{vuln.get('name', 'unknown')} {vuln.get('version', '')} has known vulnerabilities. "
+                            f"Affected by: {', '.join(cves) if cves else 'Unknown CVE'}. "
+                            f"{'This library is End-of-Life. ' if vuln.get('eol') else ''}"
+                        ),
+                        "remediation": (
+                            f"Update {vuln.get('name', 'unknown')} to version {fix_version} or later. "
+                            f"{'Consider migrating to a supported framework.' if vuln.get('eol') else ''}"
+                        ),
+                        "cwe_id": "CWE-1035",
+                        "validated": True,
+                        "status": "VALIDATED_CONFIRMED",
+                        "scan_context": self.scan_context,
+                        "evidence": {
+                            "script_src": vuln.get("script_src", ""),
+                            "version": vuln.get("version", ""),
+                            "detection_method": "version_fingerprint",
+                            "below_version": fix_version
+                        }
+                    }
+                    await self.event_bus.emit(
+                        EventType.VULNERABILITY_DETECTED,
+                        finding_data
+                    )
+                    logger.info(f"[Nuclei] Emitted JS vulnerability: {vuln.get('name')} {vuln.get('version')}")
+
             return tech_profile
 
         async def run_auth_discovery_parallel():
