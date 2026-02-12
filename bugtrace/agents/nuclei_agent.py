@@ -90,6 +90,7 @@ class NucleiAgent(BaseAgent):
                 "cdn": [],                 # Cloudflare, Akamai, etc.
                 "tech_tags": [],           # All detected tags
                 "misconfigurations": [],   # HSTS missing, cookie flags, etc.
+                "js_vulnerabilities": [],  # Vulnerable JS library versions
                 "raw_tech_findings": tech_findings,
                 "raw_vuln_findings": vuln_findings
             }
@@ -178,11 +179,11 @@ class NucleiAgent(BaseAgent):
                         "SUCCESS"
                     )
 
-            # JS dependency version detection → vulnerable versions go to misconfigurations
+            # JS dependency version detection → stored separately for VULNERABLE_DEPENDENCY emission
             if html_content:
                 js_vulns = self._detect_js_versions(html_content)
                 if js_vulns:
-                    tech_profile["misconfigurations"].extend(js_vulns)
+                    tech_profile["js_vulnerabilities"].extend(js_vulns)
                     dashboard.log(
                         f"[{self.name}] ⚠️ Found {len(js_vulns)} vulnerable JS dependencies",
                         "INFO"
@@ -454,12 +455,18 @@ class NucleiAgent(BaseAgent):
                 eol_note = " (END OF LIFE)" if lib_info.get("eol") else ""
 
                 findings.append({
-                    "name": f"Vulnerable JS library: {lib_info['name']} {v_str}{eol_note}",
+                    "name": lib_info['name'],
+                    "version": v_str,
+                    "below": list(lib_info["below"]),
+                    "cves": lib_info["cves"],
+                    "eol": lib_info.get("eol", False),
                     "severity": lib_info["severity"],
                     "description": f"{lib_info['name']} {v_str} is below {threshold_str}. Known CVEs: {cve_str}",
-                    "tags": ["misconfiguration", "js-dependency"],
+                    "tags": ["js-dependency", "vulnerable-library"],
                     "template_id": f"js-vulnerable-{lib_key}",
                     "matched_at": self.target,
+                    "script_src": source if source != "inline" else "",
+                    "display_name": f"Vulnerable JS library: {lib_info['name']} {v_str}{eol_note}",
                 })
                 logger.info(f"[{self.name}] Vulnerable JS: {lib_info['name']} {v_str} < {threshold_str} ({cve_str})")
 
