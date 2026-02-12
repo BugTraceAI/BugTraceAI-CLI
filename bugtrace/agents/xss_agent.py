@@ -268,6 +268,9 @@ class XSSAgent(BaseAgent, TechContextMixin):
         # Expert deduplication: Track emitted findings by fingerprint
         self._emitted_findings: set = set()  # (url, param, context)
 
+        # Global XSS root cause deduplication: group DOM XSS by root cause
+        self._global_xss_findings: Dict[tuple, List[str]] = {}  # root_cause_fingerprint -> [affected_urls]
+
         # WET → DRY transformation (Two-phase processing)
         self._dry_findings: List[Dict] = []  # Dedup'd findings after Phase A
 
@@ -3513,7 +3516,11 @@ Return ONLY the payloads, one per line, no explanations."""
     def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
         seen, dry_list = set(), []
         for f in wet_findings:
-            fp = self._generate_xss_fingerprint(f.get("url",""), f.get("parameter",""), f.get("context","html"))
+            _ev = f.get("evidence") or {}
+            fp = self._generate_xss_fingerprint(
+                f.get("url",""), f.get("parameter",""), f.get("context","html"),
+                sink=_ev.get("sink"), source=_ev.get("source")
+            )
             if fp not in seen:
                 seen.add(fp)
                 dry_list.append(f)
@@ -3743,9 +3750,32 @@ Return ONLY the payloads, one per line, no explanations."""
             # Collect DOM XSS findings and emit them
             for f in self.findings:
                 if f.context == "dom_xss" and f.validated:
-                    fp = self._generate_xss_fingerprint(f.url, f.parameter, "dom_xss")
+                    _ev = f.evidence or {}
+                    fp = self._generate_xss_fingerprint(
+                        f.url, f.parameter, "dom_xss",
+                        sink=_ev.get("sink"), source=_ev.get("source")
+                    )
+
+                    # Global XSS root cause grouping (e.g., postMessage->eval on shared JS)
+                    if fp[0] == "XSS_GLOBAL":
+                        if fp in self._global_xss_findings:
+                            if f.url not in self._global_xss_findings[fp]:
+                                self._global_xss_findings[fp].append(f.url)
+                            logger.info(f"[{self.name}] Global DOM XSS dedup: added {f.url} to root cause {fp[2]} "
+                                       f"(now {len(self._global_xss_findings[fp])} affected URLs)")
+                            continue  # Don't emit duplicate — already reported this root cause
+                        else:
+                            self._global_xss_findings[fp] = [f.url]
+                            logger.info(f"[{self.name}] Global DOM XSS detected: root cause {fp[2]} on {f.url}")
+
                     if fp not in self._emitted_findings:
                         self._emitted_findings.add(fp)
+                        evidence = f.evidence or {"validated": True, "level": "dom_xss"}
+                        # For global XSS, include root cause and affected URLs in evidence
+                        if fp[0] == "XSS_GLOBAL":
+                            evidence = dict(evidence)  # Copy to avoid mutating original
+                            evidence["root_cause"] = fp[2]
+                            evidence["affected_urls"] = self._global_xss_findings[fp]
                         finding_dict = {
                             "type": "XSS",
                             "subtype": "DOM_XSS",
@@ -3753,7 +3783,7 @@ Return ONLY the payloads, one per line, no explanations."""
                             "parameter": f.parameter,
                             "payload": f.payload,
                             "context": "dom_xss",
-                            "evidence": f.evidence or {"validated": True, "level": "dom_xss"}
+                            "evidence": evidence
                         }
                         self._emit_xss_finding(
                             finding_dict,
@@ -3761,7 +3791,7 @@ Return ONLY the payloads, one per line, no explanations."""
                             needs_cdp=False
                         )
                         validated.append(f)
-                        logger.info(f"[{self.name}] ✅ Emitted DOM XSS: {f.url} (source: {f.parameter})")
+                        logger.info(f"[{self.name}] Emitted DOM XSS: {f.url} (source: {f.parameter})")
         except Exception as e:
             logger.error(f"[{self.name}] Phase B.2 DOM XSS testing failed: {e}", exc_info=True)
 
@@ -5227,22 +5257,61 @@ Return ONLY the payloads, one per line, no explanations."""
             logger.debug(f"[{self.name}] Browser validation error: {e}")
             return None
 
-    def _generate_xss_fingerprint(self, url: str, parameter: str, context: str) -> tuple:
+    def _detect_xss_root_cause(self, url: str, parameter: str, context: str,
+                               sink: str = None, source: str = None) -> Optional[str]:
+        """
+        Detect if XSS is caused by a global vulnerability affecting multiple pages.
+
+        Some DOM XSS vulnerabilities originate from shared JavaScript files that
+        are loaded on every page (e.g., scanme.js with a postMessage->eval handler).
+        These should be reported as ONE finding with affected_urls, not N separate findings.
+
+        Returns:
+            Root cause identifier string if global, None if URL-specific.
+        """
+        # Pattern 1: postMessage -> eval (global event handler in shared JS)
+        if parameter == "postMessage" or source == "postMessage" or parameter == "window.postMessage" or source == "window.postMessage":
+            sink_name = str(sink).lower() if sink else "unknown"
+            if "eval" in sink_name:
+                return "postMessage_eval_global"
+            return f"postMessage_{sink_name}_global"
+
+        # Pattern 2: location.search -> document.write (global searchLogger)
+        if parameter == "location.search" and context == "dom_xss":
+            if sink and "document.write" in str(sink).lower():
+                return "location_search_docwrite_global"
+
+        # Not a global vulnerability — use per-URL fingerprint
+        return None
+
+    def _generate_xss_fingerprint(self, url: str, parameter: str, context: str,
+                                  sink: str = None, source: str = None) -> tuple:
         """
         Generate XSS finding fingerprint for expert deduplication.
 
         XSS is URL-specific and parameter-specific, but the SAME XSS
         in the SAME parameter with different payloads = DUPLICATE.
 
+        For global DOM XSS (e.g., postMessage->eval from shared JS), returns
+        a root-cause fingerprint that groups findings across different URLs.
+
         Args:
             url: Target URL
             parameter: Parameter name
             context: Reflection context (e.g., "html_attribute", "script_tag")
+            sink: DOM sink (e.g., "eval", "innerHTML") - optional, for root cause detection
+            source: DOM source (e.g., "postMessage", "location.hash") - optional
 
         Returns:
             Tuple fingerprint for deduplication
         """
         from urllib.parse import urlparse
+
+        # Check for global root cause (DOM XSS affecting multiple pages)
+        root_cause = self._detect_xss_root_cause(url, parameter, context, sink=sink, source=source)
+        if root_cause:
+            parsed = urlparse(url)
+            return ("XSS_GLOBAL", parsed.netloc, root_cause, context)
 
         parsed = urlparse(url)
         normalized_path = parsed.path.rstrip('/')
@@ -5274,7 +5343,28 @@ Return ONLY the payloads, one per line, no explanations."""
         needs_cdp = False
 
         # EXPERT DEDUPLICATION: Check if we already emitted this finding
-        fingerprint = self._generate_xss_fingerprint(result.url, result.parameter, result.context)
+        # Pass sink/source from evidence for global root cause detection
+        _sink = result.evidence.get("sink") if result.evidence else None
+        _source = result.evidence.get("source") if result.evidence else None
+        fingerprint = self._generate_xss_fingerprint(
+            result.url, result.parameter, result.context,
+            sink=_sink, source=_source
+        )
+
+        # For global XSS (e.g., postMessage->eval from shared JS), group by root cause
+        # and track affected URLs — only emit ONE finding per root cause
+        if fingerprint[0] == "XSS_GLOBAL":
+            if fingerprint in self._global_xss_findings:
+                # Already emitted this root cause — just add URL to affected list
+                if result.url not in self._global_xss_findings[fingerprint]:
+                    self._global_xss_findings[fingerprint].append(result.url)
+                logger.info(f"[{self.name}] Global XSS dedup: added {result.url} to root cause {fingerprint[2]} "
+                           f"(now {len(self._global_xss_findings[fingerprint])} affected URLs)")
+                return  # Don't emit duplicate
+            else:
+                # First occurrence — track and continue to emit
+                self._global_xss_findings[fingerprint] = [result.url]
+                logger.info(f"[{self.name}] Global XSS detected: root cause {fingerprint[2]} on {result.url}")
 
         if fingerprint in self._emitted_findings:
             logger.info(f"[{self.name}] Skipping duplicate XSS finding: {result.url}?{result.parameter} in {result.context} (already reported)")
@@ -5294,6 +5384,11 @@ Return ONLY the payloads, one per line, no explanations."""
             "validation_method": result.validation_method,
             "evidence": {"validated": True}  # Minimal evidence for validation
         }
+
+        # For global XSS, include affected_urls in evidence
+        if fingerprint[0] == "XSS_GLOBAL":
+            finding_dict["evidence"]["root_cause"] = fingerprint[2]
+            finding_dict["evidence"]["affected_urls"] = self._global_xss_findings[fingerprint]
 
         self._emit_xss_finding(
             finding_dict,
