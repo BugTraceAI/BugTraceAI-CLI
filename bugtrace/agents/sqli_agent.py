@@ -263,6 +263,33 @@ class SQLiConfidenceTier:
 
 
 # =============================================================================
+# INFRASTRUCTURE COOKIE FILTER
+# =============================================================================
+# Load balancer, CDN, and WAF cookies that produce SQLi false positives.
+# These cookies contain routing/session data that changes on every request,
+# causing time-based and boolean-based SQLi checks to trigger incorrectly.
+# Legitimate application cookies (session, TrackingId, etc.) are NOT filtered.
+
+INFRASTRUCTURE_COOKIES = {
+    # AWS Elastic Load Balancer
+    "awsalb", "awsalbcors", "awsalbtg", "awsalbtgcors",
+    # Cloudflare
+    "__cfduid", "__cf_bm", "cf_clearance", "cf_chl_prog", "cf_chl_seq",
+    # Akamai
+    "rt", "aka_a2", "bm_sz", "bm_sv", "ak_bmsc",
+    # Google Cloud Load Balancer
+    "gclb",
+    # Azure
+    "arraffinity", "arraffinitysamesite",
+    # Generic load balancers
+    "_lb", "_lb_id", "lb-cookie", "serverid", "server-id",
+}
+
+# Prefixes that identify infrastructure cookies even if exact name varies
+_INFRASTRUCTURE_COOKIE_PREFIXES = ("aws", "__cf", "aka_")
+
+
+# =============================================================================
 # SQLI AGENT V3
 # =============================================================================
 
@@ -1507,6 +1534,39 @@ Write the exploitation explanation section for the report."""
 
         await self._init_interactsh()
 
+    def _should_test_cookie(self, cookie_name: str) -> bool:
+        """Check if a cookie should be tested for SQLi.
+
+        Filters out infrastructure cookies (load balancers, CDNs, WAFs) that
+        produce false positives from routing behavior changes. Legitimate
+        application cookies (session, TrackingId, etc.) pass through.
+
+        Args:
+            cookie_name: The cookie name to evaluate.
+
+        Returns:
+            True if the cookie should be tested, False if it's infrastructure.
+        """
+        normalized = cookie_name.lower().strip()
+
+        # Exact match against known infrastructure cookies
+        if normalized in INFRASTRUCTURE_COOKIES:
+            logger.debug(
+                f"[{self.name}] Skipping infrastructure cookie: {cookie_name}"
+            )
+            return False
+
+        # Prefix match for cookie families (e.g. awsalb-*, __cf_*)
+        for prefix in _INFRASTRUCTURE_COOKIE_PREFIXES:
+            if normalized.startswith(prefix):
+                logger.debug(
+                    f"[{self.name}] Skipping infrastructure cookie "
+                    f"(prefix '{prefix}'): {cookie_name}"
+                )
+                return False
+
+        return True
+
     async def _discover_sqli_params(self, url: str) -> Dict[str, str]:
         """
         SQLi-focused parameter discovery for a given URL.
@@ -1590,7 +1650,7 @@ Write the exploitation explanation section for the report."""
                     for cookie_header in resp.headers.getall("Set-Cookie", []):
                         # Parse cookie name from "name=value; Path=/; HttpOnly"
                         cookie_name = cookie_header.split("=", 1)[0].strip()
-                        if cookie_name:
+                        if cookie_name and self._should_test_cookie(cookie_name):
                             cookie_key = f"Cookie: {cookie_name}"
                             if cookie_key not in all_params:
                                 all_params[cookie_key] = ""
