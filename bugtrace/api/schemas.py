@@ -49,6 +49,7 @@ class ScanStatusResponse(BaseModel):
     active_agent: Optional[str] = None
     phase: Optional[str] = None
     origin: str = "unknown"  # "cli", "web", or "unknown" — where scan was launched
+    enrichment_status: Optional[str] = None  # "full", "partial", "none", "pending"
 
 
 class FindingItem(BaseModel):
@@ -90,6 +91,7 @@ class ScanSummary(BaseModel):
     progress: int
     timestamp: str  # ISO format
     origin: str = "unknown"  # "cli", "web", or "unknown"
+    enrichment_status: Optional[str] = None  # "full", "partial", "none", "pending"
     has_report: bool = True  # Whether report files exist on disk
 
 

@@ -241,6 +241,8 @@ class DatabaseManager:
             self._migrate_origin_column(session)
             # Migration: Add 'report_dir' column to scan table (v5.1)
             self._migrate_report_dir_column(session)
+            # Migration: Add 'enrichment_status' column to scan table (v5.2)
+            self._migrate_enrichment_status_column(session)
 
     def _migrate_origin_column(self, session):
         """Migrate 'origin' column to scan table."""
@@ -277,6 +279,20 @@ class DatabaseManager:
         except Exception as e:
             session.rollback()
             logger.warning(f"Migration 'report_dir' column skipped: {e}")
+
+    def _migrate_enrichment_status_column(self, session):
+        """Migrate 'enrichment_status' column to scan table."""
+        try:
+            session.exec(text("SELECT enrichment_status FROM scan LIMIT 1"))
+        except Exception:
+            session.rollback()
+            try:
+                session.exec(text("ALTER TABLE scan ADD COLUMN enrichment_status VARCHAR DEFAULT NULL"))
+                session.commit()
+                logger.info("Migration: Added 'enrichment_status' column to scan table")
+            except Exception as e:
+                session.rollback()
+                logger.warning(f"Migration 'enrichment_status' column skipped: {e}")
 
     def _init_vector_store(self):
         try:
@@ -437,6 +453,15 @@ class DatabaseManager:
             scan = session.get(ScanTable, scan_id)
             if scan:
                 scan.status = status
+                session.add(scan)
+                session.commit()
+
+    def update_scan_enrichment_status(self, scan_id: int, enrichment_status: str):
+        """Update scan enrichment status."""
+        with self.get_session() as session:
+            scan = session.get(ScanTable, scan_id)
+            if scan:
+                scan.enrichment_status = enrichment_status
                 session.add(scan)
                 session.commit()
 

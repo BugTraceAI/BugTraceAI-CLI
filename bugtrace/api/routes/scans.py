@@ -443,3 +443,49 @@ async def get_detailed_metrics(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Scan {scan_id} not found",
         )
+
+
+@router.post("/scans/{scan_id}/re-enrich")
+async def re_enrich_scan(
+    scan_id: int,
+    scan_service: ScanServiceDep,
+):
+    """
+    Re-enrich a completed scan whose LLM enrichment failed.
+
+    Re-runs CVSS scoring and PoC generation on findings that
+    were not enriched due to LLM unavailability. Requires LLM
+    to be available.
+
+    Args:
+        scan_id: Scan ID to re-enrich
+        scan_service: Injected ScanService
+
+    Returns:
+        Dict with scan_id, status, and message
+
+    Raises:
+        404: Scan not found
+        409: Scan not completed
+        503: LLM unavailable
+    """
+    try:
+        result = await scan_service.re_enrich_scan(scan_id)
+        logger.info(f"Re-enrichment started for scan {scan_id}")
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "unavailable" in error_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=error_msg,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=error_msg,
+        )

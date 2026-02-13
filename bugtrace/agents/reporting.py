@@ -55,6 +55,10 @@ class ReportingAgent(BaseAgent):
         self._event_bus = event_bus
         self._subscribed = False
 
+        # Enrichment tracking
+        self._enrichment_failures = 0
+        self._enrichment_total = 0
+
     def subscribe_to_events(self) -> None:
         """
         Subscribe to validation events from the pipeline.
@@ -215,6 +219,9 @@ class ReportingAgent(BaseAgent):
 
         # Phase 5: Organize artifacts
         self._copy_screenshots(all_findings, self.output_dir / "captures")
+
+        # Persist enrichment status to database
+        self.db.update_scan_enrichment_status(self.scan_id, self._compute_enrichment_status())
 
         dashboard.log(f"[{self.name}] Generated {len(paths)} deliverables in {self.output_dir}", "SUCCESS")
         return paths
@@ -779,9 +786,11 @@ class ReportingAgent(BaseAgent):
         """Generate JSON report files.
 
         v3.2: validated_findings.json now applies deduplication
+        v3.3: validated_findings.json includes manual_review array
         """
         # Deduplicate validated findings for JSON output
         validated_deduped = self._deduplicate_findings(categorized["validated"])
+        manual_review_deduped = self._deduplicate_findings(categorized["manual_review"])
 
         return {
             "raw_findings": self._write_json(
@@ -789,12 +798,41 @@ class ReportingAgent(BaseAgent):
                 "raw_findings.json",
                 "All findings before/after AgenticValidator"
             ),
-            "validated_findings": self._write_json(
+            "validated_findings": self._write_validated_json(
                 validated_deduped,
-                "validated_findings.json",
-                "Only VALIDATED_CONFIRMED findings (deduplicated)"
+                manual_review_deduped,
             )
         }
+
+    def _write_validated_json(
+        self,
+        validated: List[Dict],
+        manual_review: List[Dict],
+    ) -> Path:
+        """Write validated_findings.json with both confirmed and manual_review."""
+        path = self.output_dir / "validated_findings.json"
+
+        output = {
+            "meta": {
+                "scan_id": self.scan_id,
+                "target": self.target_url,
+                "generated_at": datetime.now().isoformat(),
+                "description": "VALIDATED_CONFIRMED + manual_review findings (deduplicated)",
+                "count": len(validated),
+                "manual_review_count": len(manual_review),
+            },
+            "findings": validated,
+            "manual_review": manual_review,
+        }
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, default=str)
+
+        logger.info(
+            f"[{self.name}] Wrote validated_findings.json "
+            f"({len(validated)} validated, {len(manual_review)} manual_review)"
+        )
+        return path
 
     def _generate_markdown_reports(self, categorized: Dict) -> Dict[str, Path]:
         """Generate Markdown report files.
@@ -1213,6 +1251,9 @@ class ReportingAgent(BaseAgent):
         # Add validation method label for report display
         entry["validation_method_label"] = self._extract_validation_method(f)
 
+        # Enrichment status per finding (backwards compat: default True for old scans)
+        entry["enriched"] = f.get("enriched", True)
+
         # Add alternative payloads if available
         if f.get("successful_payloads") and len(f["successful_payloads"]) > 1:
             entry["successful_payloads"] = f["successful_payloads"]
@@ -1357,14 +1398,21 @@ class ReportingAgent(BaseAgent):
 
     def _engagement_build_meta(self) -> Dict:
         """Build engagement metadata section."""
-        return {
+        meta = {
             "scan_id": self.scan_id,
             "target": self.target_url,
             "scan_date": datetime.now().isoformat(),
             "tool_version": settings.VERSION,
             "validation_engine": "AgenticValidator + CDP + Vision AI",
-            "report_signature": "BUGTRACE_AI_REPORT_V5"
+            "report_signature": "BUGTRACE_AI_REPORT_V5",
+            "enrichment_status": self._compute_enrichment_status(),
+            "enrichment_stats": {
+                "total": self._enrichment_total,
+                "enriched": self._enrichment_total - self._enrichment_failures,
+                "failed": self._enrichment_failures,
+            },
         }
+        return meta
 
     def _engagement_build_stats(self, stats: Dict) -> Dict:
         """Build engagement statistics section."""
@@ -2347,6 +2395,31 @@ class ReportingAgent(BaseAgent):
         if not findings:
             return
 
+        self._enrichment_total = len(findings)
+
+        # Pre-check: Is LLM available?
+        health = llm_client.get_health_status()
+        if health["state"] == "CRITICAL":
+            logger.warning(f"[{self.name}] LLM circuit breaker OPEN. Skipping enrichment for {len(findings)} findings.")
+            dashboard.log(
+                f"[Reporting] LLM unavailable (circuit breaker OPEN). "
+                f"{len(findings)} findings will not be enriched with CVSS/PoC details. "
+                f"Use re-enrich to retry when LLM recovers.",
+                "WARN"
+            )
+            for f in findings:
+                f["enriched"] = False
+            self._enrichment_failures = len(findings)
+            await self._event_bus.emit(EventType.ENRICHMENT_DEGRADED, {
+                "scan_id": self.scan_id,
+                "total": len(findings),
+                "enriched": 0,
+                "failed": len(findings),
+                "enrichment_status": "none",
+                "message": f"LLM unavailable — {len(findings)} findings lack CVSS and exploitation details.",
+            })
+            return
+
         # Phase 1: Batch CVSS Scoring (1 LLM call per chunk of 10)
         logger.info(f"[{self.name}] Batch CVSS scoring for {len(findings)} findings...")
         await self._calculate_cvss_batch(findings)
@@ -2363,6 +2436,35 @@ class ReportingAgent(BaseAgent):
         poc_tasks = [limited_poc(f) for f in findings]
         await asyncio.gather(*poc_tasks)
 
+        # Post-check: detect findings that failed CVSS enrichment
+        for f in findings:
+            if f.get("enriched") is None and f.get("cvss_score") is None:
+                f["enriched"] = False
+                self._enrichment_failures += 1
+            elif f.get("enriched") is None:
+                f["enriched"] = True
+
+        # Emit degraded event if any failures
+        if self._enrichment_failures > 0:
+            enrichment_status = self._compute_enrichment_status()
+            enriched_count = self._enrichment_total - self._enrichment_failures
+            logger.warning(
+                f"[{self.name}] Enrichment degraded: {enriched_count}/{self._enrichment_total} findings enriched"
+            )
+            dashboard.log(
+                f"[Reporting] {self._enrichment_failures}/{self._enrichment_total} findings could not be enriched. "
+                f"Use re-enrich to retry when LLM recovers.",
+                "WARN"
+            )
+            await self._event_bus.emit(EventType.ENRICHMENT_DEGRADED, {
+                "scan_id": self.scan_id,
+                "total": self._enrichment_total,
+                "enriched": enriched_count,
+                "failed": self._enrichment_failures,
+                "enrichment_status": enrichment_status,
+                "message": f"{self._enrichment_failures}/{self._enrichment_total} findings lack enrichment.",
+            })
+
     async def _enrich_poc_with_llm(self, finding: Dict):
         """
         Use LLM to generate professional, triager-ready exploitation explanation AND detailed reproduction steps.
@@ -2373,11 +2475,33 @@ class ReportingAgent(BaseAgent):
             prompt = self._poc_build_prompt(context)
             response = await self._poc_execute_llm(prompt)
 
+            if response and "LLM unavailable" in response:
+                # Circuit breaker returned fallback — not real enrichment
+                finding["enriched"] = False
+                self._enrichment_failures += 1
+                return
+
             if response:
                 self._poc_parse_response(finding, response)
+                finding["enriched"] = True
+            else:
+                finding["enriched"] = False
+                self._enrichment_failures += 1
 
         except Exception as e:
             logger.debug(f"[{self.name}] Exploitation enrichment skipped for {finding.get('id')}: {e}")
+            finding["enriched"] = False
+            self._enrichment_failures += 1
+
+    def _compute_enrichment_status(self) -> str:
+        """Compute overall enrichment status for the scan."""
+        if self._enrichment_total == 0:
+            return "full"
+        if self._enrichment_failures == 0:
+            return "full"
+        if self._enrichment_failures == self._enrichment_total:
+            return "none"
+        return "partial"
 
     def _poc_prepare_context(self, finding: Dict) -> Dict:
         """Prepare context for PoC enrichment prompt."""

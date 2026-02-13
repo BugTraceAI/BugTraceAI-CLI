@@ -104,6 +104,9 @@ class EventType(str, Enum):
     PIPELINE_RESUMED = "pipeline_resumed"
     PIPELINE_SHUTDOWN = "pipeline_shutdown"
 
+    # Enrichment Events
+    ENRICHMENT_DEGRADED = "enrichment_degraded"
+
     # Dashboard Events (bridged to WebSocket for WEB frontend)
     PIPELINE_PROGRESS = "pipeline_progress"
     AGENT_UPDATE = "agent_update"

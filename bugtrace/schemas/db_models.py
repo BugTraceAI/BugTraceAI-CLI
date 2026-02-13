@@ -43,6 +43,7 @@ class ScanTable(SQLModel, table=True):
     progress_percent: int = 0
     origin: str = Field(default="unknown")  # "cli", "web", or "unknown" — tracks where scan was launched
     report_dir: Optional[str] = Field(default=None)  # Absolute path to the unified report directory
+    enrichment_status: Optional[str] = Field(default=None)  # "full", "partial", "none", "pending"
 
     target: Optional[TargetTable] = Relationship(back_populates="scans")
     findings: List["FindingTable"] = Relationship(back_populates="scan")

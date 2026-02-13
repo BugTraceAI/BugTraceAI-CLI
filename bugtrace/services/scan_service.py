@@ -326,6 +326,7 @@ class ScanService:
                 "active_agent": None,
                 "phase": None,
                 "origin": getattr(scan, "origin", "cli"),
+                "enrichment_status": getattr(scan, "enrichment_status", None),
             }
 
     async def stop_scan(self, scan_id: int) -> Dict[str, Any]:
@@ -481,6 +482,7 @@ class ScanService:
                 "progress": scan.progress_percent,
                 "timestamp": scan.timestamp.isoformat(),
                 "origin": getattr(scan, "origin", "cli"),
+                "enrichment_status": getattr(scan, "enrichment_status", None),
                 "has_report": has_report,
             })
         return results
@@ -991,3 +993,164 @@ class ScanService:
                 session.commit()
                 logger.info(f"Cleaned up {count} orphaned scan(s) → FAILED")
         return count
+
+    async def re_enrich_scan(self, scan_id: int) -> Dict[str, Any]:
+        """
+        Re-enrich a completed scan whose LLM enrichment failed.
+
+        Reads engagement_data.json, identifies unenriched findings,
+        runs LLM enrichment on them, and writes updated files back.
+
+        Args:
+            scan_id: Scan ID to re-enrich
+
+        Returns:
+            Dictionary with status and message
+
+        Raises:
+            ValueError: If scan not found or not completed
+            RuntimeError: If LLM unavailable or no report dir found
+        """
+        from bugtrace.core.llm_client import llm_client
+
+        # 1. Verify LLM health
+        health = llm_client.get_health_status()
+        if health["state"] == "CRITICAL":
+            raise RuntimeError("LLM unavailable (circuit breaker OPEN). Try again later.")
+
+        # 2. Verify scan exists and is completed
+        with self.db.get_session() as session:
+            from bugtrace.schemas.db_models import ScanTable, TargetTable
+            scan = session.get(ScanTable, scan_id)
+            if not scan:
+                raise ValueError(f"Scan {scan_id} not found")
+            if scan.status != ScanStatus.COMPLETED:
+                raise RuntimeError(f"Scan {scan_id} is not completed (status: {scan.status.value})")
+
+            target = session.get(TargetTable, scan.target_id)
+            target_url = target.url if target else "unknown"
+
+        # 3. Find report directory
+        report_dir = self._find_report_dir_for_scan(scan_id)
+        if not report_dir:
+            raise RuntimeError(f"No report directory found for scan {scan_id}")
+
+        # 4. Mark enrichment as pending
+        self.db.update_scan_enrichment_status(scan_id, "pending")
+
+        # 5. Launch background task
+        asyncio.create_task(
+            self._run_re_enrichment(scan_id, target_url, report_dir)
+        )
+
+        return {
+            "scan_id": scan_id,
+            "status": "re_enriching",
+            "message": f"Re-enrichment started for scan {scan_id}. Check enrichment_status for progress.",
+        }
+
+    async def _run_re_enrichment(self, scan_id: int, target_url: str, report_dir: Path):
+        """Background task: re-enrich unenriched findings in engagement_data.json."""
+        import json
+        from bugtrace.agents.reporting import ReportingAgent
+
+        try:
+            logger.info(f"Re-enrichment started for scan {scan_id}")
+
+            # 1. Load engagement_data.json
+            engagement_path = report_dir / "engagement_data.json"
+            if not engagement_path.is_file():
+                logger.error(f"engagement_data.json not found in {report_dir}")
+                self.db.update_scan_enrichment_status(scan_id, "none")
+                return
+
+            with open(engagement_path, "r") as f:
+                engagement_data = json.load(f)
+
+            findings = engagement_data.get("findings", [])
+            if not findings:
+                logger.info(f"No findings to re-enrich for scan {scan_id}")
+                self.db.update_scan_enrichment_status(scan_id, "full")
+                return
+
+            # 2. Identify unenriched findings (explicit flag or heuristic for legacy scans)
+            unenriched = []
+            for finding in findings:
+                if finding.get("enriched") is False:
+                    unenriched.append(finding)
+                elif "enriched" not in finding:
+                    # Legacy scan: detect by heuristic
+                    has_null_cvss = finding.get("cvss_score") is None
+                    has_fallback_text = False
+                    details = finding.get("exploitation_details", "")
+                    if isinstance(details, str) and ("LLM unavailable" in details or "fail open" in details):
+                        has_fallback_text = True
+                    if has_null_cvss or has_fallback_text:
+                        unenriched.append(finding)
+
+            if not unenriched:
+                logger.info(f"All findings already enriched for scan {scan_id}")
+                self.db.update_scan_enrichment_status(scan_id, "full")
+                return
+
+            logger.info(f"Re-enriching {len(unenriched)}/{len(findings)} findings for scan {scan_id}")
+
+            # 3. Create a ReportingAgent instance for enrichment only
+            agent = ReportingAgent(
+                scan_id=scan_id,
+                target_url=target_url,
+                output_dir=report_dir,
+            )
+
+            # 4. Run enrichment on unenriched findings
+            await agent._enrich_findings_batch(unenriched)
+
+            # 5. Merge enriched results back into engagement_data
+            # Build lookup by finding id
+            enriched_lookup = {f.get("id"): f for f in unenriched if f.get("id")}
+            for i, finding in enumerate(findings):
+                fid = finding.get("id")
+                if fid and fid in enriched_lookup:
+                    enriched = enriched_lookup[fid]
+                    # Update fields that enrichment populates
+                    if enriched.get("cvss_score") is not None:
+                        finding["cvss_score"] = enriched["cvss_score"]
+                    if enriched.get("cvss_vector") is not None:
+                        finding["cvss_vector"] = enriched["cvss_vector"]
+                    if enriched.get("cvss_rationale") is not None:
+                        finding["cvss_rationale"] = enriched["cvss_rationale"]
+                    if enriched.get("exploitation_details"):
+                        finding["exploitation_details"] = enriched["exploitation_details"]
+                    finding["enriched"] = enriched.get("enriched", True)
+
+            # 6. Update meta with new enrichment status
+            meta = engagement_data.get("meta", {})
+            meta["enrichment_status"] = agent._compute_enrichment_status()
+            meta["enrichment_stats"] = {
+                "total": agent._enrichment_total,
+                "enriched": agent._enrichment_total - agent._enrichment_failures,
+                "failed": agent._enrichment_failures,
+            }
+            engagement_data["meta"] = meta
+
+            # 7. Write updated engagement_data.json
+            with open(engagement_path, "w") as f:
+                json.dump(engagement_data, f, indent=2, default=str)
+
+            # 8. Write engagement_data.js (for HTML report viewer)
+            js_path = report_dir / "engagement_data.js"
+            if js_path.is_file():
+                with open(js_path, "w") as f:
+                    f.write("const ENGAGEMENT_DATA = ")
+                    json.dump(engagement_data, f, indent=2, default=str)
+                    f.write(";")
+
+            # 9. Persist final enrichment status
+            final_status = agent._compute_enrichment_status()
+            self.db.update_scan_enrichment_status(scan_id, final_status)
+
+            logger.info(f"Re-enrichment completed for scan {scan_id}: status={final_status}")
+
+        except Exception as e:
+            logger.error(f"Re-enrichment failed for scan {scan_id}: {e}", exc_info=True)
+            self.db.update_scan_enrichment_status(scan_id, "none")
