@@ -121,8 +121,14 @@ class ScanService:
             )
 
     def _create_scan_record(self, options: ScanOptions, origin: str) -> int:
-        """Create database scan record."""
-        scan_id = self.db.create_new_scan(options.target_url, origin=origin)
+        """Create database scan record with config."""
+        scan_id = self.db.create_new_scan(
+            options.target_url,
+            origin=origin,
+            scan_type=options.scan_type,
+            max_depth=options.max_depth,
+            max_urls=options.max_urls,
+        )
         logger.info(f"Created scan {scan_id} for target: {options.target_url} (origin={origin})")
         return scan_id
 
@@ -327,6 +333,9 @@ class ScanService:
                 "phase": None,
                 "origin": getattr(scan, "origin", "cli"),
                 "enrichment_status": getattr(scan, "enrichment_status", None),
+                "scan_type": scan.scan_type,
+                "max_depth": scan.max_depth,
+                "max_urls": scan.max_urls,
             }
 
     async def stop_scan(self, scan_id: int) -> Dict[str, Any]:
@@ -484,6 +493,9 @@ class ScanService:
                 "origin": getattr(scan, "origin", "cli"),
                 "enrichment_status": getattr(scan, "enrichment_status", None),
                 "has_report": has_report,
+                "scan_type": scan.scan_type,
+                "max_depth": scan.max_depth,
+                "max_urls": scan.max_urls,
             })
         return results
 

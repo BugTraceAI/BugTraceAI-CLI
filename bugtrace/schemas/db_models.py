@@ -44,6 +44,9 @@ class ScanTable(SQLModel, table=True):
     origin: str = Field(default="unknown")  # "cli", "web", or "unknown" — tracks where scan was launched
     report_dir: Optional[str] = Field(default=None)  # Absolute path to the unified report directory
     enrichment_status: Optional[str] = Field(default=None)  # "full", "partial", "none", "pending"
+    scan_type: Optional[str] = Field(default=None)  # "full", "hunter", "manager", or agent names
+    max_depth: Optional[int] = Field(default=None)  # Crawl depth used
+    max_urls: Optional[int] = Field(default=None)  # Max URLs configured
 
     target: Optional[TargetTable] = Relationship(back_populates="scans")
     findings: List["FindingTable"] = Relationship(back_populates="scan")

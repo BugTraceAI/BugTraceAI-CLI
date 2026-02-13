@@ -50,6 +50,9 @@ class ScanStatusResponse(BaseModel):
     phase: Optional[str] = None
     origin: str = "unknown"  # "cli", "web", or "unknown" — where scan was launched
     enrichment_status: Optional[str] = None  # "full", "partial", "none", "pending"
+    scan_type: Optional[str] = None
+    max_depth: Optional[int] = None
+    max_urls: Optional[int] = None
 
 
 class FindingItem(BaseModel):
@@ -93,6 +96,9 @@ class ScanSummary(BaseModel):
     origin: str = "unknown"  # "cli", "web", or "unknown"
     enrichment_status: Optional[str] = None  # "full", "partial", "none", "pending"
     has_report: bool = True  # Whether report files exist on disk
+    scan_type: Optional[str] = None
+    max_depth: Optional[int] = None
+    max_urls: Optional[int] = None
 
 
 class ScanListResponse(BaseModel):

@@ -152,4 +152,7 @@ class ScanContext:
             "findings_count": self.findings_count,
             "active_agent": self.active_agent,
             "phase": self.phase,
+            "scan_type": self.options.scan_type,
+            "max_depth": self.options.max_depth,
+            "max_urls": self.options.max_urls,
         }

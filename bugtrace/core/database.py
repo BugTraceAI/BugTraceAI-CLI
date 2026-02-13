@@ -243,6 +243,8 @@ class DatabaseManager:
             self._migrate_report_dir_column(session)
             # Migration: Add 'enrichment_status' column to scan table (v5.2)
             self._migrate_enrichment_status_column(session)
+            # Migration: Add scan config columns (v5.3)
+            self._migrate_scan_config_columns(session)
 
     def _migrate_origin_column(self, session):
         """Migrate 'origin' column to scan table."""
@@ -293,6 +295,21 @@ class DatabaseManager:
             except Exception as e:
                 session.rollback()
                 logger.warning(f"Migration 'enrichment_status' column skipped: {e}")
+
+    def _migrate_scan_config_columns(self, session):
+        """Migrate scan_type, max_depth, max_urls columns to scan table."""
+        for col, col_type in [("scan_type", "VARCHAR"), ("max_depth", "INTEGER"), ("max_urls", "INTEGER")]:
+            try:
+                session.exec(text(f"SELECT {col} FROM scan LIMIT 1"))
+            except Exception:
+                session.rollback()
+                try:
+                    session.exec(text(f"ALTER TABLE scan ADD COLUMN {col} {col_type} DEFAULT NULL"))
+                    session.commit()
+                    logger.info(f"Migration: Added '{col}' column to scan table")
+                except Exception as e:
+                    session.rollback()
+                    logger.warning(f"Migration '{col}' column skipped: {e}")
 
     def _init_vector_store(self):
         try:
@@ -418,22 +435,40 @@ class DatabaseManager:
                 progress_percent=scan.progress_percent
             )
 
-    def create_new_scan(self, target_url: str, origin: str = "cli") -> int:
+    def create_new_scan(
+        self,
+        target_url: str,
+        origin: str = "cli",
+        scan_type: str = None,
+        max_depth: int = None,
+        max_urls: int = None,
+    ) -> int:
         """Create a new scan record with RUNNING status.
 
         Args:
             target_url: Target URL to scan
             origin: Where the scan was launched from ('cli' or 'web')
+            scan_type: Scan type ('full', 'hunter', 'manager', etc.)
+            max_depth: Crawl depth configured
+            max_urls: Max URLs configured
         """
         target = self.get_or_create_target(target_url)
         target_id = target.id  # Extract ID while target is still valid
         with self.get_session() as session:
-            scan = ScanTable(target_id=target_id, status=ScanStatus.RUNNING, progress_percent=0, origin=origin)
+            scan = ScanTable(
+                target_id=target_id,
+                status=ScanStatus.RUNNING,
+                progress_percent=0,
+                origin=origin,
+                scan_type=scan_type,
+                max_depth=max_depth,
+                max_urls=max_urls,
+            )
             session.add(scan)
             session.commit()
             session.refresh(scan)
             scan_id = scan.id
-        logger.info(f"Created scan {scan_id} in database (target_id={target_id}, origin={origin})")
+        logger.info(f"Created scan {scan_id} in database (target_id={target_id}, origin={origin}, type={scan_type}, depth={max_depth}, urls={max_urls})")
         return scan_id
 
     def update_scan_progress(self, scan_id: int, progress: int, status: Optional[ScanStatus] = None):

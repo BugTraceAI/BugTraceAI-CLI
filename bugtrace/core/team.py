@@ -311,7 +311,12 @@ class TeamOrchestrator:
         else:
             # Always create new scan (DB = write-only, no reads)
             # Resume state comes from files, not DB
-            self.scan_id = self.db.create_new_scan(self.target, origin="cli")
+            self.scan_id = self.db.create_new_scan(
+                self.target,
+                origin="cli",
+                max_depth=self.max_depth,
+                max_urls=self.max_urls,
+            )
 
         # Persist the report_dir to DB so the API can find it reliably
         self.db.update_scan_report_dir(self.scan_id, str(self.report_dir))

@@ -84,9 +84,14 @@ class ReportService:
 
             target = session.get(TargetTable, scan.target_id)
             target_url = target.url if target else "unknown"
+            scan_config = {
+                "scan_type": scan.scan_type,
+                "max_depth": scan.max_depth,
+                "max_urls": scan.max_urls,
+            }
 
         # Build ReportContext using DataCollector
-        context = self._build_report_context(scan_id, target_url)
+        context = self._build_report_context(scan_id, target_url, scan_config)
 
         # Generate report based on format
         if format == "html":
@@ -96,13 +101,14 @@ class ReportService:
         elif format == "json":
             return self._generate_json_report(context, scan_id)
 
-    def _build_report_context(self, scan_id: int, target_url: str) -> ReportContext:
+    def _build_report_context(self, scan_id: int, target_url: str, scan_config: Dict[str, Any] = None) -> ReportContext:
         """
         Build ReportContext from database findings.
 
         Args:
             scan_id: Scan ID
             target_url: Target URL
+            scan_config: Optional scan configuration (scan_type, max_depth, max_urls)
 
         Returns:
             ReportContext populated with findings
@@ -127,6 +133,12 @@ class ReportService:
             if f.severity != Severity.INFO
         ])
         context.stats.validated_findings = len([f for f in context.findings if f.validated])
+
+        # Add scan configuration to stats
+        if scan_config:
+            context.stats.scan_type = scan_config.get("scan_type")
+            context.stats.max_depth = scan_config.get("max_depth")
+            context.stats.max_urls = scan_config.get("max_urls")
 
         logger.info(f"Built report context for scan {scan_id}: {len(context.findings)} findings")
 

@@ -60,6 +60,10 @@ class ScanStats(BaseModel):
     validated_findings: int = 0
     potential_findings: int = 0
     false_positives_blocked: int = 0
+    # Scan configuration (persisted from scan creation)
+    scan_type: Optional[str] = None
+    max_depth: Optional[int] = None
+    max_urls: Optional[int] = None
 
 class ReportContext(BaseModel):
     scan_id: Optional[int] = None
