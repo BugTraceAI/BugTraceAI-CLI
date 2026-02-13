@@ -133,8 +133,8 @@ def _parse_tool_output(output: str, max_size: int = MAX_JSON_SIZE) -> Dict:
 
 class ExternalToolManager:
     """
-    Manages execution of external security tools via Docker.
-    Ports capabilities from legacy tools/docker_manager.py
+    Manages execution of external security tools.
+    Prefers native binaries (fastest), falls back to Docker execution.
     """
 
     # Tool version tracking (TASK-115)
@@ -146,15 +146,32 @@ class ExternalToolManager:
 
     def __init__(self):
         self.docker_cmd = self._find_docker()
+        self._native_tools = self._detect_native_tools()
         self._tool_run_counts: Dict[str, int] = {}
         self._tool_last_run: Dict[str, float] = {}
-        
+
     def _find_docker(self) -> str:
         cmd = shutil.which("docker")
         if not cmd:
-            logger.warning("Docker not found! External tools (Nuclei, SQLMap) will be disabled.")
+            logger.info("Docker CLI not found (native tools will be preferred if available)")
             return ""
         return cmd
+
+    def _detect_native_tools(self) -> Dict[str, str]:
+        """Detect natively installed security tools (preferred over Docker)."""
+        tools = {}
+        for name in ("nuclei", "sqlmap", "gospider"):
+            path = shutil.which(name)
+            if path:
+                tools[name] = path
+                logger.info(f"Native tool available: {name} -> {path}")
+
+        if tools:
+            logger.info(f"Native tools: {', '.join(tools.keys())} (preferred over Docker)")
+        if not tools and not self.docker_cmd:
+            logger.warning("No native tools and no Docker — external scanning disabled")
+
+        return tools
 
     def get_tool_info(self) -> Dict[str, Any]:
         """
@@ -165,6 +182,7 @@ class ExternalToolManager:
         """
         return {
             "versions": self.TOOL_VERSIONS.copy(),
+            "native_tools": {k: True for k in self._native_tools},
             "run_counts": self._tool_run_counts.copy(),
             "last_run": self._tool_last_run.copy(),
             "docker_available": bool(self.docker_cmd),
@@ -181,6 +199,111 @@ class ExternalToolManager:
         self._tool_run_counts[tool_name] = self._tool_run_counts.get(tool_name, 0) + 1
         self._tool_last_run[tool_name] = time_module.time()
         logger.debug(f"Tool '{tool_name}' run #{self._tool_run_counts[tool_name]}")
+
+    async def _run_native(
+        self,
+        tool_name: str,
+        command: List[str],
+        timeout: int = 300,
+        tolerate_nonzero: bool = False,
+    ) -> str:
+        """
+        Run a tool natively via subprocess (no Docker overhead).
+
+        Args:
+            tool_name: Tool name for logging
+            command: Full command list [binary_path, arg1, arg2, ...]
+            timeout: Maximum execution time in seconds
+            tolerate_nonzero: If True, return output even on non-zero exit
+        """
+        logger.debug(f"Native Exec [{tool_name}]: {' '.join(command[:8])}...")
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+
+            if proc.returncode != 0 and not tolerate_nonzero:
+                err = stderr.decode().strip()
+                logger.error(
+                    f"Native {tool_name} failed (code {proc.returncode}): "
+                    f"{err[:500] if err else 'no stderr'}"
+                )
+                return ""
+
+            return _sanitize_output(stdout.decode())
+        except asyncio.TimeoutError:
+            if proc and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            logger.error(f"Native {tool_name} timeout after {timeout}s")
+            raise SubprocessError(
+                f"Native {tool_name} timed out after {timeout}s",
+                tool_name=tool_name,
+                context={"timeout_seconds": timeout},
+            )
+        except SubprocessError:
+            raise
+        except Exception as e:
+            logger.error(f"Native {tool_name} error: {e}", exc_info=True)
+            return ""
+
+    async def _run_native_with_limit(
+        self,
+        tool_name: str,
+        command: List[str],
+        line_limit: int,
+        timeout: int = 600,
+    ) -> str:
+        """Run a native tool with streaming output, kill after N lines."""
+        logger.debug(f"Native Streaming [{tool_name}]: limit={line_limit} lines")
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        output_lines = []
+        try:
+            while len(output_lines) < line_limit:
+                try:
+                    line_bytes = await asyncio.wait_for(
+                        process.stdout.readline(), timeout=30
+                    )
+                    if not line_bytes:
+                        break
+                    output_lines.append(line_bytes.decode("utf-8", errors="replace"))
+                except asyncio.TimeoutError:
+                    if output_lines:
+                        break
+                    raise
+
+            if len(output_lines) >= line_limit:
+                logger.info(f"{tool_name} limit reached ({line_limit} lines). Terminating...")
+                try:
+                    process.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+        except Exception as e:
+            logger.error(f"Native streaming {tool_name} error: {e}")
+            try:
+                process.kill()
+            except (ProcessLookupError, OSError):
+                pass
+
+        try:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        except Exception:
+            pass
+
+        return "".join(output_lines)
 
     def _build_docker_command(
         self,
@@ -319,39 +442,40 @@ class ExternalToolManager:
         finally:
             await self._cleanup_docker_process(proc)
 
+    async def _exec_tool(self, tool_name: str, docker_image: str, cmd: List[str], **kwargs) -> str:
+        """Execute tool via native binary (preferred) or Docker (fallback)."""
+        native = self._native_tools.get(tool_name)
+        if native:
+            return await self._run_native(tool_name, [native] + cmd, **kwargs)
+        return await self._run_container(docker_image, cmd, **kwargs)
+
     async def run_nuclei(self, target: str, cookies: List[Dict] = None) -> Dict[str, Any]:
         """
-        Runs two-phase Nuclei scan:
+        Runs two-phase Nuclei scan (native preferred, Docker fallback):
         1. Tech Detection (-tags tech): Fast detection of technologies/infrastructure
         2. Automatic Scan (-as): Smart vulnerability scan based on detected tech
 
         Returns:
             Dict with 'tech_findings' and 'vuln_findings' lists
         """
-        if not self.docker_cmd:
+        native = self._native_tools.get("nuclei")
+        if not native and not self.docker_cmd:
             return {"tech_findings": [], "vuln_findings": []}
 
         self._record_tool_run("nuclei")
-        logger.info(f"Starting Two-Phase Nuclei Scan on {target}...")
-        dashboard.log(f"[External] Launching Nuclei Engine (2-Phase) against {target}", "INFO")
+        mode = "native" if native else "Docker"
+        logger.info(f"Starting Two-Phase Nuclei Scan on {target} ({mode})...")
+        dashboard.log(f"[External] Launching Nuclei Engine ({mode}) against {target}", "INFO")
 
         # === PHASE 1: Tech Detection ===
-        dashboard.update_task("nuclei", name="Nuclei Tech-Detect", status=f"Phase 1/2: Tech Detection")
-        logger.info(f"[Nuclei] Phase 1: Tech Detection with -tags tech")
+        dashboard.update_task("nuclei", name="Nuclei Tech-Detect", status="Phase 1/2: Tech Detection")
 
-        tech_cmd = [
-            "-u", target,
-            "-tags", "tech,misconfig,exposure,token",
-            "-silent",
-            "-jsonl"
-        ]
-
-        # Add cookies to tech detection too
+        tech_cmd = ["-u", target, "-tags", "tech,misconfig,exposure,token", "-silent", "-jsonl"]
         if cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             tech_cmd.extend(["-H", f"Cookie: {cookie_str}"])
 
-        tech_output = await self._run_container("projectdiscovery/nuclei:latest", tech_cmd)
+        tech_output = await self._exec_tool("nuclei", "projectdiscovery/nuclei:latest", tech_cmd)
 
         tech_findings = []
         for line in tech_output.splitlines():
@@ -361,27 +485,19 @@ class ExternalToolManager:
             except json.JSONDecodeError:
                 continue
 
-        logger.info(f"[Nuclei] Phase 1: Found {len(tech_findings)} tech/infrastructure detections")
+        logger.info(f"[Nuclei] Phase 1: {len(tech_findings)} tech/infrastructure detections")
         dashboard.log(f"[External] Tech-Detect: {len(tech_findings)} technologies identified", "INFO")
 
         # === PHASE 2: Automatic Scan ===
-        dashboard.update_task("nuclei", name="Nuclei Auto-Scan", status=f"Phase 2/2: Smart Vulnerability Scan")
-        logger.info(f"[Nuclei] Phase 2: Automatic Scan with -as (tech-aware)")
+        dashboard.update_task("nuclei", name="Nuclei Auto-Scan", status="Phase 2/2: Smart Vulnerability Scan")
 
-        auto_cmd = [
-            "-u", target,
-            "-as",  # Automatic scan with template clustering
-            "-silent",
-            "-jsonl"
-        ]
-
-        # Add cookies
+        auto_cmd = ["-u", target, "-as", "-silent", "-jsonl"]
         if cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             auto_cmd.extend(["-H", f"Cookie: {cookie_str}"])
             auto_cmd.extend(["-H", "User-Agent: BugtraceAI/1.0"])
 
-        auto_output = await self._run_container("projectdiscovery/nuclei:latest", auto_cmd)
+        auto_output = await self._exec_tool("nuclei", "projectdiscovery/nuclei:latest", auto_cmd)
 
         vuln_findings = []
         for line in auto_output.splitlines():
@@ -391,11 +507,11 @@ class ExternalToolManager:
             except json.JSONDecodeError:
                 continue
 
-        logger.info(f"[Nuclei] Phase 2: Found {len(vuln_findings)} vulnerability detections")
+        logger.info(f"[Nuclei] Phase 2: {len(vuln_findings)} vulnerability detections")
 
         total_findings = len(tech_findings) + len(vuln_findings)
         if total_findings > 0:
-            dashboard.log(f"[External] Nuclei 2-Phase Complete: {len(tech_findings)} tech + {len(vuln_findings)} vulns", "SUCCESS")
+            dashboard.log(f"[External] Nuclei Complete: {len(tech_findings)} tech + {len(vuln_findings)} vulns", "SUCCESS")
 
         return {
             "tech_findings": tech_findings,
@@ -470,24 +586,30 @@ class ExternalToolManager:
         exploit_mode: bool = False
     ) -> Optional[Dict]:
         """
-        Runs SQLMap active scan with session context on specific URL/Param.
-        AVOIDS redundant crawling by targeting specific parameters found by GoSpider.
+        Runs SQLMap active scan (native preferred, Docker fallback).
+        Targets specific parameters found by GoSpider.
 
         Args:
             technique: Technique hint from internal checks (E/B/U/S/T/Q or combination).
                        If provided, SQLMap will try this technique first for faster detection.
         """
-        if not self.docker_cmd:
+        native = self._native_tools.get("sqlmap")
+        if not native and not self.docker_cmd:
             return None
 
         self._record_tool_run("sqlmap")
+        mode = "native" if native else "Docker"
         target_info = f"param '{target_param}' on {url}" if target_param else url
-        tech_info = f" (technique hint: {technique})" if technique else ""
-        logger.info(f"Starting SQLMap Scan on {target_info}{tech_info}...")
-        dashboard.log(f"[External] Launching SQLMap (Sniper Mode) against {target_info}{tech_info}", "INFO")
+        tech_info = f" (technique: {technique})" if technique else ""
+        logger.info(f"Starting SQLMap ({mode}) on {target_info}{tech_info}...")
+        dashboard.log(f"[External] Launching SQLMap ({mode}) against {target_info}{tech_info}", "INFO")
 
         cmd, reproduction_cmd = self._build_sqlmap_command(url, target_param, cookies, technique, exploit_mode=exploit_mode)
-        output = await self._run_container("googlesky/sqlmap:latest", cmd)
+
+        if native:
+            output = await self._run_native("sqlmap", [native] + cmd, tolerate_nonzero=True)
+        else:
+            output = await self._run_container("googlesky/sqlmap:latest", cmd)
 
         result = self._parse_sqlmap_output(output)
         if result:
@@ -555,7 +677,7 @@ class ExternalToolManager:
 
     async def run_gospider(self, url: str, cookies: List[Dict] = None, depth: int = 3, max_urls: int = None) -> List[str]:
         """
-        Runs GoSpider to crawl the target with session.
+        Runs GoSpider crawler (native preferred, Docker fallback).
         Respects max_urls to stop crawling early (Optimization).
 
         Args:
@@ -564,22 +686,17 @@ class ExternalToolManager:
             depth: Crawl depth
             max_urls: Stop after finding this many URLs (approximate)
         """
-        if not self.docker_cmd:
+        native = self._native_tools.get("gospider")
+        if not native and not self.docker_cmd:
             return []
 
         self._record_tool_run("gospider")
-        logger.info(f"Starting GoSpider on {url} (depth={depth}, limit={max_urls})...")
-        dashboard.log(f"[External] Launching GoSpider (depth={depth}) against {url}", "INFO")
+        mode = "native" if native else "Docker"
+        logger.info(f"Starting GoSpider ({mode}) on {url} (depth={depth}, limit={max_urls})...")
+        dashboard.log(f"[External] Launching GoSpider ({mode}, depth={depth}) against {url}", "INFO")
         dashboard.update_task("gospider", name="GoSpider", status=f"Crawling: {url}")
 
-        # IMPROVED 2026-01-30: Use GoSpider's full power
-        cmd = [
-            "-s", url,
-            "-d", str(depth),
-            "-c", "10",
-            "-a",           
-            "--sitemap",    
-        ]
+        cmd = ["-s", url, "-d", str(depth), "-c", "10", "-a", "--sitemap"]
 
         if cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
@@ -591,11 +708,16 @@ class ExternalToolManager:
 
         # Use streaming execution if limit is set
         if max_urls and max_urls > 0:
-            # We set a slightly higher buffer (1.5x) because GoSpider finds many dupes/junk
-            kill_limit = int(max_urls * 2.5) + 10 
-            output = await self._run_container_with_limit("trickest/gospider", cmd, line_limit=kill_limit)
+            kill_limit = int(max_urls * 2.5) + 10
+            if native:
+                output = await self._run_native_with_limit("gospider", [native] + cmd, line_limit=kill_limit)
+            else:
+                output = await self._run_container_with_limit("trickest/gospider", cmd, line_limit=kill_limit)
         else:
-            output = await self._run_container("trickest/gospider", cmd)
+            if native:
+                output = await self._run_native("gospider", [native] + cmd)
+            else:
+                output = await self._run_container("trickest/gospider", cmd)
 
         target_domain = urlparse(url).hostname.lower()
         if output:
