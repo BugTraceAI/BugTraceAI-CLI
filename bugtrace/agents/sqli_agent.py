@@ -2454,7 +2454,10 @@ Write the exploitation explanation section for the report."""
                             "parameter": param_name,
                             "technique": wet_item.get("technique", ""),
                             "priority": wet_item.get("priority", 0),
-                            "finding_data": wet_item.get("finding_data", {}),
+                            # Discovered params get empty finding_data: they don't inherit
+                            # the WET item's payload (which is param-specific and would cause
+                            # L0 to test a wrong payload). L1+ will use generic probes.
+                            "finding_data": {},
                             "_discovered": True
                         })
                         new_count += 1
@@ -3514,17 +3517,20 @@ Write the exploitation explanation section for the report."""
 
             # If SQLMap didn't confirm, still return finding based on probe detection
             # The probe already detected status code differential
-            if finding.get("confidence", 0) >= 0.85:
+            # Note: confidence lives inside finding_data, not at the top-level of dry_item
+            fd = finding.get("finding_data", {})
+            probe_confidence = fd.get("confidence", finding.get("confidence", 0))
+            if probe_confidence >= 0.85:
                 return SQLiFinding(
                     url=url,
                     parameter=f"Cookie: {cookie_name}",
                     injection_type="error_based",
                     technique="cookie_injection",
-                    working_payload=finding.get("payload", "'"),
-                    evidence={"probe_detection": finding.get("evidence", "Status code differential detected")},
+                    working_payload=fd.get("reproduction", finding.get("payload", "'")),
+                    evidence={"probe_detection": fd.get("evidence", finding.get("evidence", "Status code differential detected"))},
                     dbms_detected="Unknown",
                     validated=False,
-                    reproduction_steps=[finding.get("reproduction", "")],
+                    reproduction_steps=[fd.get("reproduction", "")],
                 )
 
             return None

@@ -153,6 +153,7 @@ class DASTySASTAgent(BaseAgent):
             capture = await browser_manager.capture_state(self.url)
             if capture and capture.get("html"):
                 html_full = capture["html"]
+                self._analysis_html = html_full  # Store full HTML for SQLi probes
                 if len(html_full) > 15000:
                      context["html_content"] = html_full[:7500] + "\n...[TRUNCATED]...\n" + html_full[-7500:]
                 else:
@@ -364,6 +365,70 @@ class DASTySASTAgent(BaseAgent):
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to extract HTML params: {e}")
             return []
+
+    def _extract_link_sqli_targets(self, html: str) -> Dict[str, Dict[str, str]]:
+        """
+        Extract query parameters from <a> href links in the HTML.
+
+        Returns a dict mapping endpoint URLs to their query params.
+        Only same-origin links are included. This catches params like
+        "category" that appear in navigation links but not in the current URL.
+
+        Example return: {
+            "https://example.com/catalog?category=Juice": {"category": "Juice"},
+            "https://example.com/product?id=1": {"id": "1"},
+        }
+        """
+        from bs4 import BeautifulSoup
+        from urllib.parse import urlparse, parse_qs, urljoin
+
+        targets = {}
+        if not html:
+            return targets
+
+        try:
+            parsed_self = urlparse(self.url)
+            soup = BeautifulSoup(html, "html.parser")
+
+            for a_tag in soup.find_all("a", href=True):
+                href = a_tag["href"]
+                if href.startswith(("javascript:", "mailto:", "#", "tel:")):
+                    continue
+                try:
+                    resolved_url = urljoin(self.url, href)
+                    resolved = urlparse(resolved_url)
+
+                    # Same-origin only
+                    if resolved.netloc and resolved.netloc != parsed_self.netloc:
+                        continue
+
+                    link_params = parse_qs(resolved.query)
+                    if not link_params:
+                        continue
+
+                    # Build clean URL (scheme + host + path)
+                    clean_url = f"{resolved.scheme}://{resolved.netloc}{resolved.path}"
+                    if clean_url not in targets:
+                        targets[clean_url] = {}
+
+                    for p_name, p_vals in link_params.items():
+                        if p_name not in targets[clean_url]:
+                            targets[clean_url][p_name] = p_vals[0] if p_vals else ""
+
+                except Exception:
+                    continue
+
+            if targets:
+                total_params = sum(len(v) for v in targets.values())
+                logger.info(
+                    f"[{self.name}] Extracted {total_params} params from "
+                    f"{len(targets)} link endpoints for SQLi probing"
+                )
+
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to extract link params: {e}")
+
+        return targets
 
     def _extract_cookies_from_http_headers(self, response) -> None:
         """
@@ -870,9 +935,12 @@ class DASTySASTAgent(BaseAgent):
     async def _check_sqli_probes(self) -> Dict:
         """
         Active SQLi probe: Send basic payloads to detect error-based SQL injection.
-        Uses two detection methods:
+        Uses three detection methods:
         1. SQL error messages in response body
         2. Status code differential (500 on ' but 200 on '' = classic SQLi)
+        3. Time-based blind SQLi (SLEEP payload)
+
+        Also discovers params from HTML <a> tags to expand attack surface coverage.
         """
         self._v.emit("discovery.sqli_probe.started", {"url": self.url})
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -904,14 +972,22 @@ class DASTySASTAgent(BaseAgent):
             parsed = urlparse(self.url)
             params = parse_qs(parsed.query)
 
-            if not params:
+            # Also extract params from HTML <a> tags (catches nav links like ?category=)
+            html = getattr(self, '_analysis_html', "")
+            link_targets = self._extract_link_sqli_targets(html) if html else {}
+
+            if not params and not link_targets:
                 return {"vulnerabilities": []}
 
             findings = []
+            tested_params = set()  # Track tested params to avoid duplicates
 
             # Use orchestrator for lifecycle-tracked connections
             async with orchestrator.session(DestinationType.TARGET) as session:
+                # === Phase 1: Test params from current URL ===
                 for param_name in params:
+                    tested_params.add(param_name)
+
                     # Test: Single quote should break SQL, double quote should escape
                     test_params_single = {k: v[0] if v else "" for k, v in params.items()}
                     test_params_single[param_name] = "'"
@@ -1050,6 +1126,83 @@ class DASTySASTAgent(BaseAgent):
                     except Exception as e:
                         logger.debug(f"[SQLi Probe] Network error testing {param_name}: {e}")
                         continue
+
+                # === Phase 2: Test params from HTML <a> links ===
+                # Discovers params like "category" from nav links that point to
+                # different endpoints (e.g., /catalog?category=Juice)
+                for link_url, link_params in link_targets.items():
+                    link_parsed = urlparse(link_url)
+
+                    for param_name, param_value in link_params.items():
+                        if param_name in tested_params:
+                            continue
+                        tested_params.add(param_name)
+
+                        try:
+                            # Build test URLs on the link's endpoint
+                            test_single = {k: v for k, v in link_params.items()}
+                            test_single[param_name] = f"{param_value}'"
+
+                            test_double = {k: v for k, v in link_params.items()}
+                            test_double[param_name] = f"{param_value}''"
+
+                            url_single = f"{link_url}?{urlencode(test_single)}"
+                            url_double = f"{link_url}?{urlencode(test_double)}"
+
+                            async with session.get(url_single, ssl=False, timeout=aiohttp.ClientTimeout(total=10)) as resp_single:
+                                status_single = resp_single.status
+                                body_single = await resp_single.text()
+
+                            async with session.get(url_double, ssl=False, timeout=aiohttp.ClientTimeout(total=10)) as resp_double:
+                                status_double = resp_double.status
+
+                            # Detection: Status code differential
+                            if status_single >= 500 and status_double < 400:
+                                logger.info(f"[SQLi Probe] Link param: status differential in {param_name} @ {link_url}: '={status_single}, ''={status_double}")
+                                findings.append({
+                                    "type": "SQLi",
+                                    "vulnerability": "SQL Injection (Error-based)",
+                                    "parameter": param_name,
+                                    "url": link_url,
+                                    "payload": "'",
+                                    "confidence": 0.9,
+                                    "severity": "Critical",
+                                    "probe_validated": True,
+                                    "fp_confidence": 0.85,
+                                    "skeptical_score": 8,
+                                    "votes": 5,
+                                    "evidence": f"Status code differential: single quote (') returns {status_single}, escaped quote ('') returns {status_double}",
+                                    "description": f"Error-based SQL injection detected in parameter '{param_name}' at {link_url}. Discovered from HTML navigation link.",
+                                    "reproduction": f"[PROBE-VALIDATED] curl -s -o /dev/null -w '%{{http_code}}' '{url_single}' # Returns {status_single}"
+                                })
+                                continue
+
+                            # Detection: SQL error messages
+                            body_lower = body_single.lower()
+                            for error_pattern in SQL_ERRORS:
+                                if error_pattern in body_lower:
+                                    logger.info(f"[SQLi Probe] Link param: SQL error '{error_pattern}' in {param_name} @ {link_url}")
+                                    findings.append({
+                                        "type": "SQLi",
+                                        "vulnerability": "SQL Injection (Error-based)",
+                                        "parameter": param_name,
+                                        "url": link_url,
+                                        "payload": "'",
+                                        "confidence": 0.95,
+                                        "severity": "Critical",
+                                        "probe_validated": True,
+                                        "fp_confidence": 0.9,
+                                        "skeptical_score": 9,
+                                        "votes": 5,
+                                        "evidence": f"SQL error detected: '{error_pattern}' in response",
+                                        "description": f"Error-based SQL injection detected in parameter '{param_name}' at {link_url}. Discovered from HTML navigation link.",
+                                        "reproduction": f"[PROBE-VALIDATED] curl '{url_single}' | grep -i 'error\\|sql'"
+                                    })
+                                    break
+
+                        except Exception as e:
+                            logger.debug(f"[SQLi Probe] Link param error testing {param_name} @ {link_url}: {e}")
+                            continue
 
             self._v.emit("discovery.sqli_probe.completed", {"url": self.url, "findings_count": len(findings)})
             return {"vulnerabilities": findings}
