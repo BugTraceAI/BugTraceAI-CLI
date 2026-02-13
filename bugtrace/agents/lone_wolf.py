@@ -225,6 +225,11 @@ class LoneWolf:
         await self._write_progress(f"LoneWolf started exploring {self.target_url}")
 
         while True:
+            # Hot-reload check: stop if disabled in config
+            if not settings.LONEWOLF_ENABLED:
+                logger.info("[LoneWolf] Disabled in config, shutting down gracefully.")
+                break
+
             # Safety valve
             if self._cycle_count >= self._max_cycles:
                 logger.info(f"[LoneWolf] Reached max cycles ({self._max_cycles}), stopping")
