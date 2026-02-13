@@ -101,53 +101,32 @@ app = FastAPI(
 
 def _get_cors_origins() -> list[str]:
     """
-    Get CORS allowed origins from environment.
+    Get CORS allowed origins from BUGTRACE_CORS_ORIGINS env var.
 
-    Returns:
-        List of allowed origin strings
+    Example: BUGTRACE_CORS_ORIGINS=http://localhost:5173,http://192.168.1.50:3000
 
-    Environment variable:
-        BUGTRACE_CORS_ORIGINS: Comma-separated list of origins
-        Example: "http://localhost:3000,http://localhost:5173"
-
-    Default (if not set):
-        Development: localhost:3000 and localhost:5173
-        Production: Empty list (must be explicitly configured)
+    If not set, allows all origins (permissive — configure for production).
     """
     env_origins = os.getenv("BUGTRACE_CORS_ORIGINS", "")
-
     if env_origins:
-        # Parse from environment
-        origins = [origin.strip() for origin in env_origins.split(",") if origin.strip()]
-        logger.info(f"CORS origins from environment: {origins}")
+        origins = [o.strip() for o in env_origins.split(",") if o.strip()]
+        logger.info(f"CORS origins: {origins}")
         return origins
 
-    # Default to common development origins
-    if settings.DEBUG or settings.ENV == "development":
-        default_origins = [
-            "http://localhost:3000",  # React default
-            "http://localhost:5173",  # Vite default
-            "http://localhost:6869",  # Docker Web UI default
-        ]
-        logger.info(f"Using default development CORS origins: {default_origins}")
-        return default_origins
-
-    # Production: require explicit configuration
-    logger.warning("No CORS origins configured for production - CORS will block all cross-origin requests")
-    return []
+    logger.warning("BUGTRACE_CORS_ORIGINS not set — allowing all origins. Set it in .env for production.")
+    return ["*"]
 
 
 # Configure CORS middleware
-# CRITICAL: Uses explicit origin list, NOT wildcard ["*"] with credentials
-# This fixes Pitfall 4 from PITFALLS.md (CORS preflight cache invalidation)
+_cors_origins = _get_cors_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_get_cors_origins(),  # Explicit origins from environment
-    allow_credentials=True,  # Allow cookies/authentication
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_origins != ["*"],
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Scan-ID"],
     expose_headers=["X-Scan-Progress"],
-    max_age=3600,  # Cache preflight for 1 hour
+    max_age=3600,
 )
 
 # Register global exception handlers
