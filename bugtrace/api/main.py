@@ -30,6 +30,10 @@ from bugtrace.services.event_bus import service_event_bus
 from bugtrace.utils.logger import get_logger, set_correlation_id
 
 logger = get_logger("api.main")
+
+# Module-level state for version check (populated at startup, read by /health)
+_update_info: Dict[str, Any] = {}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -54,6 +58,18 @@ async def lifespan(app: FastAPI):
     orphaned = scan_service.cleanup_orphaned_scans()
     if orphaned:
         logger.info(f"Marked {orphaned} orphaned scan(s) as FAILED on startup")
+
+    # Check for updates (non-blocking, silent on failure)
+    global _update_info
+    try:
+        from bugtrace.utils.version_check import check_for_update_async
+        result = await check_for_update_async(settings.VERSION)
+        if result:
+            _update_info = result
+            if result.get("update_available"):
+                logger.info(f"Update available: {settings.VERSION} -> {result['latest_version']} ({result['release_url']})")
+    except Exception:
+        pass
 
     yield
 
@@ -233,6 +249,8 @@ async def health_check(
         "docker_available": docker_available,
         "active_scans": active_scans,
         "event_bus_stats": event_stats,
+        "update_available": _update_info.get("update_available", False),
+        "latest_version": _update_info.get("latest_version"),
     }
 
 

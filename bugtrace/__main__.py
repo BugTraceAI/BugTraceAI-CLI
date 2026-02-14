@@ -58,6 +58,18 @@ def main_callback(ctx: typer.Context):
     if command_name is None:
         return
 
+    # Check for updates (silent, cached — hits GitHub at most once per 24h)
+    try:
+        from bugtrace.utils.version_check import check_for_update_sync
+        update = check_for_update_sync(settings.VERSION)
+        if update and update.get("update_available"):
+            console.print(
+                f"[yellow]Update available: {settings.VERSION} → {update['latest_version']}[/yellow]  "
+                f"[dim]Run: ./launcher.sh update[/dim]"
+            )
+    except Exception:
+        pass
+
     # Build command string for lock file
     command_str = f"bugtrace {command_name}"
     if len(sys.argv) > 2:
