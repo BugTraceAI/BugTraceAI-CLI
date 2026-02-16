@@ -16,7 +16,7 @@ logger = get_logger("core.anthropic_auth")
 
 # OAuth constants (must match anthropic_login.sh)
 TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
-CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLIENT_ID = os.environ.get("BUGTRACE_ANTHROPIC_CLIENT_ID", "")
 DEFAULT_TOKEN_FILE = Path("~/.bugtrace/auth.json")
 
 
