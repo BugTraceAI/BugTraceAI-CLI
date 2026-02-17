@@ -48,44 +48,58 @@ BugTraceAI-CLI performs **active exploitation** including:
 
 ## ✨ Features
 
-BugTraceAI-CLI implements a 5-phase pipeline that mirrors a professional penetration testing workflow.
+BugTraceAI-CLI implements a 6-phase pipeline that mirrors a professional penetration testing workflow.
 
-### Phase 1: Discovery
+### Phase 1: Reconnaissance
 - 🕷️ **GoSpider Integration**: Fast async crawling with JavaScript rendering and sitemap parsing
-- 🎯 **Nuclei CVE Scanning**: Template-based detection of known vulnerabilities
 - 🔍 **Parameter Extraction**: Automatic identification of injectable parameters
+- 🌐 **API Endpoint Enrichment**: Detail URL discovery from list endpoints
+- 🧭 **SPA Route Inference**: Infers API endpoints from frontend routes
 
-### Phase 2: Analysis (DASTySAST)
+### Phase 2: Discovery (DASTySAST)
 - 🧠 **Multi-Persona Analysis**: 6 different AI "personas" analyze each URL (bug bounty hunter, code auditor, pentester, etc.)
 - ✅ **Consensus Voting**: Requires 4/5 agreement from analysis personas to reduce false positives
 - 🔎 **Skeptical Review**: The 6th "Skeptical" persona (Claude Haiku) performs final filtering
+- 🎯 **Nuclei CVE Scanning**: Template-based detection of known vulnerabilities (runs in parallel)
 - 🛡️ **Parallel Execution**: All personas analyze simultaneously for speed
 
-### Phase 3: Intelligent Consolidation
+### Phase 3: Strategy
 - 🎯 **ThinkingConsolidationAgent**: Central brain that routes findings to specialists
 - 🔄 **Deduplication**: Eliminates redundant findings across URLs
 - ⚡ **Priority Routing**: High-confidence findings get tested first
 - 🛡️ **SQLi Bypass**: SQL injection candidates always reach SQLMap (tool decides, not LLM)
+- 🧩 **Auto-Dispatch**: Framework detection triggers specialist agents automatically (e.g., Angular → CSTIAgent)
 
 ### Phase 4: Exploitation
-Real tools, real payloads, real results:
+Real tools, real payloads, real results — 14 autonomous specialist agents:
 
 | Agent | Target | Method |
 |-------|--------|--------|
-| 🔥 **XSSAgent** | Cross-Site Scripting | Playwright browser + context-aware payloads |
+| 🔥 **XSSAgent** | Cross-Site Scripting | Playwright browser + 6-level escalation pipeline |
 | 💉 **SQLiAgent** | SQL Injection | SQLMap with WAF bypass tamper scripts |
-| 🎭 **CSTIAgent** | Client-Side Template Injection | AngularJS, Vue, React expressions |
+| 🎭 **CSTIAgent** | Client/Server-Side Template Injection | AngularJS, Vue, Jinja2, Twig, Mako |
 | 🌐 **SSRFAgent** | Server-Side Request Forgery | OOB callback verification |
 | 📄 **XXEAgent** | XML External Entity | DTD injection + OOB exfiltration |
-| 🔓 **IDORAgent** | Insecure Direct Object Reference | ID manipulation testing |
+| 🔓 **IDORAgent** | Insecure Direct Object Reference | ID manipulation + path segment testing |
 | 📁 **LFIAgent** | Local File Inclusion | Path traversal with filter evasion |
-| 🧩 **ProtoAgent** | Prototype Pollution | Browser-based property verification |
-| 🔌 **ApiAgent** | API Security | Broken Object Level Authorization (BOLA) testing |
+| 🧩 **PrototypePollutionAgent** | Prototype Pollution | Browser-based property verification |
+| 🔌 **APISecurityAgent** | API Security | Broken Object Level Authorization (BOLA) testing |
+| 🔑 **JWTAgent** | JWT Vulnerabilities | Algorithm confusion, weak secrets, token forging |
+| 🔀 **OpenRedirectAgent** | Open Redirect | HTTP 3xx + DOM-based redirect detection |
+| 💀 **RCEAgent** | Remote Code Execution | Command injection + deserialization testing |
+| 📨 **HeaderInjectionAgent** | Header Injection | CRLF injection + response splitting |
+| 📦 **MassAssignmentAgent** | Mass Assignment | Parameter pollution + privilege escalation |
 
 ### Phase 5: Validation
 - 🖥️ **Chrome DevTools Protocol**: Low-level browser verification for XSS
 - 👁️ **Vision AI**: Screenshot analysis confirms visual vulnerabilities
 - 📸 **Evidence Capture**: Every confirmed finding includes proof
+
+### Phase 6: Reporting
+- 📊 **AI-Powered Reports**: LLM-generated executive and technical assessments
+- 📝 **Multiple Formats**: JSON (machine-readable), Markdown, and HTML reports
+- 🔬 **PoC Enrichment**: Batch proof-of-concept generation for confirmed findings
+- 📁 **Specialist Audit Trail**: Per-agent WET/DRY/Results traceability
 
 ### Intelligence Systems
 - 🔀 **LLM Shifting**: Automatic fallback through model tiers (Gemini → DeepSeek → Claude → Qwen)
@@ -126,33 +140,36 @@ The key differentiator: **AI hypothesizes, tools validate**.
 
 This eliminates the "hallucination problem" of pure-AI scanners.
 
-## 🏗️ V5 Reactor Architecture
+## 🏗️ Reactor Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      BUGTRACE REACTOR                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐     │
-│  │ Discovery│ → │ Analysis │ → │ Thinking │ → │Specialist│     │
-│  │ GoSpider │   │ DASTySAST│   │ Consolid.│   │  Agents  │     │
-│  │ Nuclei   │   │ 6 Personas   │ Dedup    │   │ SQLMap   │     │
-│  └──────────┘   │ Consensus│   │ Priority │   │ Playwright    │
-│                 └──────────┘   └──────────┘   └────┬─────┘     │
-│                                                     │           │
-│                                                     ▼           │
-│                                              ┌──────────┐       │
-│                                              │Validation│       │
-│                                              │ CDP      │       │
-│                                              │ Vision AI│       │
-│                                              └──────────┘       │
-│                                                     │           │
-│                                                     ▼           │
-│                                              ┌──────────┐       │
-│                                              │  Report  │       │
-│                                              │JSON/MD/HTML     │
-│                                              └──────────┘       │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         BUGTRACE REACTOR                             │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐  │
+│  │   Phase 1  │   │   Phase 2  │   │   Phase 3  │   │   Phase 4  │  │
+│  │   Recon    │ → │  Discovery │ → │  Strategy  │ → │Exploitation│  │
+│  │  GoSpider  │   │ DASTySAST  │   │ ThinkingAg.│   │ 14 Agents  │  │
+│  │ URL Enrich │   │ 6 Personas │   │   Dedup    │   │   SQLMap   │  │
+│  │ SPA→API    │   │  + Nuclei  │   │  Routing   │   │ Playwright │  │
+│  └────────────┘   └────────────┘   └────────────┘   └─────┬──────┘  │
+│                                                            │         │
+│                                                            ▼         │
+│                                                     ┌────────────┐   │
+│                                                     │   Phase 5  │   │
+│                                                     │ Validation │   │
+│                                                     │    CDP     │   │
+│                                                     │ Vision AI  │   │
+│                                                     └─────┬──────┘   │
+│                                                            │         │
+│                                                            ▼         │
+│                                                     ┌────────────┐   │
+│                                                     │   Phase 6  │   │
+│                                                     │ Reporting  │   │
+│                                                     │JSON/MD/HTML│   │
+│                                                     └────────────┘   │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Parallelization Control
@@ -161,10 +178,12 @@ Each phase runs with independent concurrency:
 
 | Phase | Concurrency | Configurable | Notes |
 |-------|-------------|--------------|-------|
-| Discovery | 1 | No | GoSpider is already fast |
-| Analysis | 5 | Yes | Parallel DAST per URL |
+| Reconnaissance | 1 | No | GoSpider is already fast |
+| Discovery | 5 | Yes | Parallel DAST per URL |
+| Strategy | 1 | No | Sequential dedup + routing |
 | Exploitation | 10 | Yes | Parallel specialist agents |
 | Validation | 1 | **No** | CDP limitation (hardcoded) |
+| Reporting | 1 | No | Sequential report generation |
 
 > **Why is Validation = 1?** Chrome DevTools Protocol doesn't support multiple simultaneous connections. Additionally, `alert()` popups from XSS payloads block CDP indefinitely. Single-threaded with timeouts prevents crashes.
 
