@@ -408,10 +408,19 @@ class MassAssignmentAgent(BaseAgent, TechContextMixin):
                     headers={"Content-Type": "application/json"}
                 )
 
-                # Check if server accepted the injected fields
+                # Check 1: Direct response analysis
                 accepted_fields = self._check_field_acceptance(
                     resp, fields, baseline_body
                 )
+
+                # Check 2: Follow-up GET to detect silent persistence
+                # Some servers (e.g. Pydantic) silently ignore unknown fields
+                # in the response, but the ORM may still persist them
+                if not accepted_fields and resp.status_code in (200, 201, 204):
+                    followup_fields = await self._check_followup_get(
+                        client, url, fields, baseline_body
+                    )
+                    accepted_fields.extend(followup_fields)
 
                 for field_name, field_value in accepted_fields:
                     finding = self._build_finding(
@@ -446,6 +455,46 @@ class MassAssignmentAgent(BaseAgent, TechContextMixin):
                 logger.debug(f"[{self.name}] {method} {url} failed: {e}")
 
         return findings
+
+    async def _check_followup_get(
+        self, client: httpx.AsyncClient, url: str,
+        injected_fields: Dict[str, Any], baseline_body: Dict
+    ) -> List[Tuple[str, Any]]:
+        """
+        Follow-up GET after mutation to detect silent field persistence.
+        Compares baseline vs post-mutation GET response for injected fields.
+        """
+        accepted = []
+        try:
+            resp = await client.get(url)
+            if resp.status_code not in (200, 201):
+                return accepted
+            followup_body = resp.json() if resp.text.strip() else {}
+        except Exception:
+            return accepted
+
+        if not isinstance(followup_body, dict):
+            return accepted
+
+        # Compare each injected field against baseline
+        for field_name, field_value in injected_fields.items():
+            baseline_val = baseline_body.get(field_name) if isinstance(baseline_body, dict) else None
+            followup_val = followup_body.get(field_name)
+
+            if followup_val is None:
+                continue
+
+            # Field exists in follow-up — check if it changed to our injected value
+            injected_str = str(field_value).lower()
+            followup_str = str(followup_val).lower()
+            baseline_str = str(baseline_val).lower() if baseline_val is not None else ""
+
+            if followup_str == injected_str and followup_str != baseline_str:
+                logger.info(f"[{self.name}] Follow-up GET confirms mass assignment: "
+                           f"{field_name} changed from '{baseline_str}' to '{followup_str}'")
+                accepted.append((field_name, field_value))
+
+        return accepted
 
     def _group_privilege_fields(self) -> Dict[str, Dict[str, Any]]:
         """Group PRIVILEGE_FIELDS into logical test batches."""

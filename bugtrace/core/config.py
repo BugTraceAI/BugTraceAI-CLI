@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     # Model for reporting (PoC enrichment, CVSS scoring - needs uncensored analysis)
     REPORTING_MODEL: str = "deepseek/deepseek-v3.2"
 
+    # Batch PoC enrichment (Phase 6: grouped by vuln type)
+    REPORTING_POC_BATCH_SIZE: int = 10       # Max findings per LLM call within a group
+    REPORTING_POC_TOKENS_PER_FINDING: int = 600  # Output tokens budget per finding
+    REPORTING_POC_MIN_TOKENS: int = 2000     # Minimum max_tokens per batch call
+    REPORTING_POC_MAX_TOKENS: int = 8000     # Ceiling to prevent overflow
+
     # Skeptical Review Thresholds (0-10 scale)
     # CRITICAL vulns have LOWER thresholds to avoid missing them
     SKEPTICAL_THRESHOLDS: dict = {
@@ -489,6 +495,14 @@ class Settings(BaseSettings):
             self.MIN_CREDITS = section.getfloat("MIN_CREDITS")
         if "MAX_CONCURRENT_REQUESTS" in section:
             self.MAX_CONCURRENT_REQUESTS = section.getint("MAX_CONCURRENT_REQUESTS")
+        if "REPORTING_POC_BATCH_SIZE" in section:
+            self.REPORTING_POC_BATCH_SIZE = section.getint("REPORTING_POC_BATCH_SIZE")
+        if "REPORTING_POC_TOKENS_PER_FINDING" in section:
+            self.REPORTING_POC_TOKENS_PER_FINDING = section.getint("REPORTING_POC_TOKENS_PER_FINDING")
+        if "REPORTING_POC_MIN_TOKENS" in section:
+            self.REPORTING_POC_MIN_TOKENS = section.getint("REPORTING_POC_MIN_TOKENS")
+        if "REPORTING_POC_MAX_TOKENS" in section:
+            self.REPORTING_POC_MAX_TOKENS = section.getint("REPORTING_POC_MAX_TOKENS")
 
     def _load_conductor_and_scanning_config(self, config):
         """Load CONDUCTOR and SCANNING sections."""

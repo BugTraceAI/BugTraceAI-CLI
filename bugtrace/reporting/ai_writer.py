@@ -1,6 +1,7 @@
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+import asyncio
 import json
 
 from bugtrace.core.config import settings
@@ -33,9 +34,11 @@ class AIReportWriter(MarkdownGenerator):
         # 2. Prepare Data for AI
         recon_summary = self._summarize_context_for_ai(context)
         
-        # 3. Generate AI Content (Parallelize if possible, but we enforce sequential for costs)
-        tech_content = await self._generate_technical_assessment(context, recon_summary)
-        exec_content = await self._generate_executive_summary(context, recon_summary)
+        # 3. Generate AI Content (parallelized: tech + exec run concurrently)
+        tech_content, exec_content = await asyncio.gather(
+            self._generate_technical_assessment(context, recon_summary),
+            self._generate_executive_summary(context, recon_summary)
+        )
 
         # 4. Write Files directly to scan folder
         tech_path = report_dir / "technical_report.md"

@@ -3961,8 +3961,11 @@ Return ONLY the payloads, one per line, no explanations."""
             fields = target["fields"]
             text_fields = target["text_fields"]
             fmt = target["format"]
+            target_auth_failed = False
 
             for target_field in text_fields[:2]:
+                if target_auth_failed:
+                    break
                 for payload in stored_payloads:
                     try:
                         submit_data = dict(fields)
@@ -3996,8 +3999,39 @@ Return ONLY the payloads, one per line, no explanations."""
                                     post_status = resp.status
                                     post_response_text = await resp.text()
 
+                        # Skip auth-gated endpoints we can't access
+                        if post_status in (401, 403):
+                            logger.debug(f"[{self.name}] Stored XSS: auth required for POST {form_url} (HTTP {post_status})")
+                            target_auth_failed = True
+                            break
                         if post_status >= 500:
                             continue
+
+                        # Check 1: POST response itself may contain the stored payload
+                        if post_status in (200, 201) and self._check_stored_canary(post_response_text, canary, payload):
+                            findings.append({
+                                "type": "XSS",
+                                "subtype": "STORED_XSS",
+                                "url": form_url,
+                                "parameter": target_field,
+                                "payload": payload,
+                                "context": "stored_xss",
+                                "evidence": {
+                                    "validated": True,
+                                    "level": "stored",
+                                    "post_url": form_url,
+                                    "check_url": form_url,
+                                    "xss_type": "stored",
+                                    "validation_method": "post_response_reflection",
+                                    "resource_id": self._extract_resource_id(post_response_text),
+                                },
+                                "confidence": 0.95,
+                                "validated": True,
+                                "status": "VALIDATED_CONFIRMED",
+                                "http_method": "POST",
+                            })
+                            logger.info(f"[{self.name}] STORED XSS CONFIRMED: payload reflected in POST response at {form_url}")
+                            break
 
                         # Build check URLs: original page + form URL + detail URL from response
                         check_urls = [self.url]

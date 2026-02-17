@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import aiohttp
 import time
@@ -716,23 +717,56 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
         return await self._test_single_param_from_queue(url, param, finding)
 
     async def _test_single_param_from_queue(self, url: str, param: str, finding: dict) -> Optional[Dict]:
-        """Test a single parameter from queue for RCE. Retries with auth if 401/403."""
+        """Test a single parameter from queue for RCE. Detects auth gates and retries."""
         try:
+            # Phase 1: Try without auth
+            got_auth_error = False
             async with orchestrator.session(DestinationType.TARGET) as session:
                 time_payloads = self._get_time_payloads()
-                result = await self._test_parameter(session, param, time_payloads)
-                if result:
-                    return result
+                # Quick probe: send first payload and check for 403/401
+                probe_url = self._inject_payload(self.url, param, time_payloads[0])
+                try:
+                    async with session.get(probe_url, timeout=10) as resp:
+                        if resp.status in (401, 403):
+                            got_auth_error = True
+                            logger.info(f"[{self.name}] Auth gate detected on {param} (HTTP {resp.status})")
+                        else:
+                            await resp.text()
+                except Exception:
+                    pass
 
-            # If no result and endpoint might need auth, retry with forged admin JWT
+                if not got_auth_error:
+                    result = await self._test_parameter(session, param, time_payloads)
+                    if result:
+                        return result
+
+            # Phase 2: If auth error OR no result, retry with admin JWT from JWTAgent
             try:
                 from bugtrace.services.scan_context import get_scan_auth_headers
                 auth_headers = get_scan_auth_headers(self._scan_context, role="admin")
+
+                # If auth gate detected but no token yet, wait for JWTAgent to finish
+                if not auth_headers and got_auth_error:
+                    for wait_round in range(6):  # Wait up to 30s for JWT
+                        await asyncio.sleep(5)
+                        auth_headers = get_scan_auth_headers(self._scan_context, role="admin")
+                        if auth_headers:
+                            logger.info(f"[{self.name}] JWT token appeared after {(wait_round+1)*5}s wait")
+                            break
+
                 if auth_headers:
-                    logger.info(f"[{self.name}] Retrying {url}?{param} with admin auth token")
+                    logger.info(f"[{self.name}] Retrying {param} with admin auth token")
                     async with aiohttp.ClientSession(headers=auth_headers) as auth_session:
                         time_payloads = self._get_time_payloads()
-                        return await self._test_parameter(auth_session, param, time_payloads)
+                        result = await self._test_parameter(auth_session, param, time_payloads)
+                        if result:
+                            return result
+                        # Also try output-based detection (check response body for command output)
+                        result = await self._test_output_based(auth_session, param)
+                        if result:
+                            return result
+                elif got_auth_error:
+                    logger.warning(f"[{self.name}] Auth gate on {param} but no JWT token available after waiting")
             except Exception as auth_err:
                 logger.debug(f"[{self.name}] Auth retry failed: {auth_err}")
 
@@ -740,6 +774,50 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
         except Exception as e:
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
+
+    async def _test_output_based(self, session, param: str) -> Optional[Dict]:
+        """Test output-based RCE: send commands and check for output in response."""
+        output_payloads = [
+            ("id", r"uid=\d+"),
+            ("whoami", r"[a-z_][a-z0-9_-]*"),
+            ("echo BTAIRCE7331", r"BTAIRCE7331"),
+        ]
+        for cmd, pattern in output_payloads:
+            target = self._inject_payload(self.url, param, cmd)
+            try:
+                async with session.get(target, timeout=10) as resp:
+                    text = await resp.text()
+                    if resp.status == 200:
+                        import re
+                        if cmd == "echo BTAIRCE7331" and "BTAIRCE7331" in text:
+                            return self._create_output_finding(param, cmd, "BTAIRCE7331")
+                        elif cmd == "id" and re.search(r"uid=\d+", text):
+                            return self._create_output_finding(param, cmd, re.search(r"uid=\d+", text).group())
+                        elif cmd == "whoami" and "cmd_output" in text:
+                            return self._create_output_finding(param, cmd, text[:200])
+            except Exception:
+                continue
+        return None
+
+    def _create_output_finding(self, param: str, payload: str, output: str) -> Dict:
+        """Create finding for output-based RCE."""
+        return {
+            "type": "RCE",
+            "url": self.url,
+            "parameter": param,
+            "payload": payload,
+            "severity": "CRITICAL",
+            "validated": True,
+            "status": "VALIDATED_CONFIRMED",
+            "evidence": f"Command output detected: {output[:200]}",
+            "description": f"Command Injection confirmed. Parameter '{param}' executes OS commands. Command '{payload}' produced output.",
+            "reproduction": f"curl '{self._inject_payload(self.url, param, payload)}'",
+            "cwe_id": get_cwe_for_vuln("RCE"),
+            "remediation": get_remediation_for_vuln("RCE"),
+            "cve_id": "N/A",
+            "http_request": f"GET {self._inject_payload(self.url, param, payload)}",
+            "http_response": f"Command output: {output[:200]}",
+        }
 
     def _generate_rce_fingerprint(self, url: str, parameter: str) -> tuple:
         """

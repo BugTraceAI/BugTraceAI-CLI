@@ -79,6 +79,8 @@ class JWTAgent(BaseAgent, TechContextMixin):
         # Extract from nested structure if needed
         nested = finding.get("finding", {})
         evidence = finding.get("evidence", nested.get("evidence", {}))
+        if not isinstance(evidence, dict):
+            evidence = {}  # Evidence may be a string description, not a dict
 
         # JWT-specific: Must have attack type or vulnerability type
         attack_type = finding.get("attack_type", nested.get("attack_type", ""))
@@ -728,49 +730,157 @@ class JWTAgent(BaseAgent, TechContextMixin):
                 return
 
     async def _extract_app_name_from_root(self, url: str) -> List[str]:
-        """Fetch root URL and extract potential app name from welcome message / API response."""
+        """Extract potential app names for JWT secret generation.
+
+        Strategy (ordered by reliability):
+        1. Read cached recon data from disk (always available, no HTTP needed)
+        2. Fetch root URL with retry (may fail under load)
+        """
         import re
         from urllib.parse import urlparse
         import aiohttp
 
-        parsed = urlparse(url)
-        root_url = f"{parsed.scheme}://{parsed.netloc}/"
         names = []
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(root_url, timeout=aiohttp.ClientTimeout(total=5), ssl=False) as resp:
-                    text = await resp.text()
+        # --- Strategy 1: Extract from cached recon data (report_dir) ---
+        report_dir = getattr(self, 'report_dir', None)
+        if report_dir:
+            names.extend(self._extract_names_from_recon_cache(report_dir))
 
-            # Extract CamelCase words (e.g., "BugStore" → "bugstore")
-            for match in re.findall(r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b', text):
-                w = match.lower()
-                if len(w) >= 4 and w not in ("welcome", "message", "status", "running", "version", "error"):
+        # --- Strategy 2: Fetch root page with retry ---
+        parsed = urlparse(url)
+        root_url = f"{parsed.scheme}://{parsed.netloc}/"
+        timeouts = [5, 10]  # Retry with increasing timeout
+
+        for attempt, timeout_sec in enumerate(timeouts):
+            if names:
+                break  # Already have names from cache, skip HTTP
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(root_url, timeout=aiohttp.ClientTimeout(total=timeout_sec), ssl=False) as resp:
+                        text = await resp.text()
+                names.extend(self._extract_names_from_html(text))
+                break
+            except Exception as e:
+                logger.debug(f"[{self.name}] Root page fetch attempt {attempt + 1} failed: {e}")
+
+        # Deduplicate
+        names = list(dict.fromkeys(names))
+        if names:
+            logger.info(f"[{self.name}] Extracted app names for secret generation: {names}")
+        else:
+            logger.warning(f"[{self.name}] No app names extracted — dynamic JWT secrets will be limited")
+
+        return names
+
+    def _extract_names_from_html(self, text: str) -> List[str]:
+        """Extract potential app/service names from HTML content."""
+        import re
+        names = []
+        noise = {"welcome", "message", "status", "running", "version", "error",
+                 "true", "false", "null", "undefined", "module", "export",
+                 "function", "return", "script", "style", "charset"}
+
+        # CamelCase words (e.g., "BugStore" → "bugstore")
+        for match in re.findall(r'\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b', text):
+            w = match.lower()
+            if len(w) >= 4 and w not in noise:
+                names.append(w)
+
+        # Quoted strings
+        for match in re.findall(r'"([^"]{3,30})"', text):
+            for word in match.split():
+                w = word.lower().strip()
+                if len(w) >= 4 and w.isalpha() and w not in noise:
                     names.append(w)
 
-            # Extract quoted strings that could be app names (e.g., "Welcome to BugStore API")
-            for match in re.findall(r'"([^"]{3,30})"', text):
-                words = match.split()
-                for word in words:
-                    w = word.lower().strip()
-                    if len(w) >= 4 and w.isalpha() and w not in ("welcome", "message", "status", "running", "version", "error", "true", "false", "null"):
-                        names.append(w)
+        # HTML <title>
+        title_match = re.search(r'<title[^>]*>([^<]+)</title>', text, re.IGNORECASE)
+        if title_match:
+            for word in re.split(r'[\s\-_|]+', title_match.group(1)):
+                w = word.lower().strip()
+                if len(w) >= 3 and w.isalpha() and w not in noise:
+                    names.append(w)
 
-            # Also try HTML <title> if present
-            title_match = re.search(r'<title[^>]*>([^<]+)</title>', text, re.IGNORECASE)
-            if title_match:
-                for word in re.split(r'[\s\-_|]+', title_match.group(1)):
-                    w = word.lower().strip()
-                    if len(w) >= 3 and w.isalpha():
-                        names.append(w)
+        return names
 
-            # Deduplicate
-            names = list(dict.fromkeys(names))
-            if names:
-                logger.info(f"[{self.name}] Extracted app names from root page: {names}")
+    def _extract_names_from_recon_cache(self, report_dir) -> List[str]:
+        """Extract app names from cached recon data on disk (no HTTP needed)."""
+        import re
+        from pathlib import Path
+        names = []
+        noise = {"welcome", "message", "status", "running", "version", "error",
+                 "true", "false", "null", "undefined", "localhost", "http", "https"}
 
-        except Exception as e:
-            logger.debug(f"[{self.name}] Failed to fetch root URL for name extraction: {e}")
+        report_dir = Path(report_dir)
+
+        # 1. Read DASTySAST HTML captures (most likely to have app name)
+        dastysast_dir = report_dir / "dastysast"
+        if dastysast_dir.exists():
+            for json_file in sorted(dastysast_dir.glob("*.json"))[:5]:
+                try:
+                    data = json.loads(json_file.read_text(encoding="utf-8"))
+                    # DASTySAST files may contain HTML content or page title
+                    html = data.get("html_content", "") or data.get("page_source", "")
+                    if html:
+                        names.extend(self._extract_names_from_html(html))
+                    # Also check metadata for page title
+                    title = data.get("page_title", "") or data.get("title", "")
+                    if title:
+                        for word in re.split(r'[\s\-_|]+', title):
+                            w = word.lower().strip()
+                            if len(w) >= 3 and w.isalpha() and w not in noise:
+                                names.append(w)
+                except Exception:
+                    pass
+
+        # 2. Read tech_profile.json for framework/server names
+        for tp_path in [report_dir / "recon" / "tech_profile.json", report_dir / "tech_profile.json"]:
+            if tp_path.exists():
+                try:
+                    tp = json.loads(tp_path.read_text(encoding="utf-8"))
+                    # Extract from URL field (may contain app name in subdomain)
+                    tp_url = tp.get("url", "")
+                    if tp_url:
+                        from urllib.parse import urlparse
+                        parsed = urlparse(tp_url)
+                        for part in (parsed.hostname or "").replace("-", ".").replace("_", ".").split("."):
+                            if len(part) >= 4 and part.isalpha() and part not in noise:
+                                names.append(part.lower())
+                except Exception:
+                    pass
+
+        # 3. Read screenshots directory for HTML files with titles
+        captures_dir = report_dir / "captures"
+        if captures_dir.exists():
+            import glob as glob_mod
+            for html_file in glob_mod.glob(str(captures_dir / "*.html"))[:3]:
+                try:
+                    with open(html_file, 'r', errors='ignore') as f:
+                        content = f.read(5000)
+                    names.extend(self._extract_names_from_html(content))
+                except Exception:
+                    pass
+
+        # 4. Read analysis/ directory for page titles in DAST reports
+        analysis_dir = report_dir / "analysis"
+        if analysis_dir.exists():
+            for json_file in sorted(analysis_dir.glob("*.json"))[:3]:
+                try:
+                    data = json.loads(json_file.read_text(encoding="utf-8"))
+                    # Analysis reports may have target info
+                    for key in ("page_title", "title", "app_name", "target_name"):
+                        val = data.get(key, "")
+                        if val:
+                            for word in re.split(r'[\s\-_|]+', str(val)):
+                                w = word.lower().strip()
+                                if len(w) >= 3 and w.isalpha() and w not in noise:
+                                    names.append(w)
+                except Exception:
+                    pass
+
+        if names:
+            logger.debug(f"[{self.name}] Names from recon cache: {list(dict.fromkeys(names))}")
 
         return names
 
@@ -1034,7 +1144,7 @@ class JWTAgent(BaseAgent, TechContextMixin):
         except Exception as e:
             logger.debug(f"[{self.name}] Post-exploitation scan error: {e}")
 
-        post_exploit_count = len([f for f in self.findings if f.get("_post_exploit")])
+        post_exploit_count = len([f for f in self.findings if isinstance(f, dict) and f.get("_post_exploit")])
         logger.info(f"[{self.name}] Post-exploitation scan complete: {post_exploit_count} additional findings")
 
     async def _collect_auth_endpoints(self, base_url: str) -> List[str]:
@@ -1605,6 +1715,9 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
         validated_findings = []
 
         for idx, finding in enumerate(self._dry_findings, 1):
+            if not isinstance(finding, dict):
+                logger.warning(f"[{self.name}] Phase B: Skipping non-dict finding at index {idx}: {type(finding).__name__}")
+                continue
             url = finding.get("url", "")
             token = finding.get("token", "")
             vuln_type = finding.get("vuln_type", finding.get("type", "JWT"))
@@ -1620,6 +1733,7 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
             # Execute JWT attack
             try:
                 result = await self._test_single_item_from_queue(url, token, finding)
+                logger.debug(f"[{self.name}] Phase B: _test_single_item returned type={type(result).__name__}")
 
                 if result:
                     # Mark as emitted
@@ -1627,6 +1741,7 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
 
                     # Ensure dict format
                     if not isinstance(result, dict):
+                        logger.warning(f"[{self.name}] Phase B: Non-dict result from test: {type(result).__name__}")
                         result = {
                             "url": url,
                             "token": token,
@@ -1637,6 +1752,7 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
                         }
 
                     validated_findings.append(result)
+                    logger.debug(f"[{self.name}] Phase B: Emitting finding...")
 
                     # Emit event with validation
                     self._emit_jwt_finding({
@@ -1654,13 +1770,15 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
                     logger.debug(f"[{self.name}] ✗ JWT vulnerability not confirmed")
 
             except Exception as e:
-                logger.error(f"[{self.name}] Phase B: Exploitation failed: {e}")
+                logger.opt(exception=True).error(f"[{self.name}] Phase B: Exploitation failed: {e}")
 
         # FIX (2026-02-16): Capture post-exploitation findings (RCE, SSTI) that were
         # added to self.findings during authenticated scanning but not returned by
         # _test_single_item_from_queue (which only returns the last finding).
         validated_urls = {f.get("url", "") + f.get("type", "") for f in validated_findings}
         for f in self.findings:
+            if not isinstance(f, dict):
+                continue
             if f.get("_post_exploit") and (f.get("url", "") + f.get("type", "")) not in validated_urls:
                 validated_findings.append(f)
                 self._emit_jwt_finding({
@@ -1774,9 +1892,8 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
-        # Count confirmed vulnerabilities
+        # Count confirmed vulnerabilities (only validated results, not dry candidates)
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         # REPORTING: Generate specialist report
         if results or self._dry_findings:
@@ -1812,12 +1929,14 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
                 # Analyze provided token
                 await self._analyze_and_exploit(token, url, "queue")
                 if self.findings:
-                    return self.findings[-1]  # Return most recent finding
+                    last = self.findings[-1]
+                    return last if isinstance(last, dict) else None
             elif url:
                 # Discover tokens from URL
                 result = await self.check_url(url)
-                if result.get("vulnerable") and result.get("findings"):
-                    return result["findings"][0]
+                if isinstance(result, dict) and result.get("vulnerable") and result.get("findings"):
+                    first = result["findings"][0]
+                    return first if isinstance(first, dict) else None
             return None
         except Exception as e:
             logger.error(f"[{self.name}] Queue item test failed: {e}")
