@@ -327,6 +327,7 @@ class SQLiAgent(BaseAgent, TechContextMixin):
         self._detected_filters: Set[str] = set()
         self._baseline_response_time: float = 0
         self._baseline_content_length: int = 0
+        self._baseline_status_code: int = 0
         self._max_impact_achieved = False
         self._interactsh = None
 
@@ -1525,11 +1526,122 @@ Write the exploitation explanation section for the report."""
                 baseline_content = await resp.text()
                 self._baseline_response_time = time.time() - start
                 self._baseline_content_length = len(baseline_content)
+                self._baseline_status_code = resp.status
                 self._detected_db_type = self._detect_database_type(baseline_content)
+                logger.info(f"[{self.name}] Baseline: status={resp.status}, length={self._baseline_content_length}, time={self._baseline_response_time:.2f}s")
         except Exception as e:
             logger.warning(f"Baseline failed: {e}")
 
         await self._init_interactsh()
+
+    async def _detect_and_resolve_spa_url(self, url: str, param: str) -> Optional[str]:
+        """Detect SPA frontend routes and resolve to API backend URLs.
+
+        SPA frameworks (React/Vue/Angular) serve identical HTML for all routes
+        — path parameter payloads never reach the database. This method:
+        1. Checks if URL is a likely SPA route (no /api/ prefix, has path param)
+        2. Sends two requests with different path values, compares responses
+        3. If identical → it's a SPA, tries common API URL patterns
+        4. Returns the API URL if found, None otherwise
+        """
+        parsed = urlparse(url)
+        # Only check non-API URLs with path parameters
+        if "/api/" in parsed.path:
+            return None
+        if not re.search(r'/:\w+|/\d+', parsed.path):
+            return None
+
+        # Build two variant URLs to test SPA behavior
+        path = parsed.path
+        # Replace :param placeholder or last numeric segment
+        test_paths = []
+        if f":{param.lstrip(':')}" in path:
+            test_paths.append(path.replace(f":{param.lstrip(':')}", "1"))
+            test_paths.append(path.replace(f":{param.lstrip(':')}", "99999"))
+        else:
+            # Try replacing last numeric segment
+            match = re.search(r'/(\d+)(?=/|$)', path)
+            if match:
+                test_paths.append(path[:match.start()] + "/1" + path[match.end():])
+                test_paths.append(path[:match.start()] + "/99999" + path[match.end():])
+
+        if len(test_paths) < 2:
+            return None
+
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # Fetch both variants
+                async with session.get(f"{origin}{test_paths[0]}", ssl=False) as r1:
+                    body1 = await r1.text()
+                    ct1 = r1.headers.get("content-type", "")
+                async with session.get(f"{origin}{test_paths[1]}", ssl=False) as r2:
+                    body2 = await r2.text()
+
+                # SPA detection: identical HTML responses for different IDs
+                is_spa = (
+                    "text/html" in ct1
+                    and len(body1) > 100
+                    and body1 == body2
+                )
+                if not is_spa:
+                    return None
+
+                logger.info(f"[{self.name}] SPA detected: {url} returns identical HTML for different path params")
+
+                # Try to resolve API endpoint
+                segments = [s for s in parsed.path.strip("/").split("/") if s]
+                # Find the placeholder/ID segment
+                id_idx = None
+                for i, seg in enumerate(segments):
+                    if seg.startswith(":") or re.match(r'^\d+$', seg):
+                        id_idx = i
+                        break
+
+                if id_idx is None or id_idx == 0:
+                    return None
+
+                id_val = "1"  # Use a safe ID for probing
+                path_before = segments[:id_idx]
+
+                # Generate candidates
+                candidates = []
+                # Direct: /api/forum/thread/1
+                candidates.append(f"/api/{'/'.join(path_before)}/{id_val}")
+                # Pluralized last segment: /api/forum/threads/1
+                if path_before:
+                    last = path_before[-1]
+                    if not last.endswith("s"):
+                        parts = list(path_before)
+                        parts[-1] = last + "s"
+                        candidates.append(f"/api/{'/'.join(parts)}/{id_val}")
+                # Short: /api/threads/1
+                if len(path_before) >= 2:
+                    candidates.append(f"/api/{path_before[-1]}/{id_val}")
+                    if not path_before[-1].endswith("s"):
+                        candidates.append(f"/api/{path_before[-1]}s/{id_val}")
+
+                for candidate_path in candidates:
+                    candidate_url = f"{origin}{candidate_path}"
+                    try:
+                        async with session.get(candidate_url, ssl=False) as resp:
+                            if resp.status in (404, 405, 502, 503):
+                                continue
+                            ct = resp.headers.get("content-type", "")
+                            if "json" in ct:
+                                # Found the API endpoint — return with :param placeholder
+                                api_base = candidate_url.rsplit("/", 1)[0]
+                                resolved = f"{api_base}/:{param.lstrip(':')}"
+                                logger.info(f"[{self.name}] SPA→API resolved: {url} → {resolved}")
+                                return resolved
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            logger.debug(f"[{self.name}] SPA detection failed for {url}: {e}")
+
+        return None
 
     def _should_test_cookie(self, cookie_name: str) -> bool:
         """Check if a cookie should be tested for SQLi.
@@ -2055,15 +2167,23 @@ Write the exploitation explanation section for the report."""
 
     async def _test_error_payload(self, session: aiohttp.ClientSession, base_url: str,
                                   param: str, variant: str) -> Optional[SQLiFinding]:
-        """Test a single error-based payload."""
+        """Test a single error-based payload.
+
+        Detection strategy:
+        1. DB fingerprints in response body (strongest signal)
+        2. Status code differential: baseline 2xx → payload 4xx/5xx (strong signal)
+        3. Status >= 500 with SQL-related keywords (moderate signal)
+        """
         try:
             test_url = self._build_url_with_param(base_url, param, variant)
 
             async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 content = await resp.text()
+                status_code = resp.status
 
                 error_info = self._extract_info_from_error(content)
 
+                # Strategy 1: DB fingerprints found (strongest evidence)
                 if error_info.get("db_type"):
                     self._detected_db_type = error_info["db_type"]
                     if hasattr(self, '_v'):
@@ -2073,6 +2193,44 @@ Write the exploitation explanation section for the report."""
                             "db_type": error_info["db_type"],
                         })
                     return self._create_error_based_finding(param, variant, error_info)
+
+                # Strategy 2: Status code differential
+                # If baseline returned 2xx but this payload returns 4xx/5xx,
+                # the SQL metacharacter caused a server-side error → evidence of injection
+                baseline_ok = self._baseline_status_code and self._baseline_status_code < 400
+                if baseline_ok and status_code >= 400:
+                    # Check for SQL keywords or generic error patterns
+                    content_lower = content.lower()
+                    sql_indicators = [
+                        "sql", "query", "syntax", "database", "select", "insert",
+                        "update", "delete", "error", "exception", "internal server",
+                        "bad request", "server error", "operationalerror",
+                    ]
+                    has_error_indicator = any(ind in content_lower for ind in sql_indicators)
+
+                    # Strong signal: baseline 2xx → payload 4xx/5xx (even without keywords)
+                    # A SQL metacharacter like ' or " causing a status change IS evidence
+                    is_sql_metachar = variant.strip() in ("'", "\"", "''", "1'", "1\"")
+
+                    if has_error_indicator or is_sql_metachar:
+                        error_info["db_type"] = error_info.get("db_type") or "unknown"
+                        error_info["status_differential"] = {
+                            "baseline": self._baseline_status_code,
+                            "payload": status_code,
+                        }
+                        logger.info(
+                            f"[{self.name}] Status differential: {self._baseline_status_code}→{status_code} "
+                            f"on param={param} payload={variant[:40]}"
+                        )
+                        if hasattr(self, '_v'):
+                            self._v.emit("exploit.sqli.error_found", {
+                                "param": param,
+                                "payload": variant[:80],
+                                "db_type": "unknown",
+                                "detection": "status_differential",
+                            })
+                        return self._create_error_based_finding(param, variant, error_info)
+
         except Exception as e:
             logger.debug(f"Error-based test failed: {e}")
 
@@ -2264,11 +2422,65 @@ Write the exploitation explanation section for the report."""
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
     def _build_url_with_param(self, base_url: str, param: str, value: str) -> str:
-        """Build URL with specific parameter value."""
+        """Build URL with specific parameter value.
+
+        Handles query parameters, URL template variables, and path segments:
+        1. If param exists in query string → replace its value
+        2. If URL contains template variables (:param, {param}) → replace them
+        3. If path contains numeric/UUID segments → inject into last one
+        4. Fallback: add as new query parameter
+        """
         parsed = urlparse(self.url)
-        params = parse_qs(parsed.query)
-        params[param] = [value]
-        new_query = urlencode(params, doseq=True)
+        query_params = parse_qs(parsed.query)
+
+        # Case 1: param exists in query string → standard query param injection
+        if param in query_params:
+            query_params[param] = [value]
+            new_query = urlencode(query_params, doseq=True)
+            return f"{base_url}?{new_query}"
+
+        # Case 2: URL contains template variables (:param_name or {param_name})
+        # Common in REST APIs: /api/users/:id, /api/orders/{order_id}
+        path = parsed.path
+        template_patterns = [
+            (f':{param}', value),           # Express-style :id
+            (f'{{{param}}}', value),         # OpenAPI-style {id}
+            (f':{param.lstrip(":")}', value), # Handle param already prefixed with :
+        ]
+        for pattern, replacement in template_patterns:
+            if pattern in path:
+                new_path = path.replace(pattern, replacement)
+                new_base = f"{parsed.scheme}://{parsed.netloc}{new_path}"
+                if query_params:
+                    return f"{new_base}?{urlencode(query_params, doseq=True)}"
+                return new_base
+
+        # Case 3: path segment injection — replace numeric/UUID-like segments
+        segments = path.split('/')
+        injected = False
+
+        for i in range(len(segments) - 1, -1, -1):
+            seg = segments[i]
+            if not seg:
+                continue
+            # Match numeric IDs (1, 42, 100), UUIDs, or short alphanumeric IDs
+            if (seg.isdigit() or
+                    re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', seg, re.I) or
+                    (re.match(r'^[a-zA-Z0-9]{2,8}$', seg) and not seg.isalpha())):
+                segments[i] = value
+                injected = True
+                break
+
+        if injected:
+            new_path = '/'.join(segments)
+            new_base = f"{parsed.scheme}://{parsed.netloc}{new_path}"
+            if query_params:
+                return f"{new_base}?{urlencode(query_params, doseq=True)}"
+            return new_base
+
+        # Fallback: add as new query parameter
+        query_params[param] = [value]
+        new_query = urlencode(query_params, doseq=True)
         return f"{base_url}?{new_query}"
 
     def _extract_post_params(self, post_data: str) -> List[str]:
@@ -2508,8 +2720,9 @@ Write the exploitation explanation section for the report."""
         # 4. Call LLM for global analysis
         dry_list = await self._llm_analyze_and_dedup(wet_findings, context)
 
-        # 5. Save DRY list
+        # 5. Save DRY list and wet count for report metrics
         self._dry_findings = dry_list
+        self._wet_count = len(wet_findings)
 
         logger.info(f"[{self.name}] Phase A: Deduplication complete. {len(wet_findings)} WET → {len(dry_list)} DRY ({len(wet_findings) - len(dry_list)} duplicates removed)")
 
@@ -2660,6 +2873,14 @@ Write the exploitation explanation section for the report."""
             if not url or not param:
                 continue
 
+            # SPA detection: if URL is a SPA frontend route, resolve to API endpoint
+            if not param.startswith(("Cookie:", "Header:")):
+                api_url = await self._detect_and_resolve_spa_url(url, param)
+                if api_url:
+                    url = api_url
+                    dry_item = {**dry_item, "url": api_url}
+                    logger.info(f"[{self.name}] Redirected SPA route to API: {api_url}")
+
             # Configure agent for this specific test
             self.url = url
             self.param = param
@@ -2757,9 +2978,9 @@ Write the exploitation explanation section for the report."""
             "scan_id": self._scan_context.split("/")[-1],
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "phase_a": {
-                "wet_count": len(self._dry_findings) + (len(findings) - len(self._dry_findings)),  # Estimate
+                "wet_count": getattr(self, '_wet_count', len(self._dry_findings)),
                 "dry_count": len(self._dry_findings),
-                "duplicates_removed": max(0, len(self._dry_findings) - len(findings)),
+                "duplicates_removed": max(0, getattr(self, '_wet_count', len(self._dry_findings)) - len(self._dry_findings)),
                 "analysis_duration_s": 0,  # TODO: Track timing
             },
             "phase_b": {
@@ -3161,12 +3382,28 @@ Write the exploitation explanation section for the report."""
                     logger.info(f"[{self.name}] L0: WET payload triggered SQL error! DB={error_info['db_type']}")
                     return self._create_error_based_finding(param, wet_payload, error_info)
 
-                # Check for 500 + SQL-related keywords even without DB fingerprint
-                if status_code >= 500:
-                    sql_keywords = ["sql", "query", "syntax", "database", "select", "insert", "update", "delete"]
+                # Check for status code differential even without DB fingerprint
+                baseline_ok = self._baseline_status_code and self._baseline_status_code < 400
+                if baseline_ok and status_code >= 400:
+                    # Baseline was healthy (2xx/3xx) but payload caused 4xx/5xx → injection evidence
+                    error_info["db_type"] = error_info.get("db_type") or "unknown"
+                    error_info["status_differential"] = {
+                        "baseline": self._baseline_status_code,
+                        "payload": status_code,
+                    }
+                    logger.info(
+                        f"[{self.name}] L0: WET payload caused status change "
+                        f"{self._baseline_status_code}→{status_code}"
+                    )
+                    return self._create_error_based_finding(param, wet_payload, error_info)
+                elif status_code >= 400:
+                    # No baseline to compare, but 4xx/5xx with SQL keywords is still evidence
+                    # (e.g. HTTP 400 Bad Request with verbose SQL error message)
+                    sql_keywords = ["sql", "query", "syntax", "database", "select", "insert",
+                                    "update", "delete", "error", "exception", "operationalerror"]
                     content_lower = content.lower()
                     if any(kw in content_lower for kw in sql_keywords):
-                        logger.info(f"[{self.name}] L0: WET payload caused 500 with SQL keywords")
+                        logger.info(f"[{self.name}] L0: WET payload caused {status_code} with SQL keywords")
                         error_info["db_type"] = error_info.get("db_type") or "unknown"
                         return self._create_error_based_finding(param, wet_payload, error_info)
 

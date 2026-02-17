@@ -29,6 +29,8 @@ CWE_MAPPINGS = {
     "SSTI": "CWE-1336",  # Improper Neutralization of Special Elements Used in a Template Engine
     "HEADER_INJECTION": "CWE-113",  # Improper Neutralization of CRLF Sequences in HTTP Headers
     "FILE_UPLOAD": "CWE-434",  # Unrestricted Upload of File with Dangerous Type
+    "MASS_ASSIGNMENT": "CWE-915",  # Improperly Controlled Modification of Dynamically-Determined Object Attributes
+    "API_SECURITY": "CWE-863",  # Incorrect Authorization
     "MISSING_SECURITY_HEADER": "CWE-693",  # Protection Mechanism Failure
 }
 
@@ -166,6 +168,25 @@ To remediate Unrestricted File Upload vulnerabilities:
 6. Scan uploaded files for malware using antivirus engines
 7. Disable script execution in upload directories (e.g., .htaccess, web.config)
 """,
+    "MASS_ASSIGNMENT": """
+To remediate Mass Assignment vulnerabilities:
+1. Use explicit allowlists of permitted fields for each endpoint
+2. Never bind request body directly to database models or ORM objects
+3. Use Data Transfer Objects (DTOs) or serializers with declared fields
+4. Reject or strip undeclared fields from request payloads
+5. Implement role-based field access (e.g., only admins can set 'role' field)
+6. Log unexpected fields in requests for security monitoring
+""",
+    "API_SECURITY": """
+To remediate API Security vulnerabilities:
+1. Disable GraphQL introspection in production environments
+2. Implement proper authentication and authorization on all API endpoints
+3. Apply rate limiting and query depth limits on GraphQL endpoints
+4. Use field-level authorization to restrict access to sensitive data
+5. Validate and sanitize all API input parameters
+6. Implement proper pagination to prevent data enumeration
+7. Disable verbose error messages that leak internal structure
+""",
     "MISSING_SECURITY_HEADER": """
 To remediate missing security headers:
 1. Enable HSTS (Strict-Transport-Security) with includeSubDomains and preload
@@ -195,6 +216,8 @@ DEFAULT_SEVERITY = {
     "SSTI": Severity.CRITICAL,
     "HEADER_INJECTION": Severity.MEDIUM,
     "FILE_UPLOAD": Severity.HIGH,
+    "MASS_ASSIGNMENT": Severity.HIGH,
+    "API_SECURITY": Severity.HIGH,
     "MISSING_SECURITY_HEADER": Severity.LOW,
 }
 

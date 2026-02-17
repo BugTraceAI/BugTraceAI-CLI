@@ -86,6 +86,11 @@ class RCEAgent(BaseAgent, TechContextMixin):
             if not (has_time or has_output or has_callback):
                 return False, "RCE requires proof: time delay, command output, or Interactsh callback"
 
+        # Deserialization findings have different validation rules
+        finding_type = finding.get("type", nested.get("type", "")).lower()
+        if "deserialization" in finding_type:
+            return True, ""
+
         # RCE-specific: Payload should contain command patterns
         payload = finding.get("payload", nested.get("payload", ""))
         rce_markers = [';', '|', '`', '$', 'sleep', 'ping', 'curl', 'wget', 'cat', 'eval', 'exec', '__import__']
@@ -523,6 +528,51 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
                 dry_list.append(f)
         return dry_list
 
+    async def _test_deserialization(self, url: str, param: str) -> Optional[Dict]:
+        """Test deserialization vulnerability by sending a non-serialized probe via cookie."""
+        import base64
+        DESER_KEYWORDS = [
+            "invalid load key", "could not find MARK", "unpickling",
+            "pickle.loads", "_pickle.UnpicklingError", "pickle data", "_pickle.",
+            "java.io.ObjectInputStream", "ClassNotFoundException",
+            "java.io.InvalidClassException", "readObject",
+            "unserialize()", "allowed_classes",
+            "BinaryFormatter", "ObjectStateFormatter",
+            "Marshal.load",
+        ]
+        cookie_name = param.replace("Cookie: ", "").strip() if param.startswith("Cookie:") else param
+        probe_value = base64.b64encode(b"BTAI_deser_rce_probe").decode()
+        try:
+            async with orchestrator.session(DestinationType.TARGET) as session:
+                cookies = {cookie_name: probe_value}
+                async with session.get(url, cookies=cookies, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    body = await resp.text()
+                    matched = [kw for kw in DESER_KEYWORDS if kw.lower() in body.lower()]
+                    if matched:
+                        logger.info(f"[{self.name}] Deserialization CONFIRMED on {cookie_name} @ {url}: {matched}")
+                        return {
+                            "type": "Insecure Deserialization",
+                            "url": url,
+                            "parameter": param,
+                            "payload": probe_value,
+                            "severity": "CRITICAL",
+                            "validated": True,
+                            "status": "VALIDATED_CONFIRMED",
+                            "evidence": f"Deserialization error keywords in response: {matched}",
+                            "description": f"Insecure deserialization confirmed in cookie '{cookie_name}' at {url}. "
+                                           f"Non-serialized data triggers deserialization error messages, confirming "
+                                           f"the server deserializes cookie values unsafely.",
+                            "reproduction": f"curl -b '{cookie_name}={probe_value}' '{url}'",
+                            "cwe_id": "CWE-502",
+                            "remediation": get_remediation_for_vuln("RCE"),
+                            "cve_id": "N/A",
+                            "http_request": f"GET {url} (Cookie: {cookie_name}={probe_value})",
+                            "http_response": f"Error keywords: {matched}",
+                        }
+        except Exception as e:
+            logger.debug(f"[{self.name}] Deserialization test failed for {cookie_name}: {e}")
+        return None
+
     async def exploit_dry_list(self) -> List[Dict]:
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting {len(self._dry_findings)} DRY findings =====")
         validated = []
@@ -536,7 +586,13 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
 
             try:
                 self.url = url
-                result = await self._test_single_param_from_queue(url, param, f.get("finding",{}))
+                # Deserialization findings need cookie-based testing, not OS command injection
+                rationale = f.get("rationale", "").lower()
+                is_deser = "deserialization" in rationale or "pickle" in rationale or param.startswith("Cookie:")
+                if is_deser:
+                    result = await self._test_deserialization(url, param)
+                else:
+                    result = await self._test_single_param_from_queue(url, param, f.get("finding",{}))
                 if result and result.get("validated"):
                     validated.append(result)
                     fp = self._generate_rce_fingerprint(url, param)
@@ -544,14 +600,16 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
                         self._emitted_findings.add(fp)
                         if settings.WORKER_POOL_EMIT_EVENTS:
                             status = result.get("status", ValidationStatus.VALIDATED_CONFIRMED.value)
+                            finding_type = result.get("type", "RCE")
                             self._emit_rce_finding({
                                 "specialist": "rce",
-                                "type": "RCE",
+                                "type": finding_type,
                                 "url": result.get("url"),
                                 "parameter": result.get("parameter"),
                                 "payload": result.get("payload"),
                                 "status": status,
                                 "evidence": result.get("evidence", ""),
+                                "cwe_id": result.get("cwe_id", get_cwe_for_vuln("RCE")),
                                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
                             }, scan_context=self._scan_context)
                         logger.info(f"[{self.name}] ✅ Emitted unique: {url}?{param}")
@@ -658,11 +716,27 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
         return await self._test_single_param_from_queue(url, param, finding)
 
     async def _test_single_param_from_queue(self, url: str, param: str, finding: dict) -> Optional[Dict]:
-        """Test a single parameter from queue for RCE."""
+        """Test a single parameter from queue for RCE. Retries with auth if 401/403."""
         try:
             async with orchestrator.session(DestinationType.TARGET) as session:
                 time_payloads = self._get_time_payloads()
-                return await self._test_parameter(session, param, time_payloads)
+                result = await self._test_parameter(session, param, time_payloads)
+                if result:
+                    return result
+
+            # If no result and endpoint might need auth, retry with forged admin JWT
+            try:
+                from bugtrace.services.scan_context import get_scan_auth_headers
+                auth_headers = get_scan_auth_headers(self._scan_context, role="admin")
+                if auth_headers:
+                    logger.info(f"[{self.name}] Retrying {url}?{param} with admin auth token")
+                    async with aiohttp.ClientSession(headers=auth_headers) as auth_session:
+                        time_payloads = self._get_time_payloads()
+                        return await self._test_parameter(auth_session, param, time_payloads)
+            except Exception as auth_err:
+                logger.debug(f"[{self.name}] Auth retry failed: {auth_err}")
+
+            return None
         except Exception as e:
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None

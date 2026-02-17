@@ -1,6 +1,9 @@
+import logging
 from pydantic import BaseModel, Field
 from typing import List, Optional, Any
 from enum import Enum
+
+_vuln_logger = logging.getLogger("bugtrace.schemas.models")
 
 class VulnType(str, Enum):
     XSS = "XSS"
@@ -16,6 +19,10 @@ class VulnType(str, Enum):
     LFI = "LFI"
     SSRF = "SSRF"
     MISCONFIG = "SECURITY_MISCONFIGURATION"
+    JWT = "JWT"
+    MASS_ASSIGNMENT = "MASS_ASSIGNMENT"
+    API_SECURITY = "API_SECURITY"
+    FILE_UPLOAD = "FILE_UPLOAD"
 
 def normalize_vuln_type(type_str: str) -> VulnType:
     """
@@ -73,6 +80,23 @@ def _build_vuln_type_mappings() -> dict:
         "SECURITY_MISCONFIGURATION": VulnType.MISCONFIG,
         "SECURITY MISCONFIGURATION": VulnType.MISCONFIG,
         "MISCONFIG": VulnType.MISCONFIG,
+        "JWT": VulnType.JWT,
+        "JSON WEB TOKEN": VulnType.JWT,
+        "JWT ATTACK": VulnType.JWT,
+        "JWT VULNERABILITY": VulnType.JWT,
+        "WEAK JWT": VulnType.JWT,
+        "MASS_ASSIGNMENT": VulnType.MASS_ASSIGNMENT,
+        "MASS ASSIGNMENT": VulnType.MASS_ASSIGNMENT,
+        "OVERPOSTING": VulnType.MASS_ASSIGNMENT,
+        "API_SECURITY": VulnType.API_SECURITY,
+        "API SECURITY": VulnType.API_SECURITY,
+        "GRAPHQL": VulnType.API_SECURITY,
+        "GRAPHQL INJECTION": VulnType.API_SECURITY,
+        "GRAPHQL INTROSPECTION": VulnType.API_SECURITY,
+        "FILE_UPLOAD": VulnType.FILE_UPLOAD,
+        "FILE UPLOAD": VulnType.FILE_UPLOAD,
+        "UNRESTRICTED FILE UPLOAD": VulnType.FILE_UPLOAD,
+        "UNRESTRICTED UPLOAD": VulnType.FILE_UPLOAD,
     }
 
 def _try_fuzzy_match(type_upper: str, type_map: dict) -> Optional[VulnType]:
@@ -87,6 +111,10 @@ def _try_enum_match(type_str: str) -> VulnType:
     try:
         return VulnType(type_str)
     except ValueError:
+        _vuln_logger.warning(
+            f"Unknown vulnerability type '{type_str}' — falling back to SECURITY_MISCONFIGURATION. "
+            f"Consider adding it to VulnType enum and _build_vuln_type_mappings()."
+        )
         return VulnType.MISCONFIG
 
 class ReflectionContext(str, Enum):

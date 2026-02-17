@@ -243,6 +243,10 @@ class ScanService:
         ctx.progress = 100
         self.db.update_scan_status(ctx.scan_id, ScanStatus.COMPLETED)
 
+        # Clean up auth tokens stored during this scan
+        from bugtrace.services.scan_context import clear_scan_tokens
+        clear_scan_tokens(str(ctx.scan_id))
+
         await self.event_bus.emit("scan.completed", {
             "scan_id": ctx.scan_id,
             "target": ctx.options.target_url,
@@ -256,6 +260,9 @@ class ScanService:
         ctx.status = "stopped"
         self.db.update_scan_status(ctx.scan_id, ScanStatus.STOPPED)
 
+        from bugtrace.services.scan_context import clear_scan_tokens
+        clear_scan_tokens(str(ctx.scan_id))
+
         await self.event_bus.emit("scan.stopped", {
             "scan_id": ctx.scan_id,
             "target": ctx.options.target_url,
@@ -267,6 +274,9 @@ class ScanService:
         """Handle scan failure."""
         ctx.status = "failed"
         self.db.update_scan_status(ctx.scan_id, ScanStatus.FAILED)
+
+        from bugtrace.services.scan_context import clear_scan_tokens
+        clear_scan_tokens(str(ctx.scan_id))
 
         await self.event_bus.emit("scan.failed", {
             "scan_id": ctx.scan_id,

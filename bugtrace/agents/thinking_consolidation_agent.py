@@ -80,6 +80,13 @@ VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
     "code injection": "rce",
     "deserialization": "rce",
 
+    # Open redirect (BEFORE ssrf — compound types like "Open Redirect / SSRF"
+    # must match "redirect" first, since SSRF substring would match too)
+    "open redirect": "openredirect",
+    "openredirect": "openredirect",
+    "url redirect": "openredirect",
+    "redirect": "openredirect",
+
     # Server-side request forgery
     "ssrf": "ssrf",
     "server-side request forgery": "ssrf",
@@ -101,11 +108,11 @@ VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
     # Session cookies (route to IDOR for authorization testing)
     "session_cookie_discovered": "idor",  # NEW: From AuthDiscoveryAgent
 
-    # Open redirect
-    "open redirect": "openredirect",
-    "openredirect": "openredirect",
-    "url redirect": "openredirect",
-    "redirect": "openredirect",
+    # GraphQL vulnerabilities (route to API Security specialist)
+    "graphql": "api_security",
+    "graphql introspection": "api_security",
+    "graphql information disclosure": "api_security",
+    "information exposure": "api_security",
 
     # Prototype pollution
     "prototype pollution": "prototype_pollution",
@@ -119,8 +126,28 @@ VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
     "http response header injection": "header_injection",
     "response splitting": "header_injection",
     "http header injection": "header_injection",
-    "crlf injection": "xss",
     "http response splitting": "xss",
+
+    # Mass assignment (dedicated specialist)
+    "mass assignment": "mass_assignment",
+    "overposting": "mass_assignment",
+
+    # Broken authentication / access control variants
+    "bola": "idor",
+    "broken object level authorization": "idor",
+
+    # Insecure deserialization (explicit — "deserialization" already matches via substring)
+    "insecure deserialization": "rce",
+
+    # Misconfiguration types (from NucleiAgent — already validated, route to IDOR for access-control
+    # related findings, or drop purely informational ones that are already in the report)
+    "broken access control (admin)": "idor",
+    "no rate limiting": "idor",
+    "rate limiting": "idor",
+
+    # Input validation (route to SQLi — validation bypass often leads to injection)
+    "input validation": "sqli",
+    "type confusion": "sqli",
 }
 
 
@@ -200,6 +227,12 @@ SPECIALIST_DESCRIPTIONS: Dict[str, str] = {
         "API security vulnerability, REST API GraphQL security issues, "
         "API authentication bypass, rate limiting issues, API key exposure, "
         "endpoint security misconfiguration"
+    ),
+    "mass_assignment": (
+        "Mass assignment overposting vulnerability, parameter pollution, "
+        "privilege escalation through unprotected model binding, "
+        "role/admin field injection, price manipulation, "
+        "insecure direct object property modification"
     ),
 }
 
@@ -1087,11 +1120,14 @@ class ThinkingConsolidationAgent(BaseAgent):
 
         is_sqli = specialist == "sqli"
         is_template_injection = specialist == "csti"  # CSTI/SSTI queue
+        is_lfi = specialist == "lfi"  # LFI: specialist validates with actual path traversal
+        is_rce = specialist == "rce"  # RCE: too critical to filter out
         is_probe_validated = finding.get("probe_validated", False)
         has_high_skeptical_score = skeptical_score >= 6  # LLM already approved
 
         # Bypass FP filter if any bypass condition is met
-        should_bypass = is_sqli or is_template_injection or is_probe_validated or has_high_skeptical_score
+        should_bypass = (is_sqli or is_template_injection or is_lfi or is_rce
+                         or is_probe_validated or has_high_skeptical_score)
 
         if not should_bypass and fp_confidence < settings.THINKING_FP_THRESHOLD:
             if hasattr(self, '_v'):
@@ -1112,6 +1148,14 @@ class ThinkingConsolidationAgent(BaseAgent):
         if is_template_injection and fp_confidence < settings.THINKING_FP_THRESHOLD:
             logger.info(f"[{self.name}] Template injection bypass: {finding.get('type')} forwarded to CSTIAgent "
                        f"(fp_confidence: {fp_confidence:.2f} < threshold, but browser validation decides)")
+
+        if is_lfi and fp_confidence < settings.THINKING_FP_THRESHOLD:
+            logger.info(f"[{self.name}] LFI bypass: {finding.get('type')} forwarded to LFIAgent "
+                       f"(fp_confidence: {fp_confidence:.2f} < threshold, but path traversal testing decides)")
+
+        if is_rce and fp_confidence < settings.THINKING_FP_THRESHOLD:
+            logger.info(f"[{self.name}] RCE bypass: {finding.get('type')} forwarded to RCEAgent "
+                       f"(fp_confidence: {fp_confidence:.2f} < threshold, too critical to filter)")
 
         if has_high_skeptical_score and fp_confidence < settings.THINKING_FP_THRESHOLD:
             logger.info(f"[{self.name}] Skeptical review bypass: {finding.get('type')} forwarded "
@@ -1210,22 +1254,26 @@ class ThinkingConsolidationAgent(BaseAgent):
 
             is_sqli = specialist == "sqli"
             is_template_injection = specialist == "csti"
+            is_lfi = specialist == "lfi"
+            is_rce = specialist == "rce"
             is_probe_validated = finding.get("probe_validated", False)
             has_high_skeptical_score = skeptical_score >= 6
 
-            should_bypass = is_sqli or is_template_injection or is_probe_validated or has_high_skeptical_score
+            should_bypass = (is_sqli or is_template_injection or is_lfi or is_rce
+                             or is_probe_validated or has_high_skeptical_score)
 
             if not should_bypass and fp_confidence < settings.THINKING_FP_THRESHOLD:
                 self._stats["fp_filtered"] += 1
                 dedup_metrics.record_fp_filtered()
                 continue
 
-            # Dedup check
-            is_duplicate, key = await self._dedup_cache.check_and_add(finding, scan_context)
-            if is_duplicate:
-                self._stats["duplicates_filtered"] += 1
-                dedup_metrics.record_duplicate(specialist, key)
-                continue
+            # Dedup check (auto-dispatched findings bypass — specialist Phase A handles their dedup)
+            if not finding.get("_auto_dispatched"):
+                is_duplicate, key = await self._dedup_cache.check_and_add(finding, scan_context)
+                if is_duplicate:
+                    self._stats["duplicates_filtered"] += 1
+                    dedup_metrics.record_duplicate(specialist, key)
+                    continue
 
             # Classify and prioritize
             prioritized = await self._classify_and_prioritize(finding, scan_context)

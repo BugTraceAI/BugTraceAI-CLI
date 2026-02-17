@@ -78,6 +78,13 @@ class AuthDiscoveryAgent(BaseAgent):
             except Exception as e:
                 logger.error(f"[{self.name}] Failed to scan {url}: {e}")
 
+        # FIX (2026-02-16): Auto-registration to obtain JWTs when passive scan finds nothing.
+        # Many web apps have open registration. If we can register, we get a JWT that enables:
+        # - JWTAgent: test for weak secrets, algorithm confusion, token forgery
+        # - Other specialists: authenticated scanning for access control issues
+        if not self.discovered_jwts:
+            await self._attempt_auto_registration()
+
         # Save discoveries to disk
         self._save_discoveries()
 
@@ -328,6 +335,141 @@ class AuthDiscoveryAgent(BaseAgent):
 
         except Exception as e:
             logger.debug(f"[{self.name}] JavaScript extraction failed: {e}")
+
+    # ============================================================================
+    # AUTO-REGISTRATION (JWT ACQUISITION)
+    # ============================================================================
+
+    async def _attempt_auto_registration(self):
+        """
+        Attempt auto-registration on discovered auth endpoints to obtain JWTs.
+
+        Generic approach — works with any app that has open registration:
+        1. Scan recon URLs for registration/signup endpoints
+        2. POST with random test credentials
+        3. Extract JWT from response body (common patterns: access_token, token, jwt)
+        """
+        register_patterns = [
+            "register", "signup", "sign-up", "sign_up", "create-account",
+            "create_account", "join", "enroll",
+        ]
+
+        # Find registration endpoints from recon URLs
+        register_urls = []
+        for url in self.urls_to_scan:
+            url_lower = url.lower()
+            if any(p in url_lower for p in register_patterns):
+                register_urls.append(url)
+
+        if not register_urls:
+            logger.debug(f"[{self.name}] No registration endpoints found in recon URLs")
+            return
+
+        # Generate random test credentials
+        import uuid
+        random_suffix = uuid.uuid4().hex[:8]
+        test_credentials = [
+            {
+                "username": f"btai_test_{random_suffix}",
+                "password": f"BtaiTest_{random_suffix}1",
+                "email": f"btai_test_{random_suffix}@test.local",
+            },
+        ]
+
+        jwt_token_keys = [
+            "access_token", "token", "jwt", "auth_token", "id_token",
+            "accessToken", "authToken", "idToken",
+        ]
+
+        for reg_url in register_urls:
+            for creds in test_credentials:
+                try:
+                    async with orchestrator.session(DestinationType.TARGET) as session:
+                        async with session.post(
+                            reg_url,
+                            json=creds,
+                            timeout=15,
+                        ) as resp:
+                            if resp.status in (200, 201):
+                                try:
+                                    body = await resp.json()
+                                except Exception:
+                                    body_text = await resp.text()
+                                    # Scan raw text for JWT pattern
+                                    for match in self.jwt_pattern.finditer(body_text):
+                                        token = match.group(1)
+                                        if self._is_jwt(token) and not self._is_duplicate_jwt(token):
+                                            self.discovered_jwts.append({
+                                                "token": token,
+                                                "source": "auto_registration",
+                                                "url": reg_url,
+                                                "context": "registration_response_text",
+                                                "credentials": {
+                                                    "username": creds["username"],
+                                                    "email": creds["email"],
+                                                },
+                                            })
+                                            logger.info(
+                                                f"[{self.name}] JWT from auto-registration (text): {reg_url}"
+                                            )
+                                    continue
+
+                                # Check response JSON for token fields
+                                if isinstance(body, dict):
+                                    for key in jwt_token_keys:
+                                        token = body.get(key, "")
+                                        if token and self._is_jwt(token) and not self._is_duplicate_jwt(token):
+                                            self.discovered_jwts.append({
+                                                "token": token,
+                                                "source": "auto_registration",
+                                                "url": reg_url,
+                                                "context": f"registration_response.{key}",
+                                                "credentials": {
+                                                    "username": creds["username"],
+                                                    "email": creds["email"],
+                                                },
+                                            })
+                                            logger.info(
+                                                f"[{self.name}] JWT from auto-registration: "
+                                                f"{reg_url} (field: {key})"
+                                            )
+                                            dashboard.log(
+                                                f"[{self.name}] JWT obtained via auto-registration",
+                                                "SUCCESS",
+                                            )
+                                            return  # Got a token, done
+
+                                    # Also scan entire response for JWT pattern
+                                    body_str = json.dumps(body)
+                                    for match in self.jwt_pattern.finditer(body_str):
+                                        token = match.group(1)
+                                        if self._is_jwt(token) and not self._is_duplicate_jwt(token):
+                                            self.discovered_jwts.append({
+                                                "token": token,
+                                                "source": "auto_registration",
+                                                "url": reg_url,
+                                                "context": "registration_response_nested",
+                                                "credentials": {
+                                                    "username": creds["username"],
+                                                    "email": creds["email"],
+                                                },
+                                            })
+                                            logger.info(
+                                                f"[{self.name}] JWT from auto-registration (nested): {reg_url}"
+                                            )
+                                            dashboard.log(
+                                                f"[{self.name}] JWT obtained via auto-registration",
+                                                "SUCCESS",
+                                            )
+                                            return
+
+                            else:
+                                logger.debug(
+                                    f"[{self.name}] Registration attempt returned {resp.status} on {reg_url}"
+                                )
+
+                except Exception as e:
+                    logger.debug(f"[{self.name}] Auto-registration failed on {reg_url}: {e}")
 
     # ============================================================================
     # HELPER METHODS

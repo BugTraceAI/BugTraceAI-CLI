@@ -151,7 +151,7 @@ class GoSpiderAgent(BaseAgent):
     async def _fallback_discovery(self) -> List[str]:
         """
         Comprehensive fallback discovery if GoSpider fails.
-        Extracts URLs AND parameters from forms and JavaScript.
+        Extracts URLs AND parameters from forms, JavaScript, and API specs.
         """
         import httpx
 
@@ -163,6 +163,10 @@ class GoSpiderAgent(BaseAgent):
                 # Parse main page
                 await self._fallback_parse_page(client, self.target, discovered)
 
+                # Probe for OpenAPI/Swagger specs (REST API autodiscovery)
+                api_urls = await self._discover_from_openapi(client)
+                discovered.update(api_urls)
+
             # Try Playwright for JS-heavy sites
             js_urls = await self._crawl_with_playwright(self.target)
             discovered.update(js_urls)
@@ -172,6 +176,101 @@ class GoSpiderAgent(BaseAgent):
         except Exception as e:
             logger.error(f"Fallback discovery failed: {e}", exc_info=True)
             return [self.target]
+
+    async def _discover_from_openapi(self, client) -> Set[str]:
+        """
+        Probe well-known OpenAPI/Swagger endpoints and extract API URLs.
+        Works generically for any REST API with standard documentation.
+        """
+        import json
+
+        discovered: Set[str] = set()
+        parsed_target = urlparse(self.target)
+        base = f"{parsed_target.scheme}://{parsed_target.netloc}"
+
+        # Well-known OpenAPI/Swagger spec paths
+        spec_paths = [
+            "/openapi.json", "/swagger.json", "/api-docs",
+            "/v1/openapi.json", "/v2/openapi.json", "/v3/openapi.json",
+            "/api/openapi.json", "/api/swagger.json",
+            "/swagger/v1/swagger.json", "/docs/openapi.json",
+        ]
+
+        spec_data = None
+        for path in spec_paths:
+            try:
+                resp = await client.get(f"{base}{path}", timeout=5.0)
+                if resp.status_code == 200:
+                    content_type = resp.headers.get("content-type", "")
+                    if "json" in content_type or resp.text.strip().startswith("{"):
+                        spec_data = resp.json()
+                        logger.info(f"[{self.name}] Found OpenAPI spec at {path}")
+                        dashboard.log(f"[{self.name}] Found API spec at {path}", "SUCCESS")
+                        break
+            except Exception:
+                continue
+
+        if not spec_data or "paths" not in spec_data:
+            return discovered
+
+        # Extract URLs from OpenAPI paths
+        for path_template, methods in spec_data["paths"].items():
+            if not isinstance(methods, dict):
+                continue
+
+            # Build concrete URL from path template
+            # Replace {param} with sample values for testing
+            concrete_path = self._resolve_openapi_path(path_template, methods)
+            url = f"{base}{concrete_path}"
+
+            if not self._is_in_scope(url):
+                continue
+
+            discovered.add(url)
+
+            # Extract query parameters defined in the spec
+            for method, details in methods.items():
+                if not isinstance(details, dict):
+                    continue
+                params = details.get("parameters", [])
+                for param in params:
+                    if not isinstance(param, dict):
+                        continue
+                    if param.get("in") == "query" and param.get("name"):
+                        separator = "&" if "?" in url else "?"
+                        param_url = f"{url}{separator}{param['name']}=test"
+                        discovered.add(param_url)
+
+        logger.info(f"[{self.name}] OpenAPI discovery: {len(discovered)} endpoints found")
+        dashboard.log(f"[{self.name}] OpenAPI: {len(discovered)} API endpoints discovered", "INFO")
+        return discovered
+
+    def _resolve_openapi_path(self, path_template: str, methods: dict) -> str:
+        """Replace OpenAPI path template variables with sample values."""
+        import re as _re
+
+        resolved = path_template
+        # Find all {param_name} in path
+        template_vars = _re.findall(r'\{(\w+)\}', path_template)
+
+        for var in template_vars:
+            # Try to find example/default values in spec parameters
+            sample = "1"  # Default: numeric ID
+            for method_details in methods.values():
+                if not isinstance(method_details, dict):
+                    continue
+                for param in method_details.get("parameters", []):
+                    if isinstance(param, dict) and param.get("name") == var and param.get("in") == "path":
+                        example = param.get("example") or param.get("default")
+                        if example:
+                            sample = str(example)
+                        elif param.get("schema", {}).get("type") == "string":
+                            sample = "test"
+                        break
+
+            resolved = resolved.replace(f"{{{var}}}", sample)
+
+        return resolved
 
     async def _fallback_parse_page(self, client, url: str, discovered: Set[str]):
         """

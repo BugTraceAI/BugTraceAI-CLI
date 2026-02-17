@@ -15,6 +15,33 @@ from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 
 
+# Module-level auth token store for cross-agent sharing.
+# Keyed by scan_context string (agents don't always have the ScanContext object).
+_auth_token_store: Dict[str, Dict[str, Any]] = {}
+
+
+def store_auth_token(scan_ctx_id: str, name: str, token: str, token_type: str = "Bearer", roles: list = None):
+    """Store a discovered auth token for other agents to use during this scan."""
+    if scan_ctx_id not in _auth_token_store:
+        _auth_token_store[scan_ctx_id] = {}
+    _auth_token_store[scan_ctx_id][name] = {
+        "token": token, "type": token_type, "roles": roles or ["admin", "user"],
+    }
+
+
+def get_scan_auth_headers(scan_ctx_id: str, role: str = "admin") -> Dict[str, str]:
+    """Get auth headers from tokens discovered during this scan."""
+    for info in _auth_token_store.get(scan_ctx_id, {}).values():
+        if role in info.get("roles", []) and info.get("token"):
+            return {"Authorization": f"{info['type']} {info['token']}"}
+    return {}
+
+
+def clear_scan_tokens(scan_ctx_id: str):
+    """Clean up tokens when scan completes."""
+    _auth_token_store.pop(scan_ctx_id, None)
+
+
 class ScanOptions(BaseModel):
     """
     Options for a scan request.
@@ -80,6 +107,17 @@ class ScanContext:
 
         # Task reference
         self._task: Optional[asyncio.Task] = None
+
+        # Auth tokens discovered during scan (cross-agent sharing)
+        # Format: {"jwt_admin": {"token": "...", "type": "Bearer", "roles": ["admin"]}}
+        self.auth_tokens: Dict[str, Dict[str, Any]] = {}
+
+    def get_auth_headers(self, role: str = "admin") -> Dict[str, str]:
+        """Get auth headers from discovered tokens. Used by agents for auth-gated testing."""
+        for _key, info in self.auth_tokens.items():
+            if role in info.get("roles", []) and info.get("token"):
+                return {"Authorization": f"{info['type']} {info['token']}"}
+        return {}
 
     def freeze_settings(self) -> "ScanContext":
         """

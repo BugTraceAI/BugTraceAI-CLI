@@ -312,9 +312,26 @@ class DatabaseManager:
                     logger.warning(f"Migration '{col}' column skipped: {e}")
 
     def _init_vector_store(self):
+        """Initialize vector store with explicit schema for findings_embeddings."""
         try:
-            if "dom_structures" not in self.vector_db.table_names():
-                pass
+            import pyarrow as pa
+
+            collection = "findings_embeddings"
+            if collection not in self.vector_db.table_names():
+                schema = pa.schema([
+                    pa.field("finding_id", pa.string()),
+                    pa.field("type", pa.string()),
+                    pa.field("url", pa.string()),
+                    pa.field("parameter", pa.string()),
+                    pa.field("payload", pa.string()),
+                    pa.field("severity", pa.string()),
+                    pa.field("confidence", pa.float64()),
+                    pa.field("vector", pa.list_(pa.float32(), 384)),
+                    pa.field("timestamp", pa.string()),
+                ])
+                self.vector_db.create_table(collection, schema=schema)
+                logger.info(f"Created '{collection}' table with explicit schema")
+
             logger.info("Vector Store initialized.")
         except Exception as e:
             logger.error(f"Failed to init vector store: {e}", exc_info=True)
@@ -805,87 +822,119 @@ class DatabaseManager:
     def search_similar_findings(self, query_text: str, limit: int = 5) -> List[Dict]:
         """
         Search for similar findings using semantic similarity.
-        
+
         Args:
             query_text: Search query (e.g., "SQL injection in id parameter")
             limit: Max results to return
-            
+
         Returns:
-            List of similar findings with similarity scores
+            List of similar findings with similarity scores, severity, confidence, and finding_id
         """
         try:
             from bugtrace.core.embeddings import get_embedding_manager
-            
+
             collection = "findings_embeddings"
-            
-            # Check if collection exists
+
             if collection not in self.vector_db.table_names():
                 logger.debug("No findings embeddings table exists yet")
                 return []
-            
-            # Get embedding for query
+
             emb_manager = get_embedding_manager()
             query_vector = emb_manager.encode_query(query_text)
-            
-            # Search in LanceDB
+
+            # L2: Guard against failed query encoding
+            if query_vector is None:
+                logger.warning("Query encoding failed, cannot search similar findings")
+                return []
+
             tbl = self.vector_db.open_table(collection)
             results = tbl.search(query_vector).limit(limit).to_list()
-            
-            # Format results
+
             similar_findings = []
             for result in results:
                 similar_findings.append({
+                    "finding_id": result.get("finding_id"),
                     "type": result.get("type"),
                     "url": result.get("url"),
                     "parameter": result.get("parameter"),
                     "payload": result.get("payload"),
-                    "distance": result.get("_distance", 0.0),  # Lower is more similar
+                    "severity": result.get("severity", ""),
+                    "confidence": result.get("confidence", 0.0),
+                    "distance": result.get("_distance", 0.0),
                     "timestamp": result.get("timestamp")
                 })
-            
+
             logger.info(f"Found {len(similar_findings)} similar findings for query: {query_text[:50]}")
             return similar_findings
-            
+
         except Exception as e:
             logger.error(f"Vector search failed: {e}", exc_info=True)
-            import traceback
-            logger.debug(traceback.format_exc())
             return []
     
     def store_finding_embedding(self, finding: Dict, embedding: Optional[List[float]] = None):
         """
         Store a finding with its vector embedding for future similarity search.
-        
+
+        Includes type normalization (L1), zero-vector guard (L2), and deduplication (L4).
+
         Args:
             finding: Finding dictionary
             embedding: Optional pre-computed embedding. If None, will generate automatically.
         """
         try:
             from bugtrace.core.embeddings import get_embedding_manager
-            from typing import Optional
             from datetime import datetime
-            
+
             # Generate embedding if not provided
             if embedding is None:
                 emb_manager = get_embedding_manager()
                 embedding = emb_manager.encode_finding(finding)
-            
+
+            # L2: Zero-vector guard — skip storage if encoding failed
+            if embedding is None:
+                logger.warning(f"Skipping LanceDB storage for finding (embedding failed): {finding.get('type')}")
+                return
+
+            # L1: Normalize type to consistent string
+            raw_type = finding.get("type", "")
+            try:
+                from bugtrace.schemas.models import normalize_vuln_type
+                normalized_type = normalize_vuln_type(str(raw_type)).value
+            except Exception:
+                normalized_type = str(raw_type).upper().strip()
+
             collection = "findings_embeddings"
+            finding_url = finding.get("url", "")
+            finding_param = finding.get("parameter", "")
+
+            # L4: Dedup — check if (url, parameter, type) already exists
+            try:
+                if collection in self.vector_db.table_names():
+                    tbl = self.vector_db.open_table(collection)
+                    existing = tbl.search().where(
+                        f"url = '{finding_url}' AND parameter = '{finding_param}' AND type = '{normalized_type}'"
+                    ).limit(1).to_list()
+                    if existing:
+                        logger.debug(f"Dedup: finding already in LanceDB ({normalized_type} on {finding_param})")
+                        return
+            except Exception as dedup_err:
+                logger.debug(f"Dedup check skipped: {dedup_err}")
+
             data = [{
                 "finding_id": finding.get("id", "unknown"),
-                "type": finding.get("type", ""),
-                "url": finding.get("url", ""),
-                "parameter": finding.get("parameter", ""),
-                "payload": finding.get("payload", "")[:200],  # Truncate
+                "type": normalized_type,
+                "url": finding_url,
+                "parameter": finding_param,
+                "payload": str(finding.get("payload", ""))[:200],
+                "severity": finding.get("severity", ""),
+                "confidence": float(finding.get("confidence_score", finding.get("confidence", 0.0))),
                 "vector": embedding,
                 "timestamp": datetime.now().isoformat()
             }]
             self.add_vector_embedding(collection, data)
-            logger.debug(f"Stored embedding for finding: {finding.get('type')}")
+            logger.debug(f"Stored embedding for finding: {normalized_type}")
         except Exception as e:
             logger.error(f"Failed to store finding embedding: {e}", exc_info=True)
-            import traceback
-            logger.debug(traceback.format_exc())
 
     # =========================================================================
     # HEALTH CHECK & METRICS
@@ -1009,11 +1058,12 @@ class DatabaseManager:
         return os.path.getsize(backup_path)
 
     def backup_database(self, backup_dir: Optional[str] = None) -> Dict:
-        """Create a backup of the SQLite database."""
+        """Create a backup of the SQLite database and LanceDB knowledge store."""
         result = {
             "status": "failed",
             "path": None,
             "size_bytes": 0,
+            "lancedb_backup": None,
             "timestamp": datetime.utcnow().isoformat()
         }
 
@@ -1033,11 +1083,21 @@ class DatabaseManager:
             logger.info(f"Database backup created: {backup_path} ({backup_size} bytes)")
             self._cleanup_old_backups(os.path.dirname(backup_path), keep=5)
 
+            # L6: Also backup LanceDB directory
+            try:
+                import shutil
+                lancedb_src = self.vector_db_path
+                if os.path.isdir(lancedb_src):
+                    lancedb_backup_path = backup_path.replace(".db", "_lancedb")
+                    shutil.copytree(lancedb_src, lancedb_backup_path, dirs_exist_ok=True)
+                    result["lancedb_backup"] = lancedb_backup_path
+                    logger.info(f"LanceDB backup created: {lancedb_backup_path}")
+            except Exception as lance_err:
+                logger.warning(f"LanceDB backup failed (SQLite backup OK): {lance_err}")
+
         except Exception as e:
             result["error"] = str(e)
             logger.error(f"Database backup failed: {e}", exc_info=True)
-            import traceback
-            logger.debug(traceback.format_exc())
 
         return result
 

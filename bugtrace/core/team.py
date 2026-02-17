@@ -162,6 +162,7 @@ class TeamOrchestrator:
         from bugtrace.agents.openredirect_agent import OpenRedirectAgent
         from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
         from bugtrace.agents.header_injection_agent import HeaderInjectionAgent
+        from bugtrace.agents.mass_assignment_agent import MassAssignmentAgent
 
         # Initialize specialist agents with minimal parameters
         # url parameter required but will be overridden by queue work items
@@ -177,6 +178,8 @@ class TeamOrchestrator:
         self.open_redirect_worker_agent = OpenRedirectAgent(url="", event_bus=self.event_bus)
         self.prototype_pollution_worker_agent = PrototypePollutionAgent(url="", event_bus=self.event_bus)
         self.header_injection_worker_agent = HeaderInjectionAgent(url="", event_bus=self.event_bus)
+        self.api_security_worker_agent = APISecurityAgent(url="", event_bus=self.event_bus)
+        self.mass_assignment_worker_agent = MassAssignmentAgent(url="", event_bus=self.event_bus)
 
         # Inject unified report_dir into all specialists (v3.1 - fixes data fragmentation)
         for agent in [
@@ -184,10 +187,11 @@ class TeamOrchestrator:
             self.lfi_worker_agent, self.idor_worker_agent, self.rce_worker_agent,
             self.ssrf_worker_agent, self.xxe_worker_agent, self.open_redirect_worker_agent,
             self.prototype_pollution_worker_agent, self.header_injection_worker_agent,
+            self.api_security_worker_agent, self.mass_assignment_worker_agent,
             self.jwt_agent  # Also inject into JWT agent
         ]:
             agent.report_dir = self.report_dir
-        logger.info(f"Injected unified report_dir into 12 specialist agents")
+        logger.info(f"Injected unified report_dir into 14 specialist agents")
 
         # Use specialist dispatcher to check queues and start necessary specialists
         from bugtrace.core.specialist_dispatcher import dispatch_specialists
@@ -208,6 +212,8 @@ class TeamOrchestrator:
             "openredirect": self.open_redirect_worker_agent,
             "prototype_pollution": self.prototype_pollution_worker_agent,
             "header_injection": self.header_injection_worker_agent,
+            "api_security": self.api_security_worker_agent,
+            "mass_assignment": self.mass_assignment_worker_agent,
         }
 
         # Set scan depth on exploitation agents before dispatch
@@ -365,6 +371,10 @@ class TeamOrchestrator:
             logger.info(f"Injected Scan ID {self.scan_id} into ThinkingConsolidationAgent")
         self.url_queue = []
         self.vulnerabilities_by_url: Dict[str, list] = {}
+
+        # Reset class-level dedup sets for per-scan state
+        from bugtrace.agents.analysis_agent import DASTySASTAgent
+        DASTySASTAgent._emitted_cookie_configs = set()
 
         # Load active state if resuming
         if self.resume:
@@ -1678,6 +1688,368 @@ class TeamOrchestrator:
 
         return urls_to_scan
 
+    async def _enrich_api_detail_endpoints(self, urls: list) -> list:
+        """Discover API detail endpoints from list endpoints.
+
+        When GoSpider finds /api/forum/threads (returns JSON array),
+        this method extracts IDs and generates detail URLs like
+        /api/forum/threads/1 so specialists can test path parameter injection.
+
+        Also discovers sub-resource URLs from response fields
+        (e.g., image_url, file fields that hint at additional endpoints).
+        """
+        api_list_urls = [u for u in urls if "/api/" in u and not re.search(r'/:\w+', u)]
+        if not api_list_urls:
+            return urls
+
+        new_urls = []
+        existing = set(urls)
+
+        async with httpx.AsyncClient(timeout=10, verify=False, follow_redirects=True) as client:
+            for url in api_list_urls:
+                try:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
+                    content_type = resp.headers.get("content-type", "")
+                    if "json" not in content_type:
+                        continue
+
+                    data = resp.json()
+
+                    # Case 1: JSON array of objects with id fields
+                    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                        first_item = data[0]
+                        # Extract the first usable ID
+                        id_val = first_item.get("id") or first_item.get("_id")
+                        if id_val is not None:
+                            detail_url = f"{url.rstrip('/')}/{id_val}"
+                            if detail_url not in existing:
+                                new_urls.append(detail_url)
+                                existing.add(detail_url)
+
+                            # Check for sub-resource hints (file, image fields)
+                            base_origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+                            for key in first_item:
+                                key_lower = key.lower()
+                                if any(hint in key_lower for hint in ["image", "file", "avatar", "photo", "attachment"]):
+                                    val = first_item[key]
+                                    # Handle array of objects with url field: [{"url": "/api/..."}]
+                                    sub_urls = []
+                                    if isinstance(val, list):
+                                        for item in val:
+                                            if isinstance(item, dict):
+                                                sub_url = item.get("url") or item.get("src") or item.get("href")
+                                                if sub_url:
+                                                    sub_urls.append(sub_url)
+                                    elif isinstance(val, str) and val.startswith(("/", "http")):
+                                        sub_urls.append(val)
+
+                                    for sub_url in sub_urls:
+                                        abs_url = sub_url if sub_url.startswith("http") else f"{base_origin}{sub_url}"
+                                        if abs_url not in existing:
+                                            new_urls.append(abs_url)
+                                            existing.add(abs_url)
+
+                    # Case 2: Paginated response {items: [...], total: N}
+                    elif isinstance(data, dict):
+                        items = data.get("items") or data.get("results") or data.get("data")
+                        if isinstance(items, list) and len(items) > 0 and isinstance(items[0], dict):
+                            first_item = items[0]
+                            id_val = first_item.get("id") or first_item.get("_id")
+                            if id_val is not None:
+                                detail_url = f"{url.rstrip('/')}/{id_val}"
+                                if detail_url not in existing:
+                                    new_urls.append(detail_url)
+                                    existing.add(detail_url)
+
+                except Exception as e:
+                    logger.debug(f"[API Enrichment] Failed to enrich {url}: {e}")
+                    continue
+
+        if new_urls:
+            logger.info(f"[API Enrichment] Discovered {len(new_urls)} detail endpoints: {new_urls}")
+            urls.extend(new_urls)
+        else:
+            logger.debug("[API Enrichment] No new detail endpoints discovered")
+
+        return urls
+
+    async def _discover_common_vuln_endpoints(self, urls: list) -> list:
+        """Probe for common vulnerability endpoints not found by crawling.
+
+        Some endpoints (e.g., /api/redirect, /api/admin, /api/debug) are never
+        linked from any page but are common attack surfaces. This method probes
+        a short list of well-known patterns and adds any that respond.
+        """
+        # Extract base origins from existing URLs
+        origins = set()
+        api_prefixes = set()
+        for url in urls:
+            parsed = urlparse(url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            origins.add(origin)
+            # Detect API prefix patterns (e.g., /api/, /v1/, /api/v1/)
+            path = parsed.path
+            if "/api/" in path:
+                api_prefix = path[:path.index("/api/") + 5]
+                api_prefixes.add(f"{origin}{api_prefix}")
+
+        if not api_prefixes:
+            # No API endpoints found, try default /api/ prefix
+            for origin in origins:
+                api_prefixes.add(f"{origin}/api/")
+
+        # Common vulnerability-relevant endpoint suffixes (probed under api_prefix)
+        COMMON_ENDPOINTS = [
+            # Redirect endpoints
+            "redirect?url=https://example.com",
+            "redirect?to=https://example.com",
+            # Debug/admin endpoints
+            "debug",
+            "debug/vulns",
+            "admin",
+            "admin/email-preview",
+            "admin/email-templates",
+            "config",
+            # Auth endpoints
+            "auth/login",
+            "auth/register",
+            # User/profile endpoints (with IDs for IDOR testing)
+            "users/me",
+            "profile",
+            "user/profile",
+            "user/profile/1",
+            "user/profile/2",
+            "user/preferences",
+            "users",
+            "users/1",
+            # File/upload endpoints
+            "upload",
+            "files",
+            "download",
+            "import",
+            "export",
+            "products/import?url=https://example.com",
+            # GraphQL
+            "graphql",
+            # Health/system
+            "health",
+            "health?cmd=id",
+            # Checkout/payments (V-023: price manipulation)
+            "checkout",
+            "checkout/process",
+            # Review/forum (stored XSS, IDOR targets)
+            "reviews",
+            "reviews/1",
+            "blog",
+            "blog/1",
+            "blog/3",
+            "forum/threads",
+            "forum/threads/1",
+            # Admin endpoints (V-028: broken access control)
+            "admin/vulnerable-debug-stats",
+            "admin/stats",
+            "admin/products",
+            # Admin email template (SSTI target)
+            "admin/email-preview?template={{7*7}}",
+        ]
+
+        # SPA/content routes (probed against origin, not api_prefix)
+        # GoSpider can't crawl JavaScript SPAs, so common frontend routes
+        # must be probed directly to discover client-side vulnerabilities
+        SPA_ROUTES = [
+            "blog",
+            "blog/1",
+            "blog?legacy_q=test",
+            "search",
+            "search?q=test",
+            "products",
+            "products?filter=test",
+            "forum",
+            "community",
+            "admin",
+            "settings",
+        ]
+
+        new_urls = []
+        existing = set(urls)
+
+        async with httpx.AsyncClient(timeout=5, verify=False, follow_redirects=False) as client:
+            # Probe API-prefix endpoints
+            for prefix in api_prefixes:
+                for endpoint in COMMON_ENDPOINTS:
+                    probe_url = f"{prefix.rstrip('/')}/{endpoint}"
+                    # Strip query string for dedup check
+                    probe_base = probe_url.split("?")[0]
+                    # For parameterized endpoints (e.g., health?cmd=id), only dedup
+                    # against the exact URL — not the base. The base version (health)
+                    # and parameterized version (health?cmd=id) are different attack surfaces.
+                    if "?" in endpoint:
+                        if probe_url in existing:
+                            continue
+                    else:
+                        if probe_base in existing:
+                            continue
+                    try:
+                        resp = await client.get(probe_url)
+                        # Accept any non-404 response (even 401/403 = endpoint exists)
+                        if resp.status_code != 404:
+                            # Preserve query params for endpoints that need them
+                            # (e.g., redirect?url=... — the param IS the attack surface)
+                            add_url = probe_url if "?" in endpoint else probe_base
+                            if add_url not in existing:
+                                new_urls.append(add_url)
+                                existing.add(add_url)
+                                # Also add base to prevent re-probing
+                                existing.add(probe_base)
+                                logger.info(f"[Endpoint Discovery] Found: {add_url} (status: {resp.status_code})")
+                    except Exception:
+                        continue
+
+            # Probe SPA/content routes against origin (not api_prefix)
+            for origin in origins:
+                for route in SPA_ROUTES:
+                    probe_url = f"{origin.rstrip('/')}/{route}"
+                    if probe_url in existing:
+                        continue
+                    try:
+                        resp = await client.get(probe_url)
+                        if resp.status_code != 404:
+                            # Only add if response has meaningful content (not just JSON error)
+                            content_type = resp.headers.get("content-type", "")
+                            body_len = len(resp.content)
+                            # Accept HTML pages (SPA) or responses > 100 bytes
+                            if "text/html" in content_type or body_len > 100:
+                                if probe_url not in existing:
+                                    new_urls.append(probe_url)
+                                    existing.add(probe_url)
+                                    logger.info(f"[Endpoint Discovery] Found SPA route: {probe_url} (status: {resp.status_code}, type: {content_type[:30]})")
+                    except Exception:
+                        continue
+
+        if new_urls:
+            logger.info(f"[Endpoint Discovery] Discovered {len(new_urls)} common endpoints: {new_urls}")
+            urls.extend(new_urls)
+        else:
+            logger.debug("[Endpoint Discovery] No new common endpoints discovered")
+
+        return urls
+
+    async def _infer_api_from_frontend_routes(self, urls: list) -> list:
+        """Infer API endpoints from SPA frontend routes.
+
+        Modern SPAs (React/Vue/Angular) serve identical HTML for all frontend
+        routes — the actual data comes from backend API calls. When the crawler
+        finds a route like /forum/thread/1, this method generates candidate API
+        URLs (/api/forum/thread/1, /api/forum/threads/1, etc.) and probes them.
+
+        This is critical because specialists testing SPA routes get the same
+        static HTML regardless of payload, making vulnerability detection
+        impossible. The real attack surface is the API endpoint.
+        """
+        existing = set(urls)
+        new_urls = []
+
+        # Collect API prefixes from already-known API URLs
+        api_prefixes = set()
+        origins = set()
+        for url in urls:
+            parsed = urlparse(url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            origins.add(origin)
+            if "/api/" in parsed.path:
+                prefix_end = parsed.path.index("/api/") + 5
+                api_prefixes.add(f"{origin}{parsed.path[:prefix_end]}")
+
+        if not api_prefixes:
+            for origin in origins:
+                api_prefixes.add(f"{origin}/api/")
+
+        # Identify frontend routes with dynamic path segments (IDs or :param placeholders)
+        frontend_candidates = []
+        for url in urls:
+            parsed = urlparse(url)
+            if "/api/" in parsed.path:
+                continue  # Already an API URL
+            segments = [s for s in parsed.path.strip("/").split("/") if s]
+            if len(segments) < 2:
+                continue
+            for i, seg in enumerate(segments):
+                # Detect: numeric IDs, :param placeholders, {param}, UUIDs, hex hashes
+                is_dynamic = (
+                    re.match(r'^\d+$', seg)
+                    or seg.startswith(":")  # Express-style :id, :slug
+                    or (seg.startswith("{") and seg.endswith("}"))  # {id}
+                    or re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-', seg, re.I)
+                    or (re.match(r'^[0-9a-f]{6,}$', seg, re.I) and len(seg) >= 8)
+                )
+                if is_dynamic and i > 0:
+                    frontend_candidates.append((url, parsed, segments, i))
+                    break  # One dynamic segment per URL is enough
+
+        if not frontend_candidates:
+            return urls
+
+        async with httpx.AsyncClient(timeout=5, verify=False, follow_redirects=True) as client:
+            for orig_url, parsed, segments, id_idx in frontend_candidates:
+                origin = f"{parsed.scheme}://{parsed.netloc}"
+                raw_id = segments[id_idx]  # Could be ":id", "{id}", or "123"
+                # For probing, use a real ID; for URL list, keep placeholder
+                probe_id = "1"
+                if re.match(r'^\d+$', raw_id):
+                    probe_id = raw_id
+                path_before_id = segments[:id_idx]
+
+                # Generate candidate API paths (probe_url, display_url) pairs
+                candidates = []  # (probe_path, final_path)
+                for prefix in api_prefixes:
+                    p = prefix.rstrip("/")
+                    # Pattern 1: Direct — /api/forum/thread/1
+                    base = f"{p}/{'/'.join(path_before_id)}"
+                    candidates.append((f"{base}/{probe_id}", f"{base}/{raw_id}"))
+                    # Pattern 2: Pluralize last segment — /api/forum/threads/1
+                    if path_before_id:
+                        last = path_before_id[-1]
+                        if not last.endswith("s"):
+                            parts = list(path_before_id)
+                            parts[-1] = last + "s"
+                            base_p = f"{p}/{'/'.join(parts)}"
+                            candidates.append((f"{base_p}/{probe_id}", f"{base_p}/{raw_id}"))
+                    # Pattern 3: Just last segment(s) + ID — /api/threads/1
+                    if len(path_before_id) >= 2:
+                        base_s = f"{p}/{path_before_id[-1]}"
+                        candidates.append((f"{base_s}/{probe_id}", f"{base_s}/{raw_id}"))
+                        if not path_before_id[-1].endswith("s"):
+                            base_sp = f"{p}/{path_before_id[-1]}s"
+                            candidates.append((f"{base_sp}/{probe_id}", f"{base_sp}/{raw_id}"))
+
+                for probe_url, final_url in candidates:
+                    if final_url in existing:
+                        continue
+                    try:
+                        resp = await client.get(probe_url)
+                        if resp.status_code in (404, 405, 502, 503):
+                            continue
+                        ct = resp.headers.get("content-type", "")
+                        # API endpoints return JSON, not HTML
+                        if "json" in ct or "xml" in ct:
+                            if final_url not in existing:
+                                new_urls.append(final_url)
+                                existing.add(final_url)
+                                logger.info(
+                                    f"[SPA→API] Inferred: {orig_url} → {final_url} "
+                                    f"(status: {resp.status_code})"
+                                )
+                    except Exception:
+                        continue
+
+        if new_urls:
+            logger.info(f"[SPA→API] Discovered {len(new_urls)} API endpoints from {len(frontend_candidates)} frontend routes")
+            urls.extend(new_urls)
+
+        return urls
+
     def _prioritize_urls(self, urls: list) -> list:
         """Prioritize URLs by risk score (high-value targets first)."""
         from bugtrace.core.url_prioritizer import prioritize_urls
@@ -2133,6 +2505,30 @@ class TeamOrchestrator:
             logger.warning("[Pipeline] Recon found 0 URLs — aborting pipeline")
             self._v.emit("pipeline.error", {"error": "Recon found 0 URLs to scan"})
             return
+
+        # ========== API DETAIL ENDPOINT ENRICHMENT ==========
+        # Discover detail URLs from API list endpoints (e.g., /api/threads → /api/threads/1)
+        pre_enrich_count = len(self.urls_to_scan)
+        self.urls_to_scan = await self._enrich_api_detail_endpoints(self.urls_to_scan)
+        if len(self.urls_to_scan) > pre_enrich_count:
+            added = len(self.urls_to_scan) - pre_enrich_count
+            logger.info(f"[API Enrichment] Added {added} detail endpoints ({pre_enrich_count} → {len(self.urls_to_scan)} URLs)")
+
+        # ========== COMMON ENDPOINT DISCOVERY ==========
+        # Probe for well-known endpoints not found by crawling (redirect, admin, debug, etc.)
+        pre_discover_count = len(self.urls_to_scan)
+        self.urls_to_scan = await self._discover_common_vuln_endpoints(self.urls_to_scan)
+        if len(self.urls_to_scan) > pre_discover_count:
+            added = len(self.urls_to_scan) - pre_discover_count
+            logger.info(f"[Endpoint Discovery] Added {added} common endpoints ({pre_discover_count} → {len(self.urls_to_scan)} URLs)")
+
+        # ========== SPA → API INFERENCE ==========
+        # Infer API endpoints from SPA frontend routes (e.g., /forum/thread/1 → /api/forum/threads/1)
+        pre_spa_count = len(self.urls_to_scan)
+        self.urls_to_scan = await self._infer_api_from_frontend_routes(self.urls_to_scan)
+        if len(self.urls_to_scan) > pre_spa_count:
+            added = len(self.urls_to_scan) - pre_spa_count
+            logger.info(f"[SPA→API] Added {added} API endpoints ({pre_spa_count} → {len(self.urls_to_scan)} URLs)")
 
         # ========== LONEWOLF: Fire and forget ==========
         if settings.LONEWOLF_ENABLED:
@@ -2867,15 +3263,123 @@ class TeamOrchestrator:
                 if ftype in ['CSTI', 'CLIENT-SIDE TEMPLATE INJECTION', 'TEMPLATE INJECTION']:
                     existing_csti_params.add(f.get('parameter', ''))
 
-            # Inject synthetic CSTI findings for each real reflecting param not already covered
+            # Cap total auto-dispatch to 15 to avoid flooding CSTI queue with noise.
+            # Priority order: SPA routes (real query params) > recon URLs > reflecting params.
+            # SPA routes run first because they have real injectable params (e.g., legacy_q)
+            # that are highest-value targets. Reflecting params are fallback/noise.
+            MAX_CSTI_AUTO_DISPATCH = 15
             injected_count = 0
             seen_params = set()
+            seen_url_paths = set()
+
+            # --- PRIORITY 1: SPA routes from urls_to_scan ---
+            # SPA routes (e.g., /blog, /products) are discovered by common endpoint
+            # discovery but aren't in recon/urls.txt (GoSpider can't crawl SPAs).
+            # CSTIAgent's _discover_csti_params() will find JS-extracted params
+            # (like URLSearchParams) that aren't in HTML forms.
+            # Sort so URLs with query params come first — they have real param names
+            # vs _auto_discover, and path-only dedup would otherwise skip them.
+            spa_urls = sorted(
+                getattr(self, 'urls_to_scan', []),
+                key=lambda u: (0 if '?' in u else 1, u)
+            )
+            for scan_url in spa_urls:
+                if injected_count >= MAX_CSTI_AUTO_DISPATCH:
+                    break
+                parsed_su = urlparse(scan_url)
+                url_path = parsed_su.path.rstrip("/")
+                # Only non-API pages (SPA routes where Angular/Vue renders)
+                if "/api/" in url_path or url_path in seen_url_paths:
+                    continue
+                if not url_path or url_path == "/":
+                    continue
+                seen_url_paths.add(url_path)
+                # Use first query param if present, otherwise signal autonomous discovery
+                su_params = parse_qs(parsed_su.query)
+                spa_param = list(su_params.keys())[0] if su_params else "_auto_discover"
+                synthetic_csti = {
+                    "type": "CSTI",
+                    "parameter": spa_param,
+                    "url": scan_url,
+                    "severity": "High",
+                    "fp_confidence": 0.9,
+                    "confidence_score": 0.9,
+                    "votes": 5,
+                    "skeptical_score": 8,
+                    "reasoning": f"Auto-dispatch: {detected_csti_framework.upper()} framework detected. Testing SPA route '{url_path}' for CSTI.",
+                    "payload": "",
+                    "evidence": f"tech_profile.frameworks contains: {detected_frameworks}",
+                    "template_engine": detected_csti_framework,
+                    "_source_file": "auto_dispatch_spa",
+                    "_scan_context": self.scan_context,
+                    "_auto_dispatched": True
+                }
+                all_findings.append(synthetic_csti)
+                injected_count += 1
+                logger.debug(f"[Auto-Dispatch] CSTI SPA route: {url_path} (param: {spa_param})")
+
+            # --- PRIORITY 2: Recon URLs from GoSpider ---
+            # Dispatch CSTI for unique recon URL paths (not per-param).
+            # CSTIAgent's _discover_csti_params() finds all params on each URL autonomously.
+            # Injecting per-URL instead of per-param prevents LLM dedup from merging them all.
+            urls_file = getattr(self, 'report_dir', None)
+            if urls_file:
+                urls_file = urls_file / "recon" / "urls.txt"
+            if urls_file and urls_file.exists():
+                for line in urls_file.read_text().splitlines():
+                    if injected_count >= MAX_CSTI_AUTO_DISPATCH:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parsed_url = urlparse(line)
+                    url_path = parsed_url.path.rstrip("/")
+                    if url_path in seen_url_paths or not parsed_url.query:
+                        continue
+                    # Skip API endpoints — CSTI only works on pages where Angular/Vue renders HTML
+                    if "/api/" in url_path:
+                        continue
+                    seen_url_paths.add(url_path)
+                    first_param = list(parse_qs(parsed_url.query).keys())[0]
+                    if first_param in existing_csti_params:
+                        continue
+                    synthetic_csti = {
+                        "type": "CSTI",
+                        "parameter": first_param,
+                        "url": line,
+                        "severity": "High",
+                        "fp_confidence": 0.9,
+                        "confidence_score": 0.9,
+                        "votes": 5,
+                        "skeptical_score": 8,
+                        "reasoning": f"Auto-dispatch: {detected_csti_framework.upper()} framework detected. Testing URL '{url_path}' for CSTI.",
+                        "payload": "",
+                        "evidence": f"tech_profile.frameworks contains: {detected_frameworks}",
+                        "template_engine": detected_csti_framework,
+                        "_source_file": "auto_dispatch_recon",
+                        "_scan_context": self.scan_context,
+                        "_auto_dispatched": True
+                    }
+                    all_findings.append(synthetic_csti)
+                    injected_count += 1
+                    logger.debug(f"[Auto-Dispatch] CSTI recon URL: {url_path} (param: {first_param})")
+
+            # --- PRIORITY 3: Reflecting params (fallback) ---
+            # Inject synthetic CSTI findings for reflecting params on HTML pages only.
+            # API endpoints (/api/*) return JSON — Angular/Vue don't render there.
+            # Lowest priority — these often contain noise params from tech detection.
             for rf in reflecting_params:
+                if injected_count >= MAX_CSTI_AUTO_DISPATCH:
+                    break
                 param = rf["parameter"]
                 if param in existing_csti_params or param in seen_params:
                     continue
-                seen_params.add(param)
                 synth_url = rf.get("url", self.target)
+                parsed_rf = urlparse(synth_url)
+                # Skip API endpoints — CSTI only works on pages where Angular/Vue renders HTML
+                if "/api/" in parsed_rf.path:
+                    continue
+                seen_params.add(param)
                 synthetic_csti = {
                     "type": "CSTI",
                     "parameter": param,
@@ -2888,50 +3392,13 @@ class TeamOrchestrator:
                     "reasoning": f"Auto-dispatch: {detected_csti_framework.upper()} framework detected. Testing param '{param}' for CSTI.",
                     "payload": "",
                     "evidence": f"tech_profile.frameworks contains: {detected_frameworks}",
+                    "template_engine": detected_csti_framework,
                     "_source_file": "auto_dispatch",
                     "_scan_context": self.scan_context,
                     "_auto_dispatched": True
                 }
                 all_findings.append(synthetic_csti)
                 injected_count += 1
-
-            # FIX (2026-02-12): Also dispatch CSTI for params from recon URLs.
-            # DASTySAST may analyze a URL and find 0 vulns (LLM miss), but the param
-            # still reflects input. CSTIAgent's smart probe is safe — it skips non-reflecting params.
-            from urllib.parse import urlparse, parse_qs
-            urls_file = getattr(self, 'report_dir', None)
-            if urls_file:
-                urls_file = urls_file / "recon" / "urls.txt"
-            if urls_file and urls_file.exists():
-                skip_params = {'ref', 'trk', 'productId', 'postId', 'storeId'}  # Non-injectable params
-                for line in urls_file.read_text().splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parsed_url = urlparse(line)
-                    for param in parse_qs(parsed_url.query).keys():
-                        if param in seen_params or param in existing_csti_params or param in skip_params:
-                            continue
-                        seen_params.add(param)
-                        synthetic_csti = {
-                            "type": "CSTI",
-                            "parameter": param,
-                            "url": line,
-                            "severity": "High",
-                            "fp_confidence": 0.9,
-                            "confidence_score": 0.9,
-                            "votes": 5,
-                            "skeptical_score": 8,
-                            "reasoning": f"Auto-dispatch: {detected_csti_framework.upper()} framework detected. Testing recon param '{param}' for CSTI.",
-                            "payload": "",
-                            "evidence": f"tech_profile.frameworks contains: {detected_frameworks}",
-                            "_source_file": "auto_dispatch_recon",
-                            "_scan_context": self.scan_context,
-                            "_auto_dispatched": True
-                        }
-                        all_findings.append(synthetic_csti)
-                        injected_count += 1
-                        logger.debug(f"[Auto-Dispatch] CSTI recon param: {param} on {line}")
 
             if injected_count == 0 and not existing_csti_params:
                 # No reflecting params AND no recon params — fallback to target URL params
@@ -3090,29 +3557,535 @@ class TeamOrchestrator:
             logger.info("[Auto-Dispatch] Added synthetic XSS finding for DOM XSS coverage")
             dashboard.log("🔧 Auto-dispatch: XSS finding injected (DOM XSS coverage)", "INFO")
 
+        # Auto-dispatch OpenRedirectAgent when recon URLs contain redirect-like params.
+        # Open redirects are commonly missed because DASTySAST focuses on reflection,
+        # not redirect behavior. OpenRedirectAgent tests actual HTTP redirect responses.
+        has_openredirect = any(
+            'redirect' in f.get("type", "").lower() or 'open redirect' in f.get("type", "").lower()
+            for f in all_findings
+        )
+        if not has_openredirect:
+            redirect_param_names = {
+                "url", "redirect", "redirect_url", "redirect_uri", "return",
+                "return_url", "return_to", "next", "goto", "dest", "destination",
+                "continue", "redir", "target", "forward", "out", "view", "ref",
+            }
+            urls_file = getattr(self, 'report_dir', None)
+            if urls_file:
+                urls_file = urls_file / "recon" / "urls.txt"
+            redirect_url = None
+            redirect_param = None
+            # Search recon/urls.txt (GoSpider output)
+            if urls_file and urls_file.exists():
+                for line in urls_file.read_text().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parsed_redir = urlparse(line)
+                    for p in parse_qs(parsed_redir.query).keys():
+                        if p.lower() in redirect_param_names:
+                            redirect_url = line
+                            redirect_param = p
+                            break
+                    if redirect_url:
+                        break
+            # Also search urls_to_scan (includes common endpoint discoveries)
+            if not redirect_url:
+                for line in getattr(self, 'urls_to_scan', []):
+                    parsed_redir = urlparse(line)
+                    for p in parse_qs(parsed_redir.query).keys():
+                        if p.lower() in redirect_param_names:
+                            redirect_url = line
+                            redirect_param = p
+                            break
+                    if redirect_url:
+                        break
+            if redirect_url and redirect_param:
+                synthetic_redir = {
+                    "type": "Open Redirect",
+                    "parameter": redirect_param,
+                    "url": redirect_url,
+                    "severity": "Medium",
+                    "fp_confidence": 0.9,
+                    "confidence_score": 0.9,
+                    "votes": 5,
+                    "skeptical_score": 7,
+                    "reasoning": f"Auto-dispatch: URL parameter '{redirect_param}' suggests redirect behavior. OpenRedirectAgent will test for open redirect.",
+                    "payload": "",
+                    "evidence": f"Recon URL contains redirect-like parameter: {redirect_param}",
+                    "_source_file": "auto_dispatch",
+                    "_scan_context": self.scan_context,
+                    "_auto_dispatched": True
+                }
+                all_findings.append(synthetic_redir)
+                logger.info(f"[Auto-Dispatch] Added synthetic Open Redirect finding: param='{redirect_param}' on {redirect_url}")
+                dashboard.log(f"Auto-dispatch: Open Redirect finding injected for param='{redirect_param}'", "INFO")
+
+        # FIX (2026-02-16): Auto-dispatch IDORAgent for recon URLs with numeric path segments.
+        # DASTySAST LLM is non-deterministic about classifying /api/reviews/1, /api/orders/1 as IDOR.
+        # IDORAgent has autonomous _discover_idor_params() — just needs the trigger URL.
+        # Scan recon URLs for numeric path segments and inject synthetic IDOR findings.
+        has_idor = any(
+            'idor' in f.get('type', '').lower()
+            or 'insecure direct object' in f.get('type', '').lower()
+            or 'broken access' in f.get('type', '').lower()
+            for f in all_findings
+        )
+        idor_urls_file = getattr(self, 'report_dir', None)
+        if idor_urls_file:
+            idor_urls_file = idor_urls_file / "recon" / "urls.txt"
+        if idor_urls_file and idor_urls_file.exists():
+            import re
+            numeric_path_re = re.compile(r'/\d+(?:/|$|\?)')
+            existing_idor_urls = set()
+            if has_idor:
+                existing_idor_urls = {
+                    urlparse(f.get('url', '')).path.rstrip('/')
+                    for f in all_findings
+                    if 'idor' in f.get('type', '').lower()
+                    or 'insecure direct object' in f.get('type', '').lower()
+                }
+            seen_idor_bases = set()
+            idor_injected = 0
+            for line in idor_urls_file.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parsed_idor = urlparse(line)
+                path = parsed_idor.path.rstrip('/')
+                if not numeric_path_re.search(path):
+                    continue
+                # Deduplicate by base path (strip the numeric segment to get the resource type)
+                # e.g., /api/reviews/1 and /api/reviews/2 → base = /api/reviews
+                base_path = re.sub(r'/\d+(?=/|$)', '', path)
+                if base_path in seen_idor_bases:
+                    continue
+                seen_idor_bases.add(base_path)
+                if path in existing_idor_urls:
+                    continue
+                synthetic_idor = {
+                    "type": "IDOR",
+                    "parameter": "URL Path (/{id})",
+                    "url": line.split('?')[0],  # Strip query params, keep path with ID
+                    "severity": "High",
+                    "fp_confidence": 0.9,
+                    "confidence_score": 0.9,
+                    "votes": 5,
+                    "skeptical_score": 8,
+                    "reasoning": f"Auto-dispatch: Numeric path segment detected in '{path}'. IDORAgent will test for authorization bypass.",
+                    "payload": "",
+                    "evidence": f"Recon URL contains numeric path ID: {path}",
+                    "_source_file": "auto_dispatch_idor_recon",
+                    "_scan_context": self.scan_context,
+                    "_auto_dispatched": True
+                }
+                all_findings.append(synthetic_idor)
+                idor_injected += 1
+                logger.debug(f"[Auto-Dispatch] IDOR recon URL: {path} (base: {base_path})")
+            if idor_injected > 0:
+                self._v.emit("strategy.auto_dispatch", {"specialist": "IDOR", "count": idor_injected})
+                logger.info(f"[Auto-Dispatch] Injected {idor_injected} synthetic IDOR findings from recon URLs with numeric paths")
+                dashboard.log(f"Auto-dispatch: {idor_injected} IDOR findings injected (numeric path IDs)", "INFO")
+
+        # Auto-dispatch PrototypePollutionAgent when JS frameworks detected and reflecting params exist.
+        # PP is common in AngularJS/React apps but DASTySAST pre-filters PP findings as FP (low skeptical).
+        has_pp = any(
+            'prototype' in f.get('type', '').lower() or 'pollution' in f.get('type', '').lower()
+            for f in all_findings
+        )
+        has_js_framework = any(
+            fw_name in f.lower()
+            for f in getattr(self, 'tech_profile', {}).get('frameworks', [])
+            for fw_name in ('angular', 'react', 'vue', 'jquery', 'backbone', 'ember')
+        )
+        if not has_pp and has_any_param_finding and has_js_framework:
+            pp_param_finding = next(
+                (f for f in all_findings
+                 if f.get('parameter') and f['parameter'] not in (
+                     '', '_auto_dispatch', 'auto_dispatch',
+                     'General DOM', 'DOM', 'DOM/Body',
+                 )),
+                None
+            )
+            pp_param = pp_param_finding["parameter"] if pp_param_finding else "_auto_dispatch"
+            # Always use scan target for PP — it's a client-side vuln that needs real pages, not API endpoints.
+            pp_url = self.target
+
+            synthetic_pp = {
+                "type": "Prototype Pollution",
+                "parameter": pp_param,
+                "url": pp_url,
+                "severity": "High",
+                "fp_confidence": 0.9,
+                "confidence_score": 0.9,
+                "votes": 5,
+                "skeptical_score": 8,
+                "probe_validated": True,
+                "reasoning": f"Auto-dispatch: JS framework detected, testing {pp_param} for prototype pollution",
+                "description": f"Potential Prototype Pollution in parameter '{pp_param}' (JS framework detected)",
+                "_source_file": "auto_dispatch_prototype_pollution",
+                "_scan_context": self.scan_context,
+                "_auto_dispatched": True
+            }
+            all_findings.append(synthetic_pp)
+            self._v.emit("strategy.auto_dispatch", {"specialist": "PROTOTYPE_POLLUTION", "count": 1})
+            logger.info(f"[Auto-Dispatch] Added synthetic Prototype Pollution finding: param='{pp_param}' (JS framework detected)")
+            dashboard.log(f"Auto-dispatch: Prototype Pollution (JS framework detected)", "INFO")
+
+        # Auto-dispatch LFIAgent when file-like parameters found in recon URLs.
+        # LFI is commonly missed by DASTySAST when params look benign (e.g., "file", "page").
+        has_lfi = any(
+            'lfi' in f.get('type', '').lower()
+            or 'file inclusion' in f.get('type', '').lower()
+            or 'path traversal' in f.get('type', '').lower()
+            or 'directory traversal' in f.get('type', '').lower()
+            for f in all_findings
+        )
+        if not has_lfi:
+            lfi_param_names = {
+                "file", "path", "dir", "page", "include", "template",
+                "doc", "filename", "download", "filepath", "document",
+                "folder", "root", "pg", "style", "pdf", "img", "image",
+            }
+            lfi_url = None
+            lfi_param = None
+            recon_file = getattr(self, 'report_dir', None)
+            if recon_file:
+                recon_file = recon_file / "recon" / "urls.txt"
+            if recon_file and recon_file.exists():
+                for line in recon_file.read_text().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parsed_lfi = urlparse(line)
+                    for p in parse_qs(parsed_lfi.query).keys():
+                        if p.lower() in lfi_param_names:
+                            lfi_url = line
+                            lfi_param = p
+                            break
+                    if lfi_url:
+                        break
+            if lfi_url and lfi_param:
+                synthetic_lfi = {
+                    "type": "LFI",
+                    "parameter": lfi_param,
+                    "url": lfi_url,
+                    "severity": "High",
+                    "fp_confidence": 0.9,
+                    "confidence_score": 0.9,
+                    "votes": 5,
+                    "skeptical_score": 8,
+                    "reasoning": f"Auto-dispatch: File-like parameter '{lfi_param}' found. LFIAgent will test for path traversal.",
+                    "payload": "",
+                    "evidence": f"Recon URL contains file-like parameter: {lfi_param}",
+                    "_source_file": "auto_dispatch_lfi",
+                    "_scan_context": self.scan_context,
+                    "_auto_dispatched": True
+                }
+                all_findings.append(synthetic_lfi)
+                logger.info(f"[Auto-Dispatch] Added synthetic LFI finding: param='{lfi_param}' on {lfi_url}")
+                dashboard.log(f"Auto-dispatch: LFI finding injected for param='{lfi_param}'", "INFO")
+
+        # Auto-dispatch RCEAgent when command-like parameters found in recon URLs.
+        # RCE endpoints like /health?cmd= are obvious candidates but DASTySAST may not classify them.
+        has_rce = any(
+            'rce' in f.get('type', '').lower()
+            or 'command injection' in f.get('type', '').lower()
+            or 'remote code' in f.get('type', '').lower()
+            or 'os command' in f.get('type', '').lower()
+            for f in all_findings
+        )
+        if not has_rce:
+            rce_param_names = {
+                "cmd", "command", "exec", "execute", "run", "shell",
+                "ping", "query", "jump", "code", "reg", "do", "func",
+                "arg", "option", "load", "process", "step", "read",
+            }
+            rce_url = None
+            rce_param = None
+            recon_file_rce = getattr(self, 'report_dir', None)
+            if recon_file_rce:
+                recon_file_rce = recon_file_rce / "recon" / "urls.txt"
+            if recon_file_rce and recon_file_rce.exists():
+                for line in recon_file_rce.read_text().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parsed_rce = urlparse(line)
+                    for p in parse_qs(parsed_rce.query).keys():
+                        if p.lower() in rce_param_names:
+                            rce_url = line
+                            rce_param = p
+                            break
+                    if rce_url:
+                        break
+            if rce_url and rce_param:
+                synthetic_rce = {
+                    "type": "RCE",
+                    "parameter": rce_param,
+                    "url": rce_url,
+                    "severity": "Critical",
+                    "fp_confidence": 0.9,
+                    "confidence_score": 0.9,
+                    "votes": 5,
+                    "skeptical_score": 8,
+                    "reasoning": f"Auto-dispatch: Command-like parameter '{rce_param}' found. RCEAgent will test for command injection.",
+                    "payload": "",
+                    "evidence": f"Recon URL contains command-like parameter: {rce_param}",
+                    "_source_file": "auto_dispatch_rce",
+                    "_scan_context": self.scan_context,
+                    "_auto_dispatched": True
+                }
+                all_findings.append(synthetic_rce)
+                logger.info(f"[Auto-Dispatch] Added synthetic RCE finding: param='{rce_param}' on {rce_url}")
+                dashboard.log(f"Auto-dispatch: RCE finding injected for param='{rce_param}'", "INFO")
+
+        # Auto-dispatch SSRFAgent when URL-accepting parameters found in recon URLs.
+        # SSRF params (callback, webhook, import) differ from open redirect params.
+        has_ssrf = any(
+            'ssrf' in f.get('type', '').lower()
+            or 'server-side request' in f.get('type', '').lower()
+            or 'server side request' in f.get('type', '').lower()
+            for f in all_findings
+        )
+        if not has_ssrf:
+            ssrf_param_names = {
+                "callback", "webhook", "import", "import_url", "fetch",
+                "src", "source", "feed", "rss", "proxy", "api_url",
+                "load_url", "remote", "endpoint", "request", "image_url",
+                "avatar", "icon_url",
+            }
+            ssrf_url = None
+            ssrf_param = None
+            recon_file_ssrf = getattr(self, 'report_dir', None)
+            if recon_file_ssrf:
+                recon_file_ssrf = recon_file_ssrf / "recon" / "urls.txt"
+            if recon_file_ssrf and recon_file_ssrf.exists():
+                for line in recon_file_ssrf.read_text().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parsed_ssrf = urlparse(line)
+                    for p in parse_qs(parsed_ssrf.query).keys():
+                        if p.lower() in ssrf_param_names:
+                            ssrf_url = line
+                            ssrf_param = p
+                            break
+                    if ssrf_url:
+                        break
+            # Fallback: if no SSRF-specific param found but target has API endpoints,
+            # dispatch SSRF with any URL-like param (url param already handled by OR)
+            if not ssrf_url and has_any_param_finding:
+                for f in all_findings:
+                    p = f.get('parameter', '').lower()
+                    if p in ('url', 'uri', 'href', 'link'):
+                        ssrf_url = f.get('url', self.target)
+                        ssrf_param = f.get('parameter', 'url')
+                        break
+            if ssrf_url and ssrf_param:
+                synthetic_ssrf = {
+                    "type": "SSRF",
+                    "parameter": ssrf_param,
+                    "url": ssrf_url,
+                    "severity": "High",
+                    "fp_confidence": 0.9,
+                    "confidence_score": 0.9,
+                    "votes": 5,
+                    "skeptical_score": 8,
+                    "reasoning": f"Auto-dispatch: URL-accepting parameter '{ssrf_param}' found. SSRFAgent will test for server-side request forgery.",
+                    "payload": "",
+                    "evidence": f"Recon URL contains URL-accepting parameter: {ssrf_param}",
+                    "_source_file": "auto_dispatch_ssrf",
+                    "_scan_context": self.scan_context,
+                    "_auto_dispatched": True
+                }
+                all_findings.append(synthetic_ssrf)
+                logger.info(f"[Auto-Dispatch] Added synthetic SSRF finding: param='{ssrf_param}' on {ssrf_url}")
+                dashboard.log(f"Auto-dispatch: SSRF finding injected for param='{ssrf_param}'", "INFO")
+
+        # ===== Auto-dispatch MassAssignmentAgent for PUT/PATCH/POST endpoints =====
+        # Mass assignment tests all writable endpoints — doesn't depend on DASTySAST detecting it
+        mass_assign_urls = set()
+        for f in all_findings:
+            f_url = f.get("url", "")
+            if f_url and any(kw in f_url.lower() for kw in [
+                "/user", "/profile", "/account", "/register", "/settings",
+                "/preferences", "/checkout", "/order", "/admin",
+                "/api/user", "/api/auth", "/api/admin"
+            ]):
+                mass_assign_urls.add(f_url)
+
+        # Also add from recon URLs
+        for url in self.urls_to_scan:
+            if any(kw in url.lower() for kw in [
+                "/user", "/profile", "/account", "/register", "/settings",
+                "/preferences", "/checkout", "/order"
+            ]):
+                mass_assign_urls.add(url)
+
+        if mass_assign_urls:
+            ma_injected = 0
+            for ma_url in mass_assign_urls:
+                synthetic_ma = {
+                    "type": "Mass Assignment",
+                    "parameter": "auto_dispatch",
+                    "url": ma_url,
+                    "severity": "High",
+                    "fp_confidence": 0.9,
+                    "confidence_score": 0.9,
+                    "votes": 5,
+                    "skeptical_score": 8,
+                    "probe_validated": True,
+                    "reasoning": f"Auto-dispatch: Writable endpoint detected. MassAssignmentAgent will test for parameter pollution.",
+                    "payload": "",
+                    "evidence": f"Endpoint may accept additional fields: {ma_url}",
+                    "_source_file": "auto_dispatch_mass_assignment",
+                    "_scan_context": self.scan_context,
+                    "_auto_dispatched": True
+                }
+                all_findings.append(synthetic_ma)
+                ma_injected += 1
+            if ma_injected > 0:
+                self._v.emit("strategy.auto_dispatch", {"specialist": "MASS_ASSIGNMENT", "count": ma_injected})
+                logger.info(f"[Auto-Dispatch] Injected {ma_injected} mass assignment findings for writable endpoints")
+                dashboard.log(f"Auto-dispatch: {ma_injected} mass assignment targets injected", "INFO")
+
+        # ===== BAC Detection: Admin endpoints accessible without authentication =====
+        admin_bac_findings = []
+        admin_patterns = ["/admin", "/debug", "/internal", "/management"]
+        admin_urls_to_check = [
+            u for u in self.urls_to_scan
+            if any(pat in u.lower() for pat in admin_patterns)
+        ]
+        if admin_urls_to_check:
+            import aiohttp as _aiohttp
+            try:
+                async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=5)) as bac_session:
+                    for admin_url in admin_urls_to_check[:10]:  # Cap at 10
+                        try:
+                            async with bac_session.get(admin_url) as resp:
+                                if resp.status == 200:
+                                    body = await resp.text()
+                                    # Admin endpoint returned 200 without auth — possible BAC
+                                    if len(body) > 50:  # Not just an empty 200
+                                        admin_bac_findings.append({
+                                            "type": "Broken Access Control",
+                                            "parameter": urlparse(admin_url).path,
+                                            "url": admin_url,
+                                            "severity": "High",
+                                            "confidence": 0.85,
+                                            "validated": True,
+                                            "status": "VALIDATED_CONFIRMED",
+                                            "validation_method": "unauthenticated_admin_access",
+                                            "description": (
+                                                f"Admin endpoint {urlparse(admin_url).path} is accessible "
+                                                f"without authentication. Response: {resp.status} with "
+                                                f"{len(body)} bytes of content."
+                                            ),
+                                            "evidence": {
+                                                "status_code": resp.status,
+                                                "content_length": len(body),
+                                                "content_preview": body[:200]
+                                            },
+                                            "_source_file": "bac_detection",
+                                        })
+                        except Exception:
+                            continue
+            except Exception as bac_err:
+                logger.debug(f"BAC detection error: {bac_err}")
+
+        if admin_bac_findings:
+            # Write BAC findings directly to results (pre-validated)
+            try:
+                results_dir = self.report_dir / "specialists" / "results"
+                results_dir.mkdir(parents=True, exist_ok=True)
+                bac_path = results_dir / "bac_detection_results.json"
+                import json as json_mod
+                bac_path.write_text(json_mod.dumps({
+                    "agent": "BACDetector",
+                    "timestamp": datetime.now().isoformat(),
+                    "scan_context": self.scan_context,
+                    "phase_a": {"wet_count": len(admin_bac_findings), "dry_count": len(admin_bac_findings)},
+                    "phase_b": {"validated_count": len(admin_bac_findings), "total_findings": len(admin_bac_findings)},
+                    "findings": admin_bac_findings
+                }, indent=2))
+                logger.info(f"[BAC] Detected {len(admin_bac_findings)} admin endpoints accessible without auth")
+                dashboard.log(f"BAC: {len(admin_bac_findings)} admin endpoints accessible without authentication", "WARNING")
+            except Exception as bac_write_err:
+                logger.warning(f"Failed to write BAC results: {bac_write_err}")
+
         # Inject Nuclei misconfiguration findings (HSTS missing, cookie flags, etc.)
         misconfigs = self.tech_profile.get("misconfigurations", [])
         if misconfigs:
+            pre_validated_misconfigs = []
             for mc in misconfigs:
-                all_findings.append({
-                    "type": "MISSING_SECURITY_HEADER",
+                tags = mc.get("tags", [])
+                template_id = mc.get("template_id", "")
+
+                # GraphQL introspection → route to specialist for further testing
+                if "graphql" in tags or "graphql" in template_id:
+                    all_findings.append({
+                        "type": "GraphQL Introspection",
+                        "parameter": mc.get("template_id", mc["name"]),
+                        "url": mc.get("matched_at", self.target),
+                        "severity": "High",
+                        "fp_confidence": 0.95,
+                        "confidence_score": 0.95,
+                        "votes": 5,
+                        "skeptical_score": 9,
+                        "probe_validated": True,
+                        "reasoning": mc.get("description", mc["name"]),
+                        "description": mc.get("description", mc["name"]),
+                        "evidence": f"Nuclei template: {mc.get('template_id', 'unknown')}",
+                        "_source_file": "nuclei_misconfiguration",
+                        "_scan_context": self.scan_context,
+                    })
+                    continue
+
+                # Pure misconfigs (cookies, headers, vulnerable JS) → pre-validated, no specialist needed
+                if "cookies" in tags:
+                    finding_type = "Insecure Cookie Configuration"
+                    finding_severity = mc.get("severity", "medium").capitalize()
+                else:
+                    finding_type = "MISSING_SECURITY_HEADER"
+                    finding_severity = mc.get("severity", "info").capitalize()
+
+                pre_validated_misconfigs.append({
+                    "type": finding_type,
                     "parameter": mc.get("template_id", mc["name"]),
                     "url": mc.get("matched_at", self.target),
-                    "severity": mc.get("severity", "info").capitalize(),
-                    "fp_confidence": 0.95,
-                    "confidence_score": 0.95,
-                    "votes": 5,
-                    "skeptical_score": 9,
-                    "probe_validated": True,
-                    "reasoning": mc.get("description", mc["name"]),
+                    "severity": finding_severity,
+                    "confidence": 0.95,
+                    "validated": True,
+                    "status": "VALIDATED_CONFIRMED",
+                    "validation_method": "nuclei_template",
                     "description": mc.get("description", mc["name"]),
-                    "evidence": f"Nuclei template: {mc.get('template_id', 'unknown')}",
+                    "evidence": {"nuclei_template": mc.get("template_id", "unknown")},
                     "_source_file": "nuclei_misconfiguration",
-                    "_scan_context": self.scan_context,
                 })
+
+            # Write pre-validated misconfigs directly to results (bypass specialist queue)
+            if pre_validated_misconfigs:
+                try:
+                    results_dir = self.report_dir / "specialists" / "results"
+                    results_dir.mkdir(parents=True, exist_ok=True)
+                    misconfig_path = results_dir / "nuclei_misconfig_results.json"
+                    import json as json_mod
+                    misconfig_path.write_text(json_mod.dumps({
+                        "agent": "NucleiMisconfigValidator",
+                        "timestamp": datetime.now().isoformat(),
+                        "scan_context": self.scan_context,
+                        "phase_a": {"wet_count": len(pre_validated_misconfigs), "dry_count": len(pre_validated_misconfigs)},
+                        "phase_b": {"validated_count": len(pre_validated_misconfigs), "total_findings": len(pre_validated_misconfigs)},
+                        "findings": pre_validated_misconfigs
+                    }, indent=2))
+                    logger.info(f"[Nuclei] Wrote {len(pre_validated_misconfigs)} pre-validated misconfigs to {misconfig_path}")
+                except Exception as mc_err:
+                    logger.warning(f"Failed to write misconfig results: {mc_err}")
+
             self._v.emit("strategy.nuclei_injected", {"count": len(misconfigs)})
-            logger.info(f"[Nuclei] Injected {len(misconfigs)} misconfiguration findings")
-            dashboard.log(f"🔒 Nuclei: {len(misconfigs)} security misconfigurations detected", "INFO")
+            logger.info(f"[Nuclei] Processed {len(misconfigs)} misconfiguration findings ({len(pre_validated_misconfigs)} pre-validated)")
+            dashboard.log(f"Nuclei: {len(misconfigs)} security misconfigurations detected", "INFO")
 
         dashboard.log(f"Processing {len(all_findings)} findings...", "INFO")
 

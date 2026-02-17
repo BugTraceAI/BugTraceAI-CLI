@@ -21,7 +21,9 @@ class DASTySASTAgent(BaseAgent):
     Performs 5-approach analysis on a URL to identify potential vulnerabilities.
     Phase 2 (Part A) of the Sequential Pipeline.
     """
-    
+    # Class-level dedup for cookie config findings (shared across instances)
+    _emitted_cookie_configs: set = set()
+
     def __init__(self, url: str, tech_profile: Dict, report_dir: Path, state_manager: Any = None, scan_context: str = None, url_index: int = None):
         super().__init__("DASTySASTAgent", "Security Analysis", agent_id="analysis_agent")
         self.url = url
@@ -74,6 +76,8 @@ class DASTySASTAgent(BaseAgent):
 
             # 3. Consolidate & Review
             consolidated = self._consolidate(valid_analyses)
+            # 3.5 Auto-inject candidates for file/redirect params the LLM may have missed
+            consolidated = self._inject_param_based_candidates(consolidated)
             vulnerabilities = await self._skeptical_review(consolidated)
 
             # 4. Save Results
@@ -183,6 +187,7 @@ class DASTySASTAgent(BaseAgent):
             try:
                 probes = await self._run_reflection_probes(context.get("html_content", ""))
                 context["reflection_probes"] = probes
+                self._reflection_probes = probes  # Store for auto-candidate injection
                 reflecting = [p for p in probes if p.get("reflects")]
                 self._v.emit("discovery.probe.completed", {
                     "url": self.url, "total": len(probes),
@@ -366,6 +371,208 @@ class DASTySASTAgent(BaseAgent):
             logger.warning(f"[{self.name}] Failed to extract HTML params: {e}")
             return []
 
+    # ========== Parameter-based auto-candidate injection ==========
+    # File-related parameter names that suggest LFI/Path Traversal
+    _LFI_PARAM_HINTS = frozenset({
+        "file", "path", "doc", "document", "include", "template", "page",
+        "dir", "folder", "src", "download", "read", "content", "load",
+        "view", "module", "resource", "filename", "filepath", "attachment",
+        "img", "image", "loc", "location",
+    })
+    _FILE_EXTENSIONS = frozenset({
+        ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".php", ".html", ".txt",
+        ".xml", ".json", ".css", ".js", ".svg", ".ico", ".csv", ".log",
+        ".conf", ".ini", ".yml", ".yaml", ".md", ".bak",
+    })
+    # Redirect-related parameter names that suggest Open Redirect
+    _REDIRECT_PARAM_HINTS = frozenset({
+        "redirect", "next", "return", "returnurl", "goto", "dest",
+        "destination", "redir", "returnpath", "ref", "back", "backurl",
+        "continue", "forward", "out", "target", "to",
+    })
+    # RCE-related parameter names that suggest command injection
+    _RCE_PARAM_HINTS = frozenset({
+        "cmd", "command", "exec", "execute", "run", "ping", "query",
+        "ip", "host", "hostname", "shell", "process", "action",
+    })
+    # SSRF-related parameter names that suggest server-side URL fetching
+    _SSRF_PARAM_HINTS = frozenset({
+        "url", "uri", "src", "source", "link", "fetch", "request",
+        "proxy", "callback", "webhook", "api", "endpoint", "server",
+        "import", "load", "image_url", "icon_url", "avatar_url",
+    })
+
+    def _inject_param_based_candidates(self, consolidated: List[Dict]) -> List[Dict]:
+        """
+        Auto-generate specialist candidates based on parameter names/values.
+
+        Ensures file-related params (file, path, image) always reach the LFI specialist
+        and redirect-related params (url, redirect, next) reach the OpenRedirect specialist,
+        even if the LLM only detected XSS reflection.
+        """
+        from urllib.parse import urlparse, parse_qs
+
+        if not hasattr(self, '_reflection_probes'):
+            self._reflection_probes = []
+
+        # Parse original URL to get parameter values
+        parsed = urlparse(self.url)
+        url_params = parse_qs(parsed.query)
+
+        # Collect all known params: from URL + from probes
+        all_params = {}
+        for k, v in url_params.items():
+            all_params[k] = v[0] if v else ""
+        for probe in self._reflection_probes:
+            pname = probe.get("parameter", "")
+            if pname and pname not in all_params:
+                all_params[pname] = ""
+
+        if not all_params:
+            return consolidated
+
+        # Track existing finding types per parameter
+        existing = set()
+        for f in consolidated:
+            ftype = f.get("type", "").lower()
+            fparam = f.get("parameter", "").lower()
+            existing.add(f"{ftype}:{fparam}")
+
+        injected = []
+        for param_name, param_value in all_params.items():
+            param_lower = param_name.lower()
+
+            # --- LFI candidate ---
+            is_lfi_name = param_lower in self._LFI_PARAM_HINTS or any(
+                h in param_lower for h in ("file", "path", "dir", "doc", "include", "load", "read")
+            )
+            is_file_value = any(
+                param_value.lower().endswith(ext) for ext in self._FILE_EXTENSIONS
+            ) if param_value else False
+            has_path_sep = ("/" in param_value or "\\" in param_value) if param_value else False
+
+            if is_lfi_name or is_file_value or has_path_sep:
+                # Check no existing LFI finding for this param
+                has_lfi = any(
+                    fparam == param_lower and ("lfi" in ftype or "traversal" in ftype or "file" in ftype)
+                    for ftype_param in existing
+                    for ftype, fparam in [ftype_param.split(":", 1)]
+                )
+                if not has_lfi:
+                    injected.append({
+                        "type": "LFI",
+                        "parameter": param_name,
+                        "confidence_score": 7,
+                        "votes": 4,
+                        "probe_validated": True,
+                        "fp_confidence": 0.8,
+                        "skeptical_score": 8,
+                        "reasoning": (
+                            f"Parameter '{param_name}' suggests file operations "
+                            f"(value: '{param_value}'). Auto-candidate for LFI specialist."
+                        ),
+                        "exploitation_strategy": "../../../etc/passwd",
+                        "url": self.url,
+                        "_auto_dispatched": True,
+                    })
+                    existing.add(f"lfi:{param_lower}")
+                    logger.info(f"[{self.name}] Auto-injected LFI candidate: param='{param_name}', value='{param_value}'")
+
+            # --- Open Redirect candidate ---
+            is_redirect_name = param_lower in self._REDIRECT_PARAM_HINTS or any(
+                h in param_lower for h in ("url", "redirect", "return", "goto", "dest", "next")
+            )
+            has_url_value = param_value.startswith(("http", "//", "/")) if param_value else False
+
+            if is_redirect_name or has_url_value:
+                has_redirect = any(
+                    fparam == param_lower and ("redirect" in ftype or "open redirect" in ftype)
+                    for ftype_param in existing
+                    for ftype, fparam in [ftype_param.split(":", 1)]
+                )
+                if not has_redirect:
+                    injected.append({
+                        "type": "Open Redirect",
+                        "parameter": param_name,
+                        "confidence_score": 6,
+                        "votes": 4,
+                        "probe_validated": True,
+                        "fp_confidence": 0.7,
+                        "skeptical_score": 7,
+                        "reasoning": (
+                            f"Parameter '{param_name}' suggests URL redirect "
+                            f"(value: '{param_value}'). Auto-candidate for OpenRedirect specialist."
+                        ),
+                        "url": self.url,
+                        "_auto_dispatched": True,
+                    })
+                    existing.add(f"open redirect:{param_lower}")
+                    logger.info(f"[{self.name}] Auto-injected Open Redirect candidate: param='{param_name}'")
+
+            # --- RCE candidate ---
+            is_rce_name = param_lower in self._RCE_PARAM_HINTS or any(
+                h in param_lower for h in ("cmd", "exec", "command", "shell", "run")
+            )
+            if is_rce_name:
+                has_rce = any(
+                    fparam == param_lower and ("rce" in ftype or "command" in ftype or "injection" in ftype)
+                    for ftype_param in existing
+                    for ftype, fparam in [ftype_param.split(":", 1)]
+                )
+                if not has_rce:
+                    injected.append({
+                        "type": "RCE",
+                        "parameter": param_name,
+                        "confidence_score": 7,
+                        "votes": 4,
+                        "probe_validated": True,
+                        "fp_confidence": 0.8,
+                        "skeptical_score": 8,
+                        "reasoning": (
+                            f"Parameter '{param_name}' suggests command execution. "
+                            f"Auto-candidate for RCE specialist."
+                        ),
+                        "exploitation_strategy": "id",
+                        "url": self.url,
+                        "_auto_dispatched": True,
+                    })
+                    existing.add(f"rce:{param_lower}")
+                    logger.info(f"[{self.name}] Auto-injected RCE candidate: param='{param_name}'")
+
+            # --- SSRF candidate ---
+            is_ssrf_name = param_lower in self._SSRF_PARAM_HINTS
+            is_ssrf_value = param_value.startswith(("http", "//", "ftp")) if param_value else False
+            if is_ssrf_name or is_ssrf_value:
+                has_ssrf = any(
+                    fparam == param_lower and ("ssrf" in ftype or "server-side" in ftype)
+                    for ftype_param in existing
+                    for ftype, fparam in [ftype_param.split(":", 1)]
+                )
+                if not has_ssrf:
+                    injected.append({
+                        "type": "SSRF",
+                        "parameter": param_name,
+                        "confidence_score": 6,
+                        "votes": 4,
+                        "probe_validated": True,
+                        "fp_confidence": 0.7,
+                        "skeptical_score": 7,
+                        "reasoning": (
+                            f"Parameter '{param_name}' suggests URL fetching "
+                            f"(value: '{param_value}'). Auto-candidate for SSRF specialist."
+                        ),
+                        "url": self.url,
+                        "_auto_dispatched": True,
+                    })
+                    existing.add(f"ssrf:{param_lower}")
+                    logger.info(f"[{self.name}] Auto-injected SSRF candidate: param='{param_name}'")
+
+        if injected:
+            consolidated.extend(injected)
+            logger.info(f"[{self.name}] Auto-injected {len(injected)} parameter-based candidates")
+
+        return consolidated
+
     def _extract_link_sqli_targets(self, html: str) -> Dict[str, Dict[str, str]]:
         """
         Extract query parameters from <a> href links in the HTML.
@@ -463,6 +670,8 @@ class DASTySASTAgent(BaseAgent):
                 # Check flags
                 flags_lower = header_val.lower()
                 is_httponly = 'httponly' in flags_lower
+                is_secure = 'secure' in flags_lower
+                has_samesite = 'samesite' in flags_lower
 
                 # Store with metadata — HttpOnly cookies are the high-value targets
                 if name not in self._http_cookies:
@@ -470,6 +679,8 @@ class DASTySASTAgent(BaseAgent):
                         "name": name,
                         "value": value,
                         "httponly": is_httponly,
+                        "secure": is_secure,
+                        "samesite": has_samesite,
                         "_source": "http_header"
                     }
                     if is_httponly:
@@ -1232,9 +1443,38 @@ class DASTySASTAgent(BaseAgent):
             cookies = session_data.get("cookies", [])
             logger.debug(f"[Cookie SQLi Probe] Got {len(cookies)} cookies from browser session")
 
+            # If _run_reflection_probes didn't capture cookies (e.g. URL had no params),
+            # make HTTP requests to capture Set-Cookie headers.
+            # We hit both self.url AND the root "/" because cookies may only be set
+            # on specific endpoints (e.g. BugStore sets TrackingId only on GET /)
+            http_cookies = getattr(self, '_http_cookies', {})
+            if not http_cookies:
+                from urllib.parse import urlparse as _urlparse
+                parsed_url = _urlparse(self.url)
+                root_url = f"{parsed_url.scheme}://{parsed_url.netloc}/"
+                cookie_urls = [self.url]
+                if self.url.rstrip("/") != root_url.rstrip("/"):
+                    cookie_urls.append(root_url)
+                try:
+                    async with orchestrator.session(DestinationType.TARGET) as cookie_session:
+                        for curl in cookie_urls:
+                            try:
+                                async with cookie_session.get(
+                                    curl, ssl=False,
+                                    timeout=aiohttp.ClientTimeout(total=10)
+                                ) as resp:
+                                    await resp.text()
+                                    self._extract_cookies_from_http_headers(resp)
+                            except Exception:
+                                pass
+                        http_cookies = getattr(self, '_http_cookies', {})
+                        if http_cookies:
+                            logger.info(f"[Cookie SQLi Probe] Captured {len(http_cookies)} cookies via direct request")
+                except Exception as e:
+                    logger.debug(f"[Cookie SQLi Probe] Direct cookie capture failed: {e}")
+
             # Gap 1 Fix: Merge HttpOnly cookies captured from HTTP Set-Cookie headers
             # These are invisible to document.cookie but are the highest-value SQLi targets
-            http_cookies = getattr(self, '_http_cookies', {})
             if http_cookies:
                 existing_names = {c.get("name", "").lower() for c in cookies}
                 for name, cookie_data in http_cookies.items():
@@ -1255,6 +1495,56 @@ class DASTySASTAgent(BaseAgent):
                     cookies.append(sc)
 
             logger.debug(f"[Cookie SQLi Probe] Testing {len(cookies)} cookies ({len(synthetic_cookies)} synthetic)")
+
+            # Insecure Cookie Configuration Detection (V-008)
+            # Emit directly as VALIDATED_CONFIRMED via event bus (bypasses ThinkingConsolidation)
+            # Same pattern as Nuclei misconfigurations — these are observation-based, no specialist needed
+            if http_cookies:
+                for name, cookie_data in http_cookies.items():
+                    if cookie_data.get("_synthetic"):
+                        continue
+                    # Class-level dedup: only emit once per cookie name per scan
+                    if name in DASTySASTAgent._emitted_cookie_configs:
+                        continue
+                    is_httponly = cookie_data.get("httponly", False)
+                    is_secure = cookie_data.get("secure", False)
+                    is_samesite = cookie_data.get("samesite", False)
+                    missing_flags = []
+                    if not is_httponly:
+                        missing_flags.append("HttpOnly")
+                    if not is_secure:
+                        missing_flags.append("Secure")
+                    if not is_samesite:
+                        missing_flags.append("SameSite")
+                    if missing_flags:
+                        await event_bus.emit(
+                            EventType.VULNERABILITY_DETECTED,
+                            {
+                                "type": "MISCONFIGURATION",
+                                "category": "INSECURE_COOKIE",
+                                "specialist": "dastysast",
+                                "severity": "MEDIUM" if "HttpOnly" in missing_flags else "LOW",
+                                "url": self.url,
+                                "parameter": f"Cookie: {name}",
+                                "description": f"Cookie '{name}' is set without security flags: "
+                                               f"{', '.join(missing_flags)}. Missing HttpOnly allows XSS-based "
+                                               f"session hijacking, missing Secure allows MITM interception, "
+                                               f"missing SameSite enables CSRF attacks.",
+                                "remediation": f"Add the following flags to the Set-Cookie header for '{name}': "
+                                               f"{'; '.join(missing_flags)}",
+                                "cwe_id": "CWE-614",
+                                "validated": True,
+                                "status": "VALIDATED_CONFIRMED",
+                                "scan_context": self.scan_context,
+                                "evidence": {
+                                    "cookie_name": name,
+                                    "missing_flags": missing_flags,
+                                    "detection_method": "set_cookie_header_analysis",
+                                },
+                            }
+                        )
+                        DASTySASTAgent._emitted_cookie_configs.add(name)
+                        logger.info(f"[Cookie Config] Emitted: cookie '{name}' missing {', '.join(missing_flags)}")
 
             if not cookies:
                 return {"vulnerabilities": []}
@@ -1363,7 +1653,7 @@ class DASTySASTAgent(BaseAgent):
                                         "type": "SQLi",
                                         "vulnerability": "SQL Injection in Cookie (Error-based)",
                                         "parameter": f"Cookie: {cookie_name}",
-                                        "url": self.url,
+                                        "url": test_url,
                                         "payload": inj_char if "b64" not in test_type else f"Base64-encoded {repr(inj_char)} in {test_type}",
                                         "confidence": 0.9,
                                         "severity": "Critical",
@@ -1387,13 +1677,15 @@ class DASTySASTAgent(BaseAgent):
                             import time as time_module
 
                             sleep_payloads = [
-                                ("' AND SLEEP(3)--", "mysql"),
-                                ("' WAITFOR DELAY '0:0:3'--", "mssql"),
-                                ("'; SELECT pg_sleep(3);--", "postgresql"),
-                                ("' AND (SELECT * FROM (SELECT(SLEEP(3)))a)--", "mysql_subquery"),
+                                ("' AND SLEEP(3)--", "mysql", 2.5),
+                                ("' WAITFOR DELAY '0:0:3'--", "mssql", 2.5),
+                                ("'; SELECT pg_sleep(3);--", "postgresql", 2.5),
+                                ("' AND (SELECT * FROM (SELECT(SLEEP(3)))a)--", "mysql_subquery", 2.5),
+                                # SQLite has no SLEEP — use heavy computation instead
+                                ("' OR LENGTH(HEX(RANDOMBLOB(200000000)))>0--", "sqlite", 0.8),
                             ]
 
-                            for sleep_payload, db_type in sleep_payloads:
+                            for sleep_payload, db_type, delay_threshold in sleep_payloads:
                                 try:
                                     # Build cookie with sleep payload
                                     other_cookies = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
@@ -1406,13 +1698,13 @@ class DASTySASTAgent(BaseAgent):
                                         await resp_sleep.text()
                                     elapsed = time_module.time() - start_time
 
-                                    if elapsed >= 2.5:
+                                    if elapsed >= delay_threshold:
                                         logger.info(f"[Cookie SQLi Probe] Time-based blind SQLi in cookie {cookie_name} @ {test_path}: {elapsed:.2f}s delay ({db_type})")
                                         findings.append({
                                             "type": "SQLi",
                                             "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type})",
                                             "parameter": f"Cookie: {cookie_name}",
-                                            "url": self.url,
+                                            "url": test_url,
                                             "payload": sleep_payload,
                                             "confidence": 0.85,
                                             "severity": "Critical",
@@ -1433,7 +1725,7 @@ class DASTySASTAgent(BaseAgent):
                                         "type": "SQLi",
                                         "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type}, Timeout)",
                                         "parameter": f"Cookie: {cookie_name}",
-                                        "url": self.url,
+                                        "url": test_url,
                                         "payload": sleep_payload,
                                         "confidence": 0.75,
                                         "severity": "Critical",
@@ -1449,6 +1741,158 @@ class DASTySASTAgent(BaseAgent):
                                 except Exception as e:
                                     logger.debug(f"[Cookie SQLi Probe] Time-based test error for {cookie_name}: {e}")
                                     continue
+
+                        # Base64-aware Time-based Blind SQLi Detection
+                        # Many cookies are Base64-encoded (e.g., TrackingId).
+                        # Direct payload append breaks the Base64 encoding, so the
+                        # server fails at decode before reaching the SQL query.
+                        # Fix: decode → inject inside → re-encode to Base64.
+                        if not any(f.get("parameter") == f"Cookie: {cookie_name}" for f in findings):
+                            try:
+                                cv = cookie_value
+                                padded_cv = cv + "=" * (4 - len(cv) % 4) if len(cv) % 4 else cv
+                                decoded_cv = base64.b64decode(padded_cv).decode('utf-8', errors='ignore')
+                                # Only proceed if it looks like real Base64 (not random bytes)
+                                if decoded_cv and len(decoded_cv) >= 2 and all(c.isprintable() or c.isspace() for c in decoded_cv[:50]):
+                                    b64_sleep_payloads = [
+                                        ("' AND SLEEP(3)--", "mysql_b64", 2.5),
+                                        ("' WAITFOR DELAY '0:0:3'--", "mssql_b64", 2.5),
+                                        ("'; SELECT pg_sleep(3);--", "postgresql_b64", 2.5),
+                                        # SQLite heavy computation
+                                        ("' OR LENGTH(HEX(RANDOMBLOB(200000000)))>0--", "sqlite_b64", 0.8),
+                                    ]
+                                    other_cookies_b64 = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
+
+                                    for b64_payload_raw, b64_db_type, b64_threshold in b64_sleep_payloads:
+                                        try:
+                                            # Inject payload into the DECODED value, then re-encode
+                                            if decoded_cv.strip().startswith('{'):
+                                                # JSON inside Base64: inject into first string field
+                                                try:
+                                                    json_obj = json.loads(decoded_cv)
+                                                    first_str_key = next((k for k, v in json_obj.items() if isinstance(v, str)), None)
+                                                    if first_str_key:
+                                                        injected_obj = json_obj.copy()
+                                                        injected_obj[first_str_key] = json_obj[first_str_key] + b64_payload_raw
+                                                        injected_decoded = json.dumps(injected_obj)
+                                                    else:
+                                                        injected_decoded = decoded_cv + b64_payload_raw
+                                                except json.JSONDecodeError:
+                                                    injected_decoded = decoded_cv + b64_payload_raw
+                                            else:
+                                                # Plain string inside Base64: append payload
+                                                injected_decoded = decoded_cv + b64_payload_raw
+
+                                            b64_injected = base64.b64encode(injected_decoded.encode()).decode()
+                                            cookies_b64 = "; ".join(
+                                                [f"{k}={v}" for k, v in other_cookies_b64.items()] +
+                                                [f"{cookie_name}={b64_injected}"]
+                                            )
+
+                                            start_b64 = time_module.time()
+                                            async with session.get(test_url, headers={"Cookie": cookies_b64}, ssl=False, timeout=aiohttp.ClientTimeout(total=8)) as resp_b64:
+                                                await resp_b64.text()
+                                            elapsed_b64 = time_module.time() - start_b64
+
+                                            logger.debug(f"[Cookie SQLi Probe] B64 {cookie_name} @ {test_path} ({b64_db_type}): {elapsed_b64:.2f}s")
+
+                                            if elapsed_b64 >= b64_threshold:
+                                                logger.info(f"[Cookie SQLi Probe] Base64 time-based blind SQLi in cookie {cookie_name} @ {test_path}: {elapsed_b64:.2f}s ({b64_db_type})")
+                                                findings.append({
+                                                    "type": "SQLi",
+                                                    "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {b64_db_type})",
+                                                    "parameter": f"Cookie: {cookie_name}",
+                                                    "url": test_url,
+                                                    "payload": f"Base64({b64_payload_raw})",
+                                                    "confidence": 0.85,
+                                                    "severity": "Critical",
+                                                    "probe_validated": True,
+                                                    "fp_confidence": 0.8,
+                                                    "skeptical_score": 8,
+                                                    "votes": 5,
+                                                    "evidence": f"Base64-encoded cookie: decoded value injected with '{b64_payload_raw}', re-encoded. Response delayed {elapsed_b64:.2f}s vs baseline.",
+                                                    "description": f"Time-based blind SQL injection in Base64-encoded cookie '{cookie_name}' at {test_url}. The cookie value is Base64-decoded by the server before use in a SQL query.",
+                                                    "reproduction": f"[PROBE-VALIDATED] echo -n \"{injected_decoded}\" | base64 | xargs -I{{}} curl -b '{cookie_name}={{}}' '{test_url}'"
+                                                })
+                                                break
+
+                                        except asyncio.TimeoutError:
+                                            logger.info(f"[Cookie SQLi Probe] B64 timeout in cookie {cookie_name} @ {test_path} ({b64_db_type})")
+                                            findings.append({
+                                                "type": "SQLi",
+                                                "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {b64_db_type}, Timeout)",
+                                                "parameter": f"Cookie: {cookie_name}",
+                                                "url": test_url,
+                                                "payload": f"Base64({b64_payload_raw})",
+                                                "confidence": 0.75,
+                                                "severity": "Critical",
+                                                "probe_validated": True,
+                                                "fp_confidence": 0.7,
+                                                "skeptical_score": 7,
+                                                "votes": 5,
+                                                "evidence": f"Base64-encoded cookie timed out with time-based payload ({b64_db_type})",
+                                                "description": f"Possible time-based blind SQL injection in Base64-encoded cookie '{cookie_name}' at {test_url}.",
+                                                "reproduction": f"[PROBE-VALIDATED] Base64-encoded payload caused timeout"
+                                            })
+                                            break
+                                        except Exception as e:
+                                            logger.debug(f"[Cookie SQLi Probe] B64 test error for {cookie_name} ({b64_db_type}): {e}")
+                                            continue
+                            except Exception:
+                                pass  # Cookie value is not valid Base64, skip
+
+                        # Insecure Deserialization Detection
+                        # Check if cookie values trigger deserialization error messages
+                        # (e.g., Python pickle, Java ObjectInputStream, PHP unserialize)
+                        if not any(f.get("parameter") == f"Cookie: {cookie_name}" and "deserialization" in f.get("type", "").lower() for f in findings):
+                            DESER_PATTERNS = [
+                                # Python pickle
+                                "invalid load key", "could not find MARK", "unpickling",
+                                "pickle.loads", "_pickle.UnpicklingError",
+                                "pickle data", "_pickle.",
+                                # Java
+                                "java.io.ObjectInputStream", "ClassNotFoundException",
+                                "java.io.InvalidClassException", "readObject",
+                                # PHP
+                                "unserialize()", "allowed_classes",
+                                # .NET
+                                "BinaryFormatter", "ObjectStateFormatter",
+                                # Ruby
+                                "Marshal.load",
+                            ]
+                            try:
+                                # Send a Base64-encoded non-serialized probe value
+                                deser_probe = base64.b64encode(b"BTAI_deser_probe_test").decode()
+                                other_cookies_d = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
+                                cookies_deser = "; ".join(
+                                    [f"{k}={v}" for k, v in other_cookies_d.items()] +
+                                    [f"{cookie_name}={deser_probe}"]
+                                )
+                                async with session.get(test_url, headers={"Cookie": cookies_deser}, ssl=False) as resp_deser:
+                                    body_deser = await resp_deser.text()
+
+                                matched_patterns = [p for p in DESER_PATTERNS if p.lower() in body_deser.lower()]
+                                if matched_patterns:
+                                    logger.info(f"[Cookie Deser Probe] Insecure deserialization in cookie {cookie_name} @ {test_path}: {matched_patterns}")
+                                    findings.append({
+                                        "type": "Insecure Deserialization",
+                                        "vulnerability": "Insecure Deserialization via Cookie",
+                                        "parameter": f"Cookie: {cookie_name}",
+                                        "url": test_url,
+                                        "payload": deser_probe,
+                                        "confidence": 0.9,
+                                        "severity": "Critical",
+                                        "probe_validated": True,
+                                        "fp_confidence": 0.85,
+                                        "skeptical_score": 9,
+                                        "votes": 5,
+                                        "cwe_id": "CWE-502",
+                                        "evidence": f"Deserialization error keywords in response: {matched_patterns}",
+                                        "description": f"Insecure deserialization detected in cookie '{cookie_name}' at {test_url}. Non-serialized data in the cookie triggers deserialization error messages, confirming the server deserializes cookie values.",
+                                        "reproduction": f"[PROBE-VALIDATED] curl -b '{cookie_name}={deser_probe}' '{test_url}' | grep -i pickle"
+                                    })
+                            except Exception as e:
+                                logger.debug(f"[Cookie Deser Probe] Error: {e}")
 
             self._v.emit("discovery.cookie_sqli.completed", {"url": self.url, "findings_count": len(findings)})
             logger.info(f"[Cookie SQLi Probe] Completed: {len(findings)} findings")
@@ -1489,7 +1933,17 @@ class DASTySASTAgent(BaseAgent):
             "_pattern": "base64_json"
         })
 
-        # Pattern 2: Simple tracking cookie (plain value)
+        # Pattern 2: TrackingId with plain string inside Base64 (BugStore pattern)
+        # Some apps Base64-encode a UUID/string and use it directly in SQL
+        tracking_plain_b64 = base64.b64encode(random_value.encode()).decode()
+        synthetic.append({
+            "name": "TrackingId",
+            "value": tracking_plain_b64,
+            "_synthetic": True,
+            "_pattern": "base64_plain"
+        })
+
+        # Pattern 3: Simple tracking cookie (plain value)
         synthetic.append({
             "name": "tracking",
             "value": random_value,
@@ -1513,6 +1967,15 @@ class DASTySASTAgent(BaseAgent):
             "value": pref_b64,
             "_synthetic": True,
             "_pattern": "base64_json"
+        })
+
+        # Pattern 5: User preferences cookie (deserialization target)
+        # Some apps use pickle/marshal serialized cookies
+        synthetic.append({
+            "name": "user_prefs",
+            "value": pref_b64,
+            "_synthetic": True,
+            "_pattern": "base64_serialized"
         })
 
         logger.info(f"[Cookie SQLi Probe] Generated {len(synthetic)} synthetic cookies for testing")

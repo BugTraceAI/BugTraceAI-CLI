@@ -5,6 +5,7 @@ Uses sentence-transformers for semantic similarity search of vulnerabilities.
 
 Author: BugtraceAI-CLI Team
 """
+import threading
 from typing import List, Dict, Optional
 from sentence_transformers import SentenceTransformer
 from bugtrace.utils.logger import get_logger
@@ -19,38 +20,43 @@ class MockEmbeddingModel:
         if isinstance(text, list):
             return np.random.rand(len(text), 384)
         return np.random.rand(384)
-    
+
     def get_sentence_embedding_dimension(self):
         return 384
 
 
 class EmbeddingManager:
     """Manages vector embeddings for semantic search."""
-    
+
     _instance: Optional["EmbeddingManager"] = None
     _model: Optional[SentenceTransformer] = None
-    
+    _model_lock = threading.Lock()
+
     def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
         """
         Initialize embedding manager.
-        
+
         Args:
             model_name: Sentence-transformers model to use
                        'BAAI/bge-small-en-v1.5' is fast and SOTA (384 dimensions)
         """
         self.model_name = model_name
         self._load_model()
-    
+
     def _load_model(self):
-        """Lazy load the embedding model."""
-        if self._model is None:
+        """Thread-safe lazy load of the embedding model."""
+        if self._model is not None:
+            return
+        with self._model_lock:
+            if self._model is not None:
+                return
             try:
                 logger.info(f"Loading embedding model: {self.model_name}")
                 self._model = SentenceTransformer(self.model_name)
-                logger.info(f"✅ Model loaded successfully ({self._model.get_sentence_embedding_dimension()}D)")
+                logger.info(f"Model loaded successfully ({self._model.get_sentence_embedding_dimension()}D)")
             except Exception as e:
                 logger.error(f"Failed to load embedding model: {e}", exc_info=True)
-                logger.warning("⚠️ Switching to Mock Embedding Model (Offline Mode)")
+                logger.warning("Switching to Mock Embedding Model (Offline Mode)")
                 self._model = MockEmbeddingModel()
     
     @classmethod
@@ -60,15 +66,15 @@ class EmbeddingManager:
             cls._instance = cls()
         return cls._instance
     
-    def encode_finding(self, finding: Dict) -> List[float]:
+    def encode_finding(self, finding: Dict) -> Optional[List[float]]:
         """
         Generate embedding vector for a finding.
-        
+
         Args:
             finding: Finding dictionary with type, parameter, payload, etc.
-            
+
         Returns:
-            Embedding vector (list of floats)
+            Embedding vector (list of floats), or None if encoding fails
         """
         # Create semantic text representation
         text_parts = []
@@ -107,25 +113,24 @@ class EmbeddingManager:
             return embedding.tolist()
         except Exception as e:
             logger.error(f"Failed to encode finding: {e}", exc_info=True)
-            # Return zero vector as fallback
-            return [0.0] * self._model.get_sentence_embedding_dimension()
+            return None
     
-    def encode_query(self, query_text: str) -> List[float]:
+    def encode_query(self, query_text: str) -> Optional[List[float]]:
         """
         Generate embedding for search query.
-        
+
         Args:
             query_text: Search query (e.g., "SQL injection in id parameter")
-            
+
         Returns:
-            Embedding vector
+            Embedding vector, or None if encoding fails
         """
         try:
             embedding = self._model.encode(query_text, convert_to_numpy=True)
             return embedding.tolist()
         except Exception as e:
             logger.error(f"Failed to encode query: {e}", exc_info=True)
-            return [0.0] * self._model.get_sentence_embedding_dimension()
+            return None
     
     def batch_encode_findings(self, findings: List[Dict]) -> List[List[float]]:
         """
@@ -152,8 +157,7 @@ class EmbeddingManager:
             return [emb.tolist() for emb in embeddings]
         except Exception as e:
             logger.error(f"Batch encoding failed: {e}", exc_info=True)
-            dim = self._model.get_sentence_embedding_dimension()
-            return [[0.0] * dim for _ in findings]
+            return [None for _ in findings]
     
     def get_embedding_dimension(self) -> int:
         """Get the dimensionality of embeddings."""

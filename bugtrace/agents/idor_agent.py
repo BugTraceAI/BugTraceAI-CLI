@@ -149,8 +149,16 @@ class IDORAgent(BaseAgent, TechContextMixin):
             "payload": hit["id"],
             "description": f"IDOR vulnerability detected on ID {hit['id']}. Differed from baseline ID {original_value}. Status: {hit['status_code']}. Contains sensitive data: {hit.get('contains_sensitive')}",
             "severity": hit["severity"].upper() if isinstance(hit["severity"], str) else hit["severity"],
-            "validated": hit["severity"] == "CRITICAL",
-            "evidence": f"Status {hit['status_code']}. Diff Type: {hit['diff_type']}. Sensitive: {hit.get('contains_sensitive')}",
+            "validated": hit["severity"] in ["CRITICAL", "HIGH"],
+            "evidence": {
+                "differential_analysis": True,
+                "status_change": hit.get("diff_type") == "status_change",
+                "length_change": hit.get("diff_type") == "length_change",
+                "user_data_leakage": hit.get("diff_type") == "user_data_leakage",
+                "contains_sensitive": hit.get("contains_sensitive", False),
+                "status_code": hit["status_code"],
+                "diff_type": hit["diff_type"],
+            },
             "status": self._determine_validation_status("differential", confidence_level),
             "reproduction": f"# Compare responses:\ncurl '{self.url}?{param}={original_value}'\ncurl '{self.url}?{param}={hit['id']}'",
             "cwe_id": get_cwe_for_vuln("IDOR"),
@@ -217,9 +225,14 @@ class IDORAgent(BaseAgent, TechContextMixin):
             test_ids = [str(base_ts + i) for i in range(-5, 5) if i != 0]
             return "timestamp", test_ids
 
-        # Numeric (pure digits)
+        # Numeric (pure digits) — generate IDs near the original value
+        # Test adjacent IDs first (most likely to exist and reveal real IDOR)
         if original_value.isdigit():
-            return "numeric", []  # Use normal range
+            base = int(original_value)
+            # Prioritize IDs > base (likely to exist), then lower IDs, skip 0
+            above = [str(base + i) for i in range(1, 11)]
+            below = [str(base - i) for i in range(1, 3) if base - i > 0]
+            return "numeric", above + below
 
         # Alphanumeric (e.g., "ABC123")
         if re.match(r'^[A-Za-z0-9_-]+$', original_value):
@@ -414,7 +427,7 @@ Return ONLY a JSON object with an "ids" array:
                         "status_code": test_status,
                         "severity": severity,
                         "diff_type": indicators,
-                        "contains_sensitive": "user_data" in indicators.lower()
+                        "contains_sensitive": any(s in indicators.lower() for s in ["user_data", "sensitive_data", "pii_content"])
                     }, param, original_value)
 
             except Exception as e:
@@ -477,13 +490,35 @@ Return ONLY a JSON object with an "ids" array:
             indicators.append("user_data_leakage")
             return True, "CRITICAL", ",".join(indicators)
 
-        # 5. Sensitive data markers
-        sensitive_markers = ['password', 'token', 'secret', 'api_key', 'ssn', 'credit_card']
+        # 5. Sensitive data markers (expanded for PII and private data)
+        sensitive_markers = [
+            'password', 'token', 'secret', 'api_key', 'ssn', 'credit_card',
+            'address', 'shipping', 'billing', 'phone', 'payment',
+            'tracking', 'salary', 'balance',
+        ]
         test_has_sensitive = any(marker in test_body.lower() for marker in sensitive_markers)
         baseline_has_sensitive = any(marker in baseline_body.lower() for marker in sensitive_markers)
 
-        if test_has_sensitive and not baseline_has_sensitive:
+        if test_has_sensitive or baseline_has_sensitive:
             indicators.append("sensitive_data_exposure")
+
+        # 6. Content divergence: both 200, different resource data with PII
+        # Core of IDOR: same endpoint, different IDs → different private data
+        if baseline_status == 200 and test_status == 200:
+            if (test_has_sensitive or baseline_has_sensitive) and baseline_body != test_body:
+                import json as _json
+                try:
+                    b_json = _json.loads(baseline_body)
+                    t_json = _json.loads(test_body)
+                    if isinstance(b_json, dict) and isinstance(t_json, dict):
+                        # Remove primary ID field to check real content difference
+                        b_norm = {k: v for k, v in b_json.items() if k != 'id'}
+                        t_norm = {k: v for k, v in t_json.items() if k != 'id'}
+                        if b_norm != t_norm:
+                            indicators.append("pii_content_divergence")
+                except (ValueError, TypeError):
+                    # Non-JSON with different content + PII
+                    indicators.append("pii_content_divergence")
 
         # Decision logic
         if len(indicators) >= 2:
@@ -1129,6 +1164,15 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
         if not param:
             return None
 
+        # Auto-extract original_value from URL path when not provided
+        # DRY list often has empty original_value for path-based params like /api/orders/1
+        if not original_value:
+            segments = [s for s in urlparse(self.url).path.split("/") if s]
+            for seg in reversed(segments):
+                if seg.isdigit():
+                    original_value = seg
+                    break
+
         logger.info(f"[{self.name}] Testing IDOR on {param}={original_value}")
 
         # Guard: Skip if already tested
@@ -1202,17 +1246,58 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
 
 
     def _inject(self, val, param_name, original_val):
+        import re
         parsed = urlparse(self.url)
         path = parsed.path
-        
-        # 1. Path-based IDOR
-        if original_val and str(original_val) in path:
-            import re
-            new_path = re.sub(rf'(^|/){re.escape(str(original_val))}(/|$)', rf'\g<1>{val}\g<2>', path)
-            if new_path != path:
-                return urlunparse((parsed.scheme, parsed.netloc, new_path, parsed.params, parsed.query, parsed.fragment))
 
-        # 2. Query-based IDOR
+        # 0. Auto-extract original_val from URL path when empty
+        # DRY list sometimes has empty original_value for path-based params
+        if not original_val:
+            segments = [s for s in path.split("/") if s]
+            for seg in reversed(segments):
+                if seg.isdigit():
+                    original_val = seg
+                    break
+
+        # 1. Path-based IDOR — original value found in path
+        if original_val and str(original_val) in path:
+            new_path = re.sub(rf'(^|/){re.escape(str(original_val))}(/|$)', rf'\g<1>{val}\g<2>', path)
+            # Always return path-based URL (even when val==original_val for baseline)
+            return urlunparse((parsed.scheme, parsed.netloc, new_path, parsed.params, parsed.query, parsed.fragment))
+
+        # 2. Path-based IDOR — "URL Path" or template var params
+        # For REST APIs like /api/orders/, /api/users/:id, /api/items/{id}
+        path_indicators = {"URL Path", "url_path", "path", "path_id"}
+        is_path_param = (
+            param_name in path_indicators
+            or param_name.startswith(":")
+            or (param_name.startswith("{") and param_name.endswith("}"))
+            # Detect descriptive names from LLM: "URL Path (...)", "ID (Path Segment)"
+            or re.search(r'(?i)\burl\s*path\b|\bpath\s*segment\b|\bin\s*path\b', param_name)
+        )
+        if is_path_param:
+            segments = path.rstrip("/").split("/")
+            replaced = False
+            # Try replacing template vars or numeric segments
+            for i in range(len(segments) - 1, -1, -1):
+                seg = segments[i]
+                if not seg:
+                    continue
+                if seg.startswith(":") or (seg.startswith("{") and seg.endswith("}")):
+                    segments[i] = str(val)
+                    replaced = True
+                    break
+                if seg.isdigit():
+                    segments[i] = str(val)
+                    replaced = True
+                    break
+            if not replaced:
+                # REST endpoint ending with / → append ID as path segment
+                segments.append(str(val))
+            new_path = "/".join(segments)
+            return urlunparse((parsed.scheme, parsed.netloc, new_path, parsed.params, parsed.query, parsed.fragment))
+
+        # 3. Query-based IDOR
         q = parse_qs(parsed.query)
         q[param_name] = [val]
         new_query = urlencode(q, doseq=True)
@@ -1590,7 +1675,10 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
                 self.url = url
                 result = await self._test_single_param_from_queue(url, parameter, original_value, finding_data.get("finding", {}))
 
-                if result and result.get("validated"):
+                if result and result.get("status") in [
+                    ValidationStatus.VALIDATED_CONFIRMED.value,
+                    ValidationStatus.PENDING_VALIDATION.value,
+                ]:
 
                     # ===== DEEP EXPLOITATION (Phase 4b) =====
                     if settings.IDOR_ENABLE_DEEP_EXPLOITATION:

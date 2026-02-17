@@ -932,9 +932,53 @@ class ExternalToolManager:
         return urls
 
     def _build_fuzz_url(self, url: str, param: str) -> str:
-        """Build URL with FUZZ marker replacing parameter value."""
+        """Build URL with FUZZ marker replacing parameter value.
+
+        Handles three cases:
+        1. Query parameter exists in URL → replace its value with FUZZ
+        2. Path-based parameter (URL Path, :param, {param}) → replace path segment
+        3. Fallback → append as new query parameter
+        """
+        # Case 1: query param exists in URL
         if f"{param}=" in url:
             return re.sub(rf"([?&]{re.escape(param)})=([^&]*)", r"\1=FUZZ", url)
+
+        # Case 2: path-based parameter — replace last numeric/template segment
+        path_indicators = {"URL Path", "url_path", "path", "path_id"}
+        is_path_param = (
+            param in path_indicators
+            or param.startswith(":")
+            or (param.startswith("{") and param.endswith("}"))
+        )
+        if is_path_param:
+            parsed = urlparse(url)
+            segments = parsed.path.rstrip("/").split("/")
+            # Replace last numeric/UUID segment, or append FUZZ if URL ends with /
+            replaced = False
+            for i in range(len(segments) - 1, -1, -1):
+                seg = segments[i]
+                if not seg:
+                    continue
+                # Template vars: :id, {id}
+                if seg.startswith(":") or (seg.startswith("{") and seg.endswith("}")):
+                    segments[i] = "FUZZ"
+                    replaced = True
+                    break
+                # Numeric IDs
+                if seg.isdigit():
+                    segments[i] = "FUZZ"
+                    replaced = True
+                    break
+            if not replaced:
+                # URL like /api/orders/ → append FUZZ as path segment
+                segments.append("FUZZ")
+            new_path = "/".join(segments)
+            base = f"{parsed.scheme}://{parsed.netloc}{new_path}"
+            if parsed.query:
+                return f"{base}?{parsed.query}"
+            return base
+
+        # Case 3: fallback — add as new query parameter
         separator = "&" if "?" in url else "?"
         return f"{url}{separator}{param}=FUZZ"
 

@@ -1271,9 +1271,13 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                 self._v.emit("exploit.specialist.param.completed", {"agent": "OpenRedirect", "param": parameter, "url": url, "found": result is not None and result.get("validated", False)})
 
         # Phase B.2: DOM-based redirect testing (Playwright)
+        # Wrap in timeout to prevent Playwright deadlocks (max 90s for all DOM tests)
         logger.info(f"[{self.name}] Phase B.2: Starting DOM redirect tests (dry_findings: {len(self._dry_findings)} URLs)")
         try:
-            dom_findings = await self._test_dom_redirects()
+            dom_findings = await asyncio.wait_for(
+                self._test_dom_redirects(),
+                timeout=90.0
+            )
             for dom_finding in dom_findings:
                 fingerprint = self._generate_openredirect_fingerprint(
                     dom_finding["url"], dom_finding["param"]
@@ -1294,6 +1298,8 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                             "validation_requires_cdp": False,
                         }, scan_context=self._scan_context)
             logger.info(f"[{self.name}] Phase B.2: DOM redirect testing complete — {len(dom_findings)} findings")
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.name}] Phase B.2: DOM redirect testing TIMEOUT (90s), skipping remaining")
         except Exception as e:
             logger.error(f"[{self.name}] DOM redirect testing failed: {e}", exc_info=True)
 

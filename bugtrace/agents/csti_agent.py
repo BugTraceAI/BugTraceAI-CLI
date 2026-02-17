@@ -1969,8 +1969,37 @@ Response format (XML):
             logger.info(f"[{self.name}] Phase A: No findings to process")
             return []
 
-        # LLM-powered deduplication
-        dry_list = await self._llm_analyze_and_dedup(wet_findings, self._scan_context)
+        # Separate auto-dispatch items from real DASTySAST findings.
+        # Auto-dispatch items have precise URL+param combos from the pipeline —
+        # they should bypass LLM dedup which can mismatch URLs and params.
+        auto_dispatch_items = [f for f in wet_findings if f.get("_auto_dispatched")]
+        real_items = [f for f in wet_findings if not f.get("_auto_dispatched")]
+
+        # LLM-powered deduplication (only for real DASTySAST findings)
+        if real_items:
+            dry_list = await self._llm_analyze_and_dedup(real_items, self._scan_context)
+        else:
+            dry_list = []
+
+        # Fingerprint-dedup auto-dispatch items and add them
+        if auto_dispatch_items:
+            existing_fps = set()
+            for f in dry_list:
+                fp = self._generate_csti_fingerprint(
+                    f.get("url", ""), f.get("parameter", ""), f.get("template_engine", "unknown")
+                )
+                existing_fps.add(fp)
+
+            added = 0
+            for f in auto_dispatch_items:
+                fp = self._generate_csti_fingerprint(
+                    f.get("url", ""), f.get("parameter", ""), f.get("template_engine", "unknown")
+                )
+                if fp not in existing_fps:
+                    existing_fps.add(fp)
+                    dry_list.append(f)
+                    added += 1
+            logger.info(f"[{self.name}] Auto-dispatch bypass: {len(auto_dispatch_items)} items, {added} added to DRY list")
 
         # Store for later phases
         self._dry_findings = dry_list
@@ -2093,6 +2122,66 @@ Different template engines represent different attack surfaces - NEVER merge fin
         logger.info(f"[{self.name}] Fingerprint dedup: {len(wet_findings)} → {len(dry_list)}")
         return dry_list
 
+    def _normalize_csti_finding_params(self, findings: List[Dict]) -> List[Dict]:
+        """
+        Normalize synthetic param names from ThinkingConsolidation.
+
+        Some findings have synthetic params like 'URL Path/Fragment', 'None (POST Body)',
+        '_auto_discover', 'username password' etc. These are labels, not real query params.
+        When the URL already has query params, expand the finding into one per real param.
+        This ensures _inject() creates valid URLs for testing.
+        """
+        normalized = []
+        seen_url_param = set()  # Dedup: (url_path, param) pairs
+
+        for finding in findings:
+            param = finding.get("parameter", "")
+            url = finding.get("url", "")
+
+            is_synthetic = (
+                " " in param
+                or "/" in param
+                or param.startswith("_auto")
+                or param.startswith("None")
+                or param.startswith("URL ")
+                or param.startswith("POST ")
+            )
+
+            if is_synthetic:
+                parsed = urlparse(url)
+                url_params = parse_qs(parsed.query)
+
+                if url_params:
+                    for real_param in url_params:
+                        key = (parsed.path, real_param)
+                        if key not in seen_url_param:
+                            seen_url_param.add(key)
+                            new_finding = dict(finding)
+                            new_finding["parameter"] = real_param
+                            new_finding["_original_parameter"] = param
+                            normalized.append(new_finding)
+                    logger.info(
+                        f"[{self.name}] Normalized synthetic param '{param}' on {parsed.path} → {list(url_params.keys())}"
+                    )
+                else:
+                    # No URL params — keep original (auto-discover will handle)
+                    key = (parsed.path, param)
+                    if key not in seen_url_param:
+                        seen_url_param.add(key)
+                        normalized.append(finding)
+            else:
+                parsed = urlparse(url)
+                key = (parsed.path, param)
+                if key not in seen_url_param:
+                    seen_url_param.add(key)
+                    normalized.append(finding)
+                else:
+                    logger.debug(f"[{self.name}] Dedup: skipping duplicate ({parsed.path}, {param})")
+
+        if len(normalized) != len(findings):
+            logger.info(f"[{self.name}] Param normalization: {len(findings)} → {len(normalized)} findings")
+        return normalized
+
     async def exploit_dry_list(self) -> List[Dict]:
         """
         PHASE B: 6-Level Escalation Pipeline for each DRY finding.
@@ -2112,12 +2201,27 @@ Different template engines represent different attack surfaces - NEVER merge fin
         if not self.interactsh:
             await self._setup_interactsh()
 
-        for idx, finding in enumerate(self._dry_findings, 1):
+        # Prioritize real DASTySAST findings over auto-dispatch noise.
+        # Auto-dispatch items have _auto_dispatched=True; real findings don't.
+        real_findings = [f for f in self._dry_findings if not f.get("_auto_dispatched")]
+        auto_findings = [f for f in self._dry_findings if f.get("_auto_dispatched")]
+        ordered_findings = real_findings + auto_findings
+
+        # Normalize synthetic param names (e.g. "URL Path/Fragment" → actual URL query params)
+        ordered_findings = self._normalize_csti_finding_params(ordered_findings)
+        logger.info(f"[{self.name}] Phase B: {len(real_findings)} real + {len(auto_findings)} auto-dispatch findings ({len(ordered_findings)} after normalization)")
+
+        for idx, finding in enumerate(ordered_findings, 1):
             url = finding.get("url", "")
             parameter = finding.get("parameter", "")
+
+            # Skip API endpoints — CSTI only works on HTML pages with template rendering
+            if "/api/" in url:
+                logger.debug(f"[{self.name}] Phase B: Skipping API endpoint {url}")
+                continue
             template_engine = finding.get("template_engine", "unknown")
 
-            logger.info(f"[{self.name}] Phase B: [{idx}/{len(self._dry_findings)}] Testing {url} param={parameter} engine={template_engine}")
+            logger.info(f"[{self.name}] Phase B: [{idx}/{len(ordered_findings)}] Testing {url} param={parameter} engine={template_engine}")
 
             if hasattr(self, '_v'):
                 self._v.emit("exploit.specialist.param.started", {"agent": "CSTI", "param": parameter, "url": url, "engine": template_engine, "idx": idx, "total": len(self._dry_findings)})
@@ -2132,9 +2236,18 @@ Different template engines represent different attack surfaces - NEVER merge fin
                 continue
 
             # Execute 6-Level CSTI Escalation Pipeline
+            # Wrap in asyncio timeout to prevent Playwright deadlocks (max 180s per item)
+            # 180s allows full L0→L1→L2→L3→L5 pipeline for client-side engines (Angular/Vue)
             try:
                 self.url = url
-                result = await self._csti_escalation_pipeline(url, parameter, finding)
+                try:
+                    result = await asyncio.wait_for(
+                        self._csti_escalation_pipeline(url, parameter, finding),
+                        timeout=180.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{self.name}] Phase B: TIMEOUT (180s) for {parameter} on {url[:60]}, skipping")
+                    result = None
 
                 if result and result.validated:
                     self._emitted_findings.add(fingerprint)
@@ -2213,6 +2326,41 @@ Different template engines represent different attack surfaces - NEVER merge fin
         # Detect template engines from HTML and finding metadata
         engines = await self._detect_engines_for_escalation(url, finding)
 
+        # ===== AUTONOMOUS PARAM DISCOVERY (Specialist Autonomy Pattern) =====
+        # ThinkingConsolidation may mismatch params and URLs. Discover real params
+        # from the URL and test all of them. The DRY list param is just a "signal".
+        params_to_test = [param]
+        try:
+            discovered = await self._discover_csti_params(url)
+            if discovered:
+                discovered_names = list(discovered.keys())
+                # Add discovered params that aren't already in the list
+                for dp in discovered_names:
+                    if dp not in params_to_test:
+                        params_to_test.append(dp)
+                if len(params_to_test) > 1:
+                    logger.info(
+                        f"[{self.name}] Autonomous discovery: {len(params_to_test)} params to test on {url[:60]}: {params_to_test}"
+                    )
+        except Exception as e:
+            logger.debug(f"[{self.name}] Autonomous discovery failed: {e}")
+
+        # Test each discovered param through the full pipeline
+        for test_param in params_to_test:
+            result = await self._run_escalation_for_param(
+                url, test_param, finding, engines, reflecting_payloads
+            )
+            if result:
+                return result
+
+        dashboard.log(f"[{self.name}] All 6 levels exhausted for all params on {url[:60]}, no CSTI confirmed", "WARN")
+        return None
+
+    async def _run_escalation_for_param(
+        self, url: str, param: str, finding: dict,
+        engines: List[str], reflecting_payloads: list
+    ) -> Optional[CSTIFinding]:
+        """Run the full L0-L6 escalation pipeline for a single param."""
         # Fetch baseline (no injection) for false positive checking
         async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
             baseline_html = await self._get_baseline_content(session)
@@ -2258,6 +2406,17 @@ Different template engines represent different attack surfaces - NEVER merge fin
         has_client_side = any(e in ["angular", "vue"] for e in engines)
 
         if has_client_side:
+            # For SPA apps, HTTP bombing may find zero reflections because the
+            # response is a static shell rendered client-side. Seed L5 browser
+            # candidates with engine-specific payloads so Playwright always runs.
+            if not reflecting_payloads:
+                spa_payloads = [p for p in PAYLOAD_LIBRARY.get("angular", [])[:10]]
+                spa_payloads.extend(PAYLOAD_LIBRARY.get("universal", [])[:3])
+                reflecting_payloads.extend(spa_payloads)
+                logger.info(
+                    f"[{self.name}] No HTTP reflections for client-side engine, seeding {len(spa_payloads)} browser payloads"
+                )
+
             # Client-side: L5 Browser first, L4 Manipulator fallback
             if reflecting_payloads:
                 dashboard.log(f"[{self.name}] L5: Browser testing {len(reflecting_payloads)} candidates on '{param}' (client-side priority)", "INFO")
@@ -2291,7 +2450,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
             if result:
                 return result
 
-        dashboard.log(f"[{self.name}] All 6 levels exhausted for '{param}', no CSTI confirmed", "WARN")
+        dashboard.log(f"[{self.name}] All 6 levels exhausted for '{param}' on {url[:60]}", "WARN")
         return None
 
     # ===== ESCALATION HELPER METHODS =====
@@ -2316,6 +2475,14 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
             # Check if probe marker reflects at all
             if "BT_CSTI_49" not in response:
+                # For client-side engines (Angular/Vue in SPA), params may only reflect
+                # in the DOM after JavaScript rendering, not in raw HTTP response
+                if any(e in ["angular", "vue"] for e in engines):
+                    dashboard.log(
+                        f"[{self.name}] Smart probe: no HTTP reflection for '{param}' but client-side engine detected, continuing to browser testing",
+                        "INFO",
+                    )
+                    return None, True  # Continue — L5 Playwright will check DOM
                 dashboard.log(
                     f"[{self.name}] Smart probe: no reflection for '{param}', skipping",
                     "INFO",
@@ -2790,6 +2957,37 @@ Different template engines represent different attack surfaces - NEVER merge fin
                     await manipulator.shutdown()
                     return None, reflecting
 
+                # FIX (2026-02-16): Re-verify template evaluation via HTTP.
+                # ManipulatorOrchestrator may flag payloads that merely REFLECT in
+                # error messages (e.g., Pydantic validation errors) as "success".
+                # Re-send the payload and verify with _check_csti_confirmed() to
+                # confirm the template was actually EVALUATED, not just reflected.
+                verify_url = url.split("?")[0]
+                verify_params = dict(base_params)
+                verify_params[param] = working_payload
+                try:
+                    async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
+                        async with session.get(verify_url, params=verify_params, timeout=15) as resp:
+                            verify_body = await resp.text()
+                        # Also fetch baseline for comparison
+                        baseline_params = dict(base_params)
+                        baseline_params[param] = "btai_baseline_test"
+                        async with session.get(verify_url, params=baseline_params, timeout=15) as resp:
+                            baseline_body = await resp.text()
+                    confirmed, confirm_evidence = self._check_csti_confirmed(
+                        working_payload, verify_body, baseline_body
+                    )
+                    if not confirmed:
+                        logger.info(
+                            f"[{self.name}] L4: ManipulatorOrchestrator payload REFLECTED but NOT EVALUATED "
+                            f"(likely error message reflection): {working_payload[:80]}"
+                        )
+                        reflecting.append(working_payload)
+                        await manipulator.shutdown()
+                        return None, reflecting
+                except Exception as verify_err:
+                    logger.debug(f"[{self.name}] L4 verification request failed: {verify_err}")
+
                 logger.info(f"[{self.name}] L4: ManipulatorOrchestrator CONFIRMED: {param}={working_payload[:80]}")
                 await manipulator.shutdown()
                 finding = self._create_finding(param, working_payload, "L4_manipulator", verified_url=url)
@@ -2874,7 +3072,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
             template_engine=engine,
             engine_type=engine_type,
             severity="MEDIUM",
-            validated=True,
+            validated=False,
             status="NEEDS_CDP_VALIDATION",
             description=f"Potential {engine} CSTI: template syntax reflects. Best payload: {best_payload[:60]}. Flagged for CDP validation.",
             evidence={
@@ -3155,7 +3353,26 @@ Different template engines represent different attack surfaces - NEVER merge fin
                     if result:
                         return self._dict_to_finding(result)
 
-                return None
+            # If no result, retry with admin auth token (for admin-protected SSTI endpoints)
+            try:
+                from bugtrace.services.scan_context import get_scan_auth_headers
+                auth_headers = get_scan_auth_headers(self._scan_context, role="admin")
+                if auth_headers:
+                    logger.info(f"[{self.name}] Retrying {url}?{param} with admin auth token")
+                    async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as auth_session:
+                        # Inject auth headers into session
+                        auth_session._default_headers = {**(auth_session._default_headers or {}), **auth_headers}
+                        html = await self._fetch_page(auth_session)
+                        engines = TemplateEngineFingerprinter.fingerprint(html)
+                        result = await self._universal_probe(auth_session, param)
+                        if result:
+                            result["auth_required"] = True
+                            result["description"] = f"SSTI on admin-protected endpoint (accessed via forged JWT). {result.get('description', '')}"
+                            return self._dict_to_finding(result)
+            except Exception as auth_err:
+                logger.debug(f"[{self.name}] Auth retry failed: {auth_err}")
+
+            return None
 
         except Exception as e:
             logger.error(f"[{self.name}] Queue item test failed: {e}")

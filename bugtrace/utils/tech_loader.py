@@ -29,9 +29,13 @@ def load_tech_profile(scan_dir: Path) -> Dict:
         Empty dict if file not found.
     """
     tech_profile_path = scan_dir / "tech_profile.json"
-    
+
+    # NucleiAgent writes to recon/ subdirectory, specialists load from scan root
     if not tech_profile_path.exists():
-        logger.debug(f"Tech profile not found at {tech_profile_path}")
+        tech_profile_path = scan_dir / "recon" / "tech_profile.json"
+
+    if not tech_profile_path.exists():
+        logger.debug(f"Tech profile not found at {scan_dir}")
         return {
             "infrastructure": [],
             "frameworks": [],
