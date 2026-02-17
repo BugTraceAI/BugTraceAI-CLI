@@ -3787,58 +3787,72 @@ class TeamOrchestrator:
                 dashboard.log(f"Auto-dispatch: LFI finding injected for param='{lfi_param}'", "INFO")
 
         # Auto-dispatch RCEAgent when command-like parameters found in recon URLs.
-        # RCE endpoints like /health?cmd= are obvious candidates but DASTySAST may not classify them.
-        has_rce = any(
-            'rce' in f.get('type', '').lower()
-            or 'command injection' in f.get('type', '').lower()
-            or 'remote code' in f.get('type', '').lower()
-            or 'os command' in f.get('type', '').lower()
-            for f in all_findings
-        )
-        if not has_rce:
-            rce_param_names = {
-                "cmd", "command", "exec", "execute", "run", "shell",
-                "ping", "query", "jump", "code", "reg", "do", "func",
-                "arg", "option", "load", "process", "step", "read",
-            }
-            rce_url = None
-            rce_param = None
-            recon_file_rce = getattr(self, 'report_dir', None)
-            if recon_file_rce:
-                recon_file_rce = recon_file_rce / "recon" / "urls.txt"
-            if recon_file_rce and recon_file_rce.exists():
-                for line in recon_file_rce.read_text().splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parsed_rce = urlparse(line)
-                    for p in parse_qs(parsed_rce.query).keys():
-                        if p.lower() in rce_param_names:
-                            rce_url = line
-                            rce_param = p
-                            break
-                    if rce_url:
-                        break
-            if rce_url and rce_param:
-                synthetic_rce = {
-                    "type": "RCE",
-                    "parameter": rce_param,
-                    "url": rce_url,
-                    "severity": "Critical",
-                    "fp_confidence": 0.9,
-                    "confidence_score": 0.9,
-                    "votes": 5,
-                    "skeptical_score": 8,
-                    "reasoning": f"Auto-dispatch: Command-like parameter '{rce_param}' found. RCEAgent will test for command injection.",
-                    "payload": "",
-                    "evidence": f"Recon URL contains command-like parameter: {rce_param}",
-                    "_source_file": "auto_dispatch_rce",
-                    "_scan_context": self.scan_context,
-                    "_auto_dispatched": True
-                }
-                all_findings.append(synthetic_rce)
-                logger.info(f"[Auto-Dispatch] Added synthetic RCE finding: param='{rce_param}' on {rce_url}")
-                dashboard.log(f"Auto-dispatch: RCE finding injected for param='{rce_param}'", "INFO")
+        # RCE auto-dispatch: Always scan for command-like params in recon URLs AND findings.
+        # Even if DASTySAST found "RCE" from a debug page, the real cmd endpoint may be elsewhere.
+        rce_param_names = {
+            "cmd", "command", "exec", "execute", "run", "shell",
+            "ping", "code", "func", "arg", "process",
+        }
+        rce_injected_urls = set()
+
+        # Scan recon URLs for command-like params
+        recon_file_rce = getattr(self, 'report_dir', None)
+        if recon_file_rce:
+            recon_file_rce = recon_file_rce / "recon" / "urls.txt"
+        if recon_file_rce and recon_file_rce.exists():
+            for line in recon_file_rce.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parsed_rce = urlparse(line)
+                for p in parse_qs(parsed_rce.query).keys():
+                    if p.lower() in rce_param_names and line not in rce_injected_urls:
+                        all_findings.append({
+                            "type": "RCE",
+                            "parameter": p,
+                            "url": line,
+                            "severity": "Critical",
+                            "fp_confidence": 0.9,
+                            "confidence_score": 0.9,
+                            "votes": 5,
+                            "skeptical_score": 8,
+                            "reasoning": f"Auto-dispatch: Command-like parameter '{p}' found in recon URL.",
+                            "payload": "",
+                            "evidence": f"Recon URL contains command-like parameter: {p}",
+                            "_source_file": "auto_dispatch_rce",
+                            "_scan_context": self.scan_context,
+                            "_auto_dispatched": True
+                        })
+                        rce_injected_urls.add(line)
+                        logger.info(f"[Auto-Dispatch] RCE from recon URL: param='{p}' on {line}")
+
+        # Also scan DASTySAST findings for cmd-like params pointing to specific endpoints
+        for f in all_findings:
+            f_url = f.get("url", "")
+            f_param = f.get("parameter", "")
+            if f_url and f_param and f_param.lower() in rce_param_names and f_url not in rce_injected_urls:
+                # Only inject if finding URL is not already an RCE auto-dispatch
+                if not f.get("_auto_dispatched"):
+                    all_findings.append({
+                        "type": "RCE",
+                        "parameter": f_param,
+                        "url": f_url,
+                        "severity": "Critical",
+                        "fp_confidence": 0.9,
+                        "confidence_score": 0.9,
+                        "votes": 5,
+                        "skeptical_score": 8,
+                        "reasoning": f"Auto-dispatch: DASTySAST found command-like parameter '{f_param}'.",
+                        "payload": f.get("payload", ""),
+                        "evidence": f.get("evidence", f"DAST finding with cmd-like param: {f_param}"),
+                        "_source_file": "auto_dispatch_rce_from_dast",
+                        "_scan_context": self.scan_context,
+                        "_auto_dispatched": True
+                    })
+                    rce_injected_urls.add(f_url)
+
+        if rce_injected_urls:
+            dashboard.log(f"Auto-dispatch: {len(rce_injected_urls)} RCE target(s) injected", "INFO")
 
         # Auto-dispatch SSRFAgent when URL-accepting parameters found in recon URLs.
         # SSRF params (callback, webhook, import) differ from open redirect params.

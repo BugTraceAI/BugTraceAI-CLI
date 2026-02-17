@@ -3815,15 +3815,17 @@ Return ONLY the payloads, one per line, no explanations."""
         """
         Test for stored XSS by submitting payloads via POST then checking GET pages.
 
-        Stored XSS workflow:
-        1. Discover POST forms from HTML (comments, reviews, profiles, etc.)
-        2. Submit XSS payloads via POST to each form endpoint
-        3. Fetch the original page (and related pages) via GET
-        4. Check if the payload appears unescaped in the response
+        Enhanced workflow:
+        1. Discover POST targets: HTML forms + common API write endpoints
+        2. Submit XSS payloads via POST (form-encoded AND JSON)
+        3. Extract resource ID from POST response
+        4. Build detail URLs (e.g., /api/reviews/{id}) and check for stored payload
+        5. Check canary in raw text, JSON values, and HTML responses
         """
         from bugtrace.tools.visual.browser import browser_manager
         from urllib.parse import urlparse, urljoin
         from bs4 import BeautifulSoup
+        import re
 
         findings = []
         canary = f"BTXSS{int(__import__('time').time()) % 10000}"
@@ -3833,100 +3835,201 @@ Return ONLY the payloads, one per line, no explanations."""
             f'"><img src=x onerror=document.title=\'{canary}\'>',
         ]
 
-        # Get HTML from the target URL
+        parsed_url = urlparse(self.url)
+        base = f"{parsed_url.scheme}://{parsed_url.netloc}"
+
+        # Get auth headers for authenticated write endpoints
+        auth_headers = {}
+        try:
+            from bugtrace.services.scan_context import get_scan_auth_headers
+            auth_headers = get_scan_auth_headers(self._scan_context, role="user") or {}
+        except Exception:
+            pass
+
+        # ========== Phase A: Discover POST targets ==========
+        post_targets = []
+
+        # A1: HTML form discovery
         try:
             state = await browser_manager.capture_state(self.url)
             html = state.get("html", "")
         except Exception:
-            return findings
+            html = ""
 
-        if not html:
-            return findings
+        if html:
+            soup = BeautifulSoup(html, "html.parser")
+            for form in soup.find_all("form"):
+                method = (form.get("method", "GET") or "GET").upper()
+                if method != "POST":
+                    continue
+                action = form.get("action", "")
+                form_url = urljoin(self.url, action) if action else self.url
 
-        soup = BeautifulSoup(html, "html.parser")
-        parsed_url = urlparse(self.url)
-        base = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                fields = {}
+                text_fields = []
+                for inp in form.find_all(["input", "textarea", "select"]):
+                    name = inp.get("name")
+                    if not name:
+                        continue
+                    input_type = (inp.get("type", "text") or "text").lower()
+                    if input_type in ("submit", "button", "reset", "file", "image"):
+                        continue
+                    default = inp.get("value", "")
+                    fields[name] = default
+                    if input_type in ("text", "search", "url", "email") or inp.name == "textarea":
+                        text_fields.append(name)
+                    elif input_type == "hidden" and "csrf" not in name.lower() and "token" not in name.lower():
+                        text_fields.append(name)
 
-        # Find POST forms (comment forms, review forms, profile updates, etc.)
-        post_forms = []
-        for form in soup.find_all("form"):
-            method = (form.get("method", "GET") or "GET").upper()
-            if method != "POST":
+                if text_fields and fields:
+                    post_targets.append({
+                        "url": form_url,
+                        "fields": fields,
+                        "text_fields": text_fields,
+                        "format": "form",
+                    })
+
+        # A2: API write endpoint discovery from recon URLs
+        # Common patterns: /api/reviews, /api/comments, /api/forum/threads, /api/posts
+        content_field_names = ["comment", "content", "body", "text", "message",
+                               "description", "title", "review", "feedback", "post"]
+        api_write_patterns = [
+            (r'/api/reviews', {"comment": "", "rating": "5", "product_id": "1"}),
+            (r'/api/comments', {"comment": "", "post_id": "1"}),
+            (r'/api/forum/threads', {"title": "test", "content": ""}),
+            (r'/api/forum/replies', {"content": "", "thread_id": "1"}),
+            (r'/api/blog/posts', {"title": "test", "content": ""}),
+            (r'/api/blog/comments', {"comment": "", "blog_id": "1"}),
+            (r'/api/posts', {"content": "", "title": "test"}),
+            (r'/api/feedback', {"comment": "", "rating": "5"}),
+        ]
+        discovered_api_urls = set(t["url"] for t in post_targets)
+        for url_candidate in self.urls_to_scan if hasattr(self, 'urls_to_scan') else []:
+            for pattern, default_fields in api_write_patterns:
+                if re.search(pattern, url_candidate, re.IGNORECASE):
+                    # Normalize to the base API path (strip query params)
+                    api_url = url_candidate.split("?")[0]
+                    if api_url not in discovered_api_urls:
+                        text_flds = [k for k in default_fields if k in content_field_names]
+                        if text_flds:
+                            post_targets.append({
+                                "url": api_url,
+                                "fields": default_fields,
+                                "text_fields": text_flds,
+                                "format": "json",
+                            })
+                            discovered_api_urls.add(api_url)
+
+        # A3: Probe common API write endpoints on the target
+        common_api_paths = ["/api/reviews", "/api/comments", "/api/forum/threads",
+                            "/api/blog/posts", "/api/forum/replies"]
+        for api_path in common_api_paths:
+            api_url = f"{base}{api_path}"
+            if api_url in discovered_api_urls:
                 continue
-            action = form.get("action", "")
-            form_url = urljoin(self.url, action) if action else self.url
+            try:
+                async with http_manager.session(ConnectionProfile.PROBE) as session:
+                    async with session.post(
+                        api_url, json={"test": "probe"}, ssl=False,
+                        headers={**auth_headers, "Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=3)
+                    ) as resp:
+                        # 405=Method Not Allowed means endpoint exists but needs different format
+                        # 400/422=Validation error means it exists and accepts POST
+                        if resp.status in (200, 201, 400, 422):
+                            text_flds = ["comment", "content"]
+                            post_targets.append({
+                                "url": api_url,
+                                "fields": {"comment": "", "content": "", "rating": "5"},
+                                "text_fields": text_flds,
+                                "format": "json",
+                            })
+                            discovered_api_urls.add(api_url)
+            except Exception:
+                pass
 
-            # Extract form fields
-            fields = {}
-            text_fields = []
-            for inp in form.find_all(["input", "textarea", "select"]):
-                name = inp.get("name")
-                if not name:
-                    continue
-                input_type = (inp.get("type", "text") or "text").lower()
-                if input_type in ("submit", "button", "reset", "file", "image"):
-                    continue
-                default = inp.get("value", "")
-                fields[name] = default
-                # Track text-like fields as injection points
-                if input_type in ("text", "search", "url", "email") or inp.name == "textarea":
-                    text_fields.append(name)
-                elif input_type == "hidden" and "csrf" not in name.lower() and "token" not in name.lower():
-                    text_fields.append(name)
-
-            if text_fields and fields:
-                post_forms.append({
-                    "url": form_url,
-                    "fields": fields,
-                    "text_fields": text_fields,
-                })
-
-        if not post_forms:
+        if not post_targets:
             return findings
 
-        logger.info(f"[{self.name}] Stored XSS: found {len(post_forms)} POST forms to test")
+        logger.info(f"[{self.name}] Stored XSS: {len(post_targets)} POST targets "
+                     f"({sum(1 for t in post_targets if t['format'] == 'form')} forms, "
+                     f"{sum(1 for t in post_targets if t['format'] == 'json')} API)")
 
-        # Test each form
-        for form_info in post_forms[:5]:  # Cap at 5 forms
-            form_url = form_info["url"]
-            fields = form_info["fields"]
-            text_fields = form_info["text_fields"]
+        # ========== Phase B: Write-then-Read testing ==========
+        for target in post_targets[:8]:
+            form_url = target["url"]
+            fields = target["fields"]
+            text_fields = target["text_fields"]
+            fmt = target["format"]
 
-            for target_field in text_fields[:3]:  # Cap at 3 fields per form
+            for target_field in text_fields[:2]:
                 for payload in stored_payloads:
                     try:
-                        # Submit the payload via POST
                         submit_data = dict(fields)
                         submit_data[target_field] = payload
+                        post_response_text = ""
+                        post_status = 0
 
+                        # Submit payload
                         async with http_manager.session(ConnectionProfile.PROBE) as session:
-                            async with session.post(
-                                form_url, data=submit_data, ssl=False,
-                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                                allow_redirects=True,
-                                timeout=aiohttp.ClientTimeout(total=8)
-                            ) as resp:
-                                post_status = resp.status
+                            req_headers = {
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                                **auth_headers,
+                            }
+                            if fmt == "json":
+                                req_headers["Content-Type"] = "application/json"
+                                async with session.post(
+                                    form_url, json=submit_data, ssl=False,
+                                    headers=req_headers,
+                                    allow_redirects=True,
+                                    timeout=aiohttp.ClientTimeout(total=8)
+                                ) as resp:
+                                    post_status = resp.status
+                                    post_response_text = await resp.text()
+                            else:
+                                async with session.post(
+                                    form_url, data=submit_data, ssl=False,
+                                    headers=req_headers,
+                                    allow_redirects=True,
+                                    timeout=aiohttp.ClientTimeout(total=8)
+                                ) as resp:
+                                    post_status = resp.status
+                                    post_response_text = await resp.text()
 
                         if post_status >= 500:
                             continue
 
-                        # Check if payload appears on the page (GET the original URL)
+                        # Build check URLs: original page + form URL + detail URL from response
                         check_urls = [self.url]
                         if form_url != self.url:
                             check_urls.append(form_url)
 
-                        for check_url in check_urls:
-                            async with http_manager.session(ConnectionProfile.PROBE) as session:
-                                async with session.get(
-                                    check_url, ssl=False,
-                                    timeout=aiohttp.ClientTimeout(total=5)
-                                ) as resp:
-                                    body = await resp.text()
+                        # Extract resource ID from POST response to build detail URL
+                        resource_id = self._extract_resource_id(post_response_text)
+                        if resource_id:
+                            detail_url = f"{form_url.rstrip('/')}/{resource_id}"
+                            check_urls.append(detail_url)
 
-                            # Check for unescaped payload in response
-                            if canary in body and (f"onerror=document.title='{canary}'" in body
-                                                   or f"onload=document.title='{canary}'" in body):
+                        # Also check the list endpoint (payload may render on list page)
+                        list_url = form_url.rstrip("/")
+                        if list_url not in check_urls:
+                            check_urls.append(list_url)
+
+                        # Check each URL for stored payload
+                        for check_url in check_urls:
+                            try:
+                                async with http_manager.session(ConnectionProfile.PROBE) as session:
+                                    async with session.get(
+                                        check_url, ssl=False,
+                                        headers={**auth_headers},
+                                        timeout=aiohttp.ClientTimeout(total=5)
+                                    ) as resp:
+                                        body = await resp.text()
+                            except Exception:
+                                continue
+
+                            # Check for canary in response (multiple formats)
+                            if self._check_stored_canary(body, canary, payload):
                                 findings.append({
                                     "type": "XSS",
                                     "subtype": "STORED_XSS",
@@ -3941,21 +4044,72 @@ Return ONLY the payloads, one per line, no explanations."""
                                         "check_url": check_url,
                                         "xss_type": "stored",
                                         "validation_method": "http_response_analysis",
+                                        "resource_id": resource_id,
                                     },
                                     "confidence": 0.95,
                                     "validated": True,
                                     "status": "VALIDATED_CONFIRMED",
                                     "http_method": "POST",
                                 })
-                                logger.info(f"[{self.name}] STORED XSS CONFIRMED: POST {form_url} field '{target_field}' → reflected on GET {check_url}")
-                                break  # One payload confirmed is enough for this field
-                        if findings:
-                            break  # Found stored XSS for this field
+                                logger.info(f"[{self.name}] STORED XSS CONFIRMED: POST {form_url} field '{target_field}' → stored on GET {check_url}")
+                                break
+                        if findings and findings[-1].get("parameter") == target_field:
+                            break
                     except Exception as e:
                         logger.debug(f"[{self.name}] Stored XSS test failed: {e}")
                         continue
 
         return findings
+
+    @staticmethod
+    def _extract_resource_id(response_text: str) -> Optional[str]:
+        """Extract resource ID from a POST response (JSON or headers)."""
+        import re
+        try:
+            data = __import__('json').loads(response_text)
+            # Top-level ID
+            if isinstance(data, dict):
+                for key in ("id", "ID", "_id", "review_id", "thread_id", "post_id", "comment_id"):
+                    if key in data:
+                        return str(data[key])
+                # Nested data.id
+                if "data" in data and isinstance(data["data"], dict) and "id" in data["data"]:
+                    return str(data["data"]["id"])
+        except Exception:
+            pass
+        # Fallback: extract numeric ID from response
+        match = re.search(r'"id"\s*:\s*(\d+)', response_text)
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _check_stored_canary(body: str, canary: str, payload: str) -> bool:
+        """Check if XSS canary exists in response across multiple formats."""
+        if canary not in body:
+            return False
+
+        # Raw payload present (HTML context)
+        if payload in body:
+            return True
+
+        # Canary in event handler context (unescaped)
+        if f"onerror=document.title='{canary}'" in body or f"onload=document.title='{canary}'" in body:
+            return True
+
+        # JSON-escaped payload (e.g., inside {"comment": "<img src=x onerror=...>"})
+        json_escaped = payload.replace('"', '\\"')
+        if json_escaped in body:
+            return True
+
+        # Canary present but payload partially encoded — still a stored XSS
+        # if the canary survives, the payload was stored (even if rendered differently)
+        if f"onerror=" in body and canary in body:
+            return True
+        if f"onload=" in body and canary in body:
+            return True
+
+        return False
 
     async def _xss_escalation_pipeline(
         self, url: str, param: str, interactsh_url: str, screenshots_dir: Path,

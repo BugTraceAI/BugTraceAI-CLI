@@ -316,15 +316,40 @@ class MassAssignmentAgent(BaseAgent, TechContextMixin):
         3. GET again to check if fields persisted
         """
         findings = []
-        parsed = urlparse(url)
+
+        # Get auth headers from scan context (JWT tokens discovered by JWTAgent)
+        auth_headers = {}
+        try:
+            from bugtrace.services.scan_context import get_scan_auth_headers
+            auth_headers = get_scan_auth_headers(self._scan_context, role="user") or {}
+        except Exception:
+            pass
+
+        headers = {"Content-Type": "application/json"}
+        headers.update(auth_headers)
 
         async with httpx.AsyncClient(
-            timeout=10, verify=False, follow_redirects=True
+            timeout=10, verify=False, follow_redirects=True, headers=headers
         ) as client:
             # Step 1: Baseline GET to understand response structure
             baseline_body = await self._get_baseline(client, url)
             if baseline_body is None:
-                return findings
+                # Retry with admin role if user auth failed
+                if auth_headers:
+                    try:
+                        admin_headers = get_scan_auth_headers(self._scan_context, role="admin") or {}
+                        if admin_headers and admin_headers != auth_headers:
+                            headers.update(admin_headers)
+                            async with httpx.AsyncClient(
+                                timeout=10, verify=False, follow_redirects=True, headers=headers
+                            ) as admin_client:
+                                baseline_body = await self._get_baseline(admin_client, url)
+                                if baseline_body is not None:
+                                    client = admin_client
+                    except Exception:
+                        pass
+                if baseline_body is None:
+                    return findings
 
             # Step 2: Try each HTTP method that accepts body
             for method in ["POST", "PUT", "PATCH"]:
@@ -349,6 +374,9 @@ class MassAssignmentAgent(BaseAgent, TechContextMixin):
                 except Exception as e:
                     logger.debug(f"[{self.name}] JSON parse failed for {url}: {e}")
                     return {}
+            elif resp.status_code in (401, 403):
+                logger.debug(f"[{self.name}] Auth required for {url} (status {resp.status_code})")
+                return None
             return {}
         except Exception as e:
             logger.debug(f"[{self.name}] Baseline GET failed for {url}: {e}")
