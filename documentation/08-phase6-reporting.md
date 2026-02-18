@@ -2,12 +2,13 @@
 
 ## Resumen
 
-La fase de Reporting agrega todos los hallazgos verificados y genera reportes profesionales en multiples formatos. Concurrencia: **1** (secuencial).
+La fase de Reporting enriquece hallazgos validados con PoC detallado y genera reportes profesionales en multiples formatos. Concurrencia: **1** (secuencial).
 
 **Archivos:**
-- `bugtrace/agents/reporting.py` - ReportingAgent principal
+- `bugtrace/agents/reporting.py` - ReportingAgent principal (incluye batch PoC enrichment)
 - `bugtrace/agents/report_validator.py` - Validacion de calidad del reporte
 - `bugtrace/services/report_service.py` - Servicio de reportes (API)
+- `bugtrace/reporting/ai_writer.py` - Generador de reportes AI (tech + exec en paralelo)
 - `bugtrace/reporting/html_generator.py` - Generador HTML
 - `bugtrace/reporting/templates/report_viewer.html` - Template HTML
 
@@ -67,26 +68,29 @@ async def generate_all_deliverables(self) -> List[str]:
    - Disco: specialists/results/*_results.json
         |
         v
-[2. Build ReportContext]
+[2. Batch PoC Enrichment]  ← NUEVO
+   - Agrupar findings por tipo (SQLi, XSS, LFI...)
+   - 1 LLM call por grupo (no por finding)
+   - Generar: exploitation_details, reproduction_steps
+   - Escribir WET (raw LLM) y DRY (parsed) a disco
+   - Fallback individual si batch falla
+        |
+        v
+[3. Build ReportContext]
    - engagement_info (target, fecha, scope)
-   - findings (tipo, severidad, evidencia)
+   - findings (tipo, severidad, evidencia, PoC)
    - metadata (tech_profile, scan_duration)
    - screenshots references
         |
         v
-[3. Generar HTML]
+[4. Generar HTML]
    - engagement_data.js (JSON embebido)
    - report_viewer.html (template SPA)
         |
         v
-[4. Generar Technical Report (MD)]
-   - AI-written (LLM)
-   - Formato pentest profesional
-        |
-        v
-[5. Generar Executive Summary]
-   - AI-written (LLM)
-   - Resumen para management
+[5. Generar AI Reports (EN PARALELO)]
+   - Technical Report (MD) + Executive Summary
+   - asyncio.gather() para ambos simultaneamente
         |
         v
 [6. Generar JSON]
@@ -299,25 +303,77 @@ async def get_report_file(scan_id: int, filename: str):
 
 ---
 
+## Batch PoC Enrichment (WET/DRY)
+
+### Agrupacion por Tipo
+
+En lugar de hacer 1 LLM call por finding (~20 calls), los findings se agrupan por tipo de vulnerabilidad y se enriquecen en batch (~6 calls):
+
+| Metrica | Antes | Despues |
+|---------|-------|---------|
+| LLM calls PoC | ~20 (semaphore 5) | ~6 (1 por tipo) |
+| Tiempo estimado | ~40s | ~15s |
+
+### WET/DRY Traceability
+
+Cada grupo genera dos ficheros para diagnostico:
+
+| Fichero | Contenido | Diagnostico |
+|---------|-----------|-------------|
+| `poc_enrichment/wet/{type}_wet.json` | Respuesta cruda del LLM | WET con garbage → problema del LLM |
+| `poc_enrichment/dry/{type}_dry.json` | PoC parseado y estructurado | WET ok pero DRY con failures → problema del parser |
+
+### Fallback
+
+- Si batch falla completamente → fallback a enrichment individual por finding
+- Si batch parsea parcialmente (3/5) → individual solo para los 2 que faltan
+- Los ficheros WET/DRY son best-effort (no interrumpen el enrichment si falla la escritura)
+
+### Configuracion
+
+| Setting | Default | Descripcion |
+|---------|---------|-------------|
+| `REPORTING_POC_BATCH_SIZE` | 10 | Max findings por call dentro de un grupo |
+| `REPORTING_POC_TOKENS_PER_FINDING` | 600 | Tokens output por finding |
+| `REPORTING_POC_MIN_TOKENS` | 2000 | Minimo max_tokens por call |
+| `REPORTING_POC_MAX_TOKENS` | 8000 | Techo para evitar overflow |
+
+---
+
 ## Estructura Final de Reportes
 
 ```
 reports/{domain}_{timestamp}/
-  REPORT.html                 # SPA viewer
+  final_report.md             # Reporte completo (AI)
+  report.html                 # SPA viewer
   engagement_data.js          # Datos JSON embebidos
-  TECHNICAL_REPORT.md         # Reporte tecnico (AI)
   engagement_data.json        # Datos JSON crudo
+  validated_findings.json     # Findings con PoC
+  raw_findings.json           # Todos los findings
+  attack_chains.json          # Cadenas de ataque
   recon/
     urls.txt                  # URLs descubiertas
-    technologies.json         # Tech profile
+    urls_clean.txt            # URLs limpias
+    tech_profile.json         # Tech profile
+    auth_discovery/           # Auth discovery
+  dastysast/
+    *.json                    # Analisis por URL
   specialists/
-    results/
-      xss_results.json        # Resultados XSS
-      sqli_results.json       # Resultados SQLi
+    wet/                      # Candidatos crudos (Phase 3)
+    dry/                      # Deduplicados (Phase 3)
+    results/                  # Validados (Phase 4)
+      xss_results.json
+      sqli_results.json
       ...
-  {url_safe_name}/
-    finding_details.findings  # Hallazgos por URL
-    screenshot_001.png        # Screenshots
-  logs/
-    finding_details.findings  # Hallazgos sin URL match
+  poc_enrichment/             # PoC enrichment (Phase 6)
+    wet/                      # Raw LLM responses
+      sqli_wet.json
+      xss_wet.json
+      ...
+    dry/                      # Parsed PoC data
+      sqli_dry.json
+      xss_dry.json
+      ...
+  screenshots/                # Screenshots de validacion
+  logs/                       # Logs del scan
 ```
