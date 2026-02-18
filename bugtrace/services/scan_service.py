@@ -788,22 +788,25 @@ class ScanService:
             "per_page": per_page,
         }
 
+    @staticmethod
+    def _dir_has_report_files(directory: Path) -> bool:
+        """Check if a directory contains actual report deliverables."""
+        key_files = ("final_report.md", "validated_findings.json", "raw_findings.json")
+        return any((directory / f).is_file() for f in key_files)
+
     def _find_report_dir_for_scan(self, scan_id: int) -> Optional[Path]:
         """
         Find the report directory for a scan_id.
 
-        Searches two patterns:
-        1. scan_{id}/ (created by ReportService API)
-        2. {domain}_{timestamp}/ (created by scan pipeline)
+        Priority order:
+        0. scan.report_dir from DB (v5.1 architecture)
+        1. {domain}_{timestamp}/ (created by scan pipeline)
+        2. scan_{id}/ (created by ReportService API, fallback)
+
+        Validates directories contain actual report files before returning.
         """
         report_base = settings.REPORT_DIR
 
-        # Pattern 1: API-generated reports
-        api_dir = report_base / f"scan_{scan_id}"
-        if api_dir.is_dir():
-            return api_dir
-
-        # Pattern 2: Pipeline-generated reports ({domain}_{timestamp})
         try:
             with self.db.get_session() as session:
                 from bugtrace.schemas.db_models import ScanTable, TargetTable
@@ -814,19 +817,35 @@ class ScanService:
                 if not target:
                     return None
 
-                # Extract domain from URL
-                domain = urlparse(target.url).hostname or ""
+                # Pattern 0: Direct DB match (v5.1 architecture)
+                if hasattr(scan, 'report_dir') and scan.report_dir:
+                    db_dir = Path(scan.report_dir)
+                    if db_dir.is_dir() and self._dir_has_report_files(db_dir):
+                        return db_dir
 
-                # Find matching report directories, sorted newest first
+                # Pattern 1: Pipeline-generated reports ({domain}_{timestamp})
+                domain = urlparse(target.url).hostname or ""
                 matches = sorted(
                     report_base.glob(f"{domain}_*"),
                     key=lambda p: p.stat().st_mtime,
                     reverse=True,
                 )
-                if matches:
-                    return matches[0]
+                for match in matches:
+                    if self._dir_has_report_files(match):
+                        return match
+
+                # Pattern 2: API-generated reports (fallback)
+                api_dir = report_base / f"scan_{scan_id}"
+                if api_dir.is_dir():
+                    return api_dir
+
         except Exception as e:
             logger.warning(f"Error resolving report dir for scan {scan_id}: {e}")
+
+        # Last resort without DB
+        api_dir = report_base / f"scan_{scan_id}"
+        if api_dir.is_dir():
+            return api_dir
 
         return None
 

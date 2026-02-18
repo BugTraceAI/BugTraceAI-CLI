@@ -120,25 +120,29 @@ async def get_report(
         )
 
 
+def _has_report_files(directory: FilePath) -> bool:
+    """Check if a directory contains actual report deliverables."""
+    key_files = ("final_report.md", "validated_findings.json", "raw_findings.json")
+    return any((directory / f).is_file() for f in key_files)
+
+
 def _find_report_dir(scan_id: int) -> FilePath | None:
     """
     Find the report directory for a scan_id.
 
-    Searches two patterns:
-    1. scan_{id}/ (created by ReportService API)
-    2. {domain}_{timestamp}/ (created by scan pipeline)
+    Searches patterns in priority order:
+    0. scan.report_dir from DB (v5.1 architecture)
+    1. {domain}_{timestamp}/ (created by scan pipeline)
+    2. scan_{id}/ (created by ReportService API)
 
-    For pattern 2, resolves scan_id -> target URL -> domain, then finds
+    For pattern 1, resolves scan_id -> target URL -> domain, then finds
     the most recent matching directory.
+
+    Directories are validated to contain actual report files before being
+    returned, preventing empty/partial dirs from shadowing real reports.
     """
     report_base = settings.REPORT_DIR
 
-    # Pattern 1: API-generated reports
-    api_dir = report_base / f"scan_{scan_id}"
-    if api_dir.is_dir():
-        return api_dir
-
-    # Pattern 2: Pipeline-generated reports ({domain}_{timestamp})
     try:
         db = get_db_manager()
         with db.get_session() as session:
@@ -153,35 +157,41 @@ def _find_report_dir(scan_id: int) -> FilePath | None:
             # Pattern 0: Direct DB match (new v5.1 architecture)
             if hasattr(scan, 'report_dir') and scan.report_dir:
                 db_dir = FilePath(scan.report_dir)
-                if db_dir.is_dir():
+                if db_dir.is_dir() and _has_report_files(db_dir):
                     return db_dir
 
-            # Pattern 1: API-generated reports (legacy/standard)
-            api_dir = report_base / f"scan_{scan_id}"
-            if api_dir.is_dir():
-                return api_dir
-
-            # Pattern 2: Pipeline-generated reports ({domain}_{timestamp})
-            # Extract domain and timestamp from scan
+            # Pattern 1: Pipeline-generated reports ({domain}_{timestamp})
             from urllib.parse import urlparse
             domain = urlparse(target.url).hostname or ""
             scan_ts = scan.timestamp.strftime("%Y%m%d_%H%M%S")
 
-            # Priority 1: Exact timestamp match
+            # Priority 1a: Exact timestamp match
             exact_match = report_base / f"{domain}_{scan_ts}"
-            if exact_match.is_dir():
+            if exact_match.is_dir() and _has_report_files(exact_match):
                 return exact_match
 
-            # Priority 2: Fuzzy match (latest for domain) - fallback
+            # Priority 1b: Fuzzy match (latest for domain)
             matches = sorted(
                 report_base.glob(f"{domain}_*"),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
-            if matches:
-                return matches[0]
+            for match in matches:
+                if _has_report_files(match):
+                    return match
+
+            # Pattern 2: API-generated reports (fallback)
+            api_dir = report_base / f"scan_{scan_id}"
+            if api_dir.is_dir():
+                return api_dir
+
     except Exception as e:
         logger.warning(f"Error resolving report dir for scan {scan_id}: {e}")
+
+    # Last resort: check scan_{id} without DB access
+    api_dir = report_base / f"scan_{scan_id}"
+    if api_dir.is_dir():
+        return api_dir
 
     return None
 

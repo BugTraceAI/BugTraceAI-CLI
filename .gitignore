@@ -93,5 +93,17 @@ alembic.ini
 
 # Internal testing/training tools (dojos, benchmarks)
 testing/
+
+# Internal planning and analysis docs
+.planning/
+docs/SCANNER_IMPROVEMENTS.md
+docs/DETECTION_GAP_BRIEFING.md
+
+# Internal utility scripts
+tools/cumulative_best.py
+
 # Auto-learned breakouts (generated at runtime)
 bugtrace/payloads/learned_breakouts.json
+
+# Backup files
+*.backup
