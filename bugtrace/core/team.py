@@ -2530,6 +2530,16 @@ class TeamOrchestrator:
             added = len(self.urls_to_scan) - pre_spa_count
             logger.info(f"[SPA→API] Added {added} API endpoints ({pre_spa_count} → {len(self.urls_to_scan)} URLs)")
 
+        # ========== RE-ENFORCE MAX_URLS after enrichment ==========
+        # The user's target URL MUST always be first, even if GoSpider didn't find it
+        target_norm = self.target.rstrip('/')
+        remaining = [u for u in self.urls_to_scan if u.rstrip('/') != target_norm]
+        self.urls_to_scan = [self.target] + remaining
+
+        if len(self.urls_to_scan) > self.max_urls:
+            logger.info(f"Enforcing MAX_URLS={self.max_urls} after enrichment: Trimming {len(self.urls_to_scan)} -> {self.max_urls} URLs")
+            self.urls_to_scan = self.urls_to_scan[:self.max_urls]
+
         # ========== LONEWOLF: Fire and forget ==========
         if settings.LONEWOLF_ENABLED:
             from bugtrace.agents.lone_wolf import LoneWolf
