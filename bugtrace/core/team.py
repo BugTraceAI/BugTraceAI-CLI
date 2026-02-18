@@ -3432,6 +3432,123 @@ class TeamOrchestrator:
                 logger.info(f"[Auto-Dispatch] Injected {injected_count} synthetic CSTI findings with real params (detected: {detected_csti_framework})")
                 dashboard.log(f"Auto-dispatch: {injected_count} CSTI findings injected ({detected_csti_framework.upper()} detected)", "INFO")
 
+        # Auto-dispatch SSTI for template-related admin/API endpoints.
+        # DASTySAST often filters server-side SSTI as FP (low fp_confidence).
+        # CSTIAgent handles both client-side (CSTI) and server-side (SSTI) template injection.
+        ssti_path_keywords = {"template", "email-preview", "render", "preview", "email"}
+        ssti_injected_urls = set()
+        existing_csti_urls = {f.get("url", "") for f in all_findings if "csti" in f.get("type", "").lower() or "ssti" in f.get("type", "").lower()}
+
+        recon_file_ssti = getattr(self, 'report_dir', None)
+        if recon_file_ssti:
+            recon_file_ssti = recon_file_ssti / "recon" / "urls.txt"
+        if recon_file_ssti and recon_file_ssti.exists():
+            for line in recon_file_ssti.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                path_lower = urlparse(line).path.lower()
+                if any(kw in path_lower for kw in ssti_path_keywords):
+                    base_url = line.split("?")[0]
+                    if base_url not in ssti_injected_urls and base_url not in existing_csti_urls:
+                        all_findings.append({
+                            "type": "CSTI",
+                            "parameter": "body",
+                            "url": base_url,
+                            "severity": "High",
+                            "fp_confidence": 0.9,
+                            "confidence_score": 0.9,
+                            "votes": 5,
+                            "skeptical_score": 8,
+                            "reasoning": f"Auto-dispatch: SSTI-likely path '{path_lower}' detected in recon URL.",
+                            "payload": "",
+                            "evidence": f"Path contains template keyword: {path_lower}",
+                            "template_engine": "jinja2",
+                            "_source_file": "auto_dispatch_ssti",
+                            "_scan_context": self.scan_context,
+                            "_auto_dispatched": True
+                        })
+                        ssti_injected_urls.add(base_url)
+                        logger.info(f"[Auto-Dispatch] SSTI from recon URL: {base_url}")
+
+        # Also check urls_to_scan for SSTI-likely paths
+        for url in getattr(self, 'urls_to_scan', []):
+            path_lower = urlparse(url).path.lower()
+            if any(kw in path_lower for kw in ssti_path_keywords):
+                base_url = url.split("?")[0]
+                if base_url not in ssti_injected_urls and base_url not in existing_csti_urls:
+                    all_findings.append({
+                        "type": "CSTI",
+                        "parameter": "body",
+                        "url": base_url,
+                        "severity": "High",
+                        "fp_confidence": 0.9,
+                        "confidence_score": 0.9,
+                        "votes": 5,
+                        "skeptical_score": 8,
+                        "reasoning": f"Auto-dispatch: SSTI-likely path '{path_lower}' detected.",
+                        "payload": "",
+                        "evidence": f"Path contains template keyword: {path_lower}",
+                        "template_engine": "jinja2",
+                        "_source_file": "auto_dispatch_ssti",
+                        "_scan_context": self.scan_context,
+                        "_auto_dispatched": True
+                    })
+                    ssti_injected_urls.add(base_url)
+                    logger.info(f"[Auto-Dispatch] SSTI from scanned URL: {base_url}")
+
+        if ssti_injected_urls:
+            dashboard.log(f"Auto-dispatch: {len(ssti_injected_urls)} SSTI target(s) injected", "INFO")
+
+        # Auto-dispatch LFI for file/path/download parameters.
+        # DASTySAST sometimes rejects path traversal findings (score 0/10) when the
+        # endpoint response contains metadata or safe-looking error messages.
+        # LFIAgent must always test parameters named file/path/filename/download.
+        lfi_param_keywords = {"file", "path", "filename", "filepath", "document", "download", "dir", "include", "page", "template"}
+        lfi_injected = set()
+        existing_lfi_urls_params = {
+            (f.get("url", "").split("?")[0], f.get("parameter", ""))
+            for f in all_findings
+            if "lfi" in f.get("type", "").lower() or "path" in f.get("type", "").lower() or "traversal" in f.get("type", "").lower()
+        }
+
+        recon_file_lfi = getattr(self, 'report_dir', None)
+        if recon_file_lfi:
+            recon_file_lfi = recon_file_lfi / "recon" / "urls.txt"
+        if recon_file_lfi and recon_file_lfi.exists():
+            for line in recon_file_lfi.read_text().splitlines():
+                line = line.strip()
+                if not line or "?" not in line:
+                    continue
+                parsed_lfi = urlparse(line)
+                query_params = parse_qs(parsed_lfi.query)
+                for param_name in query_params:
+                    if param_name.lower() in lfi_param_keywords:
+                        base_url = line.split("?")[0]
+                        key = (base_url, param_name)
+                        if key not in existing_lfi_urls_params and key not in lfi_injected:
+                            all_findings.append({
+                                "type": "LFI",
+                                "parameter": param_name,
+                                "url": line,
+                                "severity": "High",
+                                "fp_confidence": 0.85,
+                                "confidence_score": 0.85,
+                                "votes": 5,
+                                "skeptical_score": 7,
+                                "reasoning": f"Auto-dispatch: param '{param_name}' is a common path traversal vector.",
+                                "payload": "",
+                                "evidence": f"URL param '{param_name}' in recon URL: {line}",
+                                "_source_file": "auto_dispatch_lfi",
+                                "_scan_context": self.scan_context,
+                                "_auto_dispatched": True
+                            })
+                            lfi_injected.add(key)
+
+        if lfi_injected:
+            logger.info(f"[Auto-Dispatch] LFI: {len(lfi_injected)} path-traversal target(s) injected")
+            dashboard.log(f"Auto-dispatch: {len(lfi_injected)} LFI target(s) injected", "INFO")
+
         # FIX (2026-02-08): Auto-dispatch SQLiAgent when reflecting params exist but no SQLi finding
         # SQLi is the most common web vuln - if DASTySAST found ANY parameter, SQLi should be tested.
         # Previous scans found SQLi on ginandjuice.shop but LLM non-determinism caused it to be missed.
@@ -3682,6 +3799,36 @@ class TeamOrchestrator:
                 all_findings.append(synthetic_idor)
                 idor_injected += 1
                 logger.debug(f"[Auto-Dispatch] IDOR recon URL: {path} (base: {base_path})")
+            # Also check urls_to_scan (includes Endpoint Discovery URLs not in urls.txt)
+            for url in getattr(self, 'urls_to_scan', []):
+                parsed_idor = urlparse(url)
+                path = parsed_idor.path.rstrip('/')
+                if not numeric_path_re.search(path):
+                    continue
+                base_path = re.sub(r'/\d+(?=/|$)', '', path)
+                if base_path in seen_idor_bases:
+                    continue
+                seen_idor_bases.add(base_path)
+                if path in existing_idor_urls:
+                    continue
+                all_findings.append({
+                    "type": "IDOR",
+                    "parameter": "URL Path (/{id})",
+                    "url": url.split('?')[0],
+                    "severity": "High",
+                    "fp_confidence": 0.9,
+                    "confidence_score": 0.9,
+                    "votes": 5,
+                    "skeptical_score": 8,
+                    "reasoning": f"Auto-dispatch: Numeric path segment in '{path}' (from endpoint discovery).",
+                    "payload": "",
+                    "evidence": f"Endpoint discovery URL with numeric path ID: {path}",
+                    "_source_file": "auto_dispatch_idor_endpoint",
+                    "_scan_context": self.scan_context,
+                    "_auto_dispatched": True
+                })
+                idor_injected += 1
+
             if idor_injected > 0:
                 self._v.emit("strategy.auto_dispatch", {"specialist": "IDOR", "count": idor_injected})
                 logger.info(f"[Auto-Dispatch] Injected {idor_injected} synthetic IDOR findings from recon URLs with numeric paths")

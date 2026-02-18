@@ -17,7 +17,7 @@ import aiohttp
 import json
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, is_dataclass
 from enum import Enum
 import re
 import urllib.parse
@@ -3921,32 +3921,54 @@ Return ONLY the payloads, one per line, no explanations."""
                             discovered_api_urls.add(api_url)
 
         # A3: Probe common API write endpoints on the target
+        # Try both with and without trailing slash (FastAPI routes may differ)
         common_api_paths = ["/api/reviews", "/api/comments", "/api/forum/threads",
                             "/api/blog/posts", "/api/forum/replies"]
         for api_path in common_api_paths:
-            api_url = f"{base}{api_path}"
-            if api_url in discovered_api_urls:
-                continue
-            try:
-                async with http_manager.session(ConnectionProfile.PROBE) as session:
-                    async with session.post(
-                        api_url, json={"test": "probe"}, ssl=False,
-                        headers={**auth_headers, "Content-Type": "application/json"},
-                        timeout=aiohttp.ClientTimeout(total=3)
-                    ) as resp:
-                        # 405=Method Not Allowed means endpoint exists but needs different format
-                        # 400/422=Validation error means it exists and accepts POST
-                        if resp.status in (200, 201, 400, 422):
-                            text_flds = ["comment", "content"]
-                            post_targets.append({
-                                "url": api_url,
-                                "fields": {"comment": "", "content": "", "rating": "5"},
-                                "text_fields": text_flds,
-                                "format": "json",
-                            })
-                            discovered_api_urls.add(api_url)
-            except Exception:
-                pass
+            for suffix in ["", "/"]:
+                api_url = f"{base}{api_path}{suffix}"
+                api_url_canonical = f"{base}{api_path}"
+                if api_url_canonical in discovered_api_urls:
+                    break
+                try:
+                    async with http_manager.session(ConnectionProfile.PROBE) as session:
+                        async with session.post(
+                            api_url, json={"test": "probe"}, ssl=False,
+                            headers={**auth_headers, "Content-Type": "application/json"},
+                            timeout=aiohttp.ClientTimeout(total=3)
+                        ) as resp:
+                            # 405=Method Not Allowed means endpoint exists but needs different format
+                            # 400/422=Validation error means it exists and accepts POST
+                            if resp.status in (200, 201, 400, 422):
+                                text_flds = ["comment", "content"]
+                                # Include common required ID fields for API endpoints
+                                default_fields = {
+                                    "comment": "", "content": "", "rating": 5,
+                                    "product_id": 1, "post_id": 1, "thread_id": 1,
+                                    "blog_id": 1, "item_id": 1,
+                                }
+                                # Parse 422 validation errors for required field hints
+                                if resp.status == 422:
+                                    try:
+                                        err_data = await resp.json()
+                                        for detail in err_data.get("detail", []):
+                                            loc = detail.get("loc", [])
+                                            if len(loc) >= 2:
+                                                field_name = loc[-1]
+                                                if field_name not in default_fields:
+                                                    default_fields[field_name] = "1"
+                                    except Exception:
+                                        pass
+                                post_targets.append({
+                                    "url": api_url,
+                                    "fields": default_fields,
+                                    "text_fields": text_flds,
+                                    "format": "json",
+                                })
+                                discovered_api_urls.add(api_url_canonical)
+                                break
+                except Exception:
+                    pass
 
         if not post_targets:
             return findings
@@ -3999,9 +4021,12 @@ Return ONLY the payloads, one per line, no explanations."""
                                     post_status = resp.status
                                     post_response_text = await resp.text()
 
+                        # Log POST result for debugging
+                        logger.info(f"[{self.name}] Stored XSS POST {form_url} field={target_field}: HTTP {post_status}")
+
                         # Skip auth-gated endpoints we can't access
                         if post_status in (401, 403):
-                            logger.debug(f"[{self.name}] Stored XSS: auth required for POST {form_url} (HTTP {post_status})")
+                            logger.info(f"[{self.name}] Stored XSS: auth required for POST {form_url} (HTTP {post_status})")
                             target_auth_failed = True
                             break
                         if post_status >= 500:
@@ -4975,7 +5000,8 @@ Return ONLY the payloads, one per line, no explanations."""
 
         if results or self._dry_findings:
             # v3.2: Convert XSSFinding dataclasses to dicts for JSON serialization
-            findings_as_dicts = [asdict(r) for r in results if r] if results else []
+            # Phase B.3 (Stored XSS) returns dicts, other phases return XSSFinding dataclasses
+            findings_as_dicts = [asdict(r) if is_dataclass(r) else r for r in results if r] if results else []
             await self._generate_specialist_report(findings_as_dicts)
 
         # Report completion with final stats

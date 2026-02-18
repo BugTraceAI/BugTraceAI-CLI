@@ -1,7 +1,7 @@
 {
   "version": "2.0",
   "description": "Curated high-impact breakout prefixes - optimized for speed and coverage",
-  "last_updated": "2026-02-17T00:25:50.086353",
+  "last_updated": "2026-02-18T14:20:14.913715",
   "breakouts": [
     {
       "prefix": "",
@@ -26,9 +26,9 @@
       "description": "Double quote (universal)",
       "category": "xss,sqli",
       "priority": 1,
-      "success_count": 55,
+      "success_count": 59,
       "enabled": true,
-      "last_success": "2026-02-17T00:25:50.081877"
+      "last_success": "2026-02-18T14:20:14.906057"
     },
     {
       "prefix": "'>",

@@ -576,8 +576,19 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
 
     async def exploit_dry_list(self) -> List[Dict]:
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting {len(self._dry_findings)} DRY findings =====")
+
+        # Sort: cookies/deserialization first, URL params (may need auth) last.
+        # This gives JWTAgent more time to crack secrets before we hit auth-gated endpoints.
+        def _sort_key(f):
+            p = f.get("parameter", "")
+            r = f.get("rationale", "").lower()
+            if p.startswith("Cookie:") or "deserialization" in r or "pickle" in r:
+                return 0  # Process cookies first (no auth needed)
+            return 1  # URL params last (may need auth)
+        sorted_findings = sorted(self._dry_findings, key=_sort_key)
+
         validated = []
-        for idx, f in enumerate(self._dry_findings, 1):
+        for idx, f in enumerate(sorted_findings, 1):
             param = f.get("parameter", "")
             url = f.get("url", "")
 
@@ -724,7 +735,7 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
             async with orchestrator.session(DestinationType.TARGET) as session:
                 time_payloads = self._get_time_payloads()
                 # Quick probe: send first payload and check for 403/401
-                probe_url = self._inject_payload(self.url, param, time_payloads[0])
+                probe_url = self._inject_payload(url, param, time_payloads[0])
                 try:
                     async with session.get(probe_url, timeout=10) as resp:
                         if resp.status in (401, 403):
@@ -732,22 +743,30 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
                             logger.info(f"[{self.name}] Auth gate detected on {param} (HTTP {resp.status})")
                         else:
                             await resp.text()
-                except Exception:
-                    pass
+                except Exception as probe_err:
+                    logger.info(f"[{self.name}] Auth probe exception for {param}: {probe_err}")
+                    # Treat probe failure as potential auth gate (server may reject malformed requests)
+                    got_auth_error = True
 
                 if not got_auth_error:
                     result = await self._test_parameter(session, param, time_payloads)
                     if result:
                         return result
 
-            # Phase 2: If auth error OR no result, retry with admin JWT from JWTAgent
+            # Phase 2: Always attempt auth retry when Phase 1 found nothing.
+            # Wait for JWT if auth gate detected OR param has command-like name.
             try:
                 from bugtrace.services.scan_context import get_scan_auth_headers
                 auth_headers = get_scan_auth_headers(self._scan_context, role="admin")
 
-                # If auth gate detected but no token yet, wait for JWTAgent to finish
-                if not auth_headers and got_auth_error:
-                    for wait_round in range(6):  # Wait up to 30s for JWT
+                # Determine if we should wait for JWTAgent
+                param_lower = param.lower()
+                is_cmd_like = any(kw in param_lower for kw in ("cmd", "exec", "command", "run", "shell", "system"))
+                needs_auth_wait = got_auth_error or is_cmd_like
+
+                if not auth_headers and needs_auth_wait:
+                    logger.info(f"[{self.name}] Waiting for JWT for {param} (auth_gate={got_auth_error}, cmd_like={is_cmd_like})")
+                    for wait_round in range(36):  # Wait up to 180s for JWT
                         await asyncio.sleep(5)
                         auth_headers = get_scan_auth_headers(self._scan_context, role="admin")
                         if auth_headers:
@@ -765,14 +784,14 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
                         result = await self._test_output_based(auth_session, param)
                         if result:
                             return result
-                elif got_auth_error:
-                    logger.warning(f"[{self.name}] Auth gate on {param} but no JWT token available after waiting")
+                elif needs_auth_wait:
+                    logger.warning(f"[{self.name}] Auth needed for {param} but no JWT token available after waiting")
             except Exception as auth_err:
-                logger.debug(f"[{self.name}] Auth retry failed: {auth_err}")
+                logger.warning(f"[{self.name}] Auth retry failed for {param}: {auth_err}")
 
             return None
         except Exception as e:
-            logger.error(f"[{self.name}] Queue item test failed: {e}")
+            logger.error(f"[{self.name}] Queue item test failed for {param}: {e}")
             return None
 
     async def _test_output_based(self, session, param: str) -> Optional[Dict]:

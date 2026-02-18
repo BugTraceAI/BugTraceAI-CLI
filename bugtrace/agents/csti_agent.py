@@ -2197,28 +2197,46 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
         validated_findings = []
 
+        # Load auth headers from scan_context (JWT tokens from JWTAgent)
+        self._auth_headers = {}
+        try:
+            from bugtrace.services.scan_context import get_scan_auth_headers
+            self._auth_headers = get_scan_auth_headers(self._scan_context, role="admin") or {}
+            if self._auth_headers:
+                logger.info(f"[{self.name}] Using admin auth token from JWTAgent")
+        except Exception:
+            pass
+
         # Setup Interactsh for OOB detection across all findings
         if not self.interactsh:
             await self._setup_interactsh()
 
-        # Prioritize real DASTySAST findings over auto-dispatch noise.
-        # Auto-dispatch items have _auto_dispatched=True; real findings don't.
+        # Prioritize: 1) non-API real findings (client-side CSTI, fast),
+        # 2) SSTI auto-dispatch, 3) client-side auto-dispatch,
+        # 4) API endpoints LAST (need JWT from JWTAgent, which runs in parallel)
         real_findings = [f for f in self._dry_findings if not f.get("_auto_dispatched")]
         auto_findings = [f for f in self._dry_findings if f.get("_auto_dispatched")]
-        ordered_findings = real_findings + auto_findings
+        ssti_auto = [f for f in auto_findings if f.get("template_engine") in ("jinja2", "mako", "freemarker", "twig", "erb")
+                     or "ssti" in (f.get("reasoning") or "").lower()]
+        csti_auto = [f for f in auto_findings if f not in ssti_auto]
+
+        # Separate API endpoints (need auth) from non-API (test without auth)
+        real_nonapi = [f for f in real_findings if "/api/" not in f.get("url", "")]
+        real_api = [f for f in real_findings if "/api/" in f.get("url", "")]
+        ordered_findings = real_nonapi + ssti_auto + csti_auto + real_api
 
         # Normalize synthetic param names (e.g. "URL Path/Fragment" → actual URL query params)
         ordered_findings = self._normalize_csti_finding_params(ordered_findings)
-        logger.info(f"[{self.name}] Phase B: {len(real_findings)} real + {len(auto_findings)} auto-dispatch findings ({len(ordered_findings)} after normalization)")
+        api_count = len(real_api)
+        logger.info(f"[{self.name}] Phase B: {len(real_findings)} real ({api_count} API→end) + {len(auto_findings)} auto-dispatch ({len(ordered_findings)} after normalization)")
 
         for idx, finding in enumerate(ordered_findings, 1):
             url = finding.get("url", "")
             parameter = finding.get("parameter", "")
 
-            # Skip API endpoints — CSTI only works on HTML pages with template rendering
-            if "/api/" in url:
-                logger.debug(f"[{self.name}] Phase B: Skipping API endpoint {url}")
-                continue
+            # API endpoints may have server-side template injection (SSTI)
+            # e.g. POST /api/admin/email-preview with Jinja2 rendering
+            is_api_endpoint = "/api/" in url
             template_engine = finding.get("template_engine", "unknown")
 
             logger.info(f"[{self.name}] Phase B: [{idx}/{len(ordered_findings)}] Testing {url} param={parameter} engine={template_engine}")
@@ -2234,6 +2252,54 @@ Different template engines represent different attack surfaces - NEVER merge fin
                 if hasattr(self, '_v'):
                     self._v.emit("exploit.specialist.param.completed", {"agent": "CSTI", "param": parameter, "url": url, "idx": idx, "skipped": True})
                 continue
+
+            # For API endpoints: try POST with JSON body + auth (SSTI detection)
+            # before falling through to the standard GET-based CSTI pipeline
+            if is_api_endpoint:
+                # Refresh auth before first API test (JWT may have appeared since Phase B start)
+                if not self._auth_headers:
+                    try:
+                        from bugtrace.services.scan_context import get_scan_auth_headers
+                        fresh = get_scan_auth_headers(self._scan_context, role="admin") or {}
+                        if fresh:
+                            self._auth_headers = fresh
+                            logger.info(f"[{self.name}] Refreshed auth before API SSTI tests")
+                    except Exception:
+                        pass
+                try:
+                    api_result = await asyncio.wait_for(
+                        self._test_api_ssti(url, parameter, finding),
+                        timeout=210.0
+                    )
+                    if api_result and api_result.validated:
+                        self._emitted_findings.add(fingerprint)
+                        if hasattr(self, '_v'):
+                            self._v.emit("exploit.specialist.confirmed", {"agent": "CSTI", "param": parameter, "url": url, "engine": api_result.template_engine, "payload": api_result.payload[:100], "status": "VALIDATED_CONFIRMED"})
+                        finding_dict = {
+                            "url": api_result.url,
+                            "parameter": api_result.parameter,
+                            "type": "CSTI",
+                            "severity": "CRITICAL" if api_result.engine_type == "server-side" else "HIGH",
+                            "template_engine": api_result.template_engine,
+                            "engine_type": api_result.engine_type,
+                            "payload": api_result.payload,
+                            "validated": True,
+                            "status": api_result.evidence.get("status", "VALIDATED_CONFIRMED"),
+                            "description": f"Template Injection vulnerability detected. Expression '{api_result.payload}' was evaluated by the {api_result.engine_type} engine ({api_result.template_engine}). Method: API_POST_SSTI.",
+                            "evidence": api_result.evidence,
+                            "successful_payloads": api_result.successful_payloads,
+                        }
+                        validated_findings.append(finding_dict)
+                        if settings.WORKER_POOL_EMIT_EVENTS:
+                            self._emit_csti_finding(finding_dict, scan_context=self._scan_context)
+                        logger.info(f"[{self.name}] ✅ SSTI confirmed on API endpoint {url} param={parameter}")
+                        if hasattr(self, '_v'):
+                            self._v.emit("exploit.specialist.param.completed", {"agent": "CSTI", "param": parameter, "url": url, "idx": idx})
+                        continue
+                except asyncio.TimeoutError:
+                    logger.debug(f"[{self.name}] API SSTI test timeout for {url[:60]}")
+                except Exception as e:
+                    logger.debug(f"[{self.name}] API SSTI test failed: {e}")
 
             # Execute 6-Level CSTI Escalation Pipeline
             # Wrap in asyncio timeout to prevent Playwright deadlocks (max 180s per item)
@@ -2561,6 +2627,197 @@ Different template engines represent different attack surfaces - NEVER merge fin
         except Exception as e:
             logger.debug(f"[{self.name}] Send payload failed: {e}")
             return None, None
+
+    def _resolve_api_ssti_url(self, url: str, parameter: str) -> str:
+        """
+        Resolve mismatched URL when parameter looks like an endpoint path segment.
+
+        DASTySAST sometimes creates findings where the URL is the page that *described*
+        the vulnerability (e.g. /api/debug/vulns) while the parameter is the actual
+        endpoint name (e.g. "email-preview"). This method looks up recon URLs to find
+        the correct target endpoint.
+
+        Returns the resolved URL (may be unchanged if no better match found).
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+
+        # Only resolve if parameter looks like an endpoint path segment, not a query param
+        # Typical endpoint segments: contain hyphens, or match known SSTI-related names
+        ssti_endpoint_names = {'email-preview', 'email-template', 'email-templates', 'render',
+                               'preview', 'template', 'report-preview', 'pdf-render'}
+        is_endpoint_name = (
+            '-' in parameter and parameter.lower() not in ('x-forwarded-for', 'x-custom-header')
+        ) or parameter.lower() in ssti_endpoint_names
+
+        if not is_endpoint_name:
+            return url
+
+        # Check if the parameter is already part of the URL path
+        if parameter.lower() in parsed.path.lower():
+            return url
+
+        # Look up recon URLs for a URL containing this endpoint segment
+        recon_urls = self._load_recon_urls()
+        for recon_url in recon_urls:
+            recon_parsed = urlparse(recon_url)
+            if parameter.lower() in recon_parsed.path.lower() and '/api/' in recon_parsed.path:
+                # Found the correct endpoint — use path without query params
+                resolved = f"{recon_parsed.scheme}://{recon_parsed.netloc}{recon_parsed.path}"
+                logger.info(f"[{self.name}] Resolved API SSTI URL: {url} → {resolved} (matched param '{parameter}')")
+                return resolved
+
+        return url
+
+    def _load_recon_urls(self) -> List[str]:
+        """Load discovered URLs from recon/urls.txt (cached per scan)."""
+        if hasattr(self, '_cached_recon_urls'):
+            return self._cached_recon_urls
+
+        urls = []
+        try:
+            scan_dir = getattr(self, 'report_dir', None)
+            if not scan_dir:
+                from bugtrace.core.config import settings
+                scan_id = self._scan_context.split("/")[-1] if "/" in self._scan_context else self._scan_context
+                scan_dir = settings.BASE_DIR / "reports" / scan_id
+            urls_file = scan_dir / "recon" / "urls.txt"
+            if urls_file.exists():
+                urls = [line.strip() for line in urls_file.read_text().splitlines() if line.strip()]
+        except Exception as e:
+            logger.debug(f"[{self.name}] Could not load recon URLs: {e}")
+
+        self._cached_recon_urls = urls
+        return urls
+
+    async def _test_api_ssti(self, url: str, parameter: str, finding: dict) -> Optional[CSTIFinding]:
+        """
+        Test API endpoints for Server-Side Template Injection (SSTI).
+
+        API endpoints need POST with JSON body + auth headers (unlike HTML pages
+        which use GET with query params). Tests common SSTI payloads against
+        template-rendering API endpoints (e.g. email preview, report generation).
+        """
+        import aiohttp
+
+        # Resolve mismatched URLs (e.g. param="email-preview" on url="/api/debug/vulns")
+        url = self._resolve_api_ssti_url(url, parameter)
+
+        auth_headers = getattr(self, '_auth_headers', {})
+        logger.info(f"[{self.name}] API SSTI test: {url} param={parameter} auth={'yes' if auth_headers else 'no'}")
+
+        # Common body parameter names for template content
+        body_params = [parameter] if parameter else []
+        for p in ['body', 'content', 'template', 'message', 'text', 'subject', 'description']:
+            if p not in body_params:
+                body_params.append(p)
+
+        # SSTI payloads (Jinja2 focus — most common server-side engine)
+        ssti_payloads = [
+            ("{{7*7}}", "49", "jinja2"),
+            ("{{7*'7'}}", "7777777", "jinja2"),
+            ("${7*7}", "49", "freemarker"),
+            ("<%= 7*7 %>", "49", "erb"),
+            ("#{7*7}", "49", "ruby"),
+        ]
+
+        # Get baseline (no injection) for false positive check
+        baseline_text = ""
+        try:
+            async with aiohttp.ClientSession() as session:
+                headers = {**auth_headers, "Content-Type": "application/json"}
+                # Try GET baseline first
+                async with session.get(url, headers=auth_headers, timeout=aiohttp.ClientTimeout(total=8), ssl=False) as resp:
+                    baseline_text = await resp.text()
+        except Exception:
+            pass
+
+        # Phase 1: Discover which body params the endpoint accepts
+        # Try POST with each payload on each body param
+        for template_payload, expected_result, engine_name in ssti_payloads:
+            for body_param in body_params[:5]:  # Cap at 5 params
+                # Build JSON body — include required fields for common patterns
+                json_body = {body_param: template_payload}
+                # Common required companion fields
+                if body_param == 'body':
+                    json_body['subject'] = 'Test'
+                elif body_param == 'content':
+                    json_body['title'] = 'Test'
+
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        headers = {**auth_headers, "Content-Type": "application/json"}
+                        async with session.post(
+                            url, json=json_body, headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=10), ssl=False
+                        ) as resp:
+                            status = resp.status
+                            response_text = await resp.text()
+
+                            if status in (401, 403):
+                                # Need auth or current token is invalid — try waiting for (better) JWT
+                                fresh_headers = await self._wait_for_api_ssti_auth()
+                                if fresh_headers:
+                                    auth_headers = fresh_headers
+                                    self._auth_headers = fresh_headers
+                                    # Retry with (fresh) auth
+                                    retry_headers = {**auth_headers, "Content-Type": "application/json"}
+                                    async with session.post(
+                                        url, json=json_body, headers=retry_headers,
+                                        timeout=aiohttp.ClientTimeout(total=10), ssl=False
+                                    ) as retry_resp:
+                                        status = retry_resp.status
+                                        response_text = await retry_resp.text()
+
+                            if status >= 400:
+                                continue
+
+                            # Check for template evaluation
+                            if expected_result in response_text and expected_result not in baseline_text:
+                                # Verify it's not just reflection
+                                if template_payload not in response_text or "7*7" not in response_text:
+                                    logger.info(f"[{self.name}] 🚨 API SSTI CONFIRMED: {url} param={body_param} engine={engine_name}")
+                                    finding = self._create_finding(body_param, template_payload, "API_POST_SSTI", verified_url=url)
+                                    finding.template_engine = engine_name
+                                    finding.engine_type = "server-side"
+                                    finding.evidence = {
+                                        "method": "api_post_ssti",
+                                        "proof": f"POST {body_param}={template_payload} → response contains '{expected_result}'",
+                                        "status": "VALIDATED_CONFIRMED",
+                                        "level": "API_SSTI",
+                                        "engine": engine_name,
+                                        "http_method": "POST",
+                                        "body_param": body_param,
+                                    }
+                                    finding.successful_payloads = [template_payload]
+                                    return finding
+
+                except aiohttp.ClientError:
+                    continue
+                except Exception as e:
+                    logger.debug(f"[{self.name}] API SSTI test error: {e}")
+                    continue
+
+        return None
+
+    async def _wait_for_api_ssti_auth(self, max_wait: int = 180) -> Dict:
+        """Poll for JWT token from JWTAgent for API SSTI testing."""
+        try:
+            from bugtrace.services.scan_context import get_scan_auth_headers
+            # Check immediately first (token may already be available)
+            headers = get_scan_auth_headers(self._scan_context, role="admin")
+            if headers:
+                return headers
+            for wait_round in range(max_wait // 5):
+                await asyncio.sleep(5)
+                headers = get_scan_auth_headers(self._scan_context, role="admin")
+                if headers:
+                    logger.info(f"[{self.name}] JWT token appeared after {(wait_round + 1) * 5}s wait for API SSTI")
+                    return headers
+        except Exception:
+            pass
+        return {}
 
     def _check_csti_confirmed(self, payload: str, response_html: str, baseline_html: str) -> Tuple[bool, Dict]:
         """

@@ -184,8 +184,8 @@ class MassAssignmentAgent(BaseAgent, TechContextMixin):
 
         vulns_count = len([r for r in results if r and r.get("validated")]) if results else 0
 
-        if results:
-            await self._generate_specialist_report(results)
+        # Always generate report (even 0 vulns documents what was tested)
+        await self._generate_specialist_report(results or [])
 
         report_specialist_done(
             self.name,
