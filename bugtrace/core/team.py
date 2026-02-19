@@ -2869,6 +2869,47 @@ class TeamOrchestrator:
             "pending_at_timeout": total_pending
         }
 
+    async def _auto_pause_and_wait(self, reason: str, dashboard) -> bool:
+        """Auto-pause scan via ScanContext and block until user resumes or stops.
+
+        Uses ScanContext (connected to the API pause/resume endpoints) instead of
+        PipelineLifecycle, which is designed for phase-boundary pauses only.
+
+        Returns:
+            True if user stopped the scan (caller should abort).
+            False if user resumed the scan (caller should continue).
+        """
+        from bugtrace.schemas.db_models import ScanStatus
+        from bugtrace.core.conductor import conductor
+
+        scan_ctx = getattr(self, '_scan_context', None)
+        if scan_ctx is None:
+            logger.warning("[DAST] No scan context — cannot auto-pause")
+            return False
+
+        # 1. Pause: set scan status, update DB, clear resume event
+        scan_ctx.request_pause()
+        self.db.update_scan_status(self.scan_id, ScanStatus.PAUSED)
+        logger.critical(f"[DAST] {reason}")
+        dashboard.log(f"⏸ {reason}", "CRITICAL")
+        conductor.notify_log("CRITICAL", f"[DAST] {reason}")
+
+        # 2. Block until user resumes or stops
+        logger.info("[DAST] Scan paused — waiting for resume or stop...")
+        dashboard.log("⏸ Scan paused. Resume when target is available.", "WARNING")
+        await scan_ctx.wait_if_paused()
+
+        # 3. Check if user stopped instead of resumed
+        if scan_ctx.stop_event.is_set():
+            logger.info("[DAST] Scan was stopped while paused.")
+            dashboard.log("⏹ Scan stopped by user.", "WARNING")
+            return True
+
+        # 4. Resumed — DB already updated to RUNNING by scan_service.resume_scan()
+        logger.info("[DAST] Pipeline resumed. Retrying timed-out URLs.")
+        dashboard.log("▶ Scan resumed. Retrying timed-out URLs.", "INFO")
+        return False
+
     async def _phase_2_batch_dast(self, dashboard, analysis_dir, recon_dir=None) -> Dict[str, list]:
         """Run Phase 2: DISCOVERY - Parallel execution of DAST + Reconnaissance.
 
@@ -2887,6 +2928,11 @@ class TeamOrchestrator:
         max_retries = getattr(settings, 'DAST_MAX_RETRIES', 5)
         completed_count = {"value": 0}
 
+        # Circuit breaker: auto-pause on excessive timeouts (target may be down)
+        timeout_tracker = {"consecutive": 0, "total": 0, "auto_paused": False, "pause_reason": ""}
+        consecutive_limit = getattr(settings, 'DAST_CONSECUTIVE_TIMEOUT_LIMIT', 5)
+        percent_limit = getattr(settings, 'DAST_TIMEOUT_PERCENT_LIMIT', 50)
+
         # Build index: url_index (1-based) → url
         url_index_map = {idx + 1: url for idx, url in enumerate(self.urls_to_scan)}
 
@@ -2897,7 +2943,16 @@ class TeamOrchestrator:
 
             async def _bounded_analyze(url_index: int) -> tuple:
                 url = url_index_map[url_index]
+
+                # Circuit breaker: skip remaining URLs if auto-paused
+                if timeout_tracker["auto_paused"]:
+                    return (url, [])
+
                 async with semaphore:
+                    # Re-check after acquiring semaphore (may have been set while waiting)
+                    if timeout_tracker["auto_paused"]:
+                        return (url, [])
+
                     logger.info(f"[DAST] ▶ Starting: {url[:60]}")
                     conductor.notify_log("INFO", f"[DAST] Analyzing URL {url_index}/{total_urls}: {url[:80]}")
 
@@ -2911,9 +2966,24 @@ class TeamOrchestrator:
                     try:
                         result = await asyncio.wait_for(dast.run(), timeout=analysis_timeout)
                         vulns = result.get("vulnerabilities", [])
+                        timeout_tracker["consecutive"] = 0  # Reset on success
                     except asyncio.TimeoutError:
                         logger.warning(f"[DAST] Analysis timed out after {analysis_timeout}s: {url[:50]}...")
                         vulns = []
+                        timeout_tracker["consecutive"] += 1
+                        timeout_tracker["total"] += 1
+
+                        # Check circuit breaker thresholds
+                        pct = (timeout_tracker["total"] / total_urls) * 100 if total_urls > 0 else 0
+                        if (not timeout_tracker["auto_paused"]
+                                and (timeout_tracker["consecutive"] >= consecutive_limit
+                                     or pct >= percent_limit)):
+                            timeout_tracker["auto_paused"] = True
+                            timeout_tracker["pause_reason"] = (
+                                f"Auto-paused: {timeout_tracker['consecutive']} consecutive timeouts "
+                                f"({timeout_tracker['total']}/{total_urls} total, {pct:.0f}%). "
+                                f"Target may be down."
+                            )
                     except Exception as e:
                         logger.error(f"[DAST] Analysis failed for {url[:50]}: {e}")
                         vulns = []
@@ -3087,8 +3157,15 @@ class TeamOrchestrator:
             vulnerabilities_by_url[url] = vulns
             self.processed_urls.add(url)
 
+        # ========== CIRCUIT BREAKER: Auto-pause if too many timeouts ==========
+        scan_stopped = False
+        if timeout_tracker["auto_paused"]:
+            scan_stopped = await self._auto_pause_and_wait(
+                timeout_tracker["pause_reason"], dashboard
+            )
+
         # ========== RETRY LOOP: Missing URLs with Adaptive Concurrency ==========
-        missing_indices = _get_missing_indices()
+        missing_indices = _get_missing_indices() if not scan_stopped else []
 
         if missing_indices:
             logger.warning(
@@ -3101,6 +3178,13 @@ class TeamOrchestrator:
             )
 
         for retry_round in range(1, max_retries + 1):
+            if scan_stopped:
+                break
+
+            # Reset circuit breaker for this retry round
+            timeout_tracker["auto_paused"] = False
+            timeout_tracker["consecutive"] = 0
+
             missing_indices = _get_missing_indices()
             if not missing_indices:
                 break
@@ -3137,6 +3221,14 @@ class TeamOrchestrator:
                 url, vulns = result
                 vulnerabilities_by_url[url] = vulns
                 self.processed_urls.add(url)
+
+            # Circuit breaker triggered during retry — pause and wait for resume
+            if timeout_tracker["auto_paused"]:
+                scan_stopped = await self._auto_pause_and_wait(
+                    timeout_tracker["pause_reason"], dashboard
+                )
+                if scan_stopped:
+                    break  # User stopped the scan instead of resuming
 
         # ========== FINAL CHECK: Pipeline gate ==========
         final_missing = _get_missing_indices()

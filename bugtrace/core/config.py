@@ -117,6 +117,8 @@ class Settings(BaseSettings):
     # --- DAST Analysis Timeout (Phase 38: v3.2) ---
     DAST_ANALYSIS_TIMEOUT: float = 180.0  # Seconds per URL analysis (probes + LLM)
     DAST_MAX_RETRIES: int = 5  # Max retry rounds for URLs missing dastysast JSON (pipeline stops if still missing)
+    DAST_CONSECUTIVE_TIMEOUT_LIMIT: int = 5  # Auto-pause after N consecutive timeouts (target may be down)
+    DAST_TIMEOUT_PERCENT_LIMIT: int = 50  # Auto-pause if >N% of URLs timeout (target unreliable)
 
     # --- ThinkingConsolidationAgent settings (Phase 18: v2.3) ---
     THINKING_MODE: str = "streaming"  # "streaming" | "batch"
@@ -437,6 +439,10 @@ class Settings(BaseSettings):
             self.DAST_ANALYSIS_TIMEOUT = section.getfloat("DAST_ANALYSIS_TIMEOUT")
         if "DAST_MAX_RETRIES" in section:
             self.DAST_MAX_RETRIES = section.getint("DAST_MAX_RETRIES")
+        if "DAST_CONSECUTIVE_TIMEOUT_LIMIT" in section:
+            self.DAST_CONSECUTIVE_TIMEOUT_LIMIT = section.getint("DAST_CONSECUTIVE_TIMEOUT_LIMIT")
+        if "DAST_TIMEOUT_PERCENT_LIMIT" in section:
+            self.DAST_TIMEOUT_PERCENT_LIMIT = section.getint("DAST_TIMEOUT_PERCENT_LIMIT")
         # NOTE: MAX_CONCURRENT_VALIDATION is NOT loaded from config
         # CDP client only supports 1 concurrent session - hardcoded in defaults
 
