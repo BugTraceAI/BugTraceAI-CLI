@@ -2870,14 +2870,21 @@ class TeamOrchestrator:
         }
 
     async def _auto_pause_and_wait(self, reason: str, dashboard) -> bool:
-        """Auto-pause scan via ScanContext and block until user resumes or stops.
+        """Auto-pause scan and wait for manual resume, stop, or auto-resume after delay.
 
         Uses ScanContext (connected to the API pause/resume endpoints) instead of
         PipelineLifecycle, which is designed for phase-boundary pauses only.
 
+        Behavior:
+            - Pauses the scan and updates DB to PAUSED.
+            - Waits up to DAST_AUTO_RESUME_DELAY seconds (default 300 = 5 min).
+            - If user resumes manually → continues immediately.
+            - If user stops → returns True (caller should abort).
+            - If timeout expires → auto-resumes and continues.
+
         Returns:
             True if user stopped the scan (caller should abort).
-            False if user resumed the scan (caller should continue).
+            False if scan resumed (manually or auto).
         """
         from bugtrace.schemas.db_models import ScanStatus
         from bugtrace.core.conductor import conductor
@@ -2887,6 +2894,8 @@ class TeamOrchestrator:
             logger.warning("[DAST] No scan context — cannot auto-pause")
             return False
 
+        delay = getattr(settings, 'DAST_AUTO_RESUME_DELAY', 300)
+
         # 1. Pause: set scan status, update DB, clear resume event
         scan_ctx.request_pause()
         self.db.update_scan_status(self.scan_id, ScanStatus.PAUSED)
@@ -2894,19 +2903,29 @@ class TeamOrchestrator:
         dashboard.log(f"⏸ {reason}", "CRITICAL")
         conductor.notify_log("CRITICAL", f"[DAST] {reason}")
 
-        # 2. Block until user resumes or stops
-        logger.info("[DAST] Scan paused — waiting for resume or stop...")
-        dashboard.log("⏸ Scan paused. Resume when target is available.", "WARNING")
-        await scan_ctx.wait_if_paused()
+        # 2. Wait for manual resume/stop OR auto-resume after delay
+        mins = delay // 60
+        logger.info(f"[DAST] Scan paused — auto-resume in {mins}min (or resume/stop manually)...")
+        dashboard.log(f"⏸ Paused. Auto-resume in {mins}min or resume manually.", "WARNING")
 
-        # 3. Check if user stopped instead of resumed
+        try:
+            await asyncio.wait_for(scan_ctx._resume_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            # Auto-resume: nobody touched it in time
+            logger.info(f"[DAST] Auto-resuming after {mins}min pause.")
+            dashboard.log(f"▶ Auto-resuming after {mins}min pause.", "INFO")
+            scan_ctx.request_resume()
+            self.db.update_scan_status(self.scan_id, ScanStatus.RUNNING)
+            return False
+
+        # 3. Manual action — check if user stopped instead of resumed
         if scan_ctx.stop_event.is_set():
             logger.info("[DAST] Scan was stopped while paused.")
             dashboard.log("⏹ Scan stopped by user.", "WARNING")
             return True
 
-        # 4. Resumed — DB already updated to RUNNING by scan_service.resume_scan()
-        logger.info("[DAST] Pipeline resumed. Retrying timed-out URLs.")
+        # 4. Manual resume — DB already updated to RUNNING by scan_service.resume_scan()
+        logger.info("[DAST] Pipeline resumed manually. Retrying timed-out URLs.")
         dashboard.log("▶ Scan resumed. Retrying timed-out URLs.", "INFO")
         return False
 

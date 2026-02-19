@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     """
     # --- Project Metadata ---
     APP_NAME: str = "BugtraceAI-CLI"
-    VERSION: str = "2.0.0"  # Phoenix Edition
+    VERSION: str = "2.0.1"  # Phoenix Edition
     DEBUG: bool = False
     SAFE_MODE: bool = False # Default to False, override via CLI
 
@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     
     MIN_CREDITS: float = 2.0
     MAX_CONCURRENT_REQUESTS: int = 1
-    LLM_REQUEST_TIMEOUT: float = 120.0  # Seconds to wait for LLM API response (prevent indefinite hang)
+    LLM_REQUEST_TIMEOUT: float = 30.0  # Seconds to wait for LLM API response (fail fast on slow models)
 
     # Model for skeptical analysis in DASTySAST agent
     SKEPTICAL_MODEL: str = "moonshotai/kimi-k2-thinking"
@@ -115,10 +115,11 @@ class Settings(BaseSettings):
     FP_EVIDENCE_WEIGHT: float = 0.3  # Weight of evidence quality in fp_confidence calc
 
     # --- DAST Analysis Timeout (Phase 38: v3.2) ---
-    DAST_ANALYSIS_TIMEOUT: float = 180.0  # Seconds per URL analysis (probes + LLM)
+    DAST_ANALYSIS_TIMEOUT: float = 90.0  # Seconds per URL analysis (probes + LLM)
     DAST_MAX_RETRIES: int = 5  # Max retry rounds for URLs missing dastysast JSON (pipeline stops if still missing)
     DAST_CONSECUTIVE_TIMEOUT_LIMIT: int = 5  # Auto-pause after N consecutive timeouts (target may be down)
-    DAST_TIMEOUT_PERCENT_LIMIT: int = 50  # Auto-pause if >N% of URLs timeout (target unreliable)
+    DAST_TIMEOUT_PERCENT_LIMIT: int = 75  # Auto-pause if >N% of URLs timeout (target unreliable)
+    DAST_AUTO_RESUME_DELAY: int = 300  # Seconds to wait before auto-resuming after pause (0 = wait forever)
 
     # --- ThinkingConsolidationAgent settings (Phase 18: v2.3) ---
     THINKING_MODE: str = "streaming"  # "streaming" | "batch"
@@ -443,6 +444,8 @@ class Settings(BaseSettings):
             self.DAST_CONSECUTIVE_TIMEOUT_LIMIT = section.getint("DAST_CONSECUTIVE_TIMEOUT_LIMIT")
         if "DAST_TIMEOUT_PERCENT_LIMIT" in section:
             self.DAST_TIMEOUT_PERCENT_LIMIT = section.getint("DAST_TIMEOUT_PERCENT_LIMIT")
+        if "DAST_AUTO_RESUME_DELAY" in section:
+            self.DAST_AUTO_RESUME_DELAY = section.getint("DAST_AUTO_RESUME_DELAY")
         # NOTE: MAX_CONCURRENT_VALIDATION is NOT loaded from config
         # CDP client only supports 1 concurrent session - hardcoded in defaults
 
