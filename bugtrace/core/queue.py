@@ -185,13 +185,32 @@ class SpecialistQueue:
         self._check_file_event = asyncio.Event()
 
     def enable_file_mode(self, file_path: Path):
-        """Enable file-based mode: tail file and disable manual enqueue."""
+        """Enable file-based mode: tail file and disable manual enqueue.
+
+        If already in file mode (e.g., from a previous scan), updates the file path
+        and restarts the tailer to watch the new scan's WET directory.
+        """
         if self._file_mode:
+            # Multi-scan support: update path and restart tailer for new scan directory
+            if self.file_path != file_path:
+                logger.info(f"Queue '{self.name}' switching file mode: {self.file_path} -> {file_path}")
+                self.file_path = file_path
+                # Cancel old tailer and start new one
+                if self._tail_task and not self._tail_task.done():
+                    self._tail_task.cancel()
+                # Drain any stale items from previous scan
+                while not self._queue.empty():
+                    try:
+                        self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                loop = asyncio.get_event_loop()
+                self._tail_task = loop.create_task(self._tail_file_loop())
             return
         self._file_mode = True
         self.file_path = file_path
         logger.info(f"Queue '{self.name}' enabled file mode: {file_path}")
-        
+
         # Start background tailing task
         loop = asyncio.get_event_loop()
         self._tail_task = loop.create_task(self._tail_file_loop())
