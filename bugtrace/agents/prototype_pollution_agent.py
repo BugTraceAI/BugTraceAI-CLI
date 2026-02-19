@@ -1417,10 +1417,15 @@ Return ONLY unique findings in JSON format:
                 probe_url = f"{test_url}{suffix}"
                 try:
                     async with browser_manager.get_page() as page:
-                        await page.goto(probe_url, wait_until="networkidle", timeout=10000)
-                        # Wait a bit for DOMContentLoaded handlers to complete
-                        await page.wait_for_timeout(500)
-                        result = await page.evaluate("(() => { try { return ({}).btCSPP === '1'; } catch(e) { return false; } })()")
+                        await page.goto(probe_url, wait_until="load", timeout=15000)
+                        # Wait for SPA to mount and execute legacy scripts (e.g., deepMerge in custom.js)
+                        await page.wait_for_timeout(1500)
+                        pp_check_js = "(() => { try { return ({}).btCSPP === '1'; } catch(e) { return false; } })()"
+                        result = await page.evaluate(pp_check_js)
+                        if not result:
+                            # Retry with longer wait — some SPAs need more time to execute all scripts
+                            await page.wait_for_timeout(3000)
+                            result = await page.evaluate(pp_check_js)
                         if result:
                             logger.info(f"[{self.name}] Client-side PP CONFIRMED on {test_url} via: {suffix[:60]}")
                             self._client_side_pp_confirmed = True

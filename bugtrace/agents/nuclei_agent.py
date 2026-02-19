@@ -153,21 +153,32 @@ class NucleiAgent(BaseAgent):
 
             # FIX (2026-02-06): HTML parsing fallback for framework detection
             # FIX (2026-02-17): Also check recon URLs (frameworks may only load on subpages)
-            if not tech_profile["frameworks"] and html_content:
+            # FIX (2026-02-19): Check for frontend JS frameworks specifically — GraphQL/API
+            # detections (e.g. "Graphql Strawberry Detect") don't count as frontend frameworks
+            _js_fw_names = ('angular', 'react', 'vue', 'jquery', 'backbone', 'ember', 'svelte')
+            has_js_fw = any(
+                any(fw in f.lower() for fw in _js_fw_names)
+                for f in tech_profile["frameworks"]
+            )
+            if not has_js_fw and html_content:
                 logger.info(f"[{self.name}] No frameworks detected by Nuclei - trying HTML fallback")
                 detected_frameworks = self._detect_frameworks_from_html(html_content)
                 if detected_frameworks:
-                    tech_profile["frameworks"] = detected_frameworks
+                    tech_profile["frameworks"].extend(detected_frameworks)
                     dashboard.log(
                         f"[{self.name}] ✅ HTML Fallback: Detected {', '.join(detected_frameworks)}",
                         "SUCCESS"
                     )
 
-            # If still no frameworks, check a sample of recon URLs
-            if not tech_profile["frameworks"]:
+            # If still no JS frameworks, check a sample of recon URLs
+            has_js_fw = any(
+                any(fw in f.lower() for fw in _js_fw_names)
+                for f in tech_profile["frameworks"]
+            )
+            if not has_js_fw:
                 recon_frameworks = await self._detect_frameworks_from_recon_urls()
                 if recon_frameworks:
-                    tech_profile["frameworks"] = recon_frameworks
+                    tech_profile["frameworks"].extend(recon_frameworks)
                     dashboard.log(
                         f"[{self.name}] ✅ Recon Fallback: Detected {', '.join(recon_frameworks)}",
                         "SUCCESS"
@@ -419,6 +430,14 @@ class NucleiAgent(BaseAgent):
                 frameworks.append('React')
                 logger.info(f"[{self.name}] 🎯 Detected React from HTML (pattern: {pattern})")
                 break
+        else:
+            # Modern React SPA detection (Vite/webpack/CRA bundled apps)
+            # Pattern: <div id="root"></div> + <script type="module"> = React SPA
+            has_root_div = bool(re.search(r'<div\s+id=["\']root["\']', html_lower))
+            has_module_script = bool(re.search(r'<script\s+type=["\']module["\']', html_lower))
+            if has_root_div and has_module_script:
+                frameworks.append('React')
+                logger.info(f"[{self.name}] 🎯 Detected React SPA from HTML (div#root + module script)")
 
         return frameworks
 

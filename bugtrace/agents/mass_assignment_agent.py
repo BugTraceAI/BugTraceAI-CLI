@@ -58,9 +58,9 @@ PRIVILEGE_FIELDS = {
     "accessLevel": 999,
 
     # Financial manipulation
-    "price": 0,
-    "total": 0,
-    "amount": 0,
+    "price": 0.01,
+    "total": 0.01,
+    "amount": 0.01,
     "discount": 100,
     "balance": 999999,
 
