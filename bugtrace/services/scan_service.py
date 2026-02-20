@@ -200,6 +200,9 @@ class ScanService:
         # Create and configure orchestrator
         orchestrator = self._create_orchestrator(ctx, output_dir)
 
+        # Setup auth tokens (Level 1: pass-through, Level 2: auto-login)
+        await self._setup_auth_tokens(ctx.options, orchestrator.scan_context)
+
         # Execute scan
         logger.info(f"Scan {scan_id} starting TeamOrchestrator")
         await orchestrator.start()
@@ -236,6 +239,101 @@ class ScanService:
         orchestrator._scan_context = ctx
 
         return orchestrator
+
+    async def _setup_auth_tokens(self, options: ScanOptions, scan_ctx_id: str):
+        """
+        Setup authentication tokens before scan starts.
+
+        Level 1: auth_token provided directly → store as-is.
+        Level 2: auth.login_url + auth.credentials → POST to login, extract JWT.
+        """
+        from bugtrace.services.scan_context import store_auth_token
+
+        # Level 1: Direct token pass-through
+        if options.auth_token:
+            store_auth_token(scan_ctx_id, "api_provided", options.auth_token)
+            logger.info(f"Auth Level 1: Stored provided Bearer token for scan")
+            return
+
+        # Level 2: Auto-login with credentials
+        if options.auth and isinstance(options.auth, dict):
+            login_url = options.auth.get("login_url", "")
+            credentials = options.auth.get("credentials", {})
+
+            if not login_url or not credentials:
+                logger.warning("Auth Level 2: Missing login_url or credentials, skipping")
+                return
+
+            # Resolve relative login_url against target
+            if login_url.startswith("/"):
+                login_url = options.target_url.rstrip("/") + login_url
+
+            logger.info(f"Auth Level 2: Attempting login at {login_url}")
+
+            try:
+                import httpx
+                async with httpx.AsyncClient(verify=False, timeout=15) as client:
+                    resp = await client.post(login_url, json=credentials)
+
+                    if resp.status_code not in (200, 201):
+                        logger.warning(
+                            f"Auth Level 2: Login failed (HTTP {resp.status_code})"
+                        )
+                        return
+
+                    # Extract JWT from response
+                    token = self._extract_jwt_from_response(resp)
+                    if token:
+                        store_auth_token(scan_ctx_id, "auto_login", token)
+                        logger.info("Auth Level 2: JWT extracted and stored from login response")
+                    else:
+                        logger.warning("Auth Level 2: Login succeeded but no JWT found in response")
+
+            except Exception as e:
+                logger.error(f"Auth Level 2: Login request failed: {e}")
+
+    @staticmethod
+    def _extract_jwt_from_response(resp) -> Optional[str]:
+        """Extract JWT token from an HTTP login response."""
+        import re
+        jwt_pattern = re.compile(
+            r'(eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]*)'
+        )
+
+        # Try JSON body first
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                for key in ("access_token", "token", "jwt", "auth_token", "id_token",
+                            "accessToken", "authToken", "idToken"):
+                    val = body.get(key, "")
+                    if val and jwt_pattern.match(val):
+                        return val
+                # Check nested: body.data.token, body.user.token, etc.
+                for outer_key in ("data", "user", "result", "response"):
+                    nested = body.get(outer_key, {})
+                    if isinstance(nested, dict):
+                        for key in ("access_token", "token", "jwt"):
+                            val = nested.get(key, "")
+                            if val and jwt_pattern.match(val):
+                                return val
+        except Exception:
+            pass
+
+        # Fallback: regex scan on raw text
+        text = resp.text
+        match = jwt_pattern.search(text)
+        if match:
+            return match.group(1)
+
+        # Check Authorization header in response (some APIs echo it)
+        auth_header = resp.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+            if jwt_pattern.match(token):
+                return token
+
+        return None
 
     async def _mark_scan_completed(self, ctx: ScanContext):
         """Mark scan as completed with success event."""

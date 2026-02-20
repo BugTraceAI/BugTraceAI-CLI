@@ -1449,6 +1449,9 @@ class TeamOrchestrator:
         )
         auth_results = await auth_agent.run()
 
+        # Inject pre-loaded auth tokens (from Level 1/2) into results so JWTAgent can test them
+        auth_results = self._inject_preloaded_tokens(auth_results, auth_discovery_dir)
+
         self._v.emit("recon.auth.completed", {
             "jwts_found": len(auth_results['jwts']),
             "cookies_found": len(auth_results['cookies']),
@@ -1457,6 +1460,54 @@ class TeamOrchestrator:
             f"[AuthDiscovery] Found {len(auth_results['jwts'])} JWTs, "
             f"{len(auth_results['cookies'])} cookies"
         )
+        return auth_results
+
+    def _inject_preloaded_tokens(self, auth_results: Dict, auth_discovery_dir: Path) -> Dict:
+        """Inject pre-loaded auth tokens (Level 1/2) into AuthDiscovery results.
+
+        If ScanService stored a JWT via _setup_auth_tokens(), inject it here
+        so Phase 3 routes it to JWTAgent for secret cracking/algorithm testing.
+        """
+        from bugtrace.services.scan_context import get_scan_auth_headers
+
+        headers = get_scan_auth_headers(self.scan_context)
+        if not headers:
+            return auth_results
+
+        token = headers.get("Authorization", "").replace("Bearer ", "").strip()
+        if not token or not token.startswith("eyJ"):
+            return auth_results
+
+        # Check if this JWT is already in results (avoid duplicates)
+        existing_tokens = {j.get("token") for j in auth_results.get("jwts", [])}
+        if token in existing_tokens:
+            return auth_results
+
+        # Inject as a discovered JWT
+        jwt_entry = {
+            "token": token,
+            "source": "api_provided",
+            "url": self.target,
+            "context": "scan_config",
+        }
+        auth_results["jwts"].append(jwt_entry)
+        logger.info("[AuthDiscovery] Injected pre-loaded auth token for JWTAgent testing")
+
+        # Update the jwts_discovered.json file so Phase 3 picks it up
+        jwt_file = auth_discovery_dir / "jwts_discovered.json"
+        try:
+            if jwt_file.exists():
+                with open(jwt_file, 'r') as f:
+                    data = json.load(f)
+            else:
+                data = {"jwts": [], "timestamp": datetime.now().isoformat()}
+
+            data["jwts"].append(jwt_entry)
+            with open(jwt_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to update jwts_discovered.json: {e}")
+
         return auth_results
 
     async def _run_asset_discovery(self, recon_dir: Path) -> Dict:

@@ -59,6 +59,8 @@ class ScanOptions(BaseModel):
     focused_agents: List[str] = []  # for --xss, --sqli etc.
     param: Optional[str] = None  # for focused mode parameter targeting
     scan_depth: str = ""  # empty = use settings.SCAN_DEPTH default
+    auth_token: Optional[str] = None  # Level 1: pre-authenticated Bearer token
+    auth: Optional[Dict[str, Any]] = None  # Level 2: {login_url, credentials: {email, password}}
 
 
 class ScanContext:

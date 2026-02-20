@@ -87,6 +87,8 @@ def _build_scan_options(request: CreateScanRequest) -> ScanOptions:
         use_vertical=request.use_vertical,
         focused_agents=request.focused_agents,
         param=request.param,
+        auth_token=request.auth_token,
+        auth=request.auth,
     )
 
 
