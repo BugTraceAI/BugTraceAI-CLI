@@ -148,14 +148,21 @@ class BrowserManager:
     async def capture_state(self, url: str) -> Dict[str, Any]:
         """Captures screenshot and HTML of the target URL."""
         from bugtrace.core.config import settings
-        
+
         async with self.get_page() as page:
             try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=settings.TIMEOUT_MS)
-                
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=settings.TIMEOUT_MS)
+                    logger.info(f"[capture_state] networkidle succeeded for {url[:50]}")
+                except Exception as ni_err:
+                    logger.warning(f"[capture_state] networkidle failed ({ni_err}), falling back to load+wait")
+                    await page.goto(url, wait_until="load", timeout=settings.TIMEOUT_MS)
+                    await page.wait_for_timeout(3000)
+
                 # Screenshot
                 screenshot_bytes = await page.screenshot(full_page=False)
                 html_content = await page.content()
+                logger.info(f"[capture_state] Captured {len(html_content)} chars from {url[:50]}")
                 
                 # Save screenshot temporarily for analysis
                 import uuid

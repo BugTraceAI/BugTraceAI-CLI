@@ -2050,6 +2050,50 @@ class TeamOrchestrator:
 
         return urls
 
+    def _dedup_url_patterns(self, urls: List[str]) -> List[str]:
+        """Collapse URLs with identical path patterns (e.g. /products/1 and /products/2).
+
+        Normalizes numeric IDs and UUIDs in path segments to a placeholder,
+        then keeps only the first URL per unique pattern. Query params are
+        preserved in the pattern so /products?cat=1 and /products?search=x
+        remain separate.
+        """
+        import re
+        UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+
+        def normalize_path(url: str) -> str:
+            parsed = urlparse(url)
+            segments = parsed.path.rstrip('/').split('/')
+            normalized = []
+            for seg in segments:
+                if seg.isdigit():
+                    normalized.append(':id')
+                elif UUID_RE.match(seg):
+                    normalized.append(':uuid')
+                else:
+                    normalized.append(seg)
+            # Include sorted query param NAMES (not values) in pattern
+            params = sorted(parse_qs(parsed.query).keys())
+            return '/'.join(normalized) + '?' + '&'.join(params) if params else '/'.join(normalized)
+
+        seen_patterns = {}
+        deduped = []
+        for url in urls:
+            pattern = normalize_path(url)
+            if pattern not in seen_patterns:
+                seen_patterns[pattern] = url
+                deduped.append(url)
+
+        removed = len(urls) - len(deduped)
+        if removed > 0:
+            logger.info(f"[URL Pattern Dedup] {len(urls)} → {len(deduped)} URLs ({removed} pattern duplicates removed)")
+            for pattern, url in seen_patterns.items():
+                logger.debug(f"  Pattern: {pattern} → {url[:80]}")
+        else:
+            logger.info(f"[URL Pattern Dedup] {len(urls)} URLs, no pattern duplicates found")
+
+        return deduped
+
     def _prioritize_urls(self, urls: list) -> list:
         """Prioritize URLs by risk score (high-value targets first)."""
         from bugtrace.core.url_prioritizer import prioritize_urls
@@ -2540,6 +2584,10 @@ class TeamOrchestrator:
             logger.info(f"Enforcing MAX_URLS={self.max_urls} after enrichment: Trimming {len(self.urls_to_scan)} -> {self.max_urls} URLs")
             self.urls_to_scan = self.urls_to_scan[:self.max_urls]
 
+        # ========== URL PATTERN DEDUP (collapse /products/1, /products/2 → /products/1) ==========
+        if getattr(settings, 'URL_PATTERN_DEDUP', True):
+            self.urls_to_scan = self._dedup_url_patterns(self.urls_to_scan)
+
         # ========== LONEWOLF: Fire and forget ==========
         if settings.LONEWOLF_ENABLED:
             from bugtrace.agents.lone_wolf import LoneWolf
@@ -2572,23 +2620,23 @@ class TeamOrchestrator:
             {'urls_count': urls_count},
             {'dast_reports_count': reports_generated, 'errors': errors_count})
 
-        # PIPELINE GATE: Stop before STRATEGY if not all URLs have JSON files
+        # PIPELINE GATE: Warn if not all URLs have JSON files, but continue
+        # Nuclei findings and other data are still valid even if DAST failed on some URLs
         if errors_count > 0:
-            dashboard.log(
-                f"❌ PIPELINE STOPPED: {errors_count}/{urls_count} URLs missing dastysast JSON after retries. "
-                f"Cannot proceed to STRATEGY with incomplete data.",
-                "CRITICAL"
+            if reports_generated == 0:
+                dashboard.log(
+                    f"⚠ All {urls_count} URLs failed DAST analysis — continuing with Nuclei findings only",
+                    "WARNING"
+                )
+            else:
+                dashboard.log(
+                    f"⚠ {errors_count}/{urls_count} URLs missing DAST JSON — continuing with {reports_generated} reports",
+                    "WARNING"
+                )
+            logger.warning(
+                f"[Pipeline] {errors_count}/{urls_count} URLs have no dastysast JSON. "
+                f"Reports generated: {reports_generated}. Continuing to STRATEGY..."
             )
-            logger.error(
-                f"[Pipeline] HALTED before STRATEGY: {errors_count}/{urls_count} URLs have no dastysast JSON. "
-                f"Reports generated: {reports_generated}"
-            )
-            conductor.notify_phase_change("discovery", 1.0, f"FAILED: {errors_count} URLs missing")
-            await self._lifecycle.signal_phase_complete(
-                PipelinePhase.DISCOVERY,
-                {'urls_analyzed': reports_generated, 'errors': errors_count, 'halted': True}
-            )
-            return
 
         # Signal DISCOVERY complete AFTER batch DAST finishes
         self._v.emit("discovery.completed", {"urls_analyzed": reports_generated, "urls_total": urls_count})
@@ -2993,8 +3041,10 @@ class TeamOrchestrator:
                         timeout_tracker["total"] += 1
 
                         # Check circuit breaker thresholds
+                        # Skip auto-pause for small scans (< 5 URLs) — not enough data points
                         pct = (timeout_tracker["total"] / total_urls) * 100 if total_urls > 0 else 0
                         if (not timeout_tracker["auto_paused"]
+                                and total_urls >= 5
                                 and (timeout_tracker["consecutive"] >= consecutive_limit
                                      or pct >= percent_limit)):
                             timeout_tracker["auto_paused"] = True

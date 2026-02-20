@@ -105,8 +105,8 @@ VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
     "authentication bypass": "jwt",
     "jwt_discovered": "jwt",  # NEW: From AuthDiscoveryAgent
 
-    # Session cookies (route to IDOR for authorization testing)
-    "session_cookie_discovered": "idor",  # NEW: From AuthDiscoveryAgent
+    # Session cookies — informational only (no specialist routing)
+    # "session_cookie_discovered": routed nowhere — AuthDiscoveryAgent logs it as recon
 
     # GraphQL vulnerabilities (route to API Security specialist)
     "graphql": "api_security",

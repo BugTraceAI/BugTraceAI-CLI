@@ -53,6 +53,7 @@ def extract_param_metadata(html: str, url: str) -> Dict[str, Dict[str, str]]:
         - url_query: Parameter in URL query string (always GET)
         - form_input: Parameter in HTML <form> (<input>, <textarea>, <select>)
         - anchor_href: Parameter in <a href="?param=val"> link (always GET)
+        - js_url_pattern: Parameter found in JavaScript URL construction (SPA discovery)
     """
     from bs4 import BeautifulSoup
 
@@ -135,6 +136,28 @@ def extract_param_metadata(html: str, url: str) -> Dict[str, Dict[str, str]]:
                         }
             except Exception:
                 continue
+
+        # 4. JavaScript URL construction patterns (SPA parameter discovery)
+        # Catches React/Vue/Angular SPAs that build URLs via JS instead of HTML forms.
+        # E.g., window.location.href = `/?search=${encodeURIComponent(term)}`
+        # These inputs often lack name= attributes, so sources 2-3 miss them.
+        _JS_PARAM_SKIP = frozenset({
+            "v", "ver", "version", "cb", "ts", "timestamp", "t", "hash",
+            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+            "fbclid", "gclid", "nonce", "lang", "locale", "charset", "encoding",
+        })
+        for match in re.finditer(r'[?&]([a-zA-Z_]\w{1,30})=', html):
+            param_name = match.group(1)
+            if param_name.lower() in _JS_PARAM_SKIP:
+                continue
+            if param_name not in metadata:
+                metadata[param_name] = {
+                    "method": "GET",
+                    "action_url": f"{base_origin}{parsed.path}",
+                    "enctype": "",
+                    "source": "js_url_pattern",
+                    "default_value": "",
+                }
 
     except Exception as e:
         logger.warning(f"[extract_param_metadata] HTML parsing failed: {e}")

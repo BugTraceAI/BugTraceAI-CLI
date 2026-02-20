@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     """
     # --- Project Metadata ---
     APP_NAME: str = "BugtraceAI-CLI"
-    VERSION: str = "2.0.1"  # Phoenix Edition
+    VERSION: str = "2.0.3"  # Phoenix Edition
     DEBUG: bool = False
     SAFE_MODE: bool = False # Default to False, override via CLI
 
@@ -44,9 +44,9 @@ class Settings(BaseSettings):
     GLM_API_KEY: Optional[str] = Field(default=None, min_length=20, description="GLM API key")
     
     # --- LLM Models ---
-    DEFAULT_MODEL: str = "moonshotai/kimi-k2-thinking"
-    CODE_MODEL: str = "moonshotai/kimi-k2-thinking"
-    ANALYSIS_MODEL: str = "moonshotai/kimi-k2-thinking"
+    DEFAULT_MODEL: str = "qwen/qwen3-coder"
+    CODE_MODEL: str = "qwen/qwen3-coder"
+    ANALYSIS_MODEL: str = "qwen/qwen3-coder"
     
     # --- AUTHORITY Configuration ---
     ENABLE_SELF_VALIDATION: bool = True
@@ -68,17 +68,17 @@ class Settings(BaseSettings):
     WAF_DETECTION_MODELS: str = ""
     
     # Model for payload mutation (DeepSeek has fewer safety restrictions)
-    MUTATION_MODEL: str = "deepseek/deepseek-v3.2"
+    MUTATION_MODEL: str = "x-ai/grok-4-fast"
     
     MIN_CREDITS: float = 2.0
     MAX_CONCURRENT_REQUESTS: int = 1
     LLM_REQUEST_TIMEOUT: float = 30.0  # Seconds to wait for LLM API response (fail fast on slow models)
 
     # Model for skeptical analysis in DASTySAST agent
-    SKEPTICAL_MODEL: str = "moonshotai/kimi-k2-thinking"
+    SKEPTICAL_MODEL: str = "qwen/qwen3-coder"
 
     # Model for reporting (PoC enrichment, CVSS scoring - needs uncensored analysis)
-    REPORTING_MODEL: str = "deepseek/deepseek-v3.2"
+    REPORTING_MODEL: str = "deepseek/deepseek-chat"
 
     # Batch PoC enrichment (Phase 6: grouped by vuln type)
     REPORTING_POC_BATCH_SIZE: int = 10       # Max findings per LLM call within a group
@@ -115,7 +115,7 @@ class Settings(BaseSettings):
     FP_EVIDENCE_WEIGHT: float = 0.3  # Weight of evidence quality in fp_confidence calc
 
     # --- DAST Analysis Timeout (Phase 38: v3.2) ---
-    DAST_ANALYSIS_TIMEOUT: float = 90.0  # Seconds per URL analysis (probes + LLM)
+    DAST_ANALYSIS_TIMEOUT: float = 180.0  # Seconds per URL analysis (probes + LLM)
     DAST_MAX_RETRIES: int = 5  # Max retry rounds for URLs missing dastysast JSON (pipeline stops if still missing)
     DAST_CONSECUTIVE_TIMEOUT_LIMIT: int = 5  # Auto-pause after N consecutive timeouts (target may be down)
     DAST_TIMEOUT_PERCENT_LIMIT: int = 75  # Auto-pause if >N% of URLs timeout (target unreliable)
@@ -309,9 +309,15 @@ class Settings(BaseSettings):
 
     # --- ANALYSIS Configuration (Multi-Model URL Analysis) ---
     ANALYSIS_ENABLE: bool = True
-    ANALYSIS_PENTESTER_MODEL: str = "moonshotai/kimi-k2-thinking"
-    ANALYSIS_BUG_BOUNTY_MODEL: str = "moonshotai/kimi-k2-thinking"
-    ANALYSIS_AUDITOR_MODEL: str = "moonshotai/kimi-k2-thinking"
+    ANALYSIS_APPROACH_PENTESTER: bool = True
+    ANALYSIS_APPROACH_BUG_BOUNTY: bool = True
+    ANALYSIS_APPROACH_CODE_AUDITOR: bool = True
+    ANALYSIS_APPROACH_RED_TEAM: bool = True
+    ANALYSIS_APPROACH_RESEARCHER: bool = True
+    APPROACH_MODE: str = "ALL"  # ALL = run all enabled, AUTO = wave-based (2+2, skip researcher)
+    ANALYSIS_PENTESTER_MODEL: str = "qwen/qwen3-coder"
+    ANALYSIS_BUG_BOUNTY_MODEL: str = "qwen/qwen3-coder"
+    ANALYSIS_AUDITOR_MODEL: str = "qwen/qwen3-coder"
     ANALYSIS_RED_TEAM_MODEL: str = "google/gemini-3-flash-preview"
     ANALYSIS_RESEARCHER_MODEL: str = "google/gemini-3-flash-preview"
     ANALYSIS_CONFIDENCE_THRESHOLD: float = 0.7
@@ -424,6 +430,8 @@ class Settings(BaseSettings):
             self.MAX_CONCURRENT_URL_AGENTS = config["SCAN"].getint("MAX_CONCURRENT_URL_AGENTS")
         if "GOSPIDER_NO_REDIRECT" in config["SCAN"]:
             self.GOSPIDER_NO_REDIRECT = config["SCAN"].getboolean("GOSPIDER_NO_REDIRECT")
+        if "URL_PATTERN_DEDUP" in config["SCAN"]:
+            self.URL_PATTERN_DEDUP = config["SCAN"].getboolean("URL_PATTERN_DEDUP")
 
     def _load_parallelization_config(self, config):
         """Load PARALLELIZATION section config for granular per-phase concurrency."""
@@ -584,27 +592,6 @@ class Settings(BaseSettings):
         if "TOKEN_FILE" in section:
             self.ANTHROPIC_TOKEN_FILE = section["TOKEN_FILE"].strip()
 
-    def _load_browser_advanced_config(self, config):
-        """Load BROWSER_ADVANCED section config."""
-        if "BROWSER_ADVANCED" not in config:
-            return
-        section = config["BROWSER_ADVANCED"]
-        if "USER_AGENT" in section:
-            self.USER_AGENT = section["USER_AGENT"]
-        if "VIEWPORT_WIDTH" in section:
-            self.VIEWPORT_WIDTH = section.getint("VIEWPORT_WIDTH")
-        if "VIEWPORT_HEIGHT" in section:
-            self.VIEWPORT_HEIGHT = section.getint("VIEWPORT_HEIGHT")
-        if "TIMEOUT_MS" in section:
-            self.TIMEOUT_MS = section.getint("TIMEOUT_MS")
-        if "DOM_CLICK_MAX_LINKS" in section:
-            self.DOM_CLICK_MAX_LINKS = section.getint("DOM_CLICK_MAX_LINKS")
-        if "DOM_CLICK_MAX_TEXT_LINKS" in section:
-            self.DOM_CLICK_MAX_TEXT_LINKS = section.getint("DOM_CLICK_MAX_TEXT_LINKS")
-        if "DOM_CLICK_WAIT_SEC" in section:
-            self.DOM_CLICK_WAIT_SEC = section.getfloat("DOM_CLICK_WAIT_SEC")
-        if "DOM_CLICK_INITIAL_WAIT_SEC" in section:
-            self.DOM_CLICK_INITIAL_WAIT_SEC = section.getfloat("DOM_CLICK_INITIAL_WAIT_SEC")
 
     def _load_validation_config(self, config):
         """Load VALIDATION section config for Vision-Based XSS Validation."""
@@ -694,6 +681,18 @@ class Settings(BaseSettings):
             section = config["ANALYSIS"]
             if "ENABLE_ANALYSIS" in section:
                 self.ANALYSIS_ENABLE = section.getboolean("ENABLE_ANALYSIS")
+            if "APPROACH_PENTESTER" in section:
+                self.ANALYSIS_APPROACH_PENTESTER = section.getboolean("APPROACH_PENTESTER")
+            if "APPROACH_BUG_BOUNTY" in section:
+                self.ANALYSIS_APPROACH_BUG_BOUNTY = section.getboolean("APPROACH_BUG_BOUNTY")
+            if "APPROACH_CODE_AUDITOR" in section:
+                self.ANALYSIS_APPROACH_CODE_AUDITOR = section.getboolean("APPROACH_CODE_AUDITOR")
+            if "APPROACH_RED_TEAM" in section:
+                self.ANALYSIS_APPROACH_RED_TEAM = section.getboolean("APPROACH_RED_TEAM")
+            if "APPROACH_RESEARCHER" in section:
+                self.ANALYSIS_APPROACH_RESEARCHER = section.getboolean("APPROACH_RESEARCHER")
+            if "APPROACH_MODE" in section:
+                self.APPROACH_MODE = section["APPROACH_MODE"].strip().upper()
             if "PENTESTER_MODEL" in section:
                 self.ANALYSIS_PENTESTER_MODEL = section["PENTESTER_MODEL"]
             if "BUG_BOUNTY_MODEL" in section:
@@ -710,10 +709,29 @@ class Settings(BaseSettings):
                 self.ANALYSIS_SKIP_THRESHOLD = section.getfloat("SKIP_THRESHOLD")
             if "CONSENSUS_VOTES" in section:
                 self.ANALYSIS_CONSENSUS_VOTES = section.getint("CONSENSUS_VOTES")
+            if "DAST_ANALYSIS_TIMEOUT" in section:
+                self.DAST_ANALYSIS_TIMEOUT = section.getfloat("DAST_ANALYSIS_TIMEOUT")
 
         if "BROWSER" in config:
-            if "HEADLESS" in config["BROWSER"]:
-                self.HEADLESS_BROWSER = config["BROWSER"].getboolean("HEADLESS")
+            section = config["BROWSER"]
+            if "HEADLESS" in section:
+                self.HEADLESS_BROWSER = section.getboolean("HEADLESS")
+            if "USER_AGENT" in section:
+                self.USER_AGENT = section["USER_AGENT"]
+            if "VIEWPORT_WIDTH" in section:
+                self.VIEWPORT_WIDTH = section.getint("VIEWPORT_WIDTH")
+            if "VIEWPORT_HEIGHT" in section:
+                self.VIEWPORT_HEIGHT = section.getint("VIEWPORT_HEIGHT")
+            if "TIMEOUT_MS" in section:
+                self.TIMEOUT_MS = section.getint("TIMEOUT_MS")
+            if "DOM_CLICK_MAX_LINKS" in section:
+                self.DOM_CLICK_MAX_LINKS = section.getint("DOM_CLICK_MAX_LINKS")
+            if "DOM_CLICK_MAX_TEXT_LINKS" in section:
+                self.DOM_CLICK_MAX_TEXT_LINKS = section.getint("DOM_CLICK_MAX_TEXT_LINKS")
+            if "DOM_CLICK_WAIT_SEC" in section:
+                self.DOM_CLICK_WAIT_SEC = section.getfloat("DOM_CLICK_WAIT_SEC")
+            if "DOM_CLICK_INITIAL_WAIT_SEC" in section:
+                self.DOM_CLICK_INITIAL_WAIT_SEC = section.getfloat("DOM_CLICK_INITIAL_WAIT_SEC")
 
         if "ADVANCED" in config:
             if "TRACING_ENABLED" in config["ADVANCED"]:
@@ -758,7 +776,6 @@ class Settings(BaseSettings):
         self._load_authority_config(config)
         self._load_lonewolf_config(config)
         self._load_anthropic_config(config)
-        self._load_browser_advanced_config(config)
         self._load_validation_config(config)
         self._load_qlearning_config(config)
         self._load_manipulator_config(config)
@@ -993,6 +1010,9 @@ class Settings(BaseSettings):
     ENABLE_COMMON_PATHS: bool = True
     MAX_SUBDOMAINS: int = 50
 
+    # --- URL Pattern Dedup ---
+    URL_PATTERN_DEDUP: bool = True  # Collapse /products/1, /products/2 → keep 1 per pattern
+
     # --- URL Prioritization (Phase 38: v3.0) ---
     URL_PRIORITIZATION_ENABLED: bool = True   # Enable/disable URL prioritization
     URL_PRIORITIZATION_LOG_SCORES: bool = True  # Log priority scores for each URL
@@ -1073,7 +1093,7 @@ class Settings(BaseSettings):
 
     # --- LONEWOLF Autonomous Agent Configuration ---
     LONEWOLF_ENABLED: bool = True            # Override via .conf [LONEWOLF] ENABLED
-    LONEWOLF_MODEL: str = "deepseek/deepseek-r1"  # LLM for reasoning
+    LONEWOLF_MODEL: str = "moonshotai/kimi-k2.5"  # LLM for reasoning
     LONEWOLF_RATE_LIMIT: float = 1.0       # HTTP requests per second
     LONEWOLF_MAX_CONTEXT: int = 20         # Sliding window size (actions remembered)
     LONEWOLF_RESPONSE_TRUNCATE: int = 2000 # Max chars kept from HTTP responses

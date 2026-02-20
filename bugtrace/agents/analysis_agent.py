@@ -33,9 +33,19 @@ class DASTySASTAgent(BaseAgent):
         self.scan_context = scan_context or f"scan_{id(self)}"  # Default scan context
         self.url_index = url_index  # URL index for numbered reports
 
-        # 6 different analysis approaches for maximum coverage
-        # 5 core LLM approaches + 1 skeptical approach for early FP elimination
-        self.approaches = ["pentester", "bug_bounty", "code_auditor", "red_team", "researcher", "skeptical_agent"]
+        # Core LLM approaches (each togglable via APPROACH_* in conf)
+        self.approach_mode = getattr(settings, "APPROACH_MODE", "ALL").upper()
+        approach_toggles = {
+            "pentester": settings.ANALYSIS_APPROACH_PENTESTER,
+            "bug_bounty": settings.ANALYSIS_APPROACH_BUG_BOUNTY,
+            "code_auditor": settings.ANALYSIS_APPROACH_CODE_AUDITOR,
+            "red_team": settings.ANALYSIS_APPROACH_RED_TEAM,
+            "researcher": settings.ANALYSIS_APPROACH_RESEARCHER,
+        }
+        self.approaches = [name for name, enabled in approach_toggles.items() if enabled]
+        if not self.approaches:
+            self.approaches = ["pentester"]  # Minimum 1 approach
+        self.approaches.append("skeptical_agent")  # Always runs last as reviewer
         self.model = getattr(settings, "ANALYSIS_PENTESTER_MODEL", None) or settings.DEFAULT_MODEL
         
     async def run_loop(self):
@@ -362,8 +372,30 @@ class DASTySASTAgent(BaseAgent):
                     seen.add(p)
                     unique_params.append(p)
 
+            # 5. JavaScript URL construction patterns (SPA parameter discovery)
+            # Catches React/Vue/Angular SPAs that build URLs via JS instead of forms.
+            # E.g., window.location.href = `/?search=${encodeURIComponent(term)}`
+            import re
+            _JS_PARAM_SKIP = frozenset({
+                "v", "ver", "version", "cb", "ts", "timestamp", "t", "hash",
+                "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+                "fbclid", "gclid", "nonce", "lang", "locale", "charset", "encoding",
+            })
+            js_count = 0
+            for match in re.finditer(r'[?&]([a-zA-Z_]\w{1,30})=', html):
+                param_name = match.group(1)
+                if param_name.lower() in _JS_PARAM_SKIP:
+                    continue
+                if param_name not in seen:
+                    seen.add(param_name)
+                    unique_params.append(param_name)
+                    js_count += 1
+                    logger.debug(f"[{self.name}] Found JS URL param: {param_name} (source=js_url_pattern)")
+            if js_count:
+                logger.info(f"[{self.name}] Extracted {js_count} params from JS URL patterns")
+
             if unique_params:
-                logger.info(f"[{self.name}] Extracted {len(unique_params)} params from HTML forms: {unique_params}")
+                logger.info(f"[{self.name}] Extracted {len(unique_params)} total params from HTML: {unique_params}")
 
             return unique_params
 
@@ -935,24 +967,20 @@ class DASTySASTAgent(BaseAgent):
             return False
 
     async def _run_execute_analyses(self, context: Dict) -> List[Dict]:
-        """Execute parallel analyses with all approaches."""
-        # Run 5 core approaches in parallel first
+        """Execute parallel analyses with all approaches.
+
+        Modes:
+            ALL  — Run all enabled approaches in parallel (default).
+            AUTO — Wave 1 (pentester + bug_bounty) first; if no findings,
+                   Wave 2 (code_auditor + red_team). Researcher skipped.
+                   SQLi/Cookie probes always run with Wave 1.
+        """
         core_approaches = [a for a in self.approaches if a != "skeptical_agent"]
-        self._v.emit("discovery.llm.started", {"url": self.url, "approaches": core_approaches})
-        tasks = [
-            self._analyze_with_approach(context, approach)
-            for approach in core_approaches
-        ]
 
-        # Add SQLi Probe Check (active testing for error-based SQLi)
-        tasks.append(self._check_sqli_probes())
-
-        # Add Cookie SQLi Probe Check (cookies need level=2 testing)
-        tasks.append(self._check_cookie_sqli_probes())
-
-        analyses = await asyncio.gather(*tasks, return_exceptions=True)
-        valid_analyses = [a for a in analyses if isinstance(a, dict) and not a.get("error")]
-        self._v.emit("discovery.llm.completed", {"url": self.url, "valid_analyses": len(valid_analyses), "total": len(analyses)})
+        if self.approach_mode == "AUTO":
+            valid_analyses = await self._run_auto_waves(context, core_approaches)
+        else:
+            valid_analyses = await self._run_all_approaches(context, core_approaches)
 
         # Run skeptical_agent AFTER to review findings from core approaches
         if "skeptical_agent" in self.approaches:
@@ -961,6 +989,59 @@ class DASTySASTAgent(BaseAgent):
                 valid_analyses.append(skeptical_result)
 
         return valid_analyses
+
+    async def _run_all_approaches(self, context: Dict, core_approaches: List[str]) -> List[Dict]:
+        """ALL mode: run every enabled approach + probes in parallel."""
+        self._v.emit("discovery.llm.started", {"url": self.url, "approaches": core_approaches})
+        tasks = [self._analyze_with_approach(context, a) for a in core_approaches]
+        tasks.append(self._check_sqli_probes())
+        tasks.append(self._check_cookie_sqli_probes())
+
+        analyses = await asyncio.gather(*tasks, return_exceptions=True)
+        valid = [a for a in analyses if isinstance(a, dict) and not a.get("error")]
+        self._v.emit("discovery.llm.completed", {"url": self.url, "valid_analyses": len(valid), "total": len(analyses)})
+        return valid
+
+    async def _run_auto_waves(self, context: Dict, core_approaches: List[str]) -> List[Dict]:
+        """AUTO mode: wave 1 first, wave 2 only if wave 1 found nothing."""
+        # Wave 1: high-yield approaches + probes (always run)
+        wave1_names = ["pentester", "bug_bounty"]
+        wave1 = [a for a in core_approaches if a in wave1_names]
+        if not wave1:
+            wave1 = core_approaches[:2]  # Fallback if those were disabled
+
+        self._v.emit("discovery.llm.started", {"url": self.url, "approaches": wave1, "mode": "AUTO/wave1"})
+        tasks = [self._analyze_with_approach(context, a) for a in wave1]
+        tasks.append(self._check_sqli_probes())
+        tasks.append(self._check_cookie_sqli_probes())
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        valid = [r for r in results if isinstance(r, dict) and not r.get("error")]
+        self._v.emit("discovery.llm.completed", {"url": self.url, "valid_analyses": len(valid), "total": len(results), "mode": "AUTO/wave1"})
+
+        # Check if wave 1 found any vulnerabilities
+        wave1_has_findings = any(
+            r.get("vulnerabilities") for r in valid if isinstance(r, dict)
+        )
+
+        if wave1_has_findings:
+            logger.info(f"[AUTO] Wave 1 found findings for {self.url[:50]}, skipping wave 2")
+            return valid
+
+        # Wave 2: deeper approaches (skip researcher — lowest yield)
+        wave2_names = ["code_auditor", "red_team"]
+        wave2 = [a for a in core_approaches if a in wave2_names and a not in wave1]
+        if not wave2:
+            return valid
+
+        logger.info(f"[AUTO] Wave 1 empty for {self.url[:50]}, launching wave 2: {wave2}")
+        self._v.emit("discovery.llm.started", {"url": self.url, "approaches": wave2, "mode": "AUTO/wave2"})
+        tasks2 = [self._analyze_with_approach(context, a) for a in wave2]
+        results2 = await asyncio.gather(*tasks2, return_exceptions=True)
+        valid2 = [r for r in results2 if isinstance(r, dict) and not r.get("error")]
+        self._v.emit("discovery.llm.completed", {"url": self.url, "valid_analyses": len(valid2), "total": len(results2), "mode": "AUTO/wave2"})
+
+        return valid + valid2
 
     def _deduplicate_vulnerabilities(self, vulns: List[Dict]) -> List[Dict]:
         """
@@ -1550,17 +1631,13 @@ class DASTySASTAgent(BaseAgent):
                 return {"vulnerabilities": []}
 
             parsed = urlparse(self.url)
-            # Test cookies against multiple paths since cookies are domain-wide
-            # and may only be processed by certain endpoints
-            test_paths = [
-                parsed.path,  # Current path
-                "/",          # Root
-                "/catalog",   # Common product page
-                "/api",       # API endpoint
-            ]
-            # Remove duplicates and empty paths
+            # Test cookies against current path + root only (avoid combinatorial explosion)
+            test_paths = [parsed.path, "/"]
             test_paths = list(dict.fromkeys([p for p in test_paths if p]))
             base_scheme_host = f"{parsed.scheme}://{parsed.netloc}"
+
+            import time as _time_budget
+            cookie_probe_deadline = _time_budget.time() + 90  # Max 90s for all cookie probes
 
             logger.debug(f"[Cookie SQLi Probe] Will test against {len(test_paths)} paths: {test_paths}")
 
@@ -1568,9 +1645,17 @@ class DASTySASTAgent(BaseAgent):
             async with orchestrator.session(DestinationType.TARGET) as session:
                 # Test each cookie against each path (cookies are domain-wide)
                 for test_path in test_paths:
+                    if _time_budget.time() > cookie_probe_deadline:
+                        logger.info(f"[Cookie SQLi Probe] Time budget exhausted, stopping paths")
+                        break
                     test_url = f"{base_scheme_host}{test_path}"
 
                     for cookie in cookies:
+                        # Time budget check — don't let cookie probes consume entire URL analysis
+                        if _time_budget.time() > cookie_probe_deadline:
+                            logger.info(f"[Cookie SQLi Probe] Time budget exhausted, stopping cookie probes")
+                            break
+
                         cookie_name = cookie.get("name", "")
                         cookie_value = cookie.get("value", "")
 
@@ -1672,72 +1757,89 @@ class DASTySASTAgent(BaseAgent):
                                 continue
 
                         # Time-based Blind SQLi Detection for Cookies
-                        # Only if error-based didn't find anything for this cookie
+                        # Differential confirmation: TRUE condition sleeps, FALSE doesn't.
+                        # This eliminates false positives from slow servers.
                         if not any(f.get("parameter") == f"Cookie: {cookie_name}" for f in findings):
                             import time as time_module
 
-                            sleep_payloads = [
-                                ("' AND SLEEP(3)--", "mysql", 2.5),
-                                ("' WAITFOR DELAY '0:0:3'--", "mssql", 2.5),
-                                ("'; SELECT pg_sleep(3);--", "postgresql", 2.5),
-                                ("' AND (SELECT * FROM (SELECT(SLEEP(3)))a)--", "mysql_subquery", 2.5),
-                                # SQLite has no SLEEP — use heavy computation instead
-                                ("' OR LENGTH(HEX(RANDOMBLOB(200000000)))>0--", "sqlite", 0.8),
+                            # (true_payload, false_payload, db_type, delay_threshold)
+                            # IMPORTANT: MySQL requires "-- " (with space) or "#" for comments.
+                            # Bare "--" without trailing space is NOT a comment in MySQL.
+                            sleep_pairs = [
+                                ("' OR SLEEP(2)#", "' OR SLEEP(0)#", "mysql_or", 1.5),
+                                ("' AND SLEEP(3)#", "' AND SLEEP(0)#", "mysql_and", 2.5),
+                                ("' OR SLEEP(2)-- ", "' OR SLEEP(0)-- ", "mysql_or_dash", 1.5),
+                                ("' WAITFOR DELAY '0:0:3'-- ", "' WAITFOR DELAY '0:0:0'-- ", "mssql", 2.5),
+                                ("'; SELECT pg_sleep(3);-- ", "'; SELECT pg_sleep(0);-- ", "postgresql", 2.5),
                             ]
 
-                            for sleep_payload, db_type, delay_threshold in sleep_payloads:
+                            other_cookies = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
+
+                            for true_payload, false_payload, db_type, delay_threshold in sleep_pairs:
                                 try:
-                                    # Build cookie with sleep payload
-                                    other_cookies = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
-                                    cookie_with_sleep = f"{cookie_value}{sleep_payload}"
-                                    cookies_sleep = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={cookie_with_sleep}"])
-                                    headers_sleep = {"Cookie": cookies_sleep}
+                                    # Step 1: TRUE condition (should delay)
+                                    cookie_true = f"{cookie_value}{true_payload}"
+                                    cookies_true = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={cookie_true}"])
 
-                                    start_time = time_module.time()
-                                    async with session.get(test_url, headers=headers_sleep, ssl=False, timeout=aiohttp.ClientTimeout(total=8)) as resp_sleep:
-                                        await resp_sleep.text()
-                                    elapsed = time_module.time() - start_time
+                                    start_true = time_module.time()
+                                    true_timed_out = False
+                                    try:
+                                        async with session.get(test_url, headers={"Cookie": cookies_true}, ssl=False, timeout=aiohttp.ClientTimeout(total=5)) as resp_true:
+                                            await resp_true.text()
+                                    except asyncio.TimeoutError:
+                                        true_timed_out = True
+                                    elapsed_true = time_module.time() - start_true
 
-                                    if elapsed >= delay_threshold:
-                                        logger.info(f"[Cookie SQLi Probe] Time-based blind SQLi in cookie {cookie_name} @ {test_path}: {elapsed:.2f}s delay ({db_type})")
+                                    if elapsed_true < delay_threshold and not true_timed_out:
+                                        continue  # TRUE didn't delay → not this DB type
+
+                                    # Step 2: FALSE condition (should NOT delay)
+                                    cookie_false = f"{cookie_value}{false_payload}"
+                                    cookies_false = "; ".join([f"{k}={v}" for k, v in other_cookies.items()] + [f"{cookie_name}={cookie_false}"])
+
+                                    start_false = time_module.time()
+                                    try:
+                                        async with session.get(test_url, headers={"Cookie": cookies_false}, ssl=False, timeout=aiohttp.ClientTimeout(total=5)) as resp_false:
+                                            await resp_false.text()
+                                    except asyncio.TimeoutError:
+                                        continue  # Both timeout → probably just slow server
+                                    elapsed_false = time_module.time() - start_false
+
+                                    # Differential: TRUE delayed significantly more than FALSE
+                                    delta = elapsed_true - elapsed_false
+                                    if delta >= delay_threshold or (true_timed_out and elapsed_false < delay_threshold):
+                                        logger.info(
+                                            f"[Cookie SQLi Probe] CONFIRMED time-based blind SQLi in cookie "
+                                            f"{cookie_name} @ {test_path} ({db_type}): "
+                                            f"TRUE={elapsed_true:.2f}s, FALSE={elapsed_false:.2f}s, delta={delta:.2f}s"
+                                        )
                                         findings.append({
                                             "type": "SQLi",
                                             "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type})",
                                             "parameter": f"Cookie: {cookie_name}",
                                             "url": test_url,
-                                            "payload": sleep_payload,
-                                            "confidence": 0.85,
+                                            "payload": true_payload,
+                                            "confidence": 0.9,
                                             "severity": "Critical",
                                             "probe_validated": True,
-                                            "fp_confidence": 0.8,
-                                            "skeptical_score": 8,
+                                            "fp_confidence": 0.85,
+                                            "skeptical_score": 9,
                                             "votes": 5,
-                                            "evidence": f"Response delayed {elapsed:.2f}s with SLEEP payload (expected ~3s)",
-                                            "description": f"Time-based blind SQL injection detected in cookie '{cookie_name}' at {test_url}. The {db_type} SLEEP payload caused a {elapsed:.2f}s delay.",
-                                            "reproduction": f"[PROBE-VALIDATED] curl -b '{cookie_name}={cookie_with_sleep}' '{test_url}' # Should take ~3s"
+                                            "evidence": (
+                                                f"Differential timing confirmation: "
+                                                f"TRUE payload ({true_payload}) took {elapsed_true:.2f}s, "
+                                                f"FALSE payload ({false_payload}) took {elapsed_false:.2f}s "
+                                                f"(delta: {delta:.2f}s)"
+                                            ),
+                                            "description": (
+                                                f"Time-based blind SQL injection in cookie '{cookie_name}' at {test_url}. "
+                                                f"Confirmed via differential timing: the TRUE SLEEP condition delays the response "
+                                                f"while the FALSE condition responds normally."
+                                            ),
+                                            "reproduction": f"[PROBE-VALIDATED] curl -b '{cookie_name}={cookie_true}' '{test_url}' # TRUE: ~{elapsed_true:.0f}s vs FALSE: ~{elapsed_false:.0f}s"
                                         })
-                                        break  # Found SQLi via time-based, move to next cookie
+                                        break
 
-                                except asyncio.TimeoutError:
-                                    # Timeout could indicate SLEEP worked (server hung)
-                                    logger.info(f"[Cookie SQLi Probe] Timeout (possible blind SQLi) in cookie {cookie_name} @ {test_path} with {db_type}")
-                                    findings.append({
-                                        "type": "SQLi",
-                                        "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {db_type}, Timeout)",
-                                        "parameter": f"Cookie: {cookie_name}",
-                                        "url": test_url,
-                                        "payload": sleep_payload,
-                                        "confidence": 0.75,
-                                        "severity": "Critical",
-                                        "probe_validated": True,
-                                        "fp_confidence": 0.7,
-                                        "skeptical_score": 7,
-                                        "votes": 5,
-                                        "evidence": f"Request timed out with SLEEP payload (likely hung on database)",
-                                        "description": f"Possible time-based blind SQL injection in cookie '{cookie_name}' at {test_url}. Request timed out with {db_type} SLEEP payload.",
-                                        "reproduction": f"[PROBE-VALIDATED] curl -b '{cookie_name}={cookie_value}{sleep_payload}' '{test_url}' # Should timeout"
-                                    })
-                                    break
                                 except Exception as e:
                                     logger.debug(f"[Cookie SQLi Probe] Time-based test error for {cookie_name}: {e}")
                                     continue
@@ -1747,6 +1849,7 @@ class DASTySASTAgent(BaseAgent):
                         # Direct payload append breaks the Base64 encoding, so the
                         # server fails at decode before reaching the SQL query.
                         # Fix: decode → inject inside → re-encode to Base64.
+                        # Uses differential confirmation (TRUE vs FALSE) to avoid FPs.
                         if not any(f.get("parameter") == f"Cookie: {cookie_name}" for f in findings):
                             try:
                                 cv = cookie_value
@@ -1754,87 +1857,111 @@ class DASTySASTAgent(BaseAgent):
                                 decoded_cv = base64.b64decode(padded_cv).decode('utf-8', errors='ignore')
                                 # Only proceed if it looks like real Base64 (not random bytes)
                                 if decoded_cv and len(decoded_cv) >= 2 and all(c.isprintable() or c.isspace() for c in decoded_cv[:50]):
-                                    b64_sleep_payloads = [
-                                        ("' AND SLEEP(3)--", "mysql_b64", 2.5),
-                                        ("' WAITFOR DELAY '0:0:3'--", "mssql_b64", 2.5),
-                                        ("'; SELECT pg_sleep(3);--", "postgresql_b64", 2.5),
-                                        # SQLite heavy computation
-                                        ("' OR LENGTH(HEX(RANDOMBLOB(200000000)))>0--", "sqlite_b64", 0.8),
+                                    # (true_payload, false_payload, db_type, delay_threshold)
+                                    # IMPORTANT: MySQL requires "-- " (with space) or "#" for comments.
+                                    b64_sleep_pairs = [
+                                        ("' OR SLEEP(2)#", "' OR SLEEP(0)#", "mysql_or_b64", 1.5),
+                                        ("' AND SLEEP(3)#", "' AND SLEEP(0)#", "mysql_and_b64", 2.5),
+                                        ("' OR SLEEP(2)-- ", "' OR SLEEP(0)-- ", "mysql_or_dash_b64", 1.5),
+                                        ("' WAITFOR DELAY '0:0:3'-- ", "' WAITFOR DELAY '0:0:0'-- ", "mssql_b64", 2.5),
+                                        ("'; SELECT pg_sleep(3);-- ", "'; SELECT pg_sleep(0);-- ", "postgresql_b64", 2.5),
                                     ]
                                     other_cookies_b64 = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
 
-                                    for b64_payload_raw, b64_db_type, b64_threshold in b64_sleep_payloads:
-                                        try:
-                                            # Inject payload into the DECODED value, then re-encode
-                                            if decoded_cv.strip().startswith('{'):
-                                                # JSON inside Base64: inject into first string field
-                                                try:
-                                                    json_obj = json.loads(decoded_cv)
-                                                    first_str_key = next((k for k, v in json_obj.items() if isinstance(v, str)), None)
-                                                    if first_str_key:
-                                                        injected_obj = json_obj.copy()
-                                                        injected_obj[first_str_key] = json_obj[first_str_key] + b64_payload_raw
-                                                        injected_decoded = json.dumps(injected_obj)
-                                                    else:
-                                                        injected_decoded = decoded_cv + b64_payload_raw
-                                                except json.JSONDecodeError:
-                                                    injected_decoded = decoded_cv + b64_payload_raw
-                                            else:
-                                                # Plain string inside Base64: append payload
-                                                injected_decoded = decoded_cv + b64_payload_raw
+                                    def _b64_inject(decoded_val, payload_raw):
+                                        """Inject payload into decoded B64 value and re-encode."""
+                                        if decoded_val.strip().startswith('{'):
+                                            try:
+                                                json_obj = json.loads(decoded_val)
+                                                first_str_key = next((k for k, v in json_obj.items() if isinstance(v, str)), None)
+                                                if first_str_key:
+                                                    injected_obj = json_obj.copy()
+                                                    injected_obj[first_str_key] = json_obj[first_str_key] + payload_raw
+                                                    injected = json.dumps(injected_obj)
+                                                else:
+                                                    injected = decoded_val + payload_raw
+                                            except json.JSONDecodeError:
+                                                injected = decoded_val + payload_raw
+                                        else:
+                                            injected = decoded_val + payload_raw
+                                        return injected, base64.b64encode(injected.encode()).decode()
 
-                                            b64_injected = base64.b64encode(injected_decoded.encode()).decode()
-                                            cookies_b64 = "; ".join(
+                                    for true_payload, false_payload, b64_db_type, b64_threshold in b64_sleep_pairs:
+                                        try:
+                                            # Step 1: TRUE condition (should delay)
+                                            injected_decoded_true, b64_true = _b64_inject(decoded_cv, true_payload)
+                                            cookies_true = "; ".join(
                                                 [f"{k}={v}" for k, v in other_cookies_b64.items()] +
-                                                [f"{cookie_name}={b64_injected}"]
+                                                [f"{cookie_name}={b64_true}"]
                                             )
 
-                                            start_b64 = time_module.time()
-                                            async with session.get(test_url, headers={"Cookie": cookies_b64}, ssl=False, timeout=aiohttp.ClientTimeout(total=8)) as resp_b64:
-                                                await resp_b64.text()
-                                            elapsed_b64 = time_module.time() - start_b64
+                                            start_true = time_module.time()
+                                            true_timed_out = False
+                                            try:
+                                                async with session.get(test_url, headers={"Cookie": cookies_true}, ssl=False, timeout=aiohttp.ClientTimeout(total=5)) as resp_true:
+                                                    await resp_true.text()
+                                            except asyncio.TimeoutError:
+                                                true_timed_out = True
+                                            elapsed_true = time_module.time() - start_true
 
-                                            logger.debug(f"[Cookie SQLi Probe] B64 {cookie_name} @ {test_path} ({b64_db_type}): {elapsed_b64:.2f}s")
+                                            if elapsed_true < b64_threshold and not true_timed_out:
+                                                continue  # TRUE didn't delay → not this DB type
 
-                                            if elapsed_b64 >= b64_threshold:
-                                                logger.info(f"[Cookie SQLi Probe] Base64 time-based blind SQLi in cookie {cookie_name} @ {test_path}: {elapsed_b64:.2f}s ({b64_db_type})")
+                                            # Step 2: FALSE condition (should NOT delay)
+                                            _injected_decoded_false, b64_false = _b64_inject(decoded_cv, false_payload)
+                                            cookies_false = "; ".join(
+                                                [f"{k}={v}" for k, v in other_cookies_b64.items()] +
+                                                [f"{cookie_name}={b64_false}"]
+                                            )
+
+                                            start_false = time_module.time()
+                                            try:
+                                                async with session.get(test_url, headers={"Cookie": cookies_false}, ssl=False, timeout=aiohttp.ClientTimeout(total=5)) as resp_false:
+                                                    await resp_false.text()
+                                            except asyncio.TimeoutError:
+                                                continue  # Both timeout → probably slow server
+                                            elapsed_false = time_module.time() - start_false
+
+                                            # Differential: TRUE delayed significantly more than FALSE
+                                            delta = elapsed_true - elapsed_false
+                                            if delta >= b64_threshold or (true_timed_out and elapsed_false < b64_threshold):
+                                                logger.info(
+                                                    f"[Cookie SQLi Probe] CONFIRMED B64 time-based blind SQLi in cookie "
+                                                    f"{cookie_name} @ {test_path} ({b64_db_type}): "
+                                                    f"TRUE={elapsed_true:.2f}s, FALSE={elapsed_false:.2f}s, delta={delta:.2f}s"
+                                                )
                                                 findings.append({
                                                     "type": "SQLi",
                                                     "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {b64_db_type})",
                                                     "parameter": f"Cookie: {cookie_name}",
                                                     "url": test_url,
-                                                    "payload": f"Base64({b64_payload_raw})",
-                                                    "confidence": 0.85,
+                                                    "payload": f"Base64({true_payload})",
+                                                    "confidence": 0.9,
                                                     "severity": "Critical",
                                                     "probe_validated": True,
-                                                    "fp_confidence": 0.8,
-                                                    "skeptical_score": 8,
+                                                    "fp_confidence": 0.85,
+                                                    "skeptical_score": 9,
                                                     "votes": 5,
-                                                    "evidence": f"Base64-encoded cookie: decoded value injected with '{b64_payload_raw}', re-encoded. Response delayed {elapsed_b64:.2f}s vs baseline.",
-                                                    "description": f"Time-based blind SQL injection in Base64-encoded cookie '{cookie_name}' at {test_url}. The cookie value is Base64-decoded by the server before use in a SQL query.",
-                                                    "reproduction": f"[PROBE-VALIDATED] echo -n \"{injected_decoded}\" | base64 | xargs -I{{}} curl -b '{cookie_name}={{}}' '{test_url}'"
+                                                    "evidence": (
+                                                        f"Differential timing confirmation (Base64-encoded): "
+                                                        f"TRUE payload ({true_payload}) took {elapsed_true:.2f}s, "
+                                                        f"FALSE payload ({false_payload}) took {elapsed_false:.2f}s "
+                                                        f"(delta: {delta:.2f}s)"
+                                                    ),
+                                                    "description": (
+                                                        f"Time-based blind SQL injection in Base64-encoded cookie '{cookie_name}' at {test_url}. "
+                                                        f"Confirmed via differential timing: the TRUE SLEEP condition delays the response "
+                                                        f"while the FALSE condition responds normally. "
+                                                        f"The cookie value is Base64-decoded by the server before use in a SQL query."
+                                                    ),
+                                                    "reproduction": (
+                                                        f"[PROBE-VALIDATED] echo -n \"{injected_decoded_true}\" | base64 | "
+                                                        f"xargs -I{{}} curl -b '{cookie_name}={{}}' '{test_url}' "
+                                                        f"# TRUE: ~{elapsed_true:.0f}s vs FALSE: ~{elapsed_false:.0f}s"
+                                                    )
                                                 })
                                                 break
 
-                                        except asyncio.TimeoutError:
-                                            logger.info(f"[Cookie SQLi Probe] B64 timeout in cookie {cookie_name} @ {test_path} ({b64_db_type})")
-                                            findings.append({
-                                                "type": "SQLi",
-                                                "vulnerability": f"SQL Injection in Cookie (Time-based Blind - {b64_db_type}, Timeout)",
-                                                "parameter": f"Cookie: {cookie_name}",
-                                                "url": test_url,
-                                                "payload": f"Base64({b64_payload_raw})",
-                                                "confidence": 0.75,
-                                                "severity": "Critical",
-                                                "probe_validated": True,
-                                                "fp_confidence": 0.7,
-                                                "skeptical_score": 7,
-                                                "votes": 5,
-                                                "evidence": f"Base64-encoded cookie timed out with time-based payload ({b64_db_type})",
-                                                "description": f"Possible time-based blind SQL injection in Base64-encoded cookie '{cookie_name}' at {test_url}.",
-                                                "reproduction": f"[PROBE-VALIDATED] Base64-encoded payload caused timeout"
-                                            })
-                                            break
                                         except Exception as e:
                                             logger.debug(f"[Cookie SQLi Probe] B64 test error for {cookie_name} ({b64_db_type}): {e}")
                                             continue

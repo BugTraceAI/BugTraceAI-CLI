@@ -911,7 +911,8 @@ class ScanService:
         """
         Read findings from a JSON or JSON Lines file.
 
-        Supports both formats:
+        Supports three formats:
+        - Wrapped JSON: {"findings": [...]} (nuclei_misconfig, bac_detection)
         - JSON Lines: One JSON object per line (v3.2 format)
         - JSON Array: Array of finding objects
         """
@@ -923,15 +924,28 @@ class ScanService:
         if not content:
             return []
 
-        # Try JSON Lines first (one object per line)
         if content.startswith("{"):
+            # Try as single wrapped JSON object first (e.g. nuclei_misconfig_results.json)
+            try:
+                data = json.loads(content)
+                if "findings" in data and isinstance(data["findings"], list):
+                    return data["findings"]
+                # Single finding object (one JSON object, not wrapped)
+                if "finding" in data:
+                    return [data["finding"]]
+                # Could be a single finding dict itself
+                if any(k in data for k in ("vulnerability_type", "vuln_type", "type", "severity")):
+                    return [data]
+            except json.JSONDecodeError:
+                pass
+
+            # Fall through to JSON Lines (one object per line)
             for line in content.split("\n"):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     entry = json.loads(line)
-                    # Handle v3.2 format with nested "finding" key
                     if "finding" in entry:
                         findings.append(entry["finding"])
                     else:

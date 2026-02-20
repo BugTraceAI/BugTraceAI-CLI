@@ -46,8 +46,8 @@ CB_DEGRADED_DELAY = 2.0        # Delay between requests in DEGRADED state
 CB_SUCCESS_THRESHOLD = 2       # Successes needed to recover from DEGRADED
 
 # LLM Request Timeouts (seconds)
-LLM_TOTAL_TIMEOUT = 90         # Total request timeout
-LLM_CONNECT_TIMEOUT = 30       # Connection establishment timeout
+LLM_TOTAL_TIMEOUT = 45         # Total request timeout (non-streaming)
+LLM_CONNECT_TIMEOUT = 10       # Connection establishment timeout
 
 
 def sanitize_text(text: str) -> str:
