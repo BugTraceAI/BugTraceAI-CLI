@@ -59,6 +59,11 @@ class EmbeddingManager:
                 logger.warning("Switching to Mock Embedding Model (Offline Mode)")
                 self._model = MockEmbeddingModel()
     
+    @property
+    def is_real_model(self) -> bool:
+        """True if using a real embedding model, False if MockEmbeddingModel."""
+        return self._model is not None and not isinstance(self._model, MockEmbeddingModel)
+
     @classmethod
     def get_instance(cls) -> "EmbeddingManager":
         """Get singleton instance."""

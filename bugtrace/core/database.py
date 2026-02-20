@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 from dataclasses import dataclass
 from sqlmodel import SQLModel, create_engine, Session, select
-from sqlalchemy import Engine, text, event
+from sqlalchemy import Engine, text, event, func
 from sqlalchemy.pool import QueuePool, StaticPool
 import lancedb
 from bugtrace.schemas.db_models import (
@@ -738,7 +738,33 @@ class DatabaseManager:
 
             session.commit()
             logger.info(f"Updated scan {scan.id} with {len(findings)} findings for {target_url}")
+
+            # Store embeddings in LanceDB for cross-scan learning
+            self._store_embeddings_if_enabled(findings)
+
             return scan.id
+
+    def _store_embeddings_if_enabled(self, findings: List[Dict]) -> None:
+        """Store finding embeddings in LanceDB if enabled and model is real."""
+        try:
+            from bugtrace.core.config import settings
+            if not getattr(settings, 'LANCEDB_ENABLED', False):
+                return
+
+            from bugtrace.core.embeddings import get_embedding_manager
+            emb_manager = get_embedding_manager()
+            if not emb_manager.is_real_model:
+                logger.debug("LanceDB skipped: MockEmbeddingModel active (no real model)")
+                return
+
+            stored = 0
+            for finding_data in findings:
+                self.store_finding_embedding(finding_data)
+                stored += 1
+            if stored:
+                logger.info(f"Stored {stored} finding embeddings in LanceDB")
+        except Exception as e:
+            logger.warning(f"LanceDB embedding storage failed (non-fatal): {e}")
 
     def get_findings_for_scan(self, scan_id: int) -> List[FindingTable]:
         """Get all findings for a specific scan."""
@@ -911,8 +937,11 @@ class DatabaseManager:
             try:
                 if collection in self.vector_db.table_names():
                     tbl = self.vector_db.open_table(collection)
+                    safe_url = finding_url.replace("'", "''")
+                    safe_param = finding_param.replace("'", "''")
+                    safe_type = normalized_type.replace("'", "''")
                     existing = tbl.search().where(
-                        f"url = '{finding_url}' AND parameter = '{finding_param}' AND type = '{normalized_type}'"
+                        f"url = '{safe_url}' AND parameter = '{safe_param}' AND type = '{safe_type}'"
                     ).limit(1).to_list()
                     if existing:
                         logger.debug(f"Dedup: finding already in LanceDB ({normalized_type} on {finding_param})")
@@ -1008,9 +1037,9 @@ class DatabaseManager:
         # Table row counts
         try:
             with self.get_session() as session:
-                metrics["tables"]["targets"] = session.exec(select(TargetTable)).all().__len__()
-                metrics["tables"]["scans"] = session.exec(select(ScanTable)).all().__len__()
-                metrics["tables"]["findings"] = session.exec(select(FindingTable)).all().__len__()
+                metrics["tables"]["targets"] = session.exec(select(func.count()).select_from(TargetTable)).one()
+                metrics["tables"]["scans"] = session.exec(select(func.count()).select_from(ScanTable)).one()
+                metrics["tables"]["findings"] = session.exec(select(func.count()).select_from(FindingTable)).one()
         except Exception as e:
             logger.warning(f"Failed to get table metrics: {e}")
             metrics["tables"]["error"] = str(e)
@@ -1051,10 +1080,12 @@ class DatabaseManager:
         import sqlite3
         source = sqlite3.connect(db_path)
         dest = sqlite3.connect(backup_path)
-        with dest:
-            source.backup(dest)
-        source.close()
-        dest.close()
+        try:
+            with dest:
+                source.backup(dest)
+        finally:
+            source.close()
+            dest.close()
         return os.path.getsize(backup_path)
 
     def backup_database(self, backup_dir: Optional[str] = None) -> Dict:

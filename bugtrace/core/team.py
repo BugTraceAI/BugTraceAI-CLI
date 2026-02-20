@@ -363,6 +363,16 @@ class TeamOrchestrator:
             payload=payload,
         )
 
+        # Persist specialist finding to DB so exploitation results
+        # (e.g. JWT secret cracked → CRITICAL) update the original finding
+        try:
+            if hasattr(self, 'scan_id') and self.scan_id and hasattr(self, 'db'):
+                self.db.save_scan_result(
+                    self.target, [finding], scan_id=self.scan_id
+                )
+        except Exception as e:
+            logger.error(f"Failed to persist specialist finding to DB: {e}")
+
     def _init_state(self):
         """Initialize scan state attributes."""
         # Inject scan_id into ThinkingConsolidationAgent for DB persistence

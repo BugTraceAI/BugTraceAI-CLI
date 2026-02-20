@@ -114,6 +114,9 @@ class Settings(BaseSettings):
     FP_VOTES_WEIGHT: float = 0.3  # Weight of votes in fp_confidence calc
     FP_EVIDENCE_WEIGHT: float = 0.3  # Weight of evidence quality in fp_confidence calc
 
+    # --- LanceDB Embeddings ---
+    LANCEDB_ENABLED: bool = True  # Store finding embeddings in LanceDB for cross-scan learning
+
     # --- DAST Analysis Timeout (Phase 38: v3.2) ---
     DAST_ANALYSIS_TIMEOUT: float = 180.0  # Seconds per URL analysis (probes + LLM)
     DAST_MAX_RETRIES: int = 5  # Max retry rounds for URLs missing dastysast JSON (pipeline stops if still missing)
@@ -444,6 +447,8 @@ class Settings(BaseSettings):
             self.MAX_CONCURRENT_ANALYSIS = section.getint("MAX_CONCURRENT_ANALYSIS")
         if "MAX_CONCURRENT_SPECIALISTS" in section:
             self.MAX_CONCURRENT_SPECIALISTS = section.getint("MAX_CONCURRENT_SPECIALISTS")
+        if "LANCEDB_ENABLED" in section:
+            self.LANCEDB_ENABLED = section.getboolean("LANCEDB_ENABLED")
         if "DAST_ANALYSIS_TIMEOUT" in section:
             self.DAST_ANALYSIS_TIMEOUT = section.getfloat("DAST_ANALYSIS_TIMEOUT")
         if "DAST_MAX_RETRIES" in section:

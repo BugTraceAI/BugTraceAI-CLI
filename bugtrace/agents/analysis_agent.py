@@ -1354,7 +1354,6 @@ class DASTySASTAgent(BaseAgent):
                             # Test with SLEEP payload (MySQL/MariaDB style, works on many DBs)
                             sleep_payloads = [
                                 ("' AND SLEEP(3)--", "mysql"),
-                                ("' WAITFOR DELAY '0:0:3'--", "mssql"),
                                 ("'; SELECT pg_sleep(3);--", "postgresql"),
                             ]
 
@@ -1769,7 +1768,6 @@ class DASTySASTAgent(BaseAgent):
                                 ("' OR SLEEP(2)#", "' OR SLEEP(0)#", "mysql_or", 1.5),
                                 ("' AND SLEEP(3)#", "' AND SLEEP(0)#", "mysql_and", 2.5),
                                 ("' OR SLEEP(2)-- ", "' OR SLEEP(0)-- ", "mysql_or_dash", 1.5),
-                                ("' WAITFOR DELAY '0:0:3'-- ", "' WAITFOR DELAY '0:0:0'-- ", "mssql", 2.5),
                                 ("'; SELECT pg_sleep(3);-- ", "'; SELECT pg_sleep(0);-- ", "postgresql", 2.5),
                             ]
 
@@ -1863,7 +1861,6 @@ class DASTySASTAgent(BaseAgent):
                                         ("' OR SLEEP(2)#", "' OR SLEEP(0)#", "mysql_or_b64", 1.5),
                                         ("' AND SLEEP(3)#", "' AND SLEEP(0)#", "mysql_and_b64", 2.5),
                                         ("' OR SLEEP(2)-- ", "' OR SLEEP(0)-- ", "mysql_or_dash_b64", 1.5),
-                                        ("' WAITFOR DELAY '0:0:3'-- ", "' WAITFOR DELAY '0:0:0'-- ", "mssql_b64", 2.5),
                                         ("'; SELECT pg_sleep(3);-- ", "'; SELECT pg_sleep(0);-- ", "postgresql_b64", 2.5),
                                     ]
                                     other_cookies_b64 = {c["name"]: c["value"] for c in cookies if c["name"] != cookie_name}
