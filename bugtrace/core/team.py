@@ -407,6 +407,20 @@ class TeamOrchestrator:
     def set_auth(self, creds: str):
         self.auth_creds = creds
 
+    def _sync_scan_context(self, phase: str, agent: str = "System",
+                          findings_count: Optional[int] = None,
+                          progress: Optional[int] = None) -> None:
+        """Update ScanContext so the Status API reflects real-time state."""
+        ctx = getattr(self, '_scan_context', None)
+        if ctx is None:
+            return
+        ctx.phase = phase
+        ctx.active_agent = agent
+        if findings_count is not None:
+            ctx.findings_count = findings_count
+        if progress is not None:
+            ctx.progress = progress
+
     async def pause_pipeline(self, reason: str = "User requested") -> bool:
         """Pause pipeline at next phase boundary."""
         if self._lifecycle:
@@ -2571,6 +2585,7 @@ class TeamOrchestrator:
         await self._start_pipeline()
         self._v.emit("pipeline.initializing", {"target": self.target, "scan_id": self.scan_id})
         conductor.notify_phase_change("reconnaissance", 0.0, "Pipeline started")
+        self._sync_scan_context("RECONNAISSANCE", "ReconAgent")
 
         # Setup directories
         scan_dir, recon_dir, analysis_dir, captures_dir = self._setup_scan_directory(start_time)
@@ -2597,6 +2612,7 @@ class TeamOrchestrator:
         self._v.emit("recon.completed", {"urls_found": len(self.urls_to_scan)})
         conductor.notify_phase_change("reconnaissance", 1.0, f"{len(self.urls_to_scan)} URLs discovered")
         conductor.notify_metrics(urls_discovered=len(self.urls_to_scan))
+        self._sync_scan_context("RECONNAISSANCE", "ReconAgent", progress=10)
 
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.RECONNAISSANCE,
@@ -2666,6 +2682,7 @@ class TeamOrchestrator:
         dashboard.set_phase("🔬 HUNTING VULNS")
         dashboard.set_status("Running", "Analysis in progress...")
         conductor.notify_phase_change("discovery", 0.0, f"Analyzing {len(self.urls_to_scan)} URLs")
+        self._sync_scan_context("DISCOVERY", "DASTySAST", progress=15)
 
         # Run batch DAST - this is the actual DISCOVERY work
         self.vulnerabilities_by_url = await self._phase_2_batch_dast(dashboard, analysis_dir, recon_dir)
@@ -2703,6 +2720,7 @@ class TeamOrchestrator:
         self._v.emit("discovery.completed", {"urls_analyzed": reports_generated, "urls_total": urls_count})
         conductor.notify_phase_change("discovery", 1.0, f"{reports_generated} URLs analyzed")
         conductor.notify_metrics(urls_discovered=len(self.urls_to_scan), urls_analyzed=reports_generated)
+        self._sync_scan_context("DISCOVERY", "DASTySAST", progress=35)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.DISCOVERY,
             {'urls_analyzed': reports_generated}
@@ -2720,6 +2738,7 @@ class TeamOrchestrator:
         dashboard.set_phase("🧠 STRATEGY")
         dashboard.set_status("Running", "Deduplication in progress...")
         conductor.notify_phase_change("strategy", 0.0, "Deduplication in progress")
+        self._sync_scan_context("STRATEGY", "ThinkingAgent", progress=40)
         conductor.notify_log("INFO", "[STRATEGY] ThinkingAgent processing findings batch")
 
         # Process all JSON files from scan_dir/dastysast/ (where Phase 2 saves them)
@@ -2753,6 +2772,7 @@ class TeamOrchestrator:
         # Signal STRATEGY complete
         self._v.emit("strategy.completed", {"findings_distributed": findings_count})
         conductor.notify_phase_change("strategy", 1.0, f"{findings_count} findings distributed")
+        self._sync_scan_context("STRATEGY", "ThinkingAgent", findings_count=findings_count, progress=50)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.STRATEGY,
             {'findings_processed': findings_count}
@@ -2767,6 +2787,7 @@ class TeamOrchestrator:
         self._v.emit("pipeline.phase_transition", {"phase": "exploitation"})
         dashboard.log(f"⚡ Specialists processing findings from queues", "INFO")
         conductor.notify_phase_change("exploitation", 0.0, "Specialists attacking")
+        self._sync_scan_context("EXPLOITATION", "Specialists", findings_count=findings_count, progress=55)
 
         # Initialize specialist workers NOW (consume WET → create DRY → attack DRY)
         if not self._specialist_workers_started:
@@ -2808,7 +2829,9 @@ class TeamOrchestrator:
             "items_distributed": queue_results.get('items_distributed', 0),
             "by_specialist": queue_results.get('by_specialist', {}),
         })
+        exploitation_findings = len(self.state_manager.get_findings()) if self.state_manager else 0
         conductor.notify_phase_change("exploitation", 1.0, f"{queue_results.get('items_distributed', 0)} items processed")
+        self._sync_scan_context("EXPLOITATION", "Specialists", findings_count=exploitation_findings, progress=75)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.EXPLOITATION,
             {'findings_exploited': self.thinking_agent.get_stats().get('distributed', 0) if self.thinking_agent else 0}
@@ -2824,10 +2847,12 @@ class TeamOrchestrator:
         self._v.emit("validation.started", {"findings_to_review": len(all_findings_for_review)})
         conductor.notify_phase_change("validation", 0.0, f"Reviewing {len(all_findings_for_review)} findings")
         conductor.notify_log("INFO", f"[VALIDATION] Reviewing {len(all_findings_for_review)} findings")
+        self._sync_scan_context("VALIDATION", "Validator", findings_count=len(all_findings_for_review), progress=80)
         await self._phase_3_global_review(dashboard, scan_dir)
         self._v.emit("validation.completed", {"findings_reviewed": len(all_findings_for_review)})
         conductor.notify_phase_change("validation", 1.0, "Review complete")
         conductor.notify_log("INFO", "[VALIDATION] Global review complete")
+        self._sync_scan_context("VALIDATION", "Validator", progress=85)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.VALIDATION,
             {'findings_reviewed': len(all_findings_for_review)}
@@ -2842,10 +2867,12 @@ class TeamOrchestrator:
         self._v.emit("reporting.started", {})
         conductor.notify_phase_change("reporting", 0.0, "Generating reports")
         conductor.notify_log("INFO", "[REPORTING] Generating final reports")
+        self._sync_scan_context("REPORTING", "ReportingAgent", progress=90)
         await self._phase_4_reporting(dashboard, scan_dir)
         self._v.emit("reporting.completed", {})
         conductor.notify_phase_change("reporting", 1.0, "Reports generated")
         conductor.notify_log("INFO", "[REPORTING] Reports generated")
+        self._sync_scan_context("COMPLETE", "System", progress=100)
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.REPORTING,
             {'report_generated': True}

@@ -1104,7 +1104,7 @@ class ScanService:
                 "finding_id": finding.get("_id", 0),
                 "type": finding.get("type", "Unknown"),
                 "severity": finding.get("severity", "MEDIUM"),
-                "details": finding.get("evidence") or finding.get("description") or finding.get("note", ""),
+                "details": self._normalize_details(finding),
                 "payload": finding.get("payload", ""),
                 "url": finding.get("url", ""),
                 "parameter": finding.get("parameter", ""),
@@ -1113,6 +1113,15 @@ class ScanService:
                 "confidence": finding.get("confidence", 0.0),
             })
         return results
+
+    @staticmethod
+    def _normalize_details(finding: Dict[str, Any]) -> str:
+        """Extract details from a finding, converting dicts to JSON strings."""
+        value = finding.get("evidence") or finding.get("description") or finding.get("note", "")
+        if isinstance(value, dict):
+            import json
+            return json.dumps(value)
+        return str(value) if value else ""
 
     @property
     def active_scan_count(self) -> int:

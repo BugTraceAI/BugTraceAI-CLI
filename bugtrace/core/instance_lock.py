@@ -142,6 +142,11 @@ def check_existing_instance() -> Optional[Tuple[int, str]]:
 
     pid, command = lock_info
 
+    # If the locked PID is our own PID, it's a stale lock from a previous run
+    # (common in Docker containers where PID 1 is always the main process)
+    if pid == os.getpid():
+        return None
+
     # Check if that process is still running
     if is_process_running(pid):
         # Verify it's actually BugTraceAI (not a recycled PID)
