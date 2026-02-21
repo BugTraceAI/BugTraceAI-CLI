@@ -6,6 +6,7 @@
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Required-blue?logo=docker)
+![MCP](https://img.shields.io/badge/MCP-Compatible-green?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyem0wIDE4Yy00LjQxIDAtOC0zLjU5LTgtOHMzLjU5LTggOC04IDggMy41OSA4IDgtMy41OSA4LTggOHoiLz48L3N2Zz4=)
 ![Made with](https://img.shields.io/badge/Made%20with-❤️-red)
 
 ****
@@ -17,6 +18,7 @@
 - [🏗️ Architecture](#️-architecture)
 - [🛠️ Technology Stack](#️-technology-stack)
 - [🚀 Getting Started](#-getting-started)
+- [🤖 AI Assistant Setup (MCP)](#-ai-assistant-setup-mcp)
 - [⚙️ Configuration](#️-configuration)
 - [📊 Output](#-output)
 - [📜 License](#-license)
@@ -293,6 +295,77 @@ docker-compose logs -f
 # Execute scans via API or Web UI
 curl http://localhost:8000/health
 ```
+
+## 🤖 AI Assistant Setup (MCP)
+
+BugTraceAI supports the **Model Context Protocol (MCP)**, allowing any AI assistant with terminal access to install, configure, and control security scans autonomously.
+
+### What is MCP?
+
+MCP is an open protocol that lets AI assistants connect to external tools. BugTraceAI exposes its scanning capabilities as MCP tools — so your AI assistant can start scans, check progress, and retrieve reports through natural conversation.
+
+### Quick Setup for AI Agents
+
+> **Tell your AI assistant:**
+>
+> *Clone https://github.com/BugTraceAI/BugTraceAI-CLI and deploy it with Docker. Copy `.env.example` to `.env` and ask me for the `OPENROUTER_API_KEY`. Run `docker compose up -d` to start both the API and MCP server. Then add the MCP server to your config with base URL `http://localhost:8001/sse`.*
+
+### Manual MCP Setup
+
+```bash
+# 1. Clone and configure
+git clone https://github.com/BugTraceAI/BugTraceAI-CLI
+cd BugTraceAI-CLI
+cp .env.example .env
+# Edit .env → add your OPENROUTER_API_KEY
+
+# 2. Start services (API + MCP)
+docker compose up -d
+
+# 3. Verify endpoints
+curl -f http://localhost:8000/health   # API health check
+curl -sf http://localhost:8001/sse     # MCP SSE endpoint
+```
+
+### Connect Your AI Assistant
+
+Add BugTraceAI to your MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "bugtraceai": {
+      "baseUrl": "http://localhost:8001/sse",
+      "description": "BugTraceAI Security Scanner"
+    }
+  }
+}
+```
+
+### Available MCP Tools
+
+Once connected, your AI assistant can use these tools:
+
+| Tool | Description |
+|------|-------------|
+| `start_scan` | Start a security scan on a target URL |
+| `get_scan_status` | Check scan progress and current phase |
+| `query_findings` | Retrieve vulnerability findings with filtering |
+| `stop_scan` | Stop a running scan gracefully |
+| `export_report` | Get scan report (summary, critical findings, or full) |
+
+### Prerequisites
+
+- **Docker & Docker Compose** installed and running
+- **OpenRouter API key** ([get one here](https://openrouter.ai/keys))
+- An MCP-compatible AI assistant (OpenClaw, Claude Code, Cursor, etc.)
+
+### Ports
+
+| Service | Port | Description |
+|---------|------|-------------|
+| API | 8000 | REST API + health check |
+| MCP | 8001 | SSE transport for AI assistants |
 
 ## ⚙️ Configuration
 
