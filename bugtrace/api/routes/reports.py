@@ -13,11 +13,13 @@ Date: 2026-01-27
 Version: 2.0.0
 """
 
+import io
 import mimetypes
+import zipfile
 from pathlib import Path as FilePath
 
 from fastapi import APIRouter, Depends, HTTPException, Path
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import Response, FileResponse, StreamingResponse
 
 from bugtrace.api.deps import get_report_service
 from bugtrace.core.config import settings
@@ -240,4 +242,73 @@ async def get_report_file(
         path=str(file_path),
         media_type=content_type,
         filename=file_path.name,
+    )
+
+
+# Maximum ZIP size to prevent memory issues (500 MB)
+MAX_ZIP_SIZE_BYTES = 500 * 1024 * 1024
+
+
+@router.get("/scans/{scan_id}/report-zip")
+async def get_report_zip(scan_id: int):
+    """
+    Download the complete scan report as a ZIP archive.
+
+    Includes all files from the report directory: final report, raw/validated
+    findings, recon data, specialist results (wet/dry/results), PoC enrichment,
+    individual DAST findings, attack chains, and the HTML report.
+
+    Args:
+        scan_id: Scan ID
+
+    Returns:
+        ZIP archive with all report files
+
+    Raises:
+        404: Report directory not found
+        413: Report too large to zip
+    """
+    report_dir = _find_report_dir(scan_id)
+    if not report_dir:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No report directory found for scan {scan_id}"
+        )
+
+    # Calculate total size first to prevent memory issues
+    total_size = sum(f.stat().st_size for f in report_dir.rglob("*") if f.is_file())
+    if total_size > MAX_ZIP_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Report too large to zip ({total_size // (1024*1024)} MB). Max: {MAX_ZIP_SIZE_BYTES // (1024*1024)} MB"
+        )
+
+    # Build ZIP in memory
+    zip_buffer = io.BytesIO()
+    report_dirname = report_dir.name  # e.g. "bugstore.bugtraceai.com_20260221_113155"
+
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in sorted(report_dir.rglob("*")):
+            if not file_path.is_file():
+                continue
+            # Relative path inside ZIP preserves directory structure
+            arcname = f"{report_dirname}/{file_path.relative_to(report_dir)}"
+            zf.write(file_path, arcname)
+
+    zip_buffer.seek(0)
+    zip_filename = f"{report_dirname}.zip"
+
+    logger.info(
+        f"Serving report ZIP: scan={scan_id} "
+        f"files={sum(1 for _ in report_dir.rglob('*') if _.is_file())} "
+        f"size={zip_buffer.getbuffer().nbytes // 1024}KB"
+    )
+
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_filename}"',
+            "Content-Length": str(zip_buffer.getbuffer().nbytes),
+        },
     )
