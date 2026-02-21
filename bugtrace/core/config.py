@@ -1090,6 +1090,8 @@ class Settings(BaseSettings):
     # --- MANIPULATOR Configuration (Intelligent Breakouts System) ---
     # Global rate limiting across XSS/CSTI Skills
     MANIPULATOR_GLOBAL_RATE_LIMIT: float = 2.0  # req/s total
+    MANIPULATOR_RATE_LIMIT_MIN: float = 0.2  # Minimum req/s floor when throttled by 429
+    MANIPULATOR_RATE_RECOVERY_THRESHOLD: int = 10  # Successful requests before rate recovery
     MANIPULATOR_USE_GLOBAL_RATE_LIMITER: bool = True
     MANIPULATOR_ENABLE_LLM_EXPANSION: bool = True
     MANIPULATOR_ENABLE_AGENTIC_FALLBACK: bool = False

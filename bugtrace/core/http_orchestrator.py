@@ -41,6 +41,7 @@ Date: 2026-01-31
 
 import aiohttp
 import asyncio
+import random
 import time
 from enum import Enum
 from typing import Optional, Dict, Any, Tuple, Callable, List
@@ -1046,7 +1047,20 @@ class DestinationClient:
                             await adaptive_retry.record_result(host, False, latency_ms, resp.status)
 
                             if attempt < max_retries:
-                                delay = retry_policy.get_delay(attempt)
+                                # Use Retry-After header for 429 if available
+                                if resp.status == 429:
+                                    retry_after = resp.headers.get("Retry-After")
+                                    if retry_after:
+                                        try:
+                                            delay = float(retry_after)
+                                        except ValueError:
+                                            delay = retry_policy.get_delay(attempt)
+                                    else:
+                                        delay = retry_policy.get_delay(attempt)
+                                else:
+                                    delay = retry_policy.get_delay(attempt)
+                                # Add jitter to prevent thundering herd
+                                delay *= random.uniform(0.8, 1.2)
                                 logger.debug(f"[DestinationClient:{self.destination.value}] "
                                             f"Retrying {url[:50]}... (status={resp.status}, "
                                             f"attempt={attempt+1}/{max_retries+1}, delay={delay:.1f}s)")
