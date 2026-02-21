@@ -651,6 +651,15 @@ class ExternalToolManager:
 
         return list(set(urls)), list(set(form_urls))
 
+    # Path segments that indicate a content-type or metadata, not a real endpoint
+    _INVALID_PATH_SEGMENTS = frozenset({
+        "application/json", "application/xml", "application/javascript",
+        "text/html", "text/plain", "text/css", "text/javascript",
+        "image/png", "image/jpeg", "image/gif", "image/svg+xml",
+        "multipart/form-data", "application/x-www-form-urlencoded",
+        "charset=utf-8", "charset=iso-8859-1",
+    })
+
     def _extract_urls_from_parts(self, parts: list, target_domain: str) -> list:
         """Extract in-scope URLs from line parts."""
         urls = []
@@ -661,6 +670,10 @@ class ExternalToolManager:
 
             url = self._parse_url_if_in_scope(p, target_domain)
             if url:
+                # Reject URLs where path contains MIME types (e.g. /application/json)
+                path = urlparse(url).path.lower()
+                if any(seg in path for seg in self._INVALID_PATH_SEGMENTS):
+                    continue
                 urls.append(url)
         return urls
 

@@ -1850,6 +1850,25 @@ class TeamOrchestrator:
 
         return urls
 
+    @staticmethod
+    def _load_data_lines(filename: str) -> List[str]:
+        """Load non-empty, non-comment lines from a data file in bugtrace/data/.
+
+        Returns an empty list if the file doesn't exist (graceful fallback).
+        """
+        data_dir = Path(__file__).resolve().parent.parent / "data"
+        filepath = data_dir / filename
+        if not filepath.exists():
+            logger.warning(f"[DataLoader] File not found: {filepath}")
+            return []
+        lines = []
+        with open(filepath, "r") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    lines.append(stripped)
+        return lines
+
     async def _discover_common_vuln_endpoints(self, urls: list) -> list:
         """Probe for common vulnerability endpoints not found by crawling.
 
@@ -1875,77 +1894,9 @@ class TeamOrchestrator:
             for origin in origins:
                 api_prefixes.add(f"{origin}/api/")
 
-        # Common vulnerability-relevant endpoint suffixes (probed under api_prefix)
-        COMMON_ENDPOINTS = [
-            # Redirect endpoints
-            "redirect?url=https://example.com",
-            "redirect?to=https://example.com",
-            # Debug/admin endpoints
-            "debug",
-            "debug/vulns",
-            "admin",
-            "admin/email-preview",
-            "admin/email-templates",
-            "config",
-            # Auth endpoints
-            "auth/login",
-            "auth/register",
-            # User/profile endpoints (with IDs for IDOR testing)
-            "users/me",
-            "profile",
-            "user/profile",
-            "user/profile/1",
-            "user/profile/2",
-            "user/preferences",
-            "users",
-            "users/1",
-            # File/upload endpoints
-            "upload",
-            "files",
-            "download",
-            "import",
-            "export",
-            "products/import?url=https://example.com",
-            # GraphQL
-            "graphql",
-            # Health/system
-            "health",
-            "health?cmd=id",
-            # Checkout/payments (V-023: price manipulation)
-            "checkout",
-            "checkout/process",
-            # Review/forum (stored XSS, IDOR targets)
-            "reviews",
-            "reviews/1",
-            "blog",
-            "blog/1",
-            "blog/3",
-            "forum/threads",
-            "forum/threads/1",
-            # Admin endpoints (V-028: broken access control)
-            "admin/vulnerable-debug-stats",
-            "admin/stats",
-            "admin/products",
-            # Admin email template (SSTI target)
-            "admin/email-preview?template={{7*7}}",
-        ]
-
-        # SPA/content routes (probed against origin, not api_prefix)
-        # GoSpider can't crawl JavaScript SPAs, so common frontend routes
-        # must be probed directly to discover client-side vulnerabilities
-        SPA_ROUTES = [
-            "blog",
-            "blog/1",
-            "blog?legacy_q=test",
-            "search",
-            "search?q=test",
-            "products",
-            "products?filter=test",
-            "forum",
-            "community",
-            "admin",
-            "settings",
-        ]
+        # Load endpoints from external data files (not hardcoded)
+        COMMON_ENDPOINTS = self._load_data_lines("common_endpoints.txt")
+        SPA_ROUTES = self._load_data_lines("spa_routes.txt")
 
         new_urls = []
         existing = set(urls)
@@ -1968,8 +1919,28 @@ class TeamOrchestrator:
                             continue
                     try:
                         resp = await client.get(probe_url)
-                        # Accept any non-404 response (even 401/403 = endpoint exists)
-                        if resp.status_code != 404:
+
+                        # Trailing-slash retry: some frameworks (FastAPI, Django) only
+                        # respond to /endpoint/ not /endpoint. If the first probe gets
+                        # a catch-all error or empty response, retry with trailing slash.
+                        if "?" in endpoint and resp.status_code == 200:
+                            body = resp.text.strip()
+                            if body in ('{"error":"Not found"}', '{"detail":"Not Found"}', ''):
+                                slash_base = probe_url.split("?")[0]
+                                slash_url = f"{slash_base}/?{'?'.join(probe_url.split('?')[1:])}"
+                                try:
+                                    resp2 = await client.get(slash_url)
+                                    if resp2.status_code == 200 and resp2.text.strip() != body:
+                                        # Trailing-slash version returned different content
+                                        probe_url = slash_url
+                                        probe_base = slash_url.split("?")[0]
+                                        resp = resp2
+                                except Exception:
+                                    pass
+
+                        # Accept 2xx (exists), 401/403 (auth-gated), 405 (wrong method but exists)
+                        # Reject 404, 500, 502, 503 (doesn't exist or server error)
+                        if resp.status_code < 404 or resp.status_code in (401, 403, 405):
                             # Preserve query params for endpoints that need them
                             # (e.g., redirect?url=... — the param IS the attack surface)
                             add_url = probe_url if "?" in endpoint else probe_base
@@ -2082,7 +2053,8 @@ class TeamOrchestrator:
                     p = prefix.rstrip("/")
                     # Pattern 1: Direct — /api/forum/thread/1
                     base = f"{p}/{'/'.join(path_before_id)}"
-                    candidates.append((f"{base}/{probe_id}", f"{base}/{raw_id}"))
+                    # Always use resolved probe_id in final URL (never keep :id templates)
+                    candidates.append((f"{base}/{probe_id}", f"{base}/{probe_id}"))
                     # Pattern 2: Pluralize last segment — /api/forum/threads/1
                     if path_before_id:
                         last = path_before_id[-1]
@@ -2090,14 +2062,14 @@ class TeamOrchestrator:
                             parts = list(path_before_id)
                             parts[-1] = last + "s"
                             base_p = f"{p}/{'/'.join(parts)}"
-                            candidates.append((f"{base_p}/{probe_id}", f"{base_p}/{raw_id}"))
+                            candidates.append((f"{base_p}/{probe_id}", f"{base_p}/{probe_id}"))
                     # Pattern 3: Just last segment(s) + ID — /api/threads/1
                     if len(path_before_id) >= 2:
                         base_s = f"{p}/{path_before_id[-1]}"
-                        candidates.append((f"{base_s}/{probe_id}", f"{base_s}/{raw_id}"))
+                        candidates.append((f"{base_s}/{probe_id}", f"{base_s}/{probe_id}"))
                         if not path_before_id[-1].endswith("s"):
                             base_sp = f"{p}/{path_before_id[-1]}s"
-                            candidates.append((f"{base_sp}/{probe_id}", f"{base_sp}/{raw_id}"))
+                            candidates.append((f"{base_sp}/{probe_id}", f"{base_sp}/{probe_id}"))
 
                 for probe_url, final_url in candidates:
                     if final_url in existing:
