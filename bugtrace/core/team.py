@@ -618,8 +618,7 @@ class TeamOrchestrator:
         from bugtrace.core.diagnostics import diagnostics
         if not await diagnostics.run_all():
             dashboard.log("❌ CRITICAL SYSTEM FAILURE: Diagnostics failed. Aborting.", "CRITICAL")
-            await asyncio.sleep(3)
-            sys.exit(1)
+            raise RuntimeError("Diagnostics failed — target may be unreachable")
         return True
 
     async def _handle_authentication(self):

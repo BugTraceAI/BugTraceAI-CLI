@@ -150,10 +150,18 @@ def serve(
         traceback.print_exc()
 
 @app.command(name="mcp")
-def mcp():
-    """Start the MCP server for AI assistant integration (STDIO transport)."""
+def mcp(
+    sse: bool = typer.Option(False, "--sse", help="Use SSE transport (HTTP) instead of STDIO for network access"),
+    host: str = typer.Option("0.0.0.0", "--host", help="SSE server bind address"),
+    port: int = typer.Option(8001, "--port", "-p", help="SSE server port"),
+):
+    """Start the MCP server for AI assistant integration.
+
+    Default: STDIO transport for local AI assistants (Claude Code, Cursor).
+    With --sse: HTTP/SSE transport for remote clients (OpenClaw, network MCP clients).
+    """
     from bugtrace.mcp.server import run_mcp_server
-    run_mcp_server()
+    run_mcp_server(transport="sse" if sse else "stdio", host=host, port=port)
 
 @app.command(name="summary")
 def summary(

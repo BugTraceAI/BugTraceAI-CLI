@@ -8,12 +8,14 @@ Tools:
 - get_scan_status: Check scan progress and status
 - query_findings: Retrieve vulnerability findings from a scan
 - stop_scan: Stop a running scan gracefully
+- export_report: Export final report for download/sharing
 
 Author: BugtraceAI Team
 Date: 2026-01-27
-Version: 1.0.0
+Version: 1.1.0
 """
 
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 from bugtrace.mcp.server import mcp_server
@@ -186,3 +188,229 @@ async def stop_scan(scan_id: int) -> Dict[str, Any]:
             "status": "failed",
             "message": "Failed to stop scan"
         }
+
+
+@mcp_server.tool()
+async def export_report(scan_id: int, section: str = "summary") -> Dict[str, Any]:
+    """Export a scan report summary or specific section.
+
+    Returns a concise report for a completed scan. Use section parameter to
+    control how much detail is returned.
+
+    IMPORTANT: The default "summary" section returns a brief overview suitable
+    for messaging apps. Use "critical" to see only critical/high findings.
+    Use "full" only if you need the entire report (may be very large).
+
+    Args:
+        scan_id: The ID of the scan to export
+        section: What to return:
+            - "summary" (default): Executive summary with severity counts and top findings
+            - "critical": Only critical and high severity findings with details
+            - "full": Complete markdown report (WARNING: can be 40KB+, may timeout)
+
+    Returns:
+        Dictionary with scan_id, target, report text, and findings summary
+    """
+    try:
+        from bugtrace.api.routes.reports import _find_report_dir
+        from bugtrace.core.database import get_db_manager
+
+        db = get_db_manager()
+        with db.get_session() as session:
+            from bugtrace.schemas.db_models import ScanTable, TargetTable
+            scan = session.get(ScanTable, scan_id)
+            if not scan:
+                return {"error": f"Scan {scan_id} not found", "scan_id": scan_id}
+            target = session.get(TargetTable, scan.target_id)
+            target_url = target.url if target else "unknown"
+            scan_status = scan.status
+
+        if scan_status in ("initializing", "running"):
+            return {
+                "error": f"Scan {scan_id} is still {scan_status}. Wait for completion.",
+                "scan_id": scan_id,
+                "status": scan_status,
+            }
+
+        report_dir = _find_report_dir(scan_id)
+        if not report_dir:
+            return {
+                "error": f"No report found for scan {scan_id}.",
+                "scan_id": scan_id,
+            }
+
+        findings_summary = _build_findings_summary(report_dir)
+        section = section.lower()
+
+        if section == "full":
+            md_file = report_dir / "final_report.md"
+            if not md_file.is_file():
+                md_file = report_dir / "technical_report.md"
+            if not md_file.is_file():
+                return {"error": "No report file found", "scan_id": scan_id}
+            content = md_file.read_text(encoding="utf-8")
+            # Truncate to 8000 chars to avoid LLM context overflow
+            if len(content) > 8000:
+                content = content[:8000] + "\n\n... [TRUNCATED — report is too large for chat. Full report has " + str(len(md_file.read_text(encoding="utf-8"))) + " characters] ..."
+
+        elif section == "critical":
+            content = _extract_critical_findings(report_dir, target_url)
+
+        else:  # summary (default)
+            content = _build_executive_summary(report_dir, target_url, scan_id, findings_summary)
+
+        return {
+            "scan_id": scan_id,
+            "target": target_url,
+            "section": section,
+            "report": content,
+            "findings_summary": findings_summary,
+        }
+
+    except Exception as e:
+        return {"error": str(e), "scan_id": scan_id}
+
+
+def _build_findings_summary(report_dir: Path) -> Dict[str, Any]:
+    """Build a quick severity summary from validated_findings.json."""
+    import json
+
+    summary = {"total": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    vf = report_dir / "validated_findings.json"
+    if not vf.is_file():
+        vf = report_dir / "raw_findings.json"
+    if not vf.is_file():
+        return summary
+
+    try:
+        data = json.loads(vf.read_text(encoding="utf-8"))
+        findings = data if isinstance(data, list) else data.get("findings", [])
+        summary["total"] = len(findings)
+        for f in findings:
+            sev = str(f.get("severity", "info")).lower()
+            if sev in summary:
+                summary[sev] += 1
+    except Exception:
+        pass
+
+    return summary
+
+
+def _build_executive_summary(
+    report_dir: Path, target_url: str, scan_id: int, summary: Dict[str, Any]
+) -> str:
+    """Build a concise executive summary from the report files."""
+    import json
+
+    lines = [
+        f"# BugTraceAI Scan Report — Scan #{scan_id}",
+        f"**Target:** {target_url}",
+        "",
+        "## Findings Overview",
+        f"- **Total findings:** {summary['total']}",
+        f"- **Critical:** {summary['critical']}",
+        f"- **High:** {summary['high']}",
+        f"- **Medium:** {summary['medium']}",
+        f"- **Low:** {summary['low']}",
+        f"- **Info:** {summary['info']}",
+        "",
+    ]
+
+    # Extract top findings (critical + high)
+    vf = report_dir / "validated_findings.json"
+    if not vf.is_file():
+        vf = report_dir / "raw_findings.json"
+
+    if vf.is_file():
+        try:
+            data = json.loads(vf.read_text(encoding="utf-8"))
+            findings = data if isinstance(data, list) else data.get("findings", [])
+
+            top = [f for f in findings if str(f.get("severity", "")).lower() in ("critical", "high")]
+            if top:
+                lines.append("## Critical & High Findings")
+                for i, f in enumerate(top[:10], 1):
+                    ftype = f.get("type", "Unknown")
+                    sev = f.get("severity", "?").upper()
+                    url = f.get("url") or f.get("attack_url") or "N/A"
+                    param = f.get("parameter") or f.get("vuln_parameter") or ""
+                    desc = f.get("description") or f.get("details") or ""
+                    # Truncate description
+                    if len(desc) > 150:
+                        desc = desc[:150] + "..."
+                    lines.append(f"### {i}. [{sev}] {ftype}")
+                    lines.append(f"- **URL:** {url}")
+                    if param:
+                        lines.append(f"- **Parameter:** {param}")
+                    if desc:
+                        lines.append(f"- **Details:** {desc}")
+                    lines.append("")
+
+            # Vuln type breakdown
+            type_counts: Dict[str, int] = {}
+            for f in findings:
+                ft = str(f.get("type", "unknown"))
+                type_counts[ft] = type_counts.get(ft, 0) + 1
+            if type_counts:
+                lines.append("## Vulnerability Types")
+                for vtype, count in sorted(type_counts.items(), key=lambda x: -x[1]):
+                    lines.append(f"- {vtype}: {count}")
+                lines.append("")
+
+        except Exception:
+            pass
+
+    lines.append("*Use `export_report` with `section=\"critical\"` for more details on critical findings.*")
+
+    return "\n".join(lines)
+
+
+def _extract_critical_findings(report_dir: Path, target_url: str) -> str:
+    """Extract detailed critical and high findings."""
+    import json
+
+    vf = report_dir / "validated_findings.json"
+    if not vf.is_file():
+        vf = report_dir / "raw_findings.json"
+    if not vf.is_file():
+        return "No findings data available."
+
+    try:
+        data = json.loads(vf.read_text(encoding="utf-8"))
+        findings = data if isinstance(data, list) else data.get("findings", [])
+    except Exception:
+        return "Error reading findings data."
+
+    critical = [f for f in findings if str(f.get("severity", "")).lower() in ("critical", "high")]
+    if not critical:
+        return "No critical or high severity findings."
+
+    lines = [f"# Critical & High Findings — {target_url}", ""]
+    for i, f in enumerate(critical[:15], 1):
+        ftype = f.get("type", "Unknown")
+        sev = f.get("severity", "?").upper()
+        url = f.get("url") or f.get("attack_url") or "N/A"
+        param = f.get("parameter") or f.get("vuln_parameter") or ""
+        desc = f.get("description") or f.get("details") or ""
+        payload = f.get("payload") or f.get("payload_used") or ""
+        repro = f.get("reproduction_command") or ""
+
+        lines.append(f"## {i}. [{sev}] {ftype}")
+        lines.append(f"**URL:** {url}")
+        if param:
+            lines.append(f"**Parameter:** {param}")
+        if desc:
+            if len(desc) > 500:
+                desc = desc[:500] + "..."
+            lines.append(f"**Description:** {desc}")
+        if payload:
+            if len(payload) > 300:
+                payload = payload[:300] + "..."
+            lines.append(f"**Payload:** `{payload}`")
+        if repro:
+            if len(repro) > 300:
+                repro = repro[:300] + "..."
+            lines.append(f"**Reproduce:** `{repro}`")
+        lines.append("")
+
+    return "\n".join(lines)
