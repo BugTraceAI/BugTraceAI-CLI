@@ -298,15 +298,17 @@ curl http://localhost:8000/health
 
 ## 🤖 AI Assistant Setup (MCP)
 
-BugTraceAI supports the **Model Context Protocol (MCP)**, allowing any AI assistant with terminal access to install, configure, and control security scans autonomously.
+BugTraceAI is **MCP-compatible** — control your security scans directly from your AI assistant through natural conversation.
 
-### What is MCP?
+Works with [**OpenClaw**](https://openclaw.com) (Telegram-based AI assistant), **Claude Code**, **Cursor**, and any MCP-compatible client. Deploy once, control from anywhere.
 
-MCP is an open protocol that lets AI assistants connect to external tools. BugTraceAI exposes its scanning capabilities as MCP tools — so your AI assistant can start scans, check progress, and retrieve reports through natural conversation.
+### How It Works
+
+BugTraceAI exposes its scanning engine as **MCP tools** via the [Model Context Protocol](https://modelcontextprotocol.io) — the open standard for connecting AI assistants to external tools. Your AI assistant can start scans, monitor progress, query findings, and retrieve reports — all through chat.
 
 ### Quick Setup for AI Agents
 
-> **Tell your AI assistant:**
+> **Using OpenClaw or another AI assistant? Just tell it:**
 >
 > *Clone https://github.com/BugTraceAI/BugTraceAI-CLI and deploy it with Docker. Copy `.env.example` to `.env` and ask me for the `OPENROUTER_API_KEY`. Run `docker compose up -d` to start both the API and MCP server. Then add the MCP server to your config with base URL `http://localhost:8001/sse`.*
 
@@ -358,7 +360,7 @@ Once connected, your AI assistant can use these tools:
 
 - **Docker & Docker Compose** installed and running
 - **OpenRouter API key** ([get one here](https://openrouter.ai/keys))
-- An MCP-compatible AI assistant (OpenClaw, Claude Code, Cursor, etc.)
+- An MCP-compatible AI assistant ([OpenClaw](https://openclaw.com), Claude Code, Cursor, or any MCP client)
 
 ### Ports
 
