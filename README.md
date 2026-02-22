@@ -2,7 +2,7 @@
 
 [![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white)](https://bugtraceai.com)
 [![Wiki Documentation](https://img.shields.io/badge/Wiki%20Documentation-000?logo=wikipedia&logoColor=white)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
-![License](https://img.shields.io/badge/License-Proprietary-red.svg)
+![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Required-blue?logo=docker)
@@ -421,11 +421,11 @@ CANDIDATE → PENDING_VALIDATION → CONFIRMED / FALSE_POSITIVE → PROBE_VALIDA
 
 ## 📜 License
 
-Proprietary - All Rights Reserved
+AGPL-3.0 License
 
 Copyright (c) 2026 BugTraceAI
 
-See [bugtraceai.com](https://bugtraceai.com) for licensing information.
+See [LICENSE](LICENSE) for details.
 
 ---
 
