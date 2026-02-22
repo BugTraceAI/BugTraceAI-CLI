@@ -4893,14 +4893,15 @@ Return ONLY the payloads, one per line, no explanations."""
             if hasattr(self, '_v'):
                 self._v.emit("exploit.xss.browser.testing", {"param": param, "index": i + 1, "total": len(candidates), "payload": payload[:80]})
             try:
-                browser_result = await self._validate_via_browser(url, param, payload)
+                browser_result = await self._validate_via_browser(url, param, payload, screenshot_dir=str(screenshots_dir))
                 if browser_result:
                     if hasattr(self, '_v'):
                         self._v.emit("exploit.xss.browser.result", {"param": param, "confirmed": True, "method": browser_result.get("method", "playwright")})
                     return XSSFinding(
                         url=url, parameter=param, payload=payload, context="dom",
                         validation_method="L5_browser", evidence={**browser_result, "level": "L5"},
-                        confidence=0.95, status="VALIDATED_CONFIRMED", validated=True
+                        confidence=0.95, status="VALIDATED_CONFIRMED", validated=True,
+                        screenshot_path=browser_result.get("screenshot_path"),
                     )
             except Exception as e:
                 logger.debug(f"[{self.name}] L5: Browser test {i+1} failed: {e}")
@@ -5578,7 +5579,7 @@ Return ONLY the payloads, one per line, no explanations."""
             return None
 
     async def _validate_via_browser(
-        self, url: str, param: str, payload: str
+        self, url: str, param: str, payload: str, screenshot_dir: str = None
     ) -> Optional[Dict[str, Any]]:
         """
         Validate XSS using browser with intelligent escalation.
@@ -5589,6 +5590,7 @@ Return ONLY the payloads, one per line, no explanations."""
             url: Target URL
             param: Parameter name
             payload: XSS payload
+            screenshot_dir: Directory to save evidence screenshots
 
         Returns:
             Evidence dict if confirmed, None otherwise
@@ -5605,16 +5607,19 @@ Return ONLY the payloads, one per line, no explanations."""
             # v3.2.1: CDP disabled - Playwright only (L3)
             result = await self.verifier.verify_xss(
                 url=test_url,
+                screenshot_dir=screenshot_dir,
                 timeout=15.0,
                 max_level=3  # L3=Playwright only, no CDP
             )
 
             if result and result.success:
+                ss_path = getattr(result, 'screenshot_path', None)
                 return {
                     "confirmed": True,
                     "method": result.method,
                     "evidence": getattr(result, 'evidence', {}),
-                    "screenshot": getattr(result, 'screenshot_path', None)
+                    "screenshot": ss_path,
+                    "screenshot_path": ss_path,
                 }
 
             # NOTE: DOM XSS detection removed from payload validation

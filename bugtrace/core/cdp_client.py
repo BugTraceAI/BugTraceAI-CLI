@@ -94,7 +94,8 @@ class CDPClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
             logger.warning(f"CDP exit with error: {exc_val}, cleaning up...")
-            await self.stop()
+        await self.stop()
+        return False
 
     async def _check_existing_connection(self) -> bool:
         """Check if existing connection is still healthy."""
@@ -295,9 +296,15 @@ class CDPClient:
         """Connect to Chrome and enable CDP domains."""
         self.session = aiohttp.ClientSession()
 
-        # Connect to page
-        self.ws_url = await self._connect_to_chrome_page()
-        self.ws = await self.session.ws_connect(self.ws_url)
+        try:
+            # Connect to page
+            self.ws_url = await self._connect_to_chrome_page()
+            self.ws = await self.session.ws_connect(self.ws_url)
+        except Exception:
+            # Close session if WebSocket connection fails to prevent leak
+            await self.session.close()
+            self.session = None
+            raise
 
         # Start receiver and enable domains
         self._receive_task = asyncio.create_task(self._receive_messages())

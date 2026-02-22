@@ -206,6 +206,9 @@ class XSSVerifier:
         if not dialog_detected[0]:
             early_result = await self._simulate_user_interactions(page, url, console_logs, dialog_detected)
             if early_result:
+                # Capture evidence screenshot before returning early
+                screenshot_path = await self._capture_screenshot(page, screenshot_dir, True)
+                early_result.screenshot_path = screenshot_path
                 return {
                     "verification_result": early_result,
                     "browser_refs": (browser, context, page)

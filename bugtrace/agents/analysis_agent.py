@@ -62,12 +62,13 @@ class DASTySASTAgent(BaseAgent):
         dashboard.log(f"[{self.name}] Running DAST+SAST Analysis on {self.url[:50]}...", "INFO")
 
         # Use phase-specific analysis semaphore for tracking (v2.4)
+        phase_ctx = None
         try:
             from bugtrace.core.phase_semaphores import phase_semaphores, ScanPhase
             phase_semaphores.initialize()
             phase_ctx = phase_semaphores.acquire(ScanPhase.ANALYSIS)
         except ImportError:
-            phase_ctx = None
+            pass
 
         try:
             if phase_ctx:
@@ -132,7 +133,10 @@ class DASTySASTAgent(BaseAgent):
         finally:
             # Release phase semaphore (v2.4)
             if phase_ctx:
-                await phase_ctx.__aexit__(None, None, None)
+                try:
+                    await phase_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass  # Semaphore already released or never acquired
 
     async def _run_prepare_context(self) -> Dict:
         """Prepare analysis context with OOB payload, HTML content, and ACTIVE PROBES.
