@@ -9,7 +9,7 @@ venv/
 .vscode/
 reports/
 logs/
-data/
+/data/
 *.db
 *.db-*
 tools/bin/

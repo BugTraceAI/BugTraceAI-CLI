@@ -32,12 +32,15 @@ class Settings(BaseSettings):
     """
     # --- Project Metadata ---
     APP_NAME: str = "BugtraceAI-CLI"
-    VERSION: str = "2.0.3"  # Phoenix Edition
+    VERSION: str = "2.1.1"  # Phoenix Edition
     DEBUG: bool = False
     SAFE_MODE: bool = False # Default to False, override via CLI
 
     # --- Environment (TASK-124) ---
     ENV: str = Field(default="production", description="Environment: development, staging, production")
+
+    # --- LLM Provider Selection ---
+    PROVIDER: str = "openrouter"  # Active provider: openrouter, zai
 
     # --- API Keys (Secrets) with validation (TASK-118) ---
     OPENROUTER_API_KEY: Optional[str] = Field(default=None, min_length=32, description="OpenRouter API key")
@@ -499,20 +502,69 @@ class Settings(BaseSettings):
         if "EMBEDDINGS_LOG_CONFIDENCE" in section:
             self.EMBEDDINGS_LOG_CONFIDENCE = section.getboolean("EMBEDDINGS_LOG_CONFIDENCE")
 
+    def _load_provider_section(self, config):
+        """Load [PROVIDER] section — sets self.PROVIDER."""
+        if "PROVIDER" not in config:
+            return
+        section = config["PROVIDER"]
+        if "ACTIVE" in section:
+            self.PROVIDER = section["ACTIVE"].strip().lower()
+
+    def _load_provider_preset(self):
+        """Load provider preset JSON and set model defaults.
+
+        Called BEFORE _load_llm_models_config so user overrides in
+        [LLM_MODELS] take precedence over preset defaults.
+        """
+        preset_path = self.BASE_DIR / "bugtrace" / "data" / "providers" / f"{self.PROVIDER}.json"
+        if not preset_path.exists():
+            logger.warning(f"Provider preset not found: {preset_path} — using defaults")
+            self._provider_config = {}
+            return
+
+        try:
+            preset = json.loads(preset_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"Failed to load provider preset {preset_path}: {e}")
+            self._provider_config = {}
+            return
+
+        self._provider_config = preset
+
+        # Apply model defaults from preset
+        models = preset.get("models", {})
+        for field, value in models.items():
+            if hasattr(self, field):
+                object.__setattr__(self, field, value)
+
+        logger.info(f"Provider preset loaded: {preset.get('name', self.PROVIDER)} ({len(models)} model defaults)")
+
     def _load_llm_models_config(self, config):
-        """Load LLM_MODELS section config."""
+        """Load LLM_MODELS section config.
+
+        When a non-default provider is active, model overrides from [LLM_MODELS]
+        are skipped — the provider preset already set the correct models.
+        Only numeric/non-model settings (MIN_CREDITS, batch sizes) still apply.
+        """
         if "LLM_MODELS" not in config:
             return
         section = config["LLM_MODELS"]
-        if "DEFAULT_MODEL" in section: self.DEFAULT_MODEL = section["DEFAULT_MODEL"]
-        if "PRIMARY_MODELS" in section: self.PRIMARY_MODELS = section["PRIMARY_MODELS"]
-        if "VISION_MODEL" in section: self.VISION_MODEL = section["VISION_MODEL"]
-        if "WAF_DETECTION_MODELS" in section: self.WAF_DETECTION_MODELS = section["WAF_DETECTION_MODELS"]
-        if "CODE_MODEL" in section: self.CODE_MODEL = section["CODE_MODEL"]
-        if "MUTATION_MODEL" in section: self.MUTATION_MODEL = section["MUTATION_MODEL"]
-        if "ANALYSIS_MODEL" in section: self.ANALYSIS_MODEL = section["ANALYSIS_MODEL"]
-        if "SKEPTICAL_MODEL" in section: self.SKEPTICAL_MODEL = section["SKEPTICAL_MODEL"]
-        if "REPORTING_MODEL" in section: self.REPORTING_MODEL = section["REPORTING_MODEL"]
+
+        # Skip model overrides when a provider preset is active —
+        # the preset already configured the right models for this provider.
+        # Users can still override via env vars if needed.
+        if not self._provider_config:
+            # No preset loaded, apply conf overrides as before
+            model_fields = [
+                "DEFAULT_MODEL", "PRIMARY_MODELS", "VISION_MODEL",
+                "WAF_DETECTION_MODELS", "CODE_MODEL", "MUTATION_MODEL",
+                "ANALYSIS_MODEL", "SKEPTICAL_MODEL", "REPORTING_MODEL",
+            ]
+            for field in model_fields:
+                if field in section:
+                    setattr(self, field, section[field])
+        else:
+            logger.debug(f"Skipping [LLM_MODELS] overrides — provider preset '{self.PROVIDER}' is active")
         if "MIN_CREDITS" in section:
             self.MIN_CREDITS = section.getfloat("MIN_CREDITS")
         if "MAX_CONCURRENT_REQUESTS" in section:
@@ -770,12 +822,14 @@ class Settings(BaseSettings):
         self._load_core_config(config)
         # Load paths early - other sections may depend on LOG_DIR/REPORT_DIR
         self._load_paths_config(config)
+        self._load_provider_section(config)  # Read [PROVIDER] → sets self.PROVIDER
+        self._load_provider_preset()          # Load JSON → sets model defaults
         self._load_crawler_config(config)
         self._load_scan_config(config)
         self._load_parallelization_config(config)
         self._load_url_prioritization_config(config)
         self._load_thinking_config(config)
-        self._load_llm_models_config(config)
+        self._load_llm_models_config(config)  # User overrides from [LLM_MODELS]
         self._load_conductor_and_scanning_config(config)
         self._load_analysis_and_misc_config(config)
         self._load_authority_config(config)
@@ -796,9 +850,12 @@ class Settings(BaseSettings):
         errors = []
         warnings = []
 
-        # Check required API key
-        if not self.OPENROUTER_API_KEY:
-            errors.append("OPENROUTER_API_KEY is required")
+        # Check required API key for active provider
+        provider_cfg = getattr(self, '_provider_config', {})
+        provider_key_env = provider_cfg.get("api_key_env", "OPENROUTER_API_KEY")
+        provider_key = getattr(self, provider_key_env, None) or os.environ.get(provider_key_env)
+        if not provider_key:
+            errors.append(f"{provider_key_env} is required for provider '{self.PROVIDER}'")
 
         # Check numeric bounds
         if self.MAX_DEPTH < 1:
@@ -940,6 +997,9 @@ class Settings(BaseSettings):
                     'other': other_val
                 }
         return diff
+
+    # --- Provider Config (loaded from preset JSON) ---
+    _provider_config: Dict[str, Any] = {}
 
     # --- Config Versioning (TASK-127) ---
     _config_history: List[Dict[str, Any]] = []

@@ -107,8 +107,8 @@ class ModelMetrics:
 class TokenUsageTracker:
     """Tracks token usage across models and agents with cost estimation."""
 
-    # OpenRouter pricing per 1M tokens (approximate, update as needed)
-    PRICING = {
+    # Pricing per 1M tokens — loaded from active provider preset, with fallbacks
+    _FALLBACK_PRICING = {
         "google/gemini-2.5-flash-preview": {"input": 0.05, "output": 0.15},
         "google/gemini-3-flash-preview": {"input": 0.05, "output": 0.15},
         "moonshotai/kimi-k2-thinking": {"input": 0.40, "output": 1.75},
@@ -116,6 +116,18 @@ class TokenUsageTracker:
         "anthropic/claude-3-haiku": {"input": 0.25, "output": 1.25},
         "default": {"input": 0.50, "output": 1.50}
     }
+
+    @classmethod
+    def _get_pricing(cls) -> Dict[str, Dict[str, float]]:
+        """Get pricing from active provider preset, falling back to hardcoded."""
+        provider_cfg = getattr(settings, '_provider_config', {})
+        provider_pricing = provider_cfg.get('pricing', {})
+        merged = {**cls._FALLBACK_PRICING, **provider_pricing}
+        if "default" not in merged:
+            merged["default"] = {"input": 0.50, "output": 1.50}
+        return merged
+
+    PRICING = _FALLBACK_PRICING  # Class attribute for backward compat
 
     def __init__(self):
         self.total_input_tokens = 0
@@ -141,10 +153,11 @@ class TokenUsageTracker:
         self.by_agent[agent]["output"] += output_tokens
 
     def estimate_cost(self) -> float:
-        """Estimate total cost based on OpenRouter pricing."""
+        """Estimate total cost based on active provider pricing."""
         total_cost = 0.0
+        pricing_table = self._get_pricing()
         for model, usage in self.by_model.items():
-            pricing = self.PRICING.get(model, self.PRICING["default"])
+            pricing = pricing_table.get(model, pricing_table["default"])
             input_cost = (usage["input"] / 1_000_000) * pricing["input"]
             output_cost = (usage["output"] / 1_000_000) * pricing["output"]
             total_cost += input_cost + output_cost
@@ -196,22 +209,25 @@ class LLMClient:
     ]
     
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or settings.OPENROUTER_API_KEY
-        self.base_url = "https://openrouter.ai/api/v1/chat/completions"
+        # Provider-aware initialization
+        provider_cfg = getattr(settings, '_provider_config', {})
+        self.provider_id = settings.PROVIDER
+        api_key_env = provider_cfg.get('api_key_env', 'OPENROUTER_API_KEY')
+        self.api_key = api_key or os.environ.get(api_key_env) or settings.OPENROUTER_API_KEY
+        self.base_url = provider_cfg.get('base_url', "https://openrouter.ai/api/v1/chat/completions")
         self.req_count = 0
-        
+
         # Priority list for Model Shifting (Tiered by performance/intelligence)
         # Using the specific high-performance models requested by the user
         self.models = [m.strip() for m in settings.PRIMARY_MODELS.split(",")]
-        
-        # Fallback to defaults if list is empty
+
         # Fallback to defaults if list is empty
         if not self.models:
             logger.critical("No PRIMARY_MODELS found in configuration. Please check bugtraceaicli.conf.")
             self.models = []
-        
+
         if not self.api_key:
-            logger.warning("OPENROUTER_API_KEY is not set. LLM features will be disabled.")
+            logger.warning(f"{api_key_env} is not set. LLM features will be disabled.")
 
         # Anthropic OAuth token cache (lazy-loaded on first anthropic/ model call)
         self._anthropic_token_cache: Optional[str] = None
@@ -402,11 +418,7 @@ class LLMClient:
         """Ping a single model to check connectivity."""
         dashboard.log(f"Pinging model: {model}...", "INFO")
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://bugtraceai.com",
-        }
+        headers = self._build_headers("ping")
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": "Ping"}],
@@ -452,18 +464,21 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens
         }
-        if settings.OPENROUTER_ONLINE:
+        if self.provider_id == "openrouter" and settings.OPENROUTER_ONLINE:
             payload["online"] = True
         return payload
 
     def _build_headers(self, module_name: str) -> Dict[str, str]:
-        """Build API request headers."""
-        return {
+        """Build API request headers (provider-aware)."""
+        headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://bugtraceai.com",
-            "X-Title": f"Bugtrace-{module_name}",
         }
+        # OpenRouter-specific headers
+        if self.provider_id == "openrouter":
+            headers["HTTP-Referer"] = "https://bugtraceai.com"
+            headers["X-Title"] = f"Bugtrace-{module_name}"
+        return headers
 
     def _build_messages(self, prompt: str, system_prompt: Optional[str] = None) -> List[Dict[str, str]]:
         """Build message array for API request."""
@@ -1029,7 +1044,7 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens
         }
-        if settings.OPENROUTER_ONLINE:
+        if self.provider_id == "openrouter" and settings.OPENROUTER_ONLINE:
             payload["online"] = True
 
         # Use orchestrator with LLM destination for proper timeout and lifecycle tracking
@@ -1076,8 +1091,8 @@ class LLMClient:
         return result
 
     async def update_balance(self):
-        """Polls OpenRouter for current credit balance."""
-        if not self.api_key:
+        """Polls OpenRouter for current credit balance. Skipped for non-OpenRouter providers."""
+        if self.provider_id != "openrouter" or not self.api_key:
             return
 
         try:
@@ -1133,13 +1148,8 @@ class LLMClient:
             return None
 
     def _build_vision_headers(self, module_name: str) -> Dict[str, str]:
-        """Build headers for vision API request."""
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://bugtraceai.com",
-            "X-Title": f"Bugtrace-{module_name}",
-        }
+        """Build headers for vision API request (provider-aware)."""
+        return self._build_headers(module_name)
 
     def _build_vision_payload(self, prompt: str, base64_image: str) -> Dict[str, Any]:
         """Build payload for vision API request."""
@@ -1162,7 +1172,7 @@ class LLMClient:
             "max_tokens": 1500
         }
 
-        if settings.OPENROUTER_ONLINE:
+        if self.provider_id == "openrouter" and settings.OPENROUTER_ONLINE:
             payload["online"] = True
 
         return payload
@@ -1279,12 +1289,7 @@ class LLMClient:
         temperature: float
     ) -> str:
         """Call vision API with image messages."""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://bugtraceai.com",
-            "X-Title": f"Bugtrace-{module_name}",
-        }
+        headers = self._build_headers(module_name)
         payload = {
             "model": model_override or settings.VALIDATION_VISION_MODEL,
             "messages": messages,

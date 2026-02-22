@@ -310,10 +310,12 @@ from bugtrace.api.routes.reports import router as reports_router
 from bugtrace.api.routes.config import router as config_router
 from bugtrace.api.routes.metrics import router as metrics_router
 from bugtrace.api.routes.websocket import router as websocket_router
+from bugtrace.api.routes.providers import router as providers_router
 
 app.include_router(scans_router, prefix="/api", tags=["scans"])
 app.include_router(reports_router, prefix="/api", tags=["reports"])
 app.include_router(config_router, prefix="/api", tags=["config"])
+app.include_router(providers_router, prefix="/api", tags=["providers"])
 app.include_router(metrics_router, prefix="/api", tags=["metrics"])
 app.include_router(websocket_router, prefix="/api", tags=["websocket"])
 
