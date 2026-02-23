@@ -149,13 +149,13 @@ This eliminates the "hallucination problem" of pure-AI scanners.
 │                         BUGTRACE REACTOR                             │
 ├──────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│  ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐  │
-│  │   Phase 1  │   │   Phase 2  │   │   Phase 3  │   │   Phase 4  │  │
-│  │   Recon    │ → │  Discovery │ → │  Strategy  │ → │Exploitation│  │
-│  │  GoSpider  │   │ DASTySAST  │   │ ThinkingAg.│   │ 14 Agents  │  │
-│  │ URL Enrich │   │ 6 Personas │   │   Dedup    │   │   SQLMap   │  │
-│  │ SPA→API    │   │  + Nuclei  │   │  Routing   │   │ Playwright │  │
-│  └────────────┘   └────────────┘   └────────────┘   └─────┬──────┘  │
+│  ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐   │
+│  │   Phase 1  │   │   Phase 2  │   │   Phase 3  │   │   Phase 4  │   │
+│  │   Recon    │ → │  Discovery │ → │  Strategy  │ → │Exploitation│   │
+│  │  GoSpider  │   │ DASTySAST  │   │ ThinkingAg.│   │ 14 Agents  │   │
+│  │ URL Enrich │   │ 6 Personas │   │   Dedup    │   │   SQLMap   │   │
+│  │ SPA→API    │   │  + Nuclei  │   │  Routing   │   │ Playwright │   │
+│  └────────────┘   └────────────┘   └────────────┘   └─────┬──────┘   │
 │                                                            │         │
 │                                                            ▼         │
 │                                                     ┌────────────┐   │
@@ -164,8 +164,8 @@ This eliminates the "hallucination problem" of pure-AI scanners.
 │                                                     │    CDP     │   │
 │                                                     │ Vision AI  │   │
 │                                                     └─────┬──────┘   │
-│                                                            │         │
-│                                                            ▼         │
+│                                                           │          │
+│                                                           ▼          │
 │                                                     ┌────────────┐   │
 │                                                     │   Phase 6  │   │
 │                                                     │ Reporting  │   │
