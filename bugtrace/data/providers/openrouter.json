@@ -4,7 +4,9 @@
     "base_url": "https://openrouter.ai/api/v1/chat/completions",
     "api_key_env": "OPENROUTER_API_KEY",
     "api_key_hint": "sk-or-v1-...",
+    "recommended": true,
     "features": {
+        "description": "Recommended — access 200+ models from multiple providers. Best model for each scanning task.",
         "online_mode": true,
         "balance_check": true,
         "model_discovery": true

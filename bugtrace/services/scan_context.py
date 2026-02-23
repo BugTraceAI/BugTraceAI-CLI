@@ -195,4 +195,5 @@ class ScanContext:
             "scan_type": self.options.scan_type,
             "max_depth": self.options.max_depth,
             "max_urls": self.options.max_urls,
+            "provider": self.settings_snapshot.get("PROVIDER") if self.settings_snapshot else None,
         }

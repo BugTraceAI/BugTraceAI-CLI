@@ -245,6 +245,8 @@ class DatabaseManager:
             self._migrate_enrichment_status_column(session)
             # Migration: Add scan config columns (v5.3)
             self._migrate_scan_config_columns(session)
+            # Migration: Add 'provider' column to scan table (v5.4)
+            self._migrate_provider_column(session)
 
     def _migrate_origin_column(self, session):
         """Migrate 'origin' column to scan table."""
@@ -310,6 +312,20 @@ class DatabaseManager:
                 except Exception as e:
                     session.rollback()
                     logger.warning(f"Migration '{col}' column skipped: {e}")
+
+    def _migrate_provider_column(self, session):
+        """Migrate 'provider' column to scan table."""
+        try:
+            session.exec(text("SELECT provider FROM scan LIMIT 1"))
+        except Exception:
+            session.rollback()
+            try:
+                session.exec(text("ALTER TABLE scan ADD COLUMN provider VARCHAR DEFAULT NULL"))
+                session.commit()
+                logger.info("Migration: Added 'provider' column to scan table")
+            except Exception as e:
+                session.rollback()
+                logger.warning(f"Migration 'provider' column skipped: {e}")
 
     def _init_vector_store(self):
         """Initialize vector store with explicit schema for findings_embeddings."""
@@ -459,6 +475,7 @@ class DatabaseManager:
         scan_type: str = None,
         max_depth: int = None,
         max_urls: int = None,
+        provider: str = None,
     ) -> int:
         """Create a new scan record with RUNNING status.
 
@@ -468,6 +485,7 @@ class DatabaseManager:
             scan_type: Scan type ('full', 'hunter', 'manager', etc.)
             max_depth: Crawl depth configured
             max_urls: Max URLs configured
+            provider: LLM provider used ('openrouter', 'zai', etc.)
         """
         target = self.get_or_create_target(target_url)
         target_id = target.id  # Extract ID while target is still valid
@@ -480,12 +498,13 @@ class DatabaseManager:
                 scan_type=scan_type,
                 max_depth=max_depth,
                 max_urls=max_urls,
+                provider=provider,
             )
             session.add(scan)
             session.commit()
             session.refresh(scan)
             scan_id = scan.id
-        logger.info(f"Created scan {scan_id} in database (target_id={target_id}, origin={origin}, type={scan_type}, depth={max_depth}, urls={max_urls})")
+        logger.info(f"Created scan {scan_id} in database (target_id={target_id}, origin={origin}, type={scan_type}, depth={max_depth}, urls={max_urls}, provider={provider})")
         return scan_id
 
     def update_scan_progress(self, scan_id: int, progress: int, status: Optional[ScanStatus] = None):

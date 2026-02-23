@@ -122,12 +122,14 @@ class ScanService:
 
     def _create_scan_record(self, options: ScanOptions, origin: str) -> int:
         """Create database scan record with config."""
+        from bugtrace.core.config import settings as _settings
         scan_id = self.db.create_new_scan(
             options.target_url,
             origin=origin,
             scan_type=options.scan_type,
             max_depth=options.max_depth,
             max_urls=options.max_urls,
+            provider=getattr(_settings, 'PROVIDER', None),
         )
         logger.info(f"Created scan {scan_id} for target: {options.target_url} (origin={origin})")
         return scan_id
@@ -444,6 +446,7 @@ class ScanService:
                 "scan_type": scan.scan_type,
                 "max_depth": scan.max_depth,
                 "max_urls": scan.max_urls,
+                "provider": getattr(scan, "provider", None),
             }
 
     async def stop_scan(self, scan_id: int) -> Dict[str, Any]:
@@ -604,6 +607,7 @@ class ScanService:
                 "scan_type": scan.scan_type,
                 "max_depth": scan.max_depth,
                 "max_urls": scan.max_urls,
+                "provider": getattr(scan, "provider", None),
             })
         return results
 

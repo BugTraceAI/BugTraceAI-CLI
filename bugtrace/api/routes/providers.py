@@ -30,6 +30,7 @@ PROVIDERS_DIR = settings.BASE_DIR / "bugtrace" / "data" / "providers"
 class ProviderSummary(BaseModel):
     id: str
     name: str
+    recommended: bool = False
     api_key_configured: bool
     api_key_hint: str
 
@@ -43,6 +44,11 @@ class ProviderDetail(BaseModel):
     features: Dict[str, Any]
     models: Dict[str, str]
     pricing: Dict[str, Any]
+
+
+class TestProviderRequest(BaseModel):
+    provider: str
+    api_key: Optional[str] = None
 
 
 class SwitchProviderRequest(BaseModel):
@@ -107,6 +113,7 @@ async def list_providers():
             providers.append(ProviderSummary(
                 id=preset["id"],
                 name=preset["name"],
+                recommended=preset.get("recommended", False),
                 api_key_configured=configured,
                 api_key_hint=hint if configured else preset.get("api_key_hint", ""),
             ))
@@ -145,6 +152,23 @@ async def get_current_provider():
         features=provider_cfg.get("features", {}),
         models=current_models,
         pricing=provider_cfg.get("pricing", {}),
+    )
+
+
+@router.get("/providers/{provider_id}", response_model=ProviderDetail)
+async def get_provider_detail(provider_id: str):
+    """Get the full preset configuration for any provider by ID."""
+    preset = _load_preset(provider_id)
+    configured, hint = _check_api_key(preset)
+    return ProviderDetail(
+        provider=preset["id"],
+        name=preset["name"],
+        base_url=preset.get("base_url", ""),
+        api_key_configured=configured,
+        api_key_hint=hint if configured else preset.get("api_key_hint", ""),
+        features=preset.get("features", {}),
+        models=preset.get("models", {}),
+        pricing=preset.get("pricing", {}),
     )
 
 
@@ -197,6 +221,70 @@ async def switch_provider(req: SwitchProviderRequest):
         "api_key_hint": hint,
         "models": {k: getattr(settings, k, "") for k in preset.get("models", {}).keys()},
     }
+
+
+@router.post("/provider/test")
+async def test_provider_key(req: TestProviderRequest):
+    """Test an API key against a provider by making a real LLM call."""
+    import httpx
+
+    preset = _load_preset(req.provider)
+    base_url = preset.get("base_url", "")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="Provider has no base_url configured")
+
+    # Use provided key, or fall back to configured key
+    api_key = req.api_key
+    if not api_key:
+        key_env = preset.get("api_key_env", "")
+        api_key = os.environ.get(key_env) or getattr(settings, key_env, None)
+    if not api_key:
+        return {"success": False, "message": "No API key provided and none configured."}
+
+    # Pick the fastest/cheapest model from preset for testing
+    models = preset.get("models", {})
+    test_model = models.get("ANALYSIS_MODEL") or models.get("DEFAULT_MODEL") or ""
+    if not test_model:
+        return {"success": False, "message": "No model configured for this provider."}
+
+    headers: Dict[str, str] = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept-Language": "en-US,en",
+    }
+    # Apply provider-specific headers
+    for k, v in preset.get("headers", {}).items():
+        headers[k] = v
+
+    body = {
+        "model": test_model,
+        "messages": [{"role": "user", "content": "Are you alive? Answer only yes."}],
+        "max_tokens": 5,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(base_url, json=body, headers=headers)
+        if resp.status_code == 200:
+            return {"success": True, "message": "API Key Valid Response"}
+        elif resp.status_code == 401:
+            return {"success": False, "message": "Invalid API key. Please check and try again."}
+        elif resp.status_code == 403:
+            return {"success": False, "message": "API key rejected — insufficient permissions or account issue."}
+        elif resp.status_code == 429:
+            return {"success": False, "message": "Rate limited — key is valid but too many requests. Try again later."}
+        else:
+            detail = ""
+            try:
+                data = resp.json()
+                detail = data.get("error", {}).get("message", "") if isinstance(data.get("error"), dict) else str(data.get("error", ""))
+            except Exception:
+                pass
+            return {"success": False, "message": f"Provider returned HTTP {resp.status_code}. {detail}".strip()}
+    except httpx.TimeoutException:
+        return {"success": False, "message": "Connection timed out. Check the provider URL."}
+    except Exception as e:
+        return {"success": False, "message": f"Connection failed: {str(e)}"}
 
 
 @router.patch("/provider/models")

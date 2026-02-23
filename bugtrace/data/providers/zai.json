@@ -6,28 +6,32 @@
     "api_key_env": "GLM_API_KEY",
     "api_key_hint": "...",
     "features": {
+        "description": "Z.ai direct API. Single-provider option using GLM model family.",
         "online_mode": false,
         "balance_check": false,
         "model_discovery": false,
         "coding_plan": true
     },
     "models": {
-        "DEFAULT_MODEL": "glm-4.7",
-        "CODE_MODEL": "glm-4.7",
+        "DEFAULT_MODEL": "glm-5",
+        "CODE_MODEL": "glm-5",
         "ANALYSIS_MODEL": "glm-4.7-flash",
-        "PRIMARY_MODELS": "glm-4.7,glm-4.7-flash",
+        "PRIMARY_MODELS": "glm-5,glm-4.7-flash,glm-4.6v",
         "VISION_MODEL": "glm-4.6v",
         "WAF_DETECTION_MODELS": "glm-4.7-flash",
-        "MUTATION_MODEL": "glm-4.7",
-        "SKEPTICAL_MODEL": "glm-4.7",
+        "MUTATION_MODEL": "glm-5",
+        "SKEPTICAL_MODEL": "glm-5",
         "REPORTING_MODEL": "glm-4.7-flash"
+    },
+    "headers": {
+        "Accept-Language": "en-US,en"
     },
     "rate_limit": {
         "requests_per_minute": 10,
         "retry_after_seconds": 10
     },
     "pricing": {
-        "glm-4.7": { "input": 0.60, "output": 2.20 },
+        "glm-5": { "input": 0.60, "output": 2.20 },
         "glm-4.7-flash": { "input": 0.07, "output": 0.40 },
         "glm-4.6v": { "input": 0.30, "output": 0.90 }
     }

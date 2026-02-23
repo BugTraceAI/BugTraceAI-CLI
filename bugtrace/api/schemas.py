@@ -55,6 +55,7 @@ class ScanStatusResponse(BaseModel):
     scan_type: Optional[str] = None
     max_depth: Optional[int] = None
     max_urls: Optional[int] = None
+    provider: Optional[str] = None  # LLM provider used: "openrouter", "zai", etc.
 
 
 class FindingItem(BaseModel):
@@ -101,6 +102,7 @@ class ScanSummary(BaseModel):
     scan_type: Optional[str] = None
     max_depth: Optional[int] = None
     max_urls: Optional[int] = None
+    provider: Optional[str] = None  # LLM provider used
 
 
 class ScanListResponse(BaseModel):
