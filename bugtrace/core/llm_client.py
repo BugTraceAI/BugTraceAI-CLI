@@ -46,8 +46,8 @@ CB_DEGRADED_DELAY = 2.0        # Delay between requests in DEGRADED state
 CB_SUCCESS_THRESHOLD = 2       # Successes needed to recover from DEGRADED
 
 # LLM Request Timeouts (seconds)
-LLM_TOTAL_TIMEOUT = 45         # Total request timeout (non-streaming)
-LLM_CONNECT_TIMEOUT = 10       # Connection establishment timeout
+LLM_TOTAL_TIMEOUT = 90         # Total request timeout (non-streaming) — reasoning models need 30-60s
+LLM_CONNECT_TIMEOUT = 15       # Connection establishment timeout
 
 
 def sanitize_text(text: str) -> str:
@@ -233,11 +233,11 @@ class LLMClient:
         self._anthropic_token_cache: Optional[str] = None
         self._anthropic_token_expires: float = 0
 
-        # No global semaphore - each agent runs independently
-        # Rate limiting handled by:
-        # 1. tenacity retry with exponential backoff
-        # 2. Model shifting on 429 errors
-        # 3. Circuit breaker for cascading failures
+        # Per-model concurrency limiter (from provider preset)
+        # Prevents 429 avalanches by limiting in-flight requests per model
+        concurrency_cfg = provider_cfg.get('concurrency', {})
+        self._concurrency_cfg = concurrency_cfg
+        self._model_semaphores: Dict[str, asyncio.Semaphore] = {}
 
         # TASK-130: Token usage tracking
         self.token_tracker = TokenUsageTracker()
@@ -255,6 +255,33 @@ class LLMClient:
         self.consecutive_successes = 0
         self.last_failure_time: float = 0
         self.circuit_open_until: float = 0
+
+    # ========== Per-Model Concurrency Limiter ==========
+
+    def _get_model_semaphore(self, model: str) -> asyncio.Semaphore:
+        """Get or create a semaphore for the given model.
+
+        Limits concurrent in-flight requests per model to prevent 429 avalanches.
+        Concurrency limits are read from the provider preset's 'concurrency' map.
+        """
+        if model not in self._model_semaphores:
+            limit = self._concurrency_cfg.get(model, self._concurrency_cfg.get('default', 999))
+            self._model_semaphores[model] = asyncio.Semaphore(limit)
+            if limit < 999:
+                logger.debug(f"[Concurrency] Created semaphore for {model}: max {limit} concurrent")
+        return self._model_semaphores[model]
+
+    def _sort_models_by_availability(self, models: List[str]) -> List[str]:
+        """Sort models by available semaphore slots (most available first).
+
+        Distributes load across all models instead of always hitting the first one.
+        Models with zero available slots go to the end.
+        """
+        def available_slots(model: str) -> int:
+            sem = self._get_model_semaphore(model)
+            return sem._value
+
+        return sorted(models, key=available_slots, reverse=True)
 
     # ========== Circuit Breaker Methods ==========
 
@@ -358,7 +385,7 @@ class LLMClient:
             return '{"result": "CONFIRMED", "confidence": 1.0, "reason": "LLM unavailable - fail open"}'
 
         # Payload generation tasks
-        if "payload" in combined or "generate" in combined and "xss" in combined:
+        if ("payload" in combined or "generate" in combined) and "xss" in combined:
             logger.debug("[Fallback] Payload generation - returning generic payloads")
             return '{"payloads": ["<script>alert(1)</script>", "{{7*7}}", "${7*7}"]}'
 
@@ -761,7 +788,7 @@ class LLMClient:
         if model_override:
             models_to_try = [model_override] + [m for m in self.models if m != model_override]
         else:
-            models_to_try = self.models
+            models_to_try = self._sort_models_by_availability(list(self.models))
 
         headers = self._build_headers(module_name)
         messages = self._build_messages(prompt, system_prompt)
@@ -818,6 +845,12 @@ class LLMClient:
         Handles typed exceptions for better retry logic.
         """
         for current_model in models_to_try:
+            # Skip models with zero available slots if others remain
+            sem = self._get_model_semaphore(current_model)
+            if sem._value <= 0 and current_model != models_to_try[-1]:
+                logger.debug(f"[LoadBalancer] Skipping {current_model} (0 slots free), trying next model")
+                continue
+
             # Try this model up to 3 times with exponential backoff
             for retry_attempt in range(3):
                 try:
@@ -909,22 +942,24 @@ class LLMClient:
             connect=LLM_CONNECT_TIMEOUT
         )
 
-        # Use orchestrator with LLM destination for proper timeout and lifecycle tracking
+        # Per-model concurrency limiter: wait for a slot before making the request
+        sem = self._get_model_semaphore(current_model)
         try:
-            async with orchestrator.session(DestinationType.LLM) as session:
-                async with session.post(
-                    api_url,
-                    headers=api_headers,
-                    json=api_payload,
-                    timeout=timeout
-                ) as resp:
-                    latency_ms = (time.time() - start_time) * 1000
-                    return await self._handle_api_response(
-                        resp, current_model, module_name, prompt,
-                        latency_ms, model_override, system_prompt,
-                        temperature, max_tokens,
-                        is_anthropic=is_anthropic
-                    )
+            async with sem:
+                async with orchestrator.session(DestinationType.LLM) as session:
+                    async with session.post(
+                        api_url,
+                        headers=api_headers,
+                        json=api_payload,
+                        timeout=timeout
+                    ) as resp:
+                        latency_ms = (time.time() - start_time) * 1000
+                        return await self._handle_api_response(
+                            resp, current_model, module_name, prompt,
+                            latency_ms, model_override, system_prompt,
+                            temperature, max_tokens,
+                            is_anthropic=is_anthropic
+                        )
         except asyncio.TimeoutError as e:
             # Transient: LLM request timed out - worth retrying
             latency_ms = (time.time() - start_time) * 1000
