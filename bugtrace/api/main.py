@@ -368,7 +368,7 @@ async def _ws_validate_scan(websocket: WebSocket, scan_id: int) -> bool:
     """Validate scan exists before streaming."""
     scan_service = get_scan_service()
     try:
-        scan_service.get_scan_status(scan_id)
+        await scan_service.get_scan_status(scan_id)
         return True
     except Exception as e:
         logger.warning(f"Invalid scan_id {scan_id}: {e}")

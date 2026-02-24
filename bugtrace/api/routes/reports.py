@@ -225,7 +225,8 @@ async def get_report_file(
 
     # Resolve and validate the file path (prevent path traversal)
     file_path = (report_dir / filename).resolve()
-    if not str(file_path).startswith(str(report_dir.resolve())):
+    resolved_report_dir = report_dir.resolve()
+    if not file_path.is_relative_to(resolved_report_dir):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     if not file_path.is_file():

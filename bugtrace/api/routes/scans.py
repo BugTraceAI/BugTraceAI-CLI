@@ -87,6 +87,7 @@ def _build_scan_options(request: CreateScanRequest) -> ScanOptions:
         use_vertical=request.use_vertical,
         focused_agents=request.focused_agents,
         param=request.param,
+        scan_depth=request.scan_depth,
         auth_token=request.auth_token,
         auth=request.auth,
     )
@@ -398,7 +399,7 @@ async def get_detailed_metrics(
 
         # Get queue stats for all specialists
         queue_stats = {}
-        for specialist in ["xss", "sqli", "csti", "lfi", "idor", "rce", "ssrf", "xxe", "jwt", "openredirect", "prototype_pollution"]:
+        for specialist in ["xss", "sqli", "csti", "lfi", "idor", "rce", "ssrf", "xxe", "jwt", "openredirect", "prototype_pollution", "mass_assignment", "header_injection"]:
             try:
                 queue = queue_manager.get_queue(specialist)
                 queue_stats[specialist] = {
