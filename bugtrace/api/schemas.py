@@ -103,6 +103,7 @@ class ScanSummary(BaseModel):
     max_depth: Optional[int] = None
     max_urls: Optional[int] = None
     provider: Optional[str] = None  # LLM provider used
+    findings_count: int = 0  # Total findings for this scan
 
 
 class ScanListResponse(BaseModel):

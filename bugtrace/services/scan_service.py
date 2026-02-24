@@ -203,6 +203,8 @@ class ScanService:
         orchestrator = self._create_orchestrator(ctx, output_dir)
 
         # Setup auth tokens (Level 1: pass-through, Level 2: auto-login)
+        # Store the orchestrator's scan_context key on ctx so cleanup uses the same key
+        ctx._auth_token_key = orchestrator.scan_context
         await self._setup_auth_tokens(ctx.options, orchestrator.scan_context)
 
         # Execute scan
@@ -345,7 +347,7 @@ class ScanService:
 
         # Clean up auth tokens stored during this scan
         from bugtrace.services.scan_context import clear_scan_tokens
-        clear_scan_tokens(str(ctx.scan_id))
+        clear_scan_tokens(getattr(ctx, '_auth_token_key', str(ctx.scan_id)))
 
         await self.event_bus.emit("scan.completed", {
             "scan_id": ctx.scan_id,
@@ -361,7 +363,7 @@ class ScanService:
         self.db.update_scan_status(ctx.scan_id, ScanStatus.STOPPED)
 
         from bugtrace.services.scan_context import clear_scan_tokens
-        clear_scan_tokens(str(ctx.scan_id))
+        clear_scan_tokens(getattr(ctx, '_auth_token_key', str(ctx.scan_id)))
 
         await self.event_bus.emit("scan.stopped", {
             "scan_id": ctx.scan_id,
@@ -376,7 +378,7 @@ class ScanService:
         self.db.update_scan_status(ctx.scan_id, ScanStatus.FAILED)
 
         from bugtrace.services.scan_context import clear_scan_tokens
-        clear_scan_tokens(str(ctx.scan_id))
+        clear_scan_tokens(getattr(ctx, '_auth_token_key', str(ctx.scan_id)))
 
         await self.event_bus.emit("scan.failed", {
             "scan_id": ctx.scan_id,
@@ -562,10 +564,10 @@ class ScanService:
         from sqlalchemy.orm import selectinload
         from bugtrace.schemas.db_models import ScanTable
 
-        # Use selectinload to prevent N+1 queries when accessing scan.target
+        # Use selectinload to prevent N+1 queries when accessing scan.target and scan.findings
         statement = (
             select(ScanTable)
-            .options(selectinload(ScanTable.target))
+            .options(selectinload(ScanTable.target), selectinload(ScanTable.findings))
             .order_by(ScanTable.id.desc())
         )
         if status_filter:
@@ -608,6 +610,7 @@ class ScanService:
                 "max_depth": scan.max_depth,
                 "max_urls": scan.max_urls,
                 "provider": getattr(scan, "provider", None),
+                "findings_count": len(scan.findings) if scan.findings else 0,
             })
         return results
 
@@ -1137,10 +1140,10 @@ class ScanService:
         return list(self._active_scans.keys())
 
     def cleanup_orphaned_scans(self) -> int:
-        """Mark any RUNNING/PENDING scans as FAILED on startup.
+        """Mark any RUNNING/PENDING/PAUSED scans as FAILED on startup.
 
         When the backend restarts, no scans are actually running in-process.
-        Any scan still marked RUNNING in the DB is orphaned (process died).
+        Any scan still marked RUNNING/PAUSED in the DB is orphaned (process died).
         """
         from bugtrace.schemas.db_models import ScanTable, ScanStatus
         from sqlmodel import select
@@ -1148,7 +1151,7 @@ class ScanService:
         count = 0
         with self.db.get_session() as session:
             stmt = select(ScanTable).where(
-                ScanTable.status.in_([ScanStatus.RUNNING, ScanStatus.PENDING])
+                ScanTable.status.in_([ScanStatus.RUNNING, ScanStatus.PENDING, ScanStatus.PAUSED])
             )
             orphans = session.exec(stmt).all()
             for scan in orphans:
