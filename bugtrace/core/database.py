@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from sqlmodel import SQLModel, create_engine, Session, select
 from sqlalchemy import Engine, text, event, func
 from sqlalchemy.pool import QueuePool, StaticPool
-import lancedb
+try:
+    import lancedb
+    LANCEDB_AVAILABLE = True
+except Exception:
+    lancedb = None
+    LANCEDB_AVAILABLE = False
+
 from bugtrace.schemas.db_models import (
     TargetTable, ScanTable, FindingTable, ScanStateTable,
     ScanStatus, FindingStatus
@@ -133,9 +139,13 @@ class DatabaseManager:
         # Test Connection with Retry
         self._wait_for_db()
 
-        # LanceDB Connection
-        os.makedirs(vector_db_path, exist_ok=True)
-        self.vector_db = lancedb.connect(self.vector_db_path)
+        # LanceDB Connection (optional — graceful degradation if unavailable)
+        if LANCEDB_AVAILABLE:
+            os.makedirs(vector_db_path, exist_ok=True)
+            self.vector_db = lancedb.connect(self.vector_db_path)
+        else:
+            self.vector_db = None
+            logger.warning("LanceDB unavailable (possible AVX2 requirement). Vector search disabled.")
 
         # Initialize tables
         self._create_tables()
@@ -329,6 +339,8 @@ class DatabaseManager:
 
     def _init_vector_store(self):
         """Initialize vector store with explicit schema for findings_embeddings."""
+        if not self.vector_db:
+            return
         try:
             import pyarrow as pa
 
@@ -855,6 +867,8 @@ class DatabaseManager:
     
     def add_vector_embedding(self, collection_name: str, data: List[dict]):
         """Add data (must contain 'vector' field) to LanceDB collection."""
+        if not self.vector_db:
+            return
         try:
             if collection_name in self.vector_db.table_names():
                 tbl = self.vector_db.open_table(collection_name)
@@ -875,6 +889,8 @@ class DatabaseManager:
         Returns:
             List of similar findings with similarity scores, severity, confidence, and finding_id
         """
+        if not self.vector_db:
+            return []
         try:
             from bugtrace.core.embeddings import get_embedding_manager
 
@@ -926,6 +942,8 @@ class DatabaseManager:
             finding: Finding dictionary
             embedding: Optional pre-computed embedding. If None, will generate automatically.
         """
+        if not self.vector_db:
+            return
         try:
             from bugtrace.core.embeddings import get_embedding_manager
             from datetime import datetime
@@ -1015,17 +1033,20 @@ class DatabaseManager:
             logger.error(f"SQL health check failed: {e}", exc_info=True)
 
         # Check LanceDB
-        try:
-            _ = self.vector_db.table_names()
-            result["vector_db"] = {"status": "healthy"}
-        except Exception as e:
-            result["vector_db"] = {"status": "unhealthy", "error": str(e)}
-            logger.error(f"Vector DB health check failed: {e}", exc_info=True)
+        if self.vector_db:
+            try:
+                _ = self.vector_db.table_names()
+                result["vector_db"] = {"status": "healthy"}
+            except Exception as e:
+                result["vector_db"] = {"status": "unhealthy", "error": str(e)}
+                logger.error(f"Vector DB health check failed: {e}", exc_info=True)
+        else:
+            result["vector_db"] = {"status": "disabled"}
 
         result["latency_ms"] = round((time.perf_counter() - start) * 1000, 2)
 
-        # Overall status
-        if result["sql_db"]["status"] == "healthy" and result["vector_db"]["status"] == "healthy":
+        # Overall status — healthy if SQL works (vector_db is optional)
+        if result["sql_db"]["status"] == "healthy" and result["vector_db"]["status"] in ("healthy", "disabled"):
             result["status"] = "healthy"
 
         return result
@@ -1064,11 +1085,14 @@ class DatabaseManager:
             metrics["tables"]["error"] = str(e)
 
         # Vector DB collections
-        try:
-            metrics["vector_collections"] = self.vector_db.table_names()
-        except Exception as e:
-            logger.warning(f"Failed to get vector DB metrics: {e}")
-            metrics["vector_collections_error"] = str(e)
+        if self.vector_db:
+            try:
+                metrics["vector_collections"] = self.vector_db.table_names()
+            except Exception as e:
+                logger.warning(f"Failed to get vector DB metrics: {e}")
+                metrics["vector_collections_error"] = str(e)
+        else:
+            metrics["vector_collections"] = "disabled"
 
         return metrics
 

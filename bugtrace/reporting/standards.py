@@ -32,7 +32,27 @@ CWE_MAPPINGS = {
     "MASS_ASSIGNMENT": "CWE-915",  # Improperly Controlled Modification of Dynamically-Determined Object Attributes
     "API_SECURITY": "CWE-863",  # Incorrect Authorization
     "MISSING_SECURITY_HEADER": "CWE-693",  # Protection Mechanism Failure
+    "BROKEN_ACCESS_CONTROL": "CWE-284",  # Improper Access Control
+    "INSECURE_COOKIE_CONFIGURATION": "CWE-614",  # Sensitive Cookie in HTTPS Session Without 'Secure' Attribute
+    "GRAPHQL_INTROSPECTION": "CWE-200",  # Exposure of Sensitive Information
+    "API_DOCUMENTATION_EXPOSURE": "CWE-200",  # Exposure of Sensitive Information
+    "INSECURE_DESERIALIZATION": "CWE-502",  # Deserialization of Untrusted Data
+    "VULNERABLE_DEPENDENCY": "CWE-1035",  # Using Components with Known Vulnerabilities
+    "MISSING_RATE_LIMITING": "CWE-770",  # Allocation of Resources Without Limits
+    "INFORMATION_DISCLOSURE": "CWE-200",  # Exposure of Sensitive Information
+    "CORS_MISCONFIGURATION": "CWE-942",  # Permissive Cross-domain Policy with Untrusted Domains
+    "WEAK_CRYPTOGRAPHY": "CWE-326",  # Inadequate Encryption Strength
+    "CSRF": "CWE-352",  # Cross-Site Request Forgery
 }
+
+
+def _normalize_vuln_type_key(vuln_type: str) -> str:
+    """Normalize vulnerability type string for dictionary lookups.
+
+    Converts 'Broken Access Control', 'broken access control',
+    'BROKEN_ACCESS_CONTROL' all to 'BROKEN_ACCESS_CONTROL'.
+    """
+    return vuln_type.upper().strip().replace(" ", "_")
 
 
 # Remediation Templates: Standard remediation guidance for each vulnerability type
@@ -196,6 +216,78 @@ To remediate missing security headers:
 5. Set Secure and HttpOnly flags on all session cookies
 6. Set SameSite=Strict or Lax on cookies to prevent CSRF
 """,
+    "BROKEN_ACCESS_CONTROL": """
+To remediate Broken Access Control vulnerabilities:
+1. Implement proper authentication and authorization checks on all endpoints
+2. Deny access by default; require explicit grants for each resource
+3. Remove or protect administrative endpoints from public access
+4. Use role-based access control (RBAC) consistently across the application
+5. Log and monitor all access attempts to sensitive endpoints
+6. Regularly audit exposed endpoints and remove unnecessary ones
+""",
+    "INSECURE_COOKIE_CONFIGURATION": """
+To remediate Insecure Cookie Configuration:
+1. Set the Secure flag on all cookies to ensure transmission only over HTTPS
+2. Set the HttpOnly flag to prevent JavaScript access to session cookies
+3. Set SameSite=Strict or SameSite=Lax to mitigate CSRF attacks
+4. Set appropriate cookie expiration and path restrictions
+5. Avoid storing sensitive data directly in cookies
+""",
+    "GRAPHQL_INTROSPECTION": """
+To remediate GraphQL Introspection exposure:
+1. Disable introspection queries in production environments
+2. Implement proper authentication and authorization on GraphQL endpoints
+3. Apply query depth limiting and complexity analysis
+4. Use field-level authorization to restrict access to sensitive data
+5. Implement rate limiting on GraphQL endpoints
+""",
+    "API_DOCUMENTATION_EXPOSURE": """
+To remediate API Documentation Exposure:
+1. Disable Swagger/OpenAPI/ReDoc endpoints in production environments
+2. Require authentication to access API documentation endpoints
+3. Use environment-based configuration to toggle documentation visibility
+4. Review exposed endpoints for sensitive operations or data
+""",
+    "INSECURE_DESERIALIZATION": """
+To remediate Insecure Deserialization vulnerabilities:
+1. Avoid deserializing untrusted data whenever possible
+2. Use safe serialization formats (JSON) instead of native object serialization
+3. Implement integrity checks (signatures, HMACs) on serialized data
+4. Restrict deserialization to expected types using allowlists
+5. Monitor and log deserialization failures for security events
+""",
+    "VULNERABLE_DEPENDENCY": """
+To remediate Vulnerable Dependency issues:
+1. Update the affected library to a patched version
+2. Implement a Software Composition Analysis (SCA) tool in CI/CD
+3. Monitor CVE databases for vulnerabilities in your dependencies
+4. Use package lock files to prevent accidental version drift
+5. Consider alternatives for libraries with poor security track records
+""",
+    "MISSING_RATE_LIMITING": """
+To remediate Missing Rate Limiting:
+1. Implement rate limiting on authentication and sensitive endpoints
+2. Use progressive delays or account lockout after failed attempts
+3. Apply per-IP and per-user rate limits independently
+4. Return proper HTTP 429 responses with Retry-After headers
+5. Log and alert on rate limit violations for abuse detection
+""",
+    "CORS_MISCONFIGURATION": """
+To remediate CORS Misconfiguration:
+1. Restrict Access-Control-Allow-Origin to specific trusted domains
+2. Never use wildcard (*) with credentials mode
+3. Validate the Origin header against a strict whitelist
+4. Avoid reflecting the Origin header back in Access-Control-Allow-Origin
+5. Restrict allowed methods and headers to what is actually needed
+""",
+    "CSRF": """
+To remediate Cross-Site Request Forgery (CSRF) vulnerabilities:
+1. Use anti-CSRF tokens (synchronizer token pattern) on all state-changing requests
+2. Set SameSite=Strict or SameSite=Lax on session cookies
+3. Verify the Origin and Referer headers on sensitive endpoints
+4. Use framework-provided CSRF protection mechanisms
+5. Require re-authentication for sensitive operations
+""",
 }
 
 
@@ -219,6 +311,17 @@ DEFAULT_SEVERITY = {
     "MASS_ASSIGNMENT": Severity.HIGH,
     "API_SECURITY": Severity.HIGH,
     "MISSING_SECURITY_HEADER": Severity.LOW,
+    "BROKEN_ACCESS_CONTROL": Severity.HIGH,
+    "INSECURE_COOKIE_CONFIGURATION": Severity.LOW,
+    "GRAPHQL_INTROSPECTION": Severity.MEDIUM,
+    "API_DOCUMENTATION_EXPOSURE": Severity.LOW,
+    "INSECURE_DESERIALIZATION": Severity.CRITICAL,
+    "VULNERABLE_DEPENDENCY": Severity.MEDIUM,
+    "MISSING_RATE_LIMITING": Severity.MEDIUM,
+    "INFORMATION_DISCLOSURE": Severity.LOW,
+    "CORS_MISCONFIGURATION": Severity.MEDIUM,
+    "WEAK_CRYPTOGRAPHY": Severity.MEDIUM,
+    "CSRF": Severity.MEDIUM,
 }
 
 
@@ -307,34 +410,30 @@ def get_cwe_for_vuln(vuln_type: str) -> Optional[str]:
     """
     Get the CWE ID for a given vulnerability type.
 
+    Handles both 'Broken Access Control' (spaces) and 'BROKEN_ACCESS_CONTROL' (underscores).
+
     Args:
-        vuln_type: The vulnerability type (e.g., "XSS", "SQLI")
+        vuln_type: The vulnerability type (e.g., "XSS", "SQLI", "Broken Access Control")
 
     Returns:
         CWE ID in format "CWE-XXX" or None if not found
-
-    Example:
-        >>> get_cwe_for_vuln("XSS")
-        "CWE-79"
     """
-    return CWE_MAPPINGS.get(vuln_type.upper())
+    return CWE_MAPPINGS.get(_normalize_vuln_type_key(vuln_type))
 
 
 def get_remediation_for_vuln(vuln_type: str) -> str:
     """
     Get the remediation guidance for a given vulnerability type.
 
+    Handles both 'Broken Access Control' (spaces) and 'BROKEN_ACCESS_CONTROL' (underscores).
+
     Args:
-        vuln_type: The vulnerability type (e.g., "XSS", "SQLI")
+        vuln_type: The vulnerability type (e.g., "XSS", "SQLI", "Insecure Cookie Configuration")
 
     Returns:
         Remediation text, or generic guidance if type not found
-
-    Example:
-        >>> get_remediation_for_vuln("SQLI")
-        "To remediate SQL Injection (SQLi) vulnerabilities: ..."
     """
-    remediation = REMEDIATION_TEMPLATES.get(vuln_type.upper())
+    remediation = REMEDIATION_TEMPLATES.get(_normalize_vuln_type_key(vuln_type))
     if remediation:
         return remediation.strip()
     return "Implement secure coding practices and follow OWASP guidelines for this vulnerability type."
@@ -344,17 +443,15 @@ def get_default_severity(vuln_type: str) -> Severity:
     """
     Get the default severity level for a given vulnerability type.
 
+    Handles both 'Broken Access Control' (spaces) and 'BROKEN_ACCESS_CONTROL' (underscores).
+
     Args:
-        vuln_type: The vulnerability type (e.g., "XSS", "SQLI")
+        vuln_type: The vulnerability type (e.g., "XSS", "SQLI", "Insecure Cookie Configuration")
 
     Returns:
         Severity enum value, defaults to HIGH if type not found
-
-    Example:
-        >>> get_default_severity("SQLI")
-        Severity.CRITICAL
     """
-    return DEFAULT_SEVERITY.get(vuln_type.upper(), Severity.HIGH)
+    return DEFAULT_SEVERITY.get(_normalize_vuln_type_key(vuln_type), Severity.HIGH)
 
 
 def format_cve(cve_id: str) -> str:

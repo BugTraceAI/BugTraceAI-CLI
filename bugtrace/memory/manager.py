@@ -1,6 +1,12 @@
 import networkx as nx
-import lancedb
 import pyarrow as pa
+
+try:
+    import lancedb
+    LANCEDB_AVAILABLE = True
+except Exception:
+    lancedb = None
+    LANCEDB_AVAILABLE = False
 import uuid
 import os
 import json
@@ -35,10 +41,14 @@ class MemoryManager:
         self.graph_path = settings.LOG_DIR / "knowledge_graph.gml"
         self._load_graph()
 
-        # 2. Initialize Vector DB (LanceDB)
+        # 2. Initialize Vector DB (LanceDB) — optional
         self.vector_db_path = settings.LOG_DIR / "lancedb"
-        self.vector_db_path.mkdir(parents=True, exist_ok=True)
-        self.vector_db = lancedb.connect(str(self.vector_db_path))
+        if LANCEDB_AVAILABLE:
+            self.vector_db_path.mkdir(parents=True, exist_ok=True)
+            self.vector_db = lancedb.connect(str(self.vector_db_path))
+        else:
+            self.vector_db = None
+            logger.warning("LanceDB unavailable. MemoryManager running without vector search.")
         
         # 3. Initialize Embedding Model (Lazy Load)
         self.model = None
@@ -56,7 +66,8 @@ class MemoryManager:
                 # Don't crash, just proceed without embeddings
 
         # 4. Initialize Tables
-        self._init_vector_table()
+        if self.vector_db:
+            self._init_vector_table()
 
     def _load_graph(self):
         """Loads the graph from disk if it exists."""

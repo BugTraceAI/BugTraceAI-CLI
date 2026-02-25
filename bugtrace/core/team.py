@@ -4405,13 +4405,16 @@ class TeamOrchestrator:
             except Exception as bac_write_err:
                 logger.warning(f"Failed to write BAC results: {bac_write_err}")
 
-        # Inject Nuclei misconfiguration findings (HSTS missing, cookie flags, etc.)
+        # Inject Nuclei misconfiguration findings using data-driven routing
+        # Rules loaded from bugtrace/data/nuclei_type_routing.json
         misconfigs = self.tech_profile.get("misconfigurations", [])
         if misconfigs:
+            routing_rules = self._load_nuclei_routing_rules()
             pre_validated_misconfigs = []
             for mc in misconfigs:
                 tags = mc.get("tags", [])
                 template_id = mc.get("template_id", "")
+                tags_set = set(tags)
 
                 # GraphQL introspection → route to specialist for further testing
                 if "graphql" in tags or "graphql" in template_id:
@@ -4433,14 +4436,38 @@ class TeamOrchestrator:
                     })
                     continue
 
-                # Pure misconfigs (cookies, headers, vulnerable JS) → pre-validated, no specialist needed
-                if "cookies" in tags:
-                    finding_type = "Insecure Cookie Configuration"
-                    finding_severity = mc.get("severity", "medium").capitalize()
-                else:
-                    finding_type = "MISSING_SECURITY_HEADER"
-                    finding_severity = mc.get("severity", "info").capitalize()
+                # Data-driven routing: match tags/template_id against rules
+                matched_rule = self._match_nuclei_routing_rule(routing_rules, tags_set, template_id)
+                action = matched_rule["action"]
+                finding_type = matched_rule["type"]
+                default_sev = matched_rule["default_severity"]
 
+                # "skip" → already handled elsewhere (e.g., BAC detection block)
+                if action == "skip":
+                    continue
+
+                # "route" → real vulnerability, send to specialist queue
+                if action == "route":
+                    all_findings.append({
+                        "type": finding_type,
+                        "parameter": mc.get("template_id", mc["name"]),
+                        "url": mc.get("matched_at", self.target),
+                        "severity": mc.get("severity", default_sev).capitalize(),
+                        "fp_confidence": 0.95,
+                        "confidence_score": 0.95,
+                        "votes": 5,
+                        "skeptical_score": 9,
+                        "probe_validated": True,
+                        "reasoning": mc.get("description", mc["name"]),
+                        "description": mc.get("description", mc["name"]),
+                        "evidence": f"Nuclei template: {mc.get('template_id', 'unknown')}",
+                        "_source_file": "nuclei_misconfiguration",
+                        "_scan_context": self.scan_context,
+                    })
+                    continue
+
+                # "classify" → pre-validated misconfig, write directly to results
+                finding_severity = mc.get("severity", default_sev).capitalize()
                 pre_validated_misconfigs.append({
                     "type": finding_type,
                     "parameter": mc.get("template_id", mc["name"]),
@@ -4517,6 +4544,56 @@ class TeamOrchestrator:
             )
 
         return processed_count
+
+    # ── Nuclei type routing (data-driven) ─────────────────────────────────
+
+    _nuclei_routing_cache = None
+
+    def _load_nuclei_routing_rules(self) -> dict:
+        """
+        Load nuclei type routing rules from bugtrace/data/nuclei_type_routing.json.
+        Cached after first load.
+        """
+        if TeamOrchestrator._nuclei_routing_cache is not None:
+            return TeamOrchestrator._nuclei_routing_cache
+
+        import json as json_mod
+        routing_path = Path(__file__).parent.parent / "data" / "nuclei_type_routing.json"
+        try:
+            with open(routing_path, "r") as f:
+                TeamOrchestrator._nuclei_routing_cache = json_mod.load(f)
+                logger.debug(f"Loaded {len(TeamOrchestrator._nuclei_routing_cache.get('rules', []))} nuclei routing rules")
+        except Exception as e:
+            logger.warning(f"Failed to load nuclei_type_routing.json: {e}. Using empty ruleset.")
+            TeamOrchestrator._nuclei_routing_cache = {"rules": [], "fallback": {"type": "MISSING_SECURITY_HEADER", "default_severity": "info", "action": "classify"}}
+
+        return TeamOrchestrator._nuclei_routing_cache
+
+    def _match_nuclei_routing_rule(self, routing_config: dict, tags_set: set, template_id: str) -> dict:
+        """
+        Match a Nuclei misconfiguration against routing rules.
+
+        Returns the first matching rule, or the fallback if none match.
+        Rule matching: any tag in match_tags OR any substring in match_template_id_contains
+                       OR any prefix in match_template_id_starts_with.
+        """
+        for rule in routing_config.get("rules", []):
+            # Tag match
+            match_tags = set(rule.get("match_tags", []))
+            if match_tags & tags_set:
+                return rule
+
+            # Template ID contains match
+            for pattern in rule.get("match_template_id_contains", []):
+                if pattern and pattern in template_id:
+                    return rule
+
+            # Template ID starts_with match
+            for prefix in rule.get("match_template_id_starts_with", []):
+                if prefix and template_id.startswith(prefix):
+                    return rule
+
+        return routing_config.get("fallback", {"type": "MISSING_SECURITY_HEADER", "default_severity": "info", "action": "classify"})
 
     async def _load_auth_discovery_findings(self, auth_discovery_dir: Path) -> List[Dict]:
         """
