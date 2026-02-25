@@ -12,7 +12,7 @@ services:
     env_file:
       - .env
     environment:
-      - BUGTRACE_CORS_ORIGINS=http://localhost:5173,http://localhost:6869
+      BUGTRACE_CORS_ORIGINS: ${BUGTRACE_CORS_ORIGINS:-http://localhost:5173,http://localhost:6869}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
