@@ -324,8 +324,9 @@ class TeamOrchestrator:
                 max_urls=self.max_urls,
             )
 
-        # Persist the report_dir to DB so the API can find it reliably
-        self.db.update_scan_report_dir(self.scan_id, str(self.report_dir))
+        # NOTE: report_dir is registered in DB only AFTER ReportingAgent
+        # successfully generates deliverables (see _invoke_reporting_agent).
+        # This prevents has_report=true on empty/nonexistent directories.
 
         logger.info(f"TeamOrchestrator initialized for Scan ID: {self.scan_id}")
 
@@ -796,6 +797,9 @@ class TeamOrchestrator:
         generated_paths = await reporting_agent.generate_all_deliverables()
         
         if generated_paths:
+            # Register report_dir in DB only NOW, after files are confirmed on disk.
+            # This ensures has_report is never true for empty directories.
+            self.db.update_scan_report_dir(self.scan_id, str(report_dir))
             dashboard.log(f"✅ ReportingAgent finished. Reports saved to {report_dir}", "SUCCESS")
         else:
             dashboard.log("⚠️ ReportingAgent completed but returned no paths.", "WARN")

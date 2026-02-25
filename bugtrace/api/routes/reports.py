@@ -184,7 +184,7 @@ def _find_report_dir(scan_id: int) -> FilePath | None:
 
             # Pattern 2: API-generated reports (fallback)
             api_dir = report_base / f"scan_{scan_id}"
-            if api_dir.is_dir():
+            if api_dir.is_dir() and _has_report_files(api_dir):
                 return api_dir
 
     except Exception as e:
@@ -192,7 +192,7 @@ def _find_report_dir(scan_id: int) -> FilePath | None:
 
     # Last resort: check scan_{id} without DB access
     api_dir = report_base / f"scan_{scan_id}"
-    if api_dir.is_dir():
+    if api_dir.is_dir() and _has_report_files(api_dir):
         return api_dir
 
     return None
