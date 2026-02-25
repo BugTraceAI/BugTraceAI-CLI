@@ -233,6 +233,9 @@ class LLMClient:
         self._anthropic_token_cache: Optional[str] = None
         self._anthropic_token_expires: float = 0
 
+        # Provider custom headers (e.g., Accept-Language for Z.ai)
+        self._provider_headers = provider_cfg.get('headers', {})
+
         # Per-model concurrency limiter (from provider preset)
         # Prevents 429 avalanches by limiting in-flight requests per model
         concurrency_cfg = provider_cfg.get('concurrency', {})
@@ -374,6 +377,11 @@ class LLMClient:
         system_lower = (system_prompt or "").lower()
         combined = prompt_lower + " " + system_lower
 
+        # CVSS scoring tasks - return conservative medium score (must check BEFORE payload/severity)
+        if "cvss" in combined:
+            logger.debug("[Fallback] CVSS scoring - returning conservative medium")
+            return '{"vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N", "score": 5.4, "severity": "MEDIUM", "rationale": "LLM unavailable - conservative estimate", "cwe": null, "cve": null}'
+
         # Deduplication tasks - return empty findings to not filter anything
         if "deduplication" in combined or "dedupe" in combined or "duplicate" in combined:
             logger.debug("[Fallback] Deduplication task - returning empty findings")
@@ -501,6 +509,9 @@ class LLMClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        # Apply provider custom headers (e.g., Accept-Language for Z.ai)
+        if self._provider_headers:
+            headers.update(self._provider_headers)
         # OpenRouter-specific headers
         if self.provider_id == "openrouter":
             headers["HTTP-Referer"] = "https://bugtraceai.com"

@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     """
     # --- Project Metadata ---
     APP_NAME: str = "BugtraceAI-CLI"
-    VERSION: str = "2.1.1"  # Phoenix Edition
+    VERSION: str = "2.2.6"  # Phoenix Edition
     DEBUG: bool = False
     SAFE_MODE: bool = False # Default to False, override via CLI
 

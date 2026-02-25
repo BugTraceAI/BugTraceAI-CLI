@@ -2990,20 +2990,45 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
             )
 
             confirmed_count = 0
+            skipped_count = 0
 
             for df in dom_findings:
                 sink = df.get("sink", "")
                 source_str = df.get("source", "unknown")
+                payload = df.get("payload", "")
                 param_name = source_str.split(":")[-1] if ":" in source_str else source_str
 
-                # DOM XSS detector already confirmed: payload reached the sink
-                # (via JS hook, console side channel, or page.evaluate).
-                # No vision needed — the browser-level proof IS the confirmation.
+                # --- FP filtering: reject findings that don't prove execution ---
+
+                # 1. Canary-only payloads: a plain string reaching innerHTML is NOT XSS.
+                #    Real XSS requires HTML/JS execution (e.g., <script>, onerror=, javascript:)
+                canary_base = "DOMXSS_CANARY_7x7"
+                payload_stripped = payload.replace(canary_base, "").replace("|", "").replace(param_name, "").strip()
+                is_canary_only = not payload_stripped or payload_stripped in ("", "|")
+                if is_canary_only and sink != "alert":
+                    skipped_count += 1
+                    logger.info(f"[{self.name}] DOM XSS FP filtered: canary-only payload in {sink} sink (param: {param_name})")
+                    continue
+
+                # 2. postMessage self-send: scanner sends its own message, doesn't prove
+                #    cross-origin exploitability. Reject unless alert() actually fired.
+                if source_str == "window.postMessage" and sink != "alert":
+                    skipped_count += 1
+                    logger.info(f"[{self.name}] DOM XSS FP filtered: postMessage self-send to {sink} sink")
+                    continue
+
+                # 3. Static analysis patterns: regex source→sink matching without execution proof.
+                if "source-to-sink pattern detected" in payload.lower() or "static analysis" in str(df.get("evidence", "")).lower():
+                    skipped_count += 1
+                    logger.info(f"[{self.name}] DOM XSS FP filtered: static analysis pattern, no execution proof")
+                    continue
+
+                # --- Passed FP filters: this is a real DOM XSS finding ---
                 confirmed_count += 1
                 self.findings.append(XSSFinding(
                     url=df["url"],
                     parameter=param_name,
-                    payload=df["payload"],
+                    payload=payload,
                     context="dom_xss",
                     validation_method="dom_xss_hook_confirmed",
                     evidence={
@@ -3016,11 +3041,17 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
                     status="VALIDATED_CONFIRMED",
                     validated=True,
                     reflection_context=source_str,
-                    successful_payloads=[df["payload"]]
+                    successful_payloads=[payload]
                 ))
                 dashboard.log(
                     f"[{self.name}] ✅ DOM XSS CONFIRMED via hook: {sink} (param: {param_name})",
                     "SUCCESS"
+                )
+
+            if skipped_count > 0:
+                dashboard.log(
+                    f"[{self.name}] 🛡️ DOM XSS: filtered {skipped_count}/{len(dom_findings)} false positives (canary-only/self-send/static)",
+                    "INFO"
                 )
 
             if hasattr(self, '_v'):

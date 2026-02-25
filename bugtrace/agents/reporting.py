@@ -122,24 +122,27 @@ class ReportingAgent(BaseAgent):
                 - scan_context: Scan context identifier
                 - validation_requires_cdp: Whether CDP validation was needed
         """
-        status = data.get("status", "")
+        try:
+            status = data.get("status", "")
 
-        # Only collect VALIDATED_CONFIRMED findings (skip PENDING_VALIDATION)
-        if status != ValidationStatus.VALIDATED_CONFIRMED.value:
-            return
+            # Only collect VALIDATED_CONFIRMED findings (skip PENDING_VALIDATION)
+            if status != ValidationStatus.VALIDATED_CONFIRMED.value:
+                return
 
-        finding = data.get("finding", {}).copy()
-        specialist = data.get("specialist", "unknown")
+            finding = data.get("finding", {}).copy()
+            specialist = data.get("specialist", "unknown")
 
-        # Enrich finding with event metadata
-        finding["scan_context"] = data.get("scan_context", "")
-        finding["specialist"] = specialist
-        finding["validation_requires_cdp"] = data.get("validation_requires_cdp", False)
-        finding["status"] = status
-        finding["event_source"] = "vulnerability_detected"
+            # Enrich finding with event metadata
+            finding["scan_context"] = data.get("scan_context", "")
+            finding["specialist"] = specialist
+            finding["validation_requires_cdp"] = data.get("validation_requires_cdp", False)
+            finding["status"] = status
+            finding["event_source"] = "vulnerability_detected"
 
-        self._validated_findings.append(finding)
-        logger.info(f"[{self.name}] Collected VALIDATED_CONFIRMED finding from {specialist}")
+            self._validated_findings.append(finding)
+            logger.info(f"[{self.name}] Collected VALIDATED_CONFIRMED finding from {specialist}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to handle vulnerability_detected: {e}")
 
     async def _handle_finding_validated(self, data: Dict[str, Any]) -> None:
         """
@@ -153,20 +156,23 @@ class ReportingAgent(BaseAgent):
                 - validation_result: CDP validation result with reasoning/confidence
                 - scan_context: Scan context identifier
         """
-        finding = data.get("finding", {}).copy()
-        validation_result = data.get("validation_result", {})
-        specialist = finding.get("specialist", data.get("specialist", "unknown"))
+        try:
+            finding = data.get("finding", {}).copy()
+            validation_result = data.get("validation_result", {})
+            specialist = finding.get("specialist", data.get("specialist", "unknown"))
 
-        # Mark as CDP-validated
-        finding["status"] = "VALIDATED"
-        finding["cdp_validated"] = True
-        finding["cdp_reasoning"] = validation_result.get("reasoning", "")
-        finding["cdp_confidence"] = validation_result.get("confidence", 0.0)
-        finding["scan_context"] = data.get("scan_context", "")
-        finding["event_source"] = "finding_validated"
+            # Mark as CDP-validated
+            finding["status"] = "VALIDATED"
+            finding["cdp_validated"] = True
+            finding["cdp_reasoning"] = validation_result.get("reasoning", "")
+            finding["cdp_confidence"] = validation_result.get("confidence", 0.0)
+            finding["scan_context"] = data.get("scan_context", "")
+            finding["event_source"] = "finding_validated"
 
-        self._validated_findings.append(finding)
-        logger.info(f"[{self.name}] Collected CDP-VALIDATED finding from {specialist}")
+            self._validated_findings.append(finding)
+            logger.info(f"[{self.name}] Collected CDP-VALIDATED finding from {specialist}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to handle finding_validated: {e}")
 
     def get_validated_findings(self) -> List[Dict]:
         """
@@ -207,6 +213,10 @@ class ReportingAgent(BaseAgent):
         # Phase 2: Categorize and enrich findings
         categorized = self._categorize_findings(all_findings)
         await self._enrich_findings_batch(categorized["validated"] + categorized["manual_review"])
+
+        # Phase 2.5: Consolidate informational findings (group headers, API docs, etc.)
+        categorized["validated"] = self._consolidate_informational(categorized["validated"])
+        categorized["manual_review"] = self._consolidate_informational(categorized["manual_review"])
 
         # Phase 3: Calculate statistics
         stats = self._calculate_scan_stats(all_findings)
@@ -1060,8 +1070,9 @@ class ReportingAgent(BaseAgent):
         - "CSTI (AngularJS)" → "CSTI"
         """
         normalized = vuln_type.upper().strip()
-        if "(" in normalized:
-            normalized = normalized[:normalized.index("(")].strip()
+        paren_idx = normalized.find("(")
+        if paren_idx > -1:
+            normalized = normalized[:paren_idx].strip()
         return normalized
 
     def _normalize_parameter_for_dedup(self, param: str) -> str:
@@ -1191,6 +1202,7 @@ class ReportingAgent(BaseAgent):
         url = f.get("url", "")
         if "FUZZ" in url:
             url = url.replace("=FUZZ", "").replace("FUZZ", "")
+            f["url"] = url
 
         # Fallback description when specialists don't provide one
         description = f.get("description", "")
@@ -2376,11 +2388,32 @@ class ReportingAgent(BaseAgent):
         impacts = {
             "XSS": "Cross-Site Scripting can lead to session hijacking, credential theft, defacement, and malware distribution.",
             "SQLI": "SQL Injection can lead to unauthorized data access, data manipulation, and complete database compromise.",
-            "SQLi": "SQL Injection can lead to unauthorized data access, data manipulation, and complete database compromise.",
+            "SQLI": "SQL Injection can lead to unauthorized data access, data manipulation, and complete database compromise.",
             "LFI": "Local File Inclusion can expose sensitive files and potentially lead to remote code execution.",
             "RCE": "Remote Code Execution allows attackers to run arbitrary commands on the server.",
             "SSRF": "Server-Side Request Forgery can expose internal services and sensitive data.",
             "IDOR": "Insecure Direct Object Reference can lead to unauthorized access to other users' data.",
+            "CSTI": "Client-Side Template Injection can lead to XSS, data theft, and in some cases remote code execution.",
+            "SSTI": "Server-Side Template Injection can lead to remote code execution and full server compromise.",
+            "JWT": "JWT vulnerabilities can lead to authentication bypass and unauthorized access to protected resources.",
+            "XXE": "XML External Entity injection can expose sensitive files, perform SSRF, and cause denial of service.",
+            "OPEN_REDIRECT": "Open Redirect can be used for phishing attacks and credential theft via trusted domain abuse.",
+            "PROTOTYPE_POLLUTION": "Prototype Pollution can lead to XSS, denial of service, and privilege escalation in JavaScript applications.",
+            "HEADER_INJECTION": "HTTP Header Injection can lead to cache poisoning, session fixation, and XSS via response splitting.",
+            "FILE_UPLOAD": "Unrestricted file upload can lead to remote code execution and server compromise.",
+            "MASS_ASSIGNMENT": "Mass Assignment can allow privilege escalation by modifying restricted fields like roles or permissions.",
+            "API_SECURITY": "API security issues can expose sensitive data, enable unauthorized operations, and lead to data breaches.",
+            "BROKEN_ACCESS_CONTROL": "Broken Access Control allows unauthorized users to access administrative or restricted functionality.",
+            "BROKEN ACCESS CONTROL": "Broken Access Control allows unauthorized users to access administrative or restricted functionality.",
+            "INSECURE_COOKIE_CONFIGURATION": "Insecure cookie configuration can expose session tokens to theft via network sniffing or XSS attacks.",
+            "INSECURE COOKIE CONFIGURATION": "Insecure cookie configuration can expose session tokens to theft via network sniffing or XSS attacks.",
+            "GRAPHQL_INTROSPECTION": "GraphQL introspection exposure allows attackers to map the entire API schema and discover hidden queries and mutations.",
+            "GRAPHQL INTROSPECTION": "GraphQL introspection exposure allows attackers to map the entire API schema and discover hidden queries and mutations.",
+            "API_DOCUMENTATION_EXPOSURE": "Exposed API documentation reveals endpoint structure, parameters, and data models to potential attackers.",
+            "API DOCUMENTATION EXPOSURE": "Exposed API documentation reveals endpoint structure, parameters, and data models to potential attackers.",
+            "MISSING_SECURITY_HEADER": "Missing security headers reduce defense-in-depth, making other vulnerabilities easier to exploit.",
+            "INSECURE_DESERIALIZATION": "Insecure deserialization can lead to remote code execution, authentication bypass, and data tampering.",
+            "INSECURE DESERIALIZATION": "Insecure deserialization can lead to remote code execution, authentication bypass, and data tampering.",
         }
         return impacts.get(vuln_type.upper(), "This vulnerability may compromise the security of the application.")
 
@@ -2398,8 +2431,8 @@ class ReportingAgent(BaseAgent):
         self._enrichment_total = len(findings)
 
         # Pre-check: Is LLM available?
-        health = llm_client.get_health_status()
-        if health["state"] == "CRITICAL":
+        health = llm_client.get_health_status() or {}
+        if health.get("state") == "CRITICAL":
             logger.warning(f"[{self.name}] LLM circuit breaker OPEN. Skipping enrichment for {len(findings)} findings.")
             dashboard.log(
                 f"[Reporting] LLM unavailable (circuit breaker OPEN). "
@@ -2420,21 +2453,21 @@ class ReportingAgent(BaseAgent):
             })
             return
 
-        # Phase 1: Batch CVSS Scoring (1 LLM call per chunk of 10)
-        logger.info(f"[{self.name}] Batch CVSS scoring for {len(findings)} findings...")
-        await self._calculate_cvss_batch(findings)
-
-        # Phase 2: Professional PoC Enrichment (grouped by vuln type, batch LLM calls)
+        # CVSS and PoC enrichment run IN PARALLEL (they write to different fields)
+        # CVSS writes: cvss_score, cvss_vector, severity, cvss_rationale, cwe, cve
+        # PoC writes: exploitation_details, llm_reproduction_steps, enriched
         groups = self._poc_group_findings_by_type(findings)
         logger.info(
-            f"[{self.name}] Generating professional PoC for {len(findings)} findings "
+            f"[{self.name}] Starting parallel enrichment: CVSS + PoC for {len(findings)} findings "
             f"in {len(groups)} type groups: {list(groups.keys())}"
         )
-        group_tasks = [
+
+        cvss_task = self._calculate_cvss_batch(findings)
+        poc_tasks = [
             self._poc_enrich_group_with_fallback(vtype, group)
             for vtype, group in groups.items()
         ]
-        await asyncio.gather(*group_tasks)
+        await asyncio.gather(cvss_task, *poc_tasks)
 
         # Post-check: detect findings that failed CVSS enrichment
         for f in findings:
@@ -2475,7 +2508,7 @@ class ReportingAgent(BaseAgent):
             prompt = self._poc_build_prompt(context)
             response = await self._poc_execute_llm(prompt)
 
-            if response and "LLM unavailable" in response:
+            if response and ("LLM unavailable" in response or "fail open" in response or '"payloads"' in response):
                 # Circuit breaker returned fallback — not real enrichment
                 finding["enriched"] = False
                 self._enrichment_failures += 1
@@ -2674,14 +2707,37 @@ Example format:
         enriched_count = 0
         failed_ids = []
 
-        # Extract JSON array from response
-        match = re.search(r'\[.*\]', response, re.DOTALL)
-        if not match:
-            return 0, list(range(len(findings_in_group)))
+        # Strip markdown code fences if present
+        cleaned = response.strip()
+        fence_match = re.search(r'```\w*\s*\n?(.*?)```', cleaned, re.DOTALL)
+        if fence_match:
+            cleaned = fence_match.group(1).strip()
+        elif cleaned.startswith("```"):
+            cleaned = re.sub(r'^```\w*\s*\n?', '', cleaned).strip()
 
+        # Extract JSON array from response
+        parsed = None
         try:
-            parsed = json.loads(match.group(0))
-        except json.JSONDecodeError:
+            p = json.loads(cleaned)
+            if isinstance(p, list):
+                parsed = p
+            elif isinstance(p, dict):
+                for key in p:
+                    if isinstance(p[key], list):
+                        parsed = p[key]
+                        break
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        if not parsed:
+            match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
+
+        if not parsed:
             return 0, list(range(len(findings_in_group)))
 
         # Build lookup by finding_id
@@ -2698,16 +2754,21 @@ Example format:
 
             # Reconstruct exploitation_details as markdown (compatible with current format)
             sections = []
-            if item.get("summary"):
-                sections.append(f"## Summary\n{item['summary']}")
-            if item.get("attack_scenario"):
-                sections.append(f"## Attack Scenario\n{item['attack_scenario']}")
-            if item.get("maximum_impact"):
-                sections.append(f"## Maximum Impact\n{item['maximum_impact']}")
-            if item.get("proof_of_exploitation"):
-                sections.append(f"## Proof of Exploitation\n{item['proof_of_exploitation']}")
-            if item.get("reproduction_steps"):
-                steps_text = "\n".join(item["reproduction_steps"])
+            summary = item.get("summary")
+            if summary:
+                sections.append(f"## Summary\n{summary}")
+            attack_scenario = item.get("attack_scenario")
+            if attack_scenario:
+                sections.append(f"## Attack Scenario\n{attack_scenario}")
+            max_impact = item.get("maximum_impact")
+            if max_impact:
+                sections.append(f"## Maximum Impact\n{max_impact}")
+            proof = item.get("proof_of_exploitation")
+            if proof:
+                sections.append(f"## Proof of Exploitation\n{proof}")
+            repro_steps = item.get("reproduction_steps", [])
+            if repro_steps:
+                steps_text = "\n".join(repro_steps) if isinstance(repro_steps, list) else str(repro_steps)
                 sections.append(f"## Reproduction Steps\n{steps_text}")
 
             if sections:
@@ -2871,7 +2932,7 @@ Example format:
                 prompt = self._poc_batch_build_prompt(vuln_type, chunk)
                 response = await self._poc_batch_execute_llm(prompt, len(chunk))
 
-                if response and "LLM unavailable" not in response:
+                if response and "LLM unavailable" not in response and '"payloads"' not in response:
                     self._poc_write_wet_file(vuln_type, response, "success", len(chunk))
                     enriched_count, failed_local = self._poc_batch_parse_response(response, chunk)
                     # Map local indices to global
@@ -2889,9 +2950,11 @@ Example format:
                         for fid in failed_local:
                             await self._enrich_poc_with_llm(chunk[fid])
                             if chunk[fid].get("exploitation_details"):
-                                # Update tracking: move from failed to enriched
                                 global_id = fid + offset
-                                all_failed_ids.remove(global_id)
+                                try:
+                                    all_failed_ids.remove(global_id)
+                                except ValueError:
+                                    pass
                                 all_enriched_ids.append(global_id)
                 else:
                     # Total failure: LLM unavailable or circuit breaker
@@ -2900,11 +2963,14 @@ Example format:
                     all_failed_ids.extend(range(offset, offset + len(chunk)))
 
                     logger.warning(f"[{self.name}] Batch PoC: {vuln_type} batch failed, falling back to individual")
-                    for f in chunk:
+                    for idx_in_chunk, f in enumerate(chunk):
                         await self._enrich_poc_with_llm(f)
-                        idx = offset + chunk.index(f)
+                        idx = offset + idx_in_chunk
                         if f.get("exploitation_details"):
-                            all_failed_ids.remove(idx)
+                            try:
+                                all_failed_ids.remove(idx)
+                            except ValueError:
+                                pass
                             all_enriched_ids.append(idx)
 
             except Exception as e:
@@ -2913,12 +2979,15 @@ Example format:
                 all_failed_ids.extend(range(offset, offset + len(chunk)))
 
                 # Full fallback to individual
-                for f in chunk:
+                for idx_in_chunk, f in enumerate(chunk):
                     try:
                         await self._enrich_poc_with_llm(f)
-                        idx = offset + chunk.index(f)
+                        idx = offset + idx_in_chunk
                         if f.get("exploitation_details"):
-                            all_failed_ids.remove(idx)
+                            try:
+                                all_failed_ids.remove(idx)
+                            except ValueError:
+                                pass
                             all_enriched_ids.append(idx)
                     except Exception:
                         pass
@@ -2975,66 +3044,296 @@ Example format:
         }
         return contexts.get(vuln_type.upper(), "**Context:** This is a confirmed security vulnerability. Explain the real-world impact.")
 
+    # Vuln types that are informational in bug bounty — skip LLM CVSS scoring
+    INFORMATIONAL_TYPES = {"MISSING_SECURITY_HEADER", "API DOCUMENTATION EXPOSURE"}
+
+    # Nuclei template patterns for grouping into consolidated findings
+    _HEADER_TEMPLATES = {"security-headers-hsts", "security-headers-xcto", "security-headers-xfo",
+                         "security-headers-csp", "security-headers-xxp", "security-headers-rp",
+                         "security-headers-pp", "http-missing-security-headers", "missing-sri"}
+    _API_DOCS_TEMPLATES = {"swagger-api", "redoc-api-docs", "openapi"}
+
+    def _consolidate_informational(self, findings: List[Dict]) -> List[Dict]:
+        """
+        Consolidate informational findings into grouped entries.
+
+        - All missing security header findings → 1 consolidated finding
+        - All API documentation exposure findings → 1 consolidated finding
+        - Other informational types pass through unchanged
+        """
+        header_findings = []
+        api_docs_findings = []
+        other_findings = []
+
+        for f in findings:
+            tmpl = f.get("evidence", {}).get("nuclei_template", f.get("parameter", "")).lower()
+            ftype = f.get("type", "").upper()
+
+            if ftype == "MISSING_SECURITY_HEADER" and tmpl in self._HEADER_TEMPLATES:
+                header_findings.append(f)
+            elif ftype in ("API DOCUMENTATION EXPOSURE", "MISSING_SECURITY_HEADER") and tmpl in self._API_DOCS_TEMPLATES:
+                api_docs_findings.append(f)
+            else:
+                other_findings.append(f)
+
+        result = list(other_findings)
+
+        if header_findings:
+            result.append(self._build_consolidated_header_finding(header_findings))
+
+        if api_docs_findings:
+            result.append(self._build_consolidated_api_docs_finding(api_docs_findings))
+
+        consolidated_count = len(header_findings) + len(api_docs_findings)
+        if consolidated_count > 0:
+            logger.info(
+                f"[{self.name}] Consolidated {consolidated_count} informational findings → "
+                f"{int(bool(header_findings)) + int(bool(api_docs_findings))} grouped entries"
+            )
+
+        return result
+
+    def _build_consolidated_header_finding(self, findings: List[Dict]) -> Dict:
+        """Build a single consolidated finding from multiple missing header findings."""
+        # Collect unique header names from template IDs
+        headers_detail = []
+        urls_seen = set()
+        for f in findings:
+            tmpl = f.get("evidence", {}).get("nuclei_template", f.get("parameter", ""))
+            desc = f.get("description", "").strip()
+            url = f.get("url", "")
+            if url:
+                urls_seen.add(url)
+            # Build a readable name from template
+            name = tmpl.replace("security-headers-", "").replace("http-missing-security-headers", "Multiple Headers").upper()
+            header_map = {
+                "HSTS": "Strict-Transport-Security (HSTS)",
+                "XCTO": "X-Content-Type-Options",
+                "XFO": "X-Frame-Options",
+                "CSP": "Content-Security-Policy",
+                "XXP": "X-XSS-Protection",
+                "RP": "Referrer-Policy",
+                "PP": "Permissions-Policy",
+                "MISSING-SRI": "Subresource Integrity (SRI)",
+                "MULTIPLE HEADERS": "HTTP Security Headers Bundle",
+            }
+            readable = header_map.get(name, name)
+            one_liner = desc.split("\n")[0][:120] if desc else ""
+            headers_detail.append({"header": readable, "template": tmpl, "description": one_liner})
+
+        # Build consolidated description as markdown table
+        header_lines = []
+        for h in headers_detail:
+            header_lines.append(f"| {h['header']} | {h['description']} |")
+
+        description = (
+            f"The target is missing {len(headers_detail)} recommended security headers. "
+            "These are defense-in-depth measures and best practices — not directly exploitable vulnerabilities. "
+            "In bug bounty programs, missing headers are typically classified as **Informational**.\n\n"
+            "| Missing Header | Details |\n"
+            "|---|---|\n"
+            + "\n".join(header_lines) + "\n\n"
+            "**Recommendation:** Configure the web server or application to include all standard "
+            "security headers (HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy)."
+        )
+
+        # Use first finding as base, override key fields
+        base = dict(findings[0])
+        base["type"] = "MISSING_SECURITY_HEADER"
+        base["parameter"] = "security-headers-consolidated"
+        base["title"] = f"Missing Security Headers ({len(headers_detail)} headers)"
+        base["description"] = description
+        base["severity"] = "INFO"
+        base["cvss_score"] = 0.0
+        base["cvss_vector"] = "N/A"
+        base["cvss_rationale"] = "Informational — defense-in-depth headers, not directly exploitable."
+        base["enriched"] = True
+        base["evidence"] = {
+            "nuclei_template": "security-headers-consolidated",
+            "missing_headers": [h["header"] for h in headers_detail],
+            "original_count": len(findings),
+        }
+        base["exploitation_details"] = description
+        base["url"] = sorted(urls_seen)[0] if urls_seen else base.get("url", "")
+        base.pop("cwe", None)
+        base.pop("cve", None)
+        return base
+
+    def _build_consolidated_api_docs_finding(self, findings: List[Dict]) -> Dict:
+        """Build a single consolidated finding from multiple API documentation exposure findings."""
+        endpoints = []
+        urls_seen = set()
+        for f in findings:
+            tmpl = f.get("evidence", {}).get("nuclei_template", f.get("parameter", ""))
+            url = f.get("url", "")
+            desc = f.get("description", "").strip().split("\n")[0][:120]
+            if url:
+                urls_seen.add(url)
+            endpoints.append({"template": tmpl, "url": url, "description": desc})
+
+        endpoint_lines = []
+        for ep in endpoints:
+            endpoint_lines.append(f"| {ep['url']} | {ep['description']} |")
+
+        description = (
+            f"The application exposes {len(endpoints)} API documentation endpoint(s) without authentication. "
+            "While this aids development, in production it reveals internal API structure to potential attackers. "
+            "In bug bounty programs, API documentation exposure is typically classified as **Informational**.\n\n"
+            "| Endpoint | Details |\n"
+            "|---|---|\n"
+            + "\n".join(endpoint_lines) + "\n\n"
+            "**Recommendation:** Restrict API documentation endpoints to authenticated users or internal networks only."
+        )
+
+        base = dict(findings[0])
+        base["type"] = "API DOCUMENTATION EXPOSURE"
+        base["parameter"] = "api-docs-consolidated"
+        base["title"] = f"API Documentation Exposure ({len(endpoints)} endpoints)"
+        base["description"] = description
+        base["severity"] = "INFO"
+        base["cvss_score"] = 0.0
+        base["cvss_vector"] = "N/A"
+        base["cvss_rationale"] = "Informational — API documentation exposure aids reconnaissance but is not directly exploitable."
+        base["enriched"] = True
+        base["evidence"] = {
+            "nuclei_template": "api-docs-consolidated",
+            "exposed_endpoints": [ep["url"] for ep in endpoints],
+            "original_count": len(findings),
+        }
+        base["exploitation_details"] = description
+        base["url"] = sorted(urls_seen)[0] if urls_seen else base.get("url", "")
+        base.pop("cwe", None)
+        base.pop("cve", None)
+        return base
+
     async def _calculate_cvss_batch(self, findings: List[Dict]):
         """
-        Batch CVSS scoring: 1 LLM call per chunk of 10 findings.
+        Batch CVSS scoring with concurrent chunk processing.
+        Uses semaphore to limit concurrent LLM calls.
         Falls back to individual calls on parse failure.
         """
-        CHUNK_SIZE = 10
-        for chunk_start in range(0, len(findings), CHUNK_SIZE):
-            chunk = findings[chunk_start:chunk_start + CHUNK_SIZE]
-            try:
-                # Build batch prompt
-                findings_text = []
-                for i, f in enumerate(chunk):
-                    findings_text.append(
-                        f"[Finding {i}] Type: {f.get('type')}, URL: {f.get('url')}, "
-                        f"Parameter: {f.get('parameter')}, Payload: {str(f.get('payload', ''))[:100]}, "
-                        f"Description: {str(f.get('description', ''))[:150]}"
-                    )
-                findings_block = "\n".join(findings_text)
+        # Pre-assign informational findings — no LLM needed
+        scorable = []
+        for f in findings:
+            if f.get("type", "").upper() in self.INFORMATIONAL_TYPES:
+                f["severity"] = "INFO"
+                f["cvss_score"] = 0.0
+                f["cvss_vector"] = "N/A"
+                f["cvss_rationale"] = "Informational finding — defense-in-depth measure or best practice, not a directly exploitable vulnerability."
+                f["enriched"] = True
+            else:
+                scorable.append(f)
 
-                prompt = f"""You are a Senior Penetration Testing Expert. Score ALL findings below in ONE response.
+        if not scorable:
+            logger.info(f"[{self.name}] Batch CVSS: all {len(findings)} findings are informational, no LLM scoring needed")
+            return
+
+        CHUNK_SIZE = 10
+        MAX_CONCURRENT = 3
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
+        chunks = []
+        for chunk_start in range(0, len(scorable), CHUNK_SIZE):
+            chunks.append(scorable[chunk_start:chunk_start + CHUNK_SIZE])
+
+        info_count = len(findings) - len(scorable)
+        logger.info(f"[{self.name}] Batch CVSS: {len(scorable)} scorable findings in {len(chunks)} chunks (max {MAX_CONCURRENT} concurrent), {info_count} informational skipped")
+
+        async def _score_chunk(chunk: List[Dict], chunk_idx: int):
+            async with semaphore:
+                try:
+                    await self._cvss_score_single_chunk(chunk, chunk_idx)
+                except Exception as e:
+                    logger.warning(f"[{self.name}] Batch CVSS chunk {chunk_idx} failed: {e}, falling back to individual")
+                    for f in chunk:
+                        await self._calculate_cvss(f)
+                        await asyncio.sleep(0.5)
+
+        await asyncio.gather(*[
+            _score_chunk(chunk, i) for i, chunk in enumerate(chunks)
+        ])
+
+    async def _cvss_score_single_chunk(self, chunk: List[Dict], chunk_idx: int):
+        """Score a single chunk of findings via batch LLM call."""
+        findings_text = []
+        for i, f in enumerate(chunk):
+            findings_text.append(
+                f"[Finding {i}] Type: {f.get('type')}, URL: {f.get('url')}, "
+                f"Parameter: {f.get('parameter')}, Payload: {str(f.get('payload', ''))[:100]}, "
+                f"Description: {str(f.get('description', ''))[:150]}"
+            )
+        findings_block = "\n".join(findings_text)
+
+        prompt = f"""You are a Senior Bug Bounty Triager scoring vulnerabilities for a bug bounty program. Be CONSERVATIVE — overrating wastes program resources and damages credibility. Score ALL findings below in ONE response.
 
 **Findings:**
 {findings_block}
 
-**Severity Calibration:**
-- CRITICAL (9.0-10.0): RCE, SQLi with full DB access, Auth Bypass
-- HIGH (7.0-8.9): Stored XSS, SSRF internal, XXE file read, CSTI/SSTI
-- MEDIUM (4.0-6.9): Reflected XSS, CSRF, Info Disclosure, Open Redirect
-- LOW (0.1-3.9): Misconfigurations, Minor info leaks
+**Bug Bounty Severity Calibration (be strict, do NOT inflate):**
+- CRITICAL (9.0-10.0): ONLY RCE with proven code execution, SQLi with full DB dump/write, Authentication Bypass to admin
+- HIGH (7.0-8.9): Stored XSS with session hijack, SSRF to internal services, XXE with file read, IDOR accessing other users' sensitive data
+- MEDIUM (4.0-6.9): Reflected XSS (requires user interaction), CSRF on sensitive actions, CSTI/SSTI without RCE escalation
+- LOW (2.0-3.9): Open Redirect, CSRF on non-sensitive actions, verbose error messages, minor info disclosure
+- INFO (0.1-1.9): Missing security headers, version disclosure, API documentation exposure, rate limiting issues, cookie flags
+
+**Scoring rules:**
+- Reflected XSS is MEDIUM at most (6.1), NEVER HIGH — it requires user interaction
+- Open Redirect is LOW (3.1-4.0) unless chained with OAuth token theft
+- Missing headers, rate limiting, API docs exposure = always INFO
+- CSTI that only achieves client-side template evaluation = MEDIUM (5.4)
+- Only score what the finding ACTUALLY demonstrates, not theoretical maximum impact
 
 For EACH finding, provide: CVSS vector, score, severity, rationale (2-3 sentences), CWE, CVE (or null).
 
 Output STRICT JSON array (no markdown):
 [
   {{"finding_id": 0, "vector": "CVSS:3.1/...", "score": 9.8, "severity": "CRITICAL", "rationale": "...", "cwe": "CWE-89", "cve": null}},
-  {{"finding_id": 1, "vector": "CVSS:3.1/...", "score": 6.5, "severity": "MEDIUM", "rationale": "...", "cwe": "CWE-79", "cve": null}}
+  {{"finding_id": 1, "vector": "CVSS:3.1/...", "score": 6.1, "severity": "MEDIUM", "rationale": "...", "cwe": "CWE-79", "cve": null}}
 ]"""
 
-                response = await self._cvss_execute_llm(prompt)
-                if response:
-                    # Parse JSON array from response
-                    json_match = re.search(r'\[.*\]', response, re.DOTALL)
-                    if json_match:
+        response = await self._cvss_execute_llm(prompt)
+        if response:
+            # Strip markdown code fences if present
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = re.sub(r'^```\w*\s*\n?', '', cleaned)
+                cleaned = re.sub(r'\n?```\s*$', '', cleaned)
+
+            # Parse JSON array from response
+            results = None
+            try:
+                parsed = json.loads(cleaned.strip())
+                if isinstance(parsed, list):
+                    results = parsed
+                elif isinstance(parsed, dict):
+                    for key in parsed:
+                        if isinstance(parsed[key], list):
+                            results = parsed[key]
+                            break
+            except (json.JSONDecodeError, ValueError):
+                json_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+                if json_match:
+                    try:
                         results = json.loads(json_match.group(0))
-                        for item in results:
-                            idx = item.get("finding_id", -1)
-                            if 0 <= idx < len(chunk):
-                                self._cvss_update_finding(chunk[idx], item)
-                        logger.info(f"[{self.name}] Batch CVSS: scored {len(results)}/{len(chunk)} findings in 1 call")
-                        continue  # Success, skip fallback
+                    except json.JSONDecodeError:
+                        pass
 
-                # Fallback: individual calls for this chunk
-                logger.warning(f"[{self.name}] Batch CVSS parse failed, falling back to individual calls")
-                for f in chunk:
-                    await self._calculate_cvss(f)
+            if results and isinstance(results, list):
+                scored = 0
+                for item in results:
+                    if isinstance(item, dict):
+                        idx = item.get("finding_id", -1)
+                        if 0 <= idx < len(chunk):
+                            self._cvss_update_finding(chunk[idx], item)
+                            scored += 1
+                logger.info(f"[{self.name}] Batch CVSS chunk {chunk_idx}: scored {scored}/{len(chunk)} findings")
+                return
 
-            except Exception as e:
-                logger.warning(f"[{self.name}] Batch CVSS failed: {e}, falling back to individual")
-                for f in chunk:
-                    await self._calculate_cvss(f)
+        # Fallback: individual calls for this chunk
+        logger.warning(f"[{self.name}] Batch CVSS chunk {chunk_idx} parse failed, falling back to individual. Response: {str(response)[:300]}")
+        for f in chunk:
+            await self._calculate_cvss(f)
+            await asyncio.sleep(0.5)
 
     async def _calculate_cvss(self, f: Dict):
         """
@@ -3049,6 +3348,10 @@ Output STRICT JSON array (no markdown):
                 data = self._cvss_parse_response(response)
                 if data:
                     self._cvss_update_finding(f, data)
+                else:
+                    logger.debug(f"[{self.name}] CVSS parse returned None for {f.get('type')}. Raw: {response[:200]}")
+            else:
+                logger.debug(f"[{self.name}] CVSS LLM returned None for {f.get('type')}")
 
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to enrich finding {f.get('id')}: {e}")
@@ -3122,19 +3425,77 @@ Output STRICT JSON array (no markdown):
 
     def _cvss_parse_response(self, response: str) -> Optional[Dict]:
         """Parse LLM response and extract CVSS data."""
-        # Extract JSON from potential markdown blocks
-        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        # Extract content from markdown code fences (robust: handles trailing text)
+        cleaned = response.strip()
+        fence_match = re.search(r'```\w*\s*\n?(.*?)```', cleaned, re.DOTALL)
+        if fence_match:
+            cleaned = fence_match.group(1).strip()
+        elif cleaned.startswith("```"):
+            # Opening fence without closing — strip opening only
+            cleaned = re.sub(r'^```\w*\s*\n?', '', cleaned).strip()
+
+        # Try direct parse first (cleanest case)
+        try:
+            data = json.loads(cleaned.strip())
+            if isinstance(data, dict):
+                return data
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                return data[0]
+        except (json.JSONDecodeError, IndexError):
+            pass
+
+        # Extract JSON object from mixed text
+        json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
         if json_match:
-            return json.loads(json_match.group(0))
+            try:
+                return json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                pass
+
+        # Last resort: extract individual CVSS fields with regex (handles truncated JSON)
+        extracted = {}
+        vector_m = re.search(r'"vector(?:_string)?":\s*"(CVSS:3\.1/[^"]+)"', response)
+        if vector_m:
+            extracted['vector'] = vector_m.group(1)
+        score_m = re.search(r'"(?:cvss_)?score":\s*([\d.]+)', response)
+        if score_m:
+            try:
+                extracted['score'] = float(score_m.group(1))
+            except ValueError:
+                pass
+        severity_m = re.search(r'"severity":\s*"(CRITICAL|HIGH|MEDIUM|LOW|INFO)"', response, re.IGNORECASE)
+        if severity_m:
+            extracted['severity'] = severity_m.group(1).upper()
+        rationale_m = re.search(r'"rationale":\s*"([^"]{10,})', response)
+        if rationale_m:
+            extracted['rationale'] = rationale_m.group(1)
+        cwe_m = re.search(r'"cwe":\s*"(CWE-\d+)"', response)
+        if cwe_m:
+            extracted['cwe'] = cwe_m.group(1)
+
+        if extracted.get('score') is not None or extracted.get('vector'):
+            logger.info(f"[{self.name}] CVSS extracted from truncated response: score={extracted.get('score')}, severity={extracted.get('severity')}")
+            return extracted
+
+        logger.warning(f"[{self.name}] CVSS no JSON found. Raw response: {response[:300]}")
         return None
 
     def _cvss_update_finding(self, f: Dict, data: Dict):
         """Update finding with CVSS data."""
-        # Update finding
-        f['severity'] = data.get('severity', f.get('severity')).upper()
-        f['cvss_score'] = data.get('score')
-        f['cvss_vector'] = data.get('vector')
-        f['cvss_rationale'] = data.get('rationale')
+        # Only overwrite severity/score with non-null LLM values; preserve originals on failure
+        new_severity = data.get('severity')
+        if new_severity:
+            f['severity'] = new_severity.upper()
+        # Accept score from multiple possible field names (provider compatibility)
+        new_score = data.get('score') or data.get('cvss_score') or data.get('base_score')
+        if new_score is not None:
+            try:
+                f['cvss_score'] = float(new_score)
+            except (ValueError, TypeError):
+                pass
+        new_vector = data.get('vector') or data.get('cvss_vector') or data.get('vector_string')
+        f['cvss_vector'] = new_vector or f.get('cvss_vector')
+        f['cvss_rationale'] = data.get('rationale') or data.get('analysis') or f.get('cvss_rationale')
 
         vuln_type = f.get('type', '')
 
@@ -3153,7 +3514,7 @@ Output STRICT JSON array (no markdown):
         # Append rationale to description or notes
         rationale = data.get('rationale', '')
 
-        enrichment_text = f"\n\n**CVSS Analysis**:\n- **Severity**: {f['severity']} ({f['cvss_score']})\n- **Vector**: `{f['cvss_vector']}`\n- **Rationale**: {rationale}"
+        enrichment_text = f"\n\n**CVSS Analysis**:\n- **Severity**: {f.get('severity', 'N/A')} ({f.get('cvss_score', 'N/A')})\n- **Vector**: `{f.get('cvss_vector', 'N/A')}`\n- **Rationale**: {rationale}"
         if cve:
             enrichment_text += f"\n- **Reference CVE**: [{cve}](https://nvd.nist.gov/vuln/detail/{cve})"
 
