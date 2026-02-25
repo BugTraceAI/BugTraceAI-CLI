@@ -1,0 +1,107 @@
+{
+  "cloudflare": {
+    "waf_name": "cloudflare",
+    "strategies": {
+      "unicode_encode": {
+        "attempts": 5,
+        "successes": 3,
+        "last_used": ""
+      },
+      "html_entity_hex": {
+        "attempts": 5,
+        "successes": 2,
+        "last_used": ""
+      },
+      "case_mixing": {
+        "attempts": 5,
+        "successes": 2,
+        "last_used": ""
+      },
+      "double_url_encode": {
+        "attempts": 5,
+        "successes": 1,
+        "last_used": ""
+      }
+    }
+  },
+  "modsecurity": {
+    "waf_name": "modsecurity",
+    "strategies": {
+      "comment_injection": {
+        "attempts": 5,
+        "successes": 4,
+        "last_used": ""
+      },
+      "null_byte_injection": {
+        "attempts": 5,
+        "successes": 3,
+        "last_used": ""
+      },
+      "double_url_encode": {
+        "attempts": 5,
+        "successes": 3,
+        "last_used": ""
+      }
+    }
+  },
+  "aws_waf": {
+    "waf_name": "aws_waf",
+    "strategies": {
+      "double_url_encode": {
+        "attempts": 5,
+        "successes": 3,
+        "last_used": ""
+      },
+      "comment_injection": {
+        "attempts": 5,
+        "successes": 2,
+        "last_used": ""
+      },
+      "whitespace_obfuscation": {
+        "attempts": 5,
+        "successes": 2,
+        "last_used": ""
+      }
+    }
+  },
+  "akamai": {
+    "waf_name": "akamai",
+    "strategies": {
+      "unicode_encode": {
+        "attempts": 5,
+        "successes": 3,
+        "last_used": ""
+      },
+      "whitespace_obfuscation": {
+        "attempts": 5,
+        "successes": 3,
+        "last_used": ""
+      },
+      "html_entity_encode": {
+        "attempts": 5,
+        "successes": 2,
+        "last_used": ""
+      }
+    }
+  },
+  "imperva": {
+    "waf_name": "imperva",
+    "strategies": {
+      "backslash_escape": {
+        "attempts": 5,
+        "successes": 3,
+        "last_used": ""
+      },
+      "unicode_encode": {
+        "attempts": 5,
+        "successes": 2,
+        "last_used": ""
+      },
+      "overlong_utf8": {
+        "attempts": 5,
+        "successes": 2,
+        "last_used": ""
+      }
+    }
+  }
+}

