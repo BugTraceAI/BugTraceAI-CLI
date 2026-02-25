@@ -941,7 +941,7 @@ class ScanService:
 
                 # Pattern 2: API-generated reports (fallback)
                 api_dir = report_base / f"scan_{scan_id}"
-                if api_dir.is_dir():
+                if api_dir.is_dir() and self._dir_has_report_files(api_dir):
                     return api_dir
 
         except Exception as e:
@@ -949,7 +949,7 @@ class ScanService:
 
         # Last resort without DB
         api_dir = report_base / f"scan_{scan_id}"
-        if api_dir.is_dir():
+        if api_dir.is_dir() and self._dir_has_report_files(api_dir):
             return api_dir
 
         return None

@@ -388,7 +388,7 @@ def filter_dom_xss_false_positives(
 
         # 1. Canary-only payloads: a plain string reaching innerHTML is NOT XSS.
         #    Real XSS requires HTML/JS execution (e.g., <script>, onerror=, javascript:)
-        canary_base = "DOMXSS_CANARY_7x7"
+        canary_base = "BUGTRACEAI_7x7"
         payload_stripped = payload.replace(canary_base, "").replace("|", "").replace(param_name, "").strip()
         is_canary_only = not payload_stripped or payload_stripped in ("", "|")
         if is_canary_only and sink != "alert":

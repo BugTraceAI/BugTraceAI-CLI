@@ -100,7 +100,7 @@ class DOMXSSDetector:
         return """
             window.__domxss_findings = [];
             window.__domxss_sources = [];
-            const CANARY = 'DOMXSS_CANARY_7x7';
+            const CANARY = 'BUGTRACEAI_7x7';
         """
 
     def _build_source_tracking(self) -> str:
@@ -320,7 +320,7 @@ class DOMXSSDetector:
         """Build jQuery-specific hooks if jQuery is present."""
         return """
             if (window.jQuery) {
-                const CANARY = 'DOMXSS_CANARY_7x7';
+                const CANARY = 'BUGTRACEAI_7x7';
                 const originalHtml = jQuery.fn.html;
                 jQuery.fn.html = function(value) {
                     if (value && value.toString().includes(CANARY)) {
@@ -373,7 +373,7 @@ class DOMXSSDetector:
         """ADDED (2026-01-30): Build AngularJS-specific hooks for template execution detection."""
         return """
             if (window.angular) {
-                const CANARY = 'DOMXSS_CANARY_7x7';
+                const CANARY = 'BUGTRACEAI_7x7';
                 // Monitor Angular template compilation
                 const originalCompile = angular.element.prototype.html;
                 if (originalCompile) {
@@ -444,7 +444,7 @@ class DOMXSSDetector:
 
         IMPROVED (2026-01-30): Added AngularJS-specific payloads for ginandjuice.shop.
         """
-        canary = "DOMXSS_CANARY_7x7"
+        canary = "BUGTRACEAI_7x7"
 
         return [
             {"payload": canary, "type": "canary"},
@@ -492,10 +492,10 @@ class DOMXSSDetector:
 
         try:
             # Test hash source (single canary + javascript: URI = 2 page loads)
-            hash_finding = await self._test_payload(f"{url}#DOMXSS_CANARY_7x7", "DOMXSS_CANARY_7x7", "hash", page)
+            hash_finding = await self._test_payload(f"{url}#BUGTRACEAI_7x7", "BUGTRACEAI_7x7", "hash", page)
             if hash_finding:
                 findings.append(hash_finding)
-            hash_js = await self._test_payload(f"{url}#javascript:alert('DOMXSS_CANARY_7x7')", "javascript:alert('DOMXSS_CANARY_7x7')", "hash", page)
+            hash_js = await self._test_payload(f"{url}#javascript:alert('BUGTRACEAI_7x7')", "javascript:alert('BUGTRACEAI_7x7')", "hash", page)
             if hash_js:
                 findings.append(hash_js)
 
@@ -567,7 +567,7 @@ class DOMXSSDetector:
 
         # Phase 1: Batch canary sweep — ONE request with unique canary per param
         # Identifies which params reach dangerous sinks without N separate page loads
-        canary_base = "DOMXSS_CANARY_7x7"
+        canary_base = "BUGTRACEAI_7x7"
         param_canary_map = {}  # full_canary → param_name
         test_params = {k: v[0] for k, v in params.items()}
         for param_name in all_param_names:
@@ -666,7 +666,7 @@ class DOMXSSDetector:
             await page.goto(url, wait_until="networkidle", timeout=self.timeout)
 
             # Inject postMessage with XSS payload
-            canary = "DOMXSS_CANARY_7x7"
+            canary = "BUGTRACEAI_7x7"
             payload = f"<img src=x onerror=alert('{canary}')>"
 
             result = await page.evaluate(f"""
