@@ -59,10 +59,14 @@ bin/
 *.log
 logs/
 
-# Runtime data
-reports/
-data/
-uploads/
+# Runtime data (scan output dirs at project root)
+/reports/
+/data/
+/uploads/
+
+# Runtime-generated data files (not templates)
+bugtrace/data/waf_strategy_learning.json.backup.*
+bugtrace/data/xss_proven_payloads.lock
 
 # Claude Code config (private)
 .claude/
@@ -102,8 +106,9 @@ docs/DETECTION_GAP_BRIEFING.md
 # Internal utility scripts
 tools/cumulative_best.py
 
-# Auto-learned breakouts (generated at runtime)
+# Auto-learned data (generated at runtime, not shipped)
 bugtrace/payloads/learned_breakouts.json
+bugtrace/data/xss_proven_payloads.json
 
 # Backup files
 *.backup
