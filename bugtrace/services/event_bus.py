@@ -256,16 +256,17 @@ class ServiceEventBus:
         return None
 
     async def _bridge_event(self, event_name: str, data: Dict[str, Any]):
-        """Bridge handler: forward core event bus events to scan-scoped streams."""
+        """Bridge handler: forward core event bus events to scan-scoped streams.
+
+        Always stores events in history so WebSocket clients that connect later
+        can replay them. Only pushes to live queues if consumers exist.
+        """
         scan_id = self._resolve_scan_id(data)
         if scan_id is None:
             return
 
-        # Only bridge if someone is actively streaming this scan
-        if scan_id not in self._scan_queues or not self._scan_queues[scan_id]:
-            return
-
-        # _store_event_in_history handles mapping, seq, and queue push
+        # Always store in history (even without active consumers),
+        # so late-connecting WebSocket clients get the full replay.
         async with self._lock:
             await self._store_event_in_history(scan_id, event_name, data)
 

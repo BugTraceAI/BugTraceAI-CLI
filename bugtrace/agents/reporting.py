@@ -3274,12 +3274,14 @@ Example format:
 - HIGH (7.0-8.9): Stored XSS with session hijack, SSRF to internal services, XXE with file read, IDOR accessing other users' sensitive data
 - MEDIUM (4.0-6.9): Reflected XSS (requires user interaction), CSRF on sensitive actions, CSTI/SSTI without RCE escalation
 - LOW (2.0-3.9): Open Redirect, CSRF on non-sensitive actions, verbose error messages, minor info disclosure
-- INFO (0.1-1.9): Missing security headers, version disclosure, API documentation exposure, rate limiting issues, cookie flags
+- INFO (0.1-1.9): Missing security headers, version disclosure, API documentation exposure, cookie flags
 
 **Scoring rules:**
 - Reflected XSS is MEDIUM at most (6.1), NEVER HIGH — it requires user interaction
 - Open Redirect is LOW (3.1-4.0) unless chained with OAuth token theft
-- Missing headers, rate limiting, API docs exposure = always INFO
+- Missing headers, API docs exposure = always INFO
+- Missing rate limiting on authentication endpoints (login, register, password reset) = MEDIUM (5.3) — enables brute force and credential stuffing
+- Missing rate limiting on non-auth endpoints = LOW (2.0-3.0)
 - CSTI that only achieves client-side template evaluation = MEDIUM (5.4)
 - Only score what the finding ACTUALLY demonstrates, not theoretical maximum impact
 
