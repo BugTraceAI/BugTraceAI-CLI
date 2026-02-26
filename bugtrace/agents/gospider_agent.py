@@ -94,7 +94,10 @@ class GoSpiderAgent(BaseAgent):
             return []
 
         # Scope enforcement (same domain only)
-        target_domain = urlparse(self.target).hostname.lower()
+        _hostname = urlparse(self.target).hostname
+        if not _hostname:
+            return []
+        target_domain = _hostname.lower()
         scoped_urls = [u for u in gospider_urls if urlparse(u).hostname and urlparse(u).hostname.lower().endswith(target_domain)]
 
         # Extension filtering (exclude static files)

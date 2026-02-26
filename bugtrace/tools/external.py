@@ -732,7 +732,11 @@ class ExternalToolManager:
             else:
                 output = await self._run_container("trickest/gospider", cmd)
 
-        target_domain = urlparse(url).hostname.lower()
+        _hostname = urlparse(url).hostname
+        if not _hostname:
+            logger.warning(f"GoSpider: could not extract hostname from URL: {url}")
+            return []
+        target_domain = _hostname.lower()
         if output:
             lines = output.splitlines()
             logger.info(f"GoSpider raw output examples:\n{chr(10).join(lines[:5])}")
