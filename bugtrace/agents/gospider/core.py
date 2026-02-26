@@ -116,7 +116,10 @@ def filter_and_prioritize_urls(
         return []
 
     # Scope enforcement (same domain only)
-    target_domain = urlparse(target).hostname.lower()
+    _hostname = urlparse(target).hostname
+    if not _hostname:
+        return []
+    target_domain = _hostname.lower()
     scoped_urls = [
         u for u in gospider_urls
         if urlparse(u).hostname and urlparse(u).hostname.lower().endswith(target_domain)
