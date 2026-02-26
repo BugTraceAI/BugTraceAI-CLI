@@ -102,8 +102,8 @@ def generate_fingerprint(
     netloc, normalized_path = normalize_url_for_dedup(url)
 
     if context:
-        return (vuln_type, netloc, normalized_path, param.lower(), context)
-    return (vuln_type, netloc, normalized_path, param.lower())
+        return (vuln_type, netloc, normalized_path, (param or "").lower(), context)
+    return (vuln_type, netloc, normalized_path, (param or "").lower())
 
 
 def dedup_by_fingerprint(
@@ -149,7 +149,7 @@ def _default_fingerprint(finding: Dict) -> Tuple:
     param = finding.get("parameter", "")
     vuln_type = finding.get("type", "UNKNOWN")
     netloc, normalized_path = normalize_url_for_dedup(url)
-    return (vuln_type, netloc, normalized_path, param.lower())
+    return (vuln_type, netloc, normalized_path, (param or "").lower())
 
 
 # =========================================================================
@@ -194,7 +194,7 @@ def xss_fingerprint(
         return ("XSS_GLOBAL", netloc, root_cause, context)
 
     netloc, normalized_path = normalize_url_for_dedup(url)
-    return ("XSS", netloc, normalized_path, parameter.lower(), context)
+    return ("XSS", netloc, normalized_path, (parameter or "").lower(), context)
 
 
 def _detect_xss_root_cause(
@@ -249,7 +249,7 @@ def sqli_fingerprint(parameter: str, url: str) -> Tuple:
     Returns:
         Hashable tuple fingerprint.
     """
-    param_lower = parameter.lower()
+    param_lower = (parameter or "").lower()
 
     # Cookie-based SQLi: Global vulnerability (ignore URL path)
     if "cookie:" in param_lower:
@@ -264,7 +264,7 @@ def sqli_fingerprint(parameter: str, url: str) -> Tuple:
     # URL/POST param: path-specific vulnerability
     parsed = urlparse(url)
     normalized_path = parsed.path.rstrip("/")
-    param_name = parameter.split(":")[-1].strip().lower()
+    param_name = (parameter or "").split(":")[-1].strip().lower()
 
     return ("SQLI", "param", parsed.netloc, normalized_path, param_name)
 
@@ -297,7 +297,7 @@ def csti_fingerprint(url: str, parameter: str, template_engine: str) -> Tuple:
         return ("CSTI", netloc, normalized_path, template_engine)
     else:
         # Server-side: each parameter is a separate injection point
-        return ("CSTI", netloc, normalized_path, parameter.lower(), template_engine)
+        return ("CSTI", netloc, normalized_path, (parameter or "").lower(), template_engine)
 
 
 def lfi_fingerprint(url: str, parameter: str) -> Tuple:
@@ -309,7 +309,7 @@ def lfi_fingerprint(url: str, parameter: str) -> Tuple:
     Pure function. Replaces LFIAgent._generate_lfi_fingerprint.
     """
     netloc, normalized_path = normalize_url_for_dedup(url)
-    return ("LFI", netloc, normalized_path, parameter.lower())
+    return ("LFI", netloc, normalized_path, (parameter or "").lower())
 
 
 def rce_fingerprint(url: str, parameter: str) -> Tuple:
@@ -321,7 +321,7 @@ def rce_fingerprint(url: str, parameter: str) -> Tuple:
     Pure function. Replaces RCEAgent._generate_rce_fingerprint.
     """
     netloc, normalized_path = normalize_url_for_dedup(url)
-    return ("RCE", netloc, normalized_path, parameter.lower())
+    return ("RCE", netloc, normalized_path, (parameter or "").lower())
 
 
 def ssrf_fingerprint(url: str, parameter: str) -> Tuple:
@@ -335,7 +335,7 @@ def ssrf_fingerprint(url: str, parameter: str) -> Tuple:
     Pure function. Replaces SSRFAgent._generate_ssrf_fingerprint.
     """
     netloc, normalized_path = normalize_url_for_dedup(url)
-    return ("SSRF", netloc, normalized_path, parameter.lower())
+    return ("SSRF", netloc, normalized_path, (parameter or "").lower())
 
 
 def idor_fingerprint(url: str, resource_type: str) -> Tuple:
@@ -401,7 +401,7 @@ def openredirect_fingerprint(url: str, parameter: str) -> Tuple:
     Pure function. Replaces OpenRedirectAgent._generate_openredirect_fingerprint.
     """
     netloc, normalized_path = normalize_url_for_dedup(url)
-    return ("OPEN_REDIRECT", netloc, normalized_path, parameter.lower())
+    return ("OPEN_REDIRECT", netloc, normalized_path, (parameter or "").lower())
 
 
 def header_injection_fingerprint(header_name: str) -> Tuple:
@@ -413,7 +413,7 @@ def header_injection_fingerprint(header_name: str) -> Tuple:
 
     Pure function. Replaces HeaderInjectionAgent._generate_headerinjection_fingerprint.
     """
-    return ("HEADER_INJECTION", header_name.lower())
+    return ("HEADER_INJECTION", (header_name or "").lower())
 
 
 def prototype_pollution_fingerprint(url: str, parameter: str) -> Tuple:
@@ -423,7 +423,7 @@ def prototype_pollution_fingerprint(url: str, parameter: str) -> Tuple:
     Pure function. Replaces PrototypePollutionAgent._generate_protopollution_fingerprint.
     """
     netloc, normalized_path = normalize_url_for_dedup(url)
-    return ("PROTOTYPE_POLLUTION", netloc, normalized_path, parameter.lower())
+    return ("PROTOTYPE_POLLUTION", netloc, normalized_path, (parameter or "").lower())
 
 
 # =========================================================================

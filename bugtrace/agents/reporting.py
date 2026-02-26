@@ -686,6 +686,8 @@ class ReportingAgent(BaseAgent):
         }
 
         def _display_name(raw: str) -> str:
+            if not raw:
+                return "Unknown"
             return _DISPLAY_NAMES.get(raw.lower(), raw.capitalize())
 
         # Merge findings by product/technology, keeping best version info
@@ -1075,7 +1077,7 @@ class ReportingAgent(BaseAgent):
         - "XSS" → "XSS"
         - "CSTI (AngularJS)" → "CSTI"
         """
-        normalized = vuln_type.upper().strip()
+        normalized = (vuln_type or "UNKNOWN").upper().strip()
         paren_idx = normalized.find("(")
         if paren_idx > -1:
             normalized = normalized[:paren_idx].strip()
@@ -1091,7 +1093,7 @@ class ReportingAgent(BaseAgent):
 
         Returns lowercase normalized key for grouping.
         """
-        param_lower = param.lower().strip()
+        param_lower = (param or "").lower().strip()
 
         # Cookie normalization: extract just the cookie name
         if "cookie" in param_lower:
@@ -2797,7 +2799,7 @@ Example format:
             wet_dir = self.output_dir / "poc_enrichment" / "wet"
             wet_dir.mkdir(parents=True, exist_ok=True)
 
-            safe_type = vuln_type.lower().replace(" ", "_")
+            safe_type = (vuln_type or "unknown").lower().replace(" ", "_")
             wet_path = wet_dir / f"{safe_type}_wet.json"
 
             wet_data = {
@@ -2840,7 +2842,7 @@ Example format:
             dry_dir = self.output_dir / "poc_enrichment" / "dry"
             dry_dir.mkdir(parents=True, exist_ok=True)
 
-            safe_type = vuln_type.lower().replace(" ", "_")
+            safe_type = (vuln_type or "unknown").lower().replace(" ", "_")
             dry_path = dry_dir / f"{safe_type}_dry.json"
 
             findings_summary = []
@@ -3080,7 +3082,7 @@ Example format:
         other_findings = []
 
         for f in findings:
-            tmpl = self._safe_evidence_get(f, "nuclei_template", f.get("parameter", "")).lower()
+            tmpl = str(self._safe_evidence_get(f, "nuclei_template", f.get("parameter", "") or "")).lower()
             ftype = f.get("type", "").upper()
 
             if ftype == "MISSING_SECURITY_HEADER" and tmpl in self._HEADER_TEMPLATES:
