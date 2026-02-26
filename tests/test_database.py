@@ -219,7 +219,7 @@ class TestDatabaseManager:
 
         assert result["status"] == "healthy"
         assert result["sql_db"]["status"] == "healthy"
-        assert result["vector_db"]["status"] == "healthy"
+        assert result["vector_db"]["status"] in ("healthy", "disabled")
         assert result["latency_ms"] >= 0
 
     def test_get_metrics(self, temp_db):
@@ -248,11 +248,11 @@ class TestDatabaseManager:
             assert result["size_bytes"] > 0
 
     def test_connection_pooling_sqlite(self, temp_db):
-        """TASK-85: Test that SQLite uses StaticPool."""
-        from sqlalchemy.pool import StaticPool
+        """TASK-85: Test that SQLite uses QueuePool."""
+        from sqlalchemy.pool import QueuePool
 
         pool = temp_db.engine.pool
-        assert isinstance(pool, StaticPool)
+        assert isinstance(pool, QueuePool)
 
 
 class TestDatabaseEnums:

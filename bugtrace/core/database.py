@@ -188,14 +188,24 @@ class DatabaseManager:
         - PostgreSQL/MySQL: Uses QueuePool with configurable size
         """
         is_sqlite = self.db_url.startswith("sqlite")
+        is_memory = ":memory:" in self.db_url or self.db_url == "sqlite://"
 
-        if is_sqlite:
-            # SQLite: Use StaticPool for thread-safe single connection
-            # Also enable foreign keys and WAL mode for better concurrency
+        if is_sqlite and is_memory:
+            # SQLite memory: Use StaticPool for thread-safe single connection
             engine = create_engine(
                 self.db_url,
                 poolclass=StaticPool,
                 connect_args={"check_same_thread": False},
+                echo=False
+            )
+        elif is_sqlite:
+            # SQLite file: Use QueuePool
+            engine = create_engine(
+                self.db_url,
+                poolclass=QueuePool,
+                pool_size=self.POOL_SIZE,
+                max_overflow=self.MAX_OVERFLOW,
+                connect_args={"check_same_thread": False, "timeout": 30.0},
                 echo=False
             )
             # Enable SQLite optimizations
