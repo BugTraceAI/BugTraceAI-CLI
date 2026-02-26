@@ -686,6 +686,8 @@ class DatabaseManager:
         if finding_data.get("validated") or finding_data.get("conductor_validated"):
             existing_finding.visual_validated = True
             existing_finding.status = FindingStatus.VALIDATED_CONFIRMED
+            if existing_finding.confidence_score < 0.95:
+                existing_finding.confidence_score = 0.95
 
         new_conf = finding_data.get("confidence")
         if new_conf is not None and new_conf > existing_finding.confidence_score:
@@ -722,13 +724,17 @@ class DatabaseManager:
                 else FindingStatus.PENDING_VALIDATION
             )
 
+        confidence = finding_data.get("confidence", 0.85)
+        if finding_status == FindingStatus.VALIDATED_CONFIRMED and confidence < 0.95:
+            confidence = 0.95
+
         return FindingTable(
             scan_id=scan_id,
             type=vuln_type,
             severity=finding_data.get("severity", "MEDIUM"),
             details=_evidence_to_description(finding_data),
             payload_used=finding_data.get("payload") or "N/A",
-            confidence_score=finding_data.get("confidence", 0.85),
+            confidence_score=confidence,
             visual_validated=finding_data.get("validated") or finding_data.get("conductor_validated", False),
             attack_url=finding_data.get("url", target_url),
             vuln_parameter=finding_data.get("parameter", finding_data.get("param", "")),
