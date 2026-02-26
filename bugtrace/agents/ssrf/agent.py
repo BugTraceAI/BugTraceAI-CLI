@@ -182,18 +182,19 @@ class SSRFAgent(BaseAgent, TechContextMixin):
 
     async def _test_payload(self, param: str, payload: str) -> Optional[Dict]:  # I/O
         """Injects payload and returns results if interesting."""
+        from urllib.parse import unquote, urlencode, parse_qs, urlparse, urlunparse
+        
         parsed = urlparse(self.url)
         params = parse_qs(parsed.query)
-        params[param] = [payload]
-
-        # Aiohttp automatically encodes URLs when requested. 
-        # To avoid double-encoding (if payload is already encoded), we manually build the query
-        query_parts = []
-        for k, v in params.items():
-            for item in v:
-                query_parts.append(f"{k}={item}")
         
-        test_url = urlunparse(parsed._replace(query="&".join(query_parts)))
+        # Ensure exactly ONE layer of URL encoding.
+        # If payload is already encoded (e.g. %3D%3D), unquote makes it raw (==).
+        # urlencode then properly encodes it to %3D%3D (preserving Base64 + and =).
+        # This fixes double-encoding while maintaining Base64 transmission integrity.
+        raw_payload = unquote(payload)
+        params[param] = [raw_payload]
+
+        test_url = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
 
         try:
             async with orchestrator.session(DestinationType.TARGET) as session:
