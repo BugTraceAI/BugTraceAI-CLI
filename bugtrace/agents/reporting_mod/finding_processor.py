@@ -21,6 +21,14 @@ from bugtrace.utils.logger import get_logger
 logger = get_logger("agents.reporting.finding_processor")
 
 
+def _safe_evidence_get(finding: Dict, key: str, default: str = "") -> str:
+    """Safely extract a key from finding['evidence'], handling string evidence."""
+    evidence = finding.get("evidence", {})
+    if isinstance(evidence, dict):
+        return evidence.get(key, default)
+    return default
+
+
 # PURE
 def categorize_findings(all_findings: List[Dict]) -> Dict[str, List[Dict]]:
     """
@@ -342,7 +350,7 @@ def consolidate_informational(findings: List[Dict]) -> List[Dict]:
     other_findings = []
 
     for f in findings:
-        tmpl = f.get("evidence", {}).get("nuclei_template", f.get("parameter", "")).lower()
+        tmpl = _safe_evidence_get(f, "nuclei_template", f.get("parameter", "")).lower()
         ftype = f.get("type", "").upper()
 
         if ftype == "MISSING_SECURITY_HEADER" and tmpl in HEADER_TEMPLATES:
@@ -376,7 +384,7 @@ def build_consolidated_header_finding(findings: List[Dict]) -> Dict:
     headers_detail = []
     urls_seen = set()
     for f in findings:
-        tmpl = f.get("evidence", {}).get("nuclei_template", f.get("parameter", ""))
+        tmpl = _safe_evidence_get(f, "nuclei_template", f.get("parameter", ""))
         desc = f.get("description", "").strip()
         url = f.get("url", "")
         if url:
@@ -429,7 +437,7 @@ def build_consolidated_api_docs_finding(findings: List[Dict]) -> Dict:
     endpoints = []
     urls_seen = set()
     for f in findings:
-        tmpl = f.get("evidence", {}).get("nuclei_template", f.get("parameter", ""))
+        tmpl = _safe_evidence_get(f, "nuclei_template", f.get("parameter", ""))
         url = f.get("url", "")
         desc = f.get("description", "").strip().split("\n")[0][:120]
         if url:
