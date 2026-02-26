@@ -447,8 +447,8 @@ FINGERPRINT_REGISTRY: Dict[str, Callable[[Dict], Tuple]] = {
         f.get("url", ""),
         f.get("parameter", ""),
         f.get("context", "html"),
-        sink=(f.get("evidence") or {}).get("sink"),
-        source=(f.get("evidence") or {}).get("source"),
+        sink=(f.get("evidence") if isinstance(f.get("evidence"), dict) else {}).get("sink"),
+        source=(f.get("evidence") if isinstance(f.get("evidence"), dict) else {}).get("source"),
     ),
     "SQLI": lambda f: sqli_fingerprint(f.get("parameter", ""), f.get("url", "")),
     "CSTI": lambda f: csti_fingerprint(

@@ -106,6 +106,8 @@ def requires_cdp_validation(finding: Dict[str, Any]) -> bool:
 
     # Check evidence for high-confidence validation methods that skip CDP
     evidence = finding.get("evidence", {})
+    if not isinstance(evidence, dict):
+        evidence = {}
     if evidence.get("interactsh_hit"):
         return False
     if evidence.get("dialog_detected"):
@@ -158,6 +160,8 @@ def get_validation_status(
     evidence = finding.get("evidence", {})
 
     # High-confidence validation methods → VALIDATED_CONFIRMED
+    if not isinstance(evidence, dict):
+        evidence = {}
     if evidence.get("interactsh_hit"):
         return ValidationStatus.VALIDATED_CONFIRMED
     if evidence.get("dialog_detected"):

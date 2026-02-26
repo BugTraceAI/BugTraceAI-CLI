@@ -120,7 +120,7 @@ def get_payload_impact_tier(payload: str, evidence: Optional[Dict[str, Any]] = N
     # TIER 1: Medium Impact - Confirmed execution
     if any(ind.lower() in combined for ind in ["alert(", "confirm(", "prompt(", "eval("]):
         # Check if it actually executed (not just reflected)
-        if evidence and (
+        if evidence and isinstance(evidence, dict) and (
             evidence.get("dialog_detected") or
             evidence.get("interactsh_hit") or
             evidence.get("vision_confirmed") or

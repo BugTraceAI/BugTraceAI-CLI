@@ -464,6 +464,8 @@ class ReportingAgent(BaseAgent):
             Dictionary with DB-compatible field names
         """
         evidence = event_finding.get("evidence", {})
+        if not isinstance(evidence, dict):
+            evidence = {}
 
         return {
             "id": None,  # Event findings don't have DB IDs
