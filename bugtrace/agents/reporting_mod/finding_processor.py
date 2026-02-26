@@ -270,6 +270,8 @@ def event_finding_to_db_format(event_finding: Dict) -> Dict:
         Dictionary with DB-compatible field names
     """
     evidence = event_finding.get("evidence", {})
+    if not isinstance(evidence, dict):
+        evidence = {}
 
     return {
         "id": None,
