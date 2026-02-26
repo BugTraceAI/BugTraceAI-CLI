@@ -212,7 +212,11 @@ class ReportingAgent(BaseAgent):
 
         # Phase 2: Categorize and enrich findings
         categorized = self._categorize_findings(all_findings)
-        await self._enrich_findings_batch(categorized["validated"] + categorized["manual_review"])
+        enriched_list = categorized["validated"] + categorized["manual_review"]
+        await self._enrich_findings_batch(enriched_list)
+
+        # Phase 2.1: Persist enriched severity/confidence back to DB
+        self.db.update_findings_from_enrichment(self.scan_id, enriched_list)
 
         # Phase 2.5: Consolidate informational findings (group headers, API docs, etc.)
         categorized["validated"] = self._consolidate_informational(categorized["validated"])
