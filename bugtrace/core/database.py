@@ -561,6 +561,50 @@ class DatabaseManager:
                 session.add(finding)
                 session.commit()
 
+    def update_findings_from_enrichment(self, scan_id: int, enriched_findings: List[Dict]):
+        """Persist enriched severity and confidence back to DB after CVSS enrichment."""
+        severity_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+        with self.get_session() as session:
+            db_findings = session.exec(
+                select(FindingTable).where(FindingTable.scan_id == scan_id)
+            ).all()
+
+            lookup = {}
+            for f in db_findings:
+                key = (str(f.type.value if hasattr(f.type, 'value') else f.type).upper(), (f.vuln_parameter or "").lower())
+                lookup[key] = f
+
+            updated = 0
+            for ef in enriched_findings:
+                etype = (ef.get("type") or "").upper()
+                eparam = (ef.get("parameter") or ef.get("param") or "").lower()
+                key = (etype, eparam)
+                db_f = lookup.get(key)
+                if not db_f:
+                    continue
+
+                changed = False
+                new_sev = ef.get("severity")
+                if new_sev:
+                    new_rank = severity_rank.get(new_sev.upper(), -1)
+                    old_rank = severity_rank.get((db_f.severity or "").upper(), -1)
+                    if new_rank > old_rank:
+                        db_f.severity = new_sev.upper()
+                        changed = True
+
+                new_conf = ef.get("confidence")
+                if new_conf is not None and new_conf > db_f.confidence_score:
+                    db_f.confidence_score = new_conf
+                    changed = True
+
+                if changed:
+                    session.add(db_f)
+                    updated += 1
+
+            if updated:
+                session.commit()
+                logger.info(f"Enrichment persisted: updated {updated} findings in DB for scan {scan_id}")
+
     def update_scan_report_dir(self, scan_id: int, report_dir: str):
         """Update scan report directory."""
         with self.get_session() as session:
@@ -643,9 +687,17 @@ class DatabaseManager:
             existing_finding.visual_validated = True
             existing_finding.status = FindingStatus.VALIDATED_CONFIRMED
 
-        new_conf = finding_data.get("confidence", 0.0)
-        if new_conf > existing_finding.confidence_score:
+        new_conf = finding_data.get("confidence")
+        if new_conf is not None and new_conf > existing_finding.confidence_score:
             existing_finding.confidence_score = new_conf
+
+        new_severity = finding_data.get("severity")
+        if new_severity:
+            severity_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+            new_rank = severity_rank.get(new_severity.upper(), -1)
+            old_rank = severity_rank.get((existing_finding.severity or "").upper(), -1)
+            if new_rank > old_rank:
+                existing_finding.severity = new_severity.upper()
 
         new_details = _evidence_to_description(finding_data)
         if len(new_details) > len(existing_finding.details):
