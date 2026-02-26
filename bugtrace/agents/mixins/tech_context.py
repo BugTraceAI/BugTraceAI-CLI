@@ -195,7 +195,7 @@ class TechContextMixin:
 
         # 1. Direct database detection from tech tags
         for tag in tech_tags + infrastructure:
-            tag_lower = tag.lower()
+            tag_lower = (tag or "").lower()
             for db_hint, db_type in TAG_TO_DB.items():
                 if db_hint in tag_lower:
                     stack["db"] = db_type
@@ -207,7 +207,7 @@ class TechContextMixin:
         # 2. Framework → Database inference (if no direct detection)
         if stack["db"] == "generic":
             for framework in frameworks:
-                framework_lower = framework.lower()
+                framework_lower = (framework or "").lower()
                 for fw_hint, db_type in FRAMEWORK_TO_DB.items():
                     if fw_hint in framework_lower:
                         stack["db"] = db_type
@@ -218,7 +218,7 @@ class TechContextMixin:
 
         # 3. Server detection
         for server in servers:
-            server_lower = server.lower()
+            server_lower = (server or "").lower()
             for srv_hint in ["apache", "nginx", "iis", "tomcat", "jetty", "gunicorn", "uvicorn"]:
                 if srv_hint in server_lower:
                     stack["server"] = srv_hint.title()

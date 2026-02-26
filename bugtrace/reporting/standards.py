@@ -513,7 +513,7 @@ def normalize_severity(severity: str) -> Severity:
         >>> normalize_severity("High")
         Severity.HIGH
     """
-    severity_upper = severity.upper().strip()
+    severity_upper = (severity or "HIGH").upper().strip()
 
     # Handle common variations
     severity_map = {

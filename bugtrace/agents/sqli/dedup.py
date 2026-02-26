@@ -33,7 +33,7 @@ def generate_sqli_fingerprint(parameter: str, url: str) -> Tuple:
     Returns:
         Tuple fingerprint for deduplication
     """
-    param_lower = parameter.lower()
+    param_lower = (parameter or "").lower()
 
     # Cookie-based SQLi: Global vulnerability (ignore URL)
     if "cookie:" in param_lower:
@@ -49,7 +49,7 @@ def generate_sqli_fingerprint(parameter: str, url: str) -> Tuple:
     parsed = urlparse(url)
     normalized_path = parsed.path.rstrip('/')
 
-    param_name = parameter.split(":")[-1].strip().lower()
+    param_name = (parameter or "").split(":")[-1].strip().lower()
 
     return ("SQLI", "param", parsed.netloc, normalized_path, param_name)
 

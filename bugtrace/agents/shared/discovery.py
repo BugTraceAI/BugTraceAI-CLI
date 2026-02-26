@@ -539,7 +539,7 @@ def prioritize_params(
     low: List[str] = []
 
     for param in params:
-        param_lower = param.lower()
+        param_lower = (param or "").lower()
 
         is_high = any(
             hp == param_lower or hp in param_lower or param_lower in hp

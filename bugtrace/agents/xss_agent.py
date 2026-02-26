@@ -6595,7 +6595,7 @@ Return ONLY the payloads, one per line, no explanations."""
 
     def _is_waf_blocked(self, html: str) -> bool:
         """Check if response contains WAF block signatures."""
-        lower_html = html.lower()
+        lower_html = (html or "").lower()
         block_signatures = ["blocked:", "waf block", "security violation", "forbidden", "not acceptable", "access denied"]
         return any(sig in lower_html for sig in block_signatures)
 
@@ -8090,7 +8090,7 @@ Answer with ONLY one word: SI or NO"""
         low_priority = []
 
         for param in params:
-            param_lower = param.lower()
+            param_lower = (param or "").lower()
 
             # Check if it's a high-priority param
             is_high = False
