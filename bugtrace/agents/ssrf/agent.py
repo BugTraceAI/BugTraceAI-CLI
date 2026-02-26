@@ -186,7 +186,14 @@ class SSRFAgent(BaseAgent, TechContextMixin):
         params = parse_qs(parsed.query)
         params[param] = [payload]
 
-        test_url = urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+        # Aiohttp automatically encodes URLs when requested. 
+        # To avoid double-encoding (if payload is already encoded), we manually build the query
+        query_parts = []
+        for k, v in params.items():
+            for item in v:
+                query_parts.append(f"{k}={item}")
+        
+        test_url = urlunparse(parsed._replace(query="&".join(query_parts)))
 
         try:
             async with orchestrator.session(DestinationType.TARGET) as session:
@@ -286,7 +293,7 @@ class SSRFAgent(BaseAgent, TechContextMixin):
             "description": f"Confirmed SSRF in '{res['param']}'. Response contains internal data or indicators.",
             "validated": True,
             "status": "VALIDATED_CONFIRMED",
-            "reproduction": f"curl '{self.url}' --data-urlencode '{res['param']}={res['payload']}'",
+            "reproduction": f"curl '{self.url}?{res['param']}={res['payload']}'",
             "cwe_id": get_cwe_for_vuln("SSRF"),
             "remediation": get_remediation_for_vuln("SSRF"),
             "cve_id": "N/A",
