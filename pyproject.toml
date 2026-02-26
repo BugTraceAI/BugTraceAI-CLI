@@ -1,6 +1,6 @@
 [project]
 name = "bugtraceai-cli"
-version = "2.2.6"
+version = "2.2.7"
 description = "AI-Driven Professional Penetration Testing Framework"
 authors = [
     { name = "Bugtrace AI Team" }

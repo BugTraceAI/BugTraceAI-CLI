@@ -3053,6 +3053,14 @@ Example format:
                          "security-headers-pp", "http-missing-security-headers", "missing-sri"}
     _API_DOCS_TEMPLATES = {"swagger-api", "redoc-api-docs", "openapi"}
 
+    @staticmethod
+    def _safe_evidence_get(finding: Dict, key: str, default: str = "") -> str:
+        """Safely extract a key from finding['evidence'], handling string evidence."""
+        evidence = finding.get("evidence", {})
+        if isinstance(evidence, dict):
+            return evidence.get(key, default)
+        return default
+
     def _consolidate_informational(self, findings: List[Dict]) -> List[Dict]:
         """
         Consolidate informational findings into grouped entries.
@@ -3066,7 +3074,7 @@ Example format:
         other_findings = []
 
         for f in findings:
-            tmpl = f.get("evidence", {}).get("nuclei_template", f.get("parameter", "")).lower()
+            tmpl = self._safe_evidence_get(f, "nuclei_template", f.get("parameter", "")).lower()
             ftype = f.get("type", "").upper()
 
             if ftype == "MISSING_SECURITY_HEADER" and tmpl in self._HEADER_TEMPLATES:
@@ -3099,7 +3107,7 @@ Example format:
         headers_detail = []
         urls_seen = set()
         for f in findings:
-            tmpl = f.get("evidence", {}).get("nuclei_template", f.get("parameter", ""))
+            tmpl = self._safe_evidence_get(f, "nuclei_template", f.get("parameter", ""))
             desc = f.get("description", "").strip()
             url = f.get("url", "")
             if url:
@@ -3164,7 +3172,7 @@ Example format:
         endpoints = []
         urls_seen = set()
         for f in findings:
-            tmpl = f.get("evidence", {}).get("nuclei_template", f.get("parameter", ""))
+            tmpl = self._safe_evidence_get(f, "nuclei_template", f.get("parameter", ""))
             url = f.get("url", "")
             desc = f.get("description", "").strip().split("\n")[0][:120]
             if url:
