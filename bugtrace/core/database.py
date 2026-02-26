@@ -98,6 +98,35 @@ def _convert_evidence_to_description(evidence: Dict, finding_data: Dict) -> str:
     return "\n".join(parts) if parts else "Vulnerability detected."
 
 
+# -- Pure functions for finding field resolution --
+
+SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+
+CONFIDENCE_FLOOR = {
+    FindingStatus.VALIDATED_CONFIRMED: 0.95,
+    FindingStatus.PENDING_VALIDATION: 0.5,
+}
+
+DEFAULT_CONFIDENCE = 0.85
+
+
+def _rank_severity(severity: str) -> int:
+    """# PURE — Map severity string to numeric rank for comparison."""
+    return SEVERITY_RANK.get((severity or "").upper(), -1)
+
+
+def _higher_severity(current: str, candidate: str) -> str:
+    """# PURE — Return the higher of two severity values."""
+    return candidate.upper() if _rank_severity(candidate) > _rank_severity(current) else current
+
+
+def _resolve_confidence(explicit: float | None, status: FindingStatus) -> float:
+    """# PURE — Derive confidence from explicit value + status floor."""
+    floor = CONFIDENCE_FLOOR.get(status, 0.0)
+    base = explicit if explicit is not None else DEFAULT_CONFIDENCE
+    return max(base, floor)
+
+
 def _evidence_to_description(finding_data: Dict) -> str:
     """Convert finding data to a human-readable description."""
     # Priority: description > note > evidence (converted) > fallback
@@ -563,39 +592,29 @@ class DatabaseManager:
 
     def update_findings_from_enrichment(self, scan_id: int, enriched_findings: List[Dict]):
         """Persist enriched severity and confidence back to DB after CVSS enrichment."""
-        severity_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
         with self.get_session() as session:
             db_findings = session.exec(
                 select(FindingTable).where(FindingTable.scan_id == scan_id)
             ).all()
 
-            lookup = {}
-            for f in db_findings:
-                key = (str(f.type.value if hasattr(f.type, 'value') else f.type).upper(), (f.vuln_parameter or "").lower())
-                lookup[key] = f
+            lookup = {
+                (str(f.type.value if hasattr(f.type, 'value') else f.type).upper(), (f.vuln_parameter or "").lower()): f
+                for f in db_findings
+            }
 
             updated = 0
             for ef in enriched_findings:
-                etype = (ef.get("type") or "").upper()
-                eparam = (ef.get("parameter") or ef.get("param") or "").lower()
-                key = (etype, eparam)
+                key = ((ef.get("type") or "").upper(), (ef.get("parameter") or ef.get("param") or "").lower())
                 db_f = lookup.get(key)
                 if not db_f:
                     continue
 
-                changed = False
-                new_sev = ef.get("severity")
-                if new_sev:
-                    new_rank = severity_rank.get(new_sev.upper(), -1)
-                    old_rank = severity_rank.get((db_f.severity or "").upper(), -1)
-                    if new_rank > old_rank:
-                        db_f.severity = new_sev.upper()
-                        changed = True
+                new_sev = _higher_severity(db_f.severity, ef.get("severity") or db_f.severity)
+                new_conf = max(db_f.confidence_score, ef.get("confidence") or 0.0)
 
-                new_conf = ef.get("confidence")
-                if new_conf is not None and new_conf > db_f.confidence_score:
-                    db_f.confidence_score = new_conf
-                    changed = True
+                changed = new_sev != db_f.severity or new_conf != db_f.confidence_score
+                db_f.severity = new_sev
+                db_f.confidence_score = new_conf
 
                 if changed:
                     session.add(db_f)
@@ -686,20 +705,15 @@ class DatabaseManager:
         if finding_data.get("validated") or finding_data.get("conductor_validated"):
             existing_finding.visual_validated = True
             existing_finding.status = FindingStatus.VALIDATED_CONFIRMED
-            if existing_finding.confidence_score < 0.95:
-                existing_finding.confidence_score = 0.95
 
-        new_conf = finding_data.get("confidence")
-        if new_conf is not None and new_conf > existing_finding.confidence_score:
-            existing_finding.confidence_score = new_conf
+        existing_finding.confidence_score = max(
+            existing_finding.confidence_score,
+            _resolve_confidence(finding_data.get("confidence"), existing_finding.status),
+        )
 
         new_severity = finding_data.get("severity")
         if new_severity:
-            severity_rank = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
-            new_rank = severity_rank.get(new_severity.upper(), -1)
-            old_rank = severity_rank.get((existing_finding.severity or "").upper(), -1)
-            if new_rank > old_rank:
-                existing_finding.severity = new_severity.upper()
+            existing_finding.severity = _higher_severity(existing_finding.severity, new_severity)
 
         new_details = _evidence_to_description(finding_data)
         if len(new_details) > len(existing_finding.details):
@@ -724,17 +738,13 @@ class DatabaseManager:
                 else FindingStatus.PENDING_VALIDATION
             )
 
-        confidence = finding_data.get("confidence", 0.85)
-        if finding_status == FindingStatus.VALIDATED_CONFIRMED and confidence < 0.95:
-            confidence = 0.95
-
         return FindingTable(
             scan_id=scan_id,
             type=vuln_type,
             severity=finding_data.get("severity", "MEDIUM"),
             details=_evidence_to_description(finding_data),
             payload_used=finding_data.get("payload") or "N/A",
-            confidence_score=confidence,
+            confidence_score=_resolve_confidence(finding_data.get("confidence"), finding_status),
             visual_validated=finding_data.get("validated") or finding_data.get("conductor_validated", False),
             attack_url=finding_data.get("url", target_url),
             vuln_parameter=finding_data.get("parameter", finding_data.get("param", "")),
