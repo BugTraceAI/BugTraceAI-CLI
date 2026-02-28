@@ -9,9 +9,10 @@
 ![MCP](https://img.shields.io/badge/MCP-Compatible-green?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyem0wIDE4Yy00LjQxIDAtOC0zLjU5LTgtOHMzLjU5LTggOC04IDggMy41OSA4IDgtMy41OSA4LTggOHoiLz48L3N2Zz4=)
 ![Made with](https://img.shields.io/badge/Made%20with-❤️-red)
 
-****
+---
 
 ## 📑 Table of Contents
+
 - [🚨 Disclaimer](#-disclaimer)
 - [✨ Features](#-features)
 - [🔬 Core Methodology](#-core-methodology)
@@ -23,7 +24,7 @@
 - [📊 Output](#-output)
 - [📜 License](#-license)
 
-***
+---
 
 > 🏆 **The First Agentic Framework Intelligently Designed for Bug Bounty Hunting**
 
@@ -36,12 +37,14 @@ The core philosophy is **"Think like a pentester, execute like a machine, valida
 This tool is for **authorized security testing only**.
 
 BugTraceAI-CLI performs **active exploitation** including:
+
 - Real SQL injection payloads via SQLMap
 - XSS payload execution in browsers
 - Template injection testing
 - Server-side request forgery probing
 
 **By using this tool, you acknowledge and agree that:**
+
 - You will only test applications for which you have explicit, written permission
 - You understand this tool sends actual attack payloads to targets
 - The creators assume no liability for any misuse or damage caused
@@ -53,12 +56,14 @@ BugTraceAI-CLI performs **active exploitation** including:
 BugTraceAI-CLI implements a 6-phase pipeline that mirrors a professional penetration testing workflow.
 
 ### Phase 1: Reconnaissance
+
 - 🕷️ **GoSpider Integration**: Fast async crawling with JavaScript rendering and sitemap parsing
 - 🔍 **Parameter Extraction**: Automatic identification of injectable parameters
 - 🌐 **API Endpoint Enrichment**: Detail URL discovery from list endpoints
 - 🧭 **SPA Route Inference**: Infers API endpoints from frontend routes
 
 ### Phase 2: Discovery (DASTySAST)
+
 - 🧠 **Multi-Persona Analysis**: 6 different AI "personas" analyze each URL (bug bounty hunter, code auditor, pentester, etc.)
 - ✅ **Consensus Voting**: Requires 4/5 agreement from analysis personas to reduce false positives
 - 🔎 **Skeptical Review**: The 6th "Skeptical" persona (Claude Haiku) performs final filtering
@@ -66,6 +71,7 @@ BugTraceAI-CLI implements a 6-phase pipeline that mirrors a professional penetra
 - 🛡️ **Parallel Execution**: All personas analyze simultaneously for speed
 
 ### Phase 3: Strategy
+
 - 🎯 **ThinkingConsolidationAgent**: Central brain that routes findings to specialists
 - 🔄 **Deduplication**: Eliminates redundant findings across URLs
 - ⚡ **Priority Routing**: High-confidence findings get tested first
@@ -73,46 +79,54 @@ BugTraceAI-CLI implements a 6-phase pipeline that mirrors a professional penetra
 - 🧩 **Auto-Dispatch**: Framework detection triggers specialist agents automatically (e.g., Angular → CSTIAgent)
 
 ### Phase 4: Exploitation
+
 Real tools, real payloads, real results — 14 autonomous specialist agents:
 
-| Agent | Target | Method |
-|-------|--------|--------|
-| 🔥 **XSSAgent** | Cross-Site Scripting | Playwright browser + 6-level escalation pipeline |
-| 💉 **SQLiAgent** | SQL Injection | SQLMap with WAF bypass tamper scripts |
-| 🎭 **CSTIAgent** | Client/Server-Side Template Injection | AngularJS, Vue, Jinja2, Twig, Mako |
-| 🌐 **SSRFAgent** | Server-Side Request Forgery | OOB callback verification |
-| 📄 **XXEAgent** | XML External Entity | DTD injection + OOB exfiltration |
-| 🔓 **IDORAgent** | Insecure Direct Object Reference | ID manipulation + path segment testing |
-| 📁 **LFIAgent** | Local File Inclusion | Path traversal with filter evasion |
-| 🧩 **PrototypePollutionAgent** | Prototype Pollution | Browser-based property verification |
-| 🔌 **APISecurityAgent** | API Security | Broken Object Level Authorization (BOLA) testing |
-| 🔑 **JWTAgent** | JWT Vulnerabilities | Algorithm confusion, weak secrets, token forging |
-| 🔀 **OpenRedirectAgent** | Open Redirect | HTTP 3xx + DOM-based redirect detection |
-| 💀 **RCEAgent** | Remote Code Execution | Command injection + deserialization testing |
-| 📨 **HeaderInjectionAgent** | Header Injection | CRLF injection + response splitting |
-| 📦 **MassAssignmentAgent** | Mass Assignment | Parameter pollution + privilege escalation |
+| Agent                          | Target                                | Method                                                            |
+| ------------------------------ | ------------------------------------- | ----------------------------------------------------------------- |
+| 🔥 **XSSAgent**                | Cross-Site Scripting                  | Playwright browser + 6-level escalation pipeline                  |
+| 💉 **SQLiAgent**               | SQL Injection                         | SQLMap with WAF bypass tamper scripts                             |
+| 🎭 **CSTIAgent**               | Client/Server-Side Template Injection | AngularJS, Vue, Jinja2, Twig, Mako                                |
+| 🌐 **SSRFAgent**               | Server-Side Request Forgery           | OOB callback verification                                         |
+| 📄 **XXEAgent**                | XML External Entity                   | DTD injection + OOB exfiltration                                  |
+| 🔓 **IDORAgent**               | Insecure Direct Object Reference      | ID manipulation + path segment testing                            |
+| 📁 **LFIAgent**                | Local File Inclusion                  | Path traversal with filter evasion                                |
+| 🧩 **PrototypePollutionAgent** | Prototype Pollution                   | Browser-based property verification                               |
+| 🔌 **APISecurityAgent**        | API Security                          | Broken Object Level Authorization (BOLA) testing                  |
+| 🔑 **JWTAgent**                | JWT Vulnerabilities                   | Algorithm confusion, weak secrets, token forging                  |
+| 🔀 **OpenRedirectAgent**       | Open Redirect                         | HTTP 3xx + DOM-based redirect detection                           |
+| 💀 **RCEAgent**                | Remote Code Execution                 | Command injection + deserialization testing                       |
+| 📨 **HeaderInjectionAgent**    | Header Injection                      | CRLF injection + response splitting                               |
+| 📦 **MassAssignmentAgent**     | Mass Assignment                       | Parameter pollution + privilege escalation                        |
+| 💀 **KaliAgent**               | Advanced Exploitation                 | Full Kali Linux terminal toolset via MCP (Nmap, Metasploit, etc.) |
+| 🕵️ **ReconAgent**              | Automated Recon                       | Fully automated ReconFTW orchestration for deep reconnaissance    |
 
 ### Phase 5: Validation
+
 - 🖥️ **Chrome DevTools Protocol**: Low-level browser verification for XSS
 - 👁️ **Vision AI**: Screenshot analysis confirms visual vulnerabilities
 - 📸 **Evidence Capture**: Every confirmed finding includes proof
 
 ### Phase 6: Reporting
+
 - 📊 **AI-Powered Reports**: LLM-generated executive and technical assessments
 - 📝 **Multiple Formats**: JSON (machine-readable), Markdown, and HTML reports
 - 🔬 **PoC Enrichment**: Batch proof-of-concept generation for confirmed findings
 - 📁 **Specialist Audit Trail**: Per-agent WET/DRY/Results traceability
 
 ### Intelligence Systems
+
 - 🔀 **LLM Shifting**: Automatic fallback through model tiers (Gemini → DeepSeek → Claude → Qwen)
 - 🛡️ **WAF Detection**: Identifies Cloudflare, Akamai, AWS WAF, ModSecurity
 - 🎯 **Adaptive Bypass**: Encoding, chunking, and case mixing strategies per WAF type
+- 🛡️ **Ecosystem Robustness**: Built-in circuit breakers for infinite loops, adaptive rate-limiting, and cross-interface (LAN/Remote) compatibility.
 
 ## 🔬 Core Methodology
 
 BugTraceAI-CLI uses a multi-layered approach to maximize accuracy while minimizing false positives.
 
 ### Multi-Persona Analysis
+
 Instead of a single AI scan, each URL is analyzed by 6 different "personas" providing diverse perspectives:
 
 1. **Bug Bounty Hunter**: Focuses on high-impact, reward-worthy issues (RCE, SQLi, SSRF)
@@ -123,6 +137,7 @@ Instead of a single AI scan, each URL is analyzed by 6 different "personas" prov
 6. **Skeptical Reviewer**: A separate "critic" agent that aggressively filters false positives
 
 ### Consensus + Skeptical Review
+
 ```
 5 Analysis Personas run in parallel
         ↓
@@ -134,6 +149,7 @@ Passed to specialist agents
 ```
 
 ### Tool-Based Validation
+
 The key differentiator: **AI hypothesizes, tools validate**.
 
 - SQLi findings → SQLMap confirms with real injection
@@ -178,14 +194,14 @@ This eliminates the "hallucination problem" of pure-AI scanners.
 
 Each phase runs with independent concurrency:
 
-| Phase | Concurrency | Configurable | Notes |
-|-------|-------------|--------------|-------|
-| Reconnaissance | 1 | No | GoSpider is already fast |
-| Discovery | 5 | Yes | Parallel DAST per URL |
-| Strategy | 1 | No | Sequential dedup + routing |
-| Exploitation | 10 | Yes | Parallel specialist agents |
-| Validation | 1 | **No** | CDP limitation (hardcoded) |
-| Reporting | 1 | No | Sequential report generation |
+| Phase          | Concurrency | Configurable | Notes                        |
+| -------------- | ----------- | ------------ | ---------------------------- |
+| Reconnaissance | 1           | No           | GoSpider is already fast     |
+| Discovery      | 5           | Yes          | Parallel DAST per URL        |
+| Strategy       | 1           | No           | Sequential dedup + routing   |
+| Exploitation   | 10          | Yes          | Parallel specialist agents   |
+| Validation     | 1           | **No**       | CDP limitation (hardcoded)   |
+| Reporting      | 1           | No           | Sequential report generation |
 
 > **Why is Validation = 1?** Chrome DevTools Protocol doesn't support multiple simultaneous connections. Additionally, `alert()` popups from XSS payloads block CDP indefinitely. Single-threaded with timeouts prevents crashes.
 
@@ -204,6 +220,7 @@ Each phase runs with independent concurrency:
 ## 🚀 Getting Started
 
 ### Prerequisites
+
 - **For Docker**: Docker & Docker Compose
 - **For Local**: Python 3.10+, Docker (for some agents), nmap (optional)
 - OpenRouter API key ([get one here](https://openrouter.ai/keys))
@@ -222,6 +239,7 @@ cd BugTraceAI-CLI
 ```
 
 The wizard will:
+
 - ✅ Check system requirements automatically
 - 🔍 Detect and use free ports for Docker (no conflicts!)
 - ⚙️ Set up environment configuration
@@ -229,6 +247,7 @@ The wizard will:
 - 🎨 Provide beautiful, interactive terminal UI
 
 **Installation Options:**
+
 1. **Local Installation** - Python virtual environment (best for development)
 2. **Docker Installation** - Containerized deployment (best for production)
 
@@ -288,6 +307,7 @@ docker-compose logs -f
 ```
 
 **Docker Users:**
+
 ```bash
 # API is already running at http://localhost:8000
 # (or whatever port was auto-selected during installation)
@@ -310,7 +330,7 @@ BugTraceAI exposes its scanning engine as **MCP tools** via the [Model Context P
 
 > **Using OpenClaw or another AI assistant? Just tell it:**
 >
-> *Clone https://github.com/BugTraceAI/BugTraceAI-CLI and deploy it with Docker. Copy `.env.example` to `.env` and ask me for the `OPENROUTER_API_KEY`. Run `docker compose up -d` to start both the API and MCP server. Then add the MCP server to your config with base URL `http://localhost:8001/sse`.*
+> _Clone https://github.com/BugTraceAI/BugTraceAI-CLI and deploy it with Docker. Copy `.env.example` to `.env` and ask me for the `OPENROUTER_API_KEY`. Run `docker compose up -d` to start both the API and MCP server. Then add the MCP server to your config with base URL `http://localhost:8001/sse`._
 
 ### Manual MCP Setup
 
@@ -348,13 +368,13 @@ Add BugTraceAI to your MCP client configuration:
 
 Once connected, your AI assistant can use these tools:
 
-| Tool | Description |
-|------|-------------|
-| `start_scan` | Start a security scan on a target URL |
-| `get_scan_status` | Check scan progress and current phase |
-| `query_findings` | Retrieve vulnerability findings with filtering |
-| `stop_scan` | Stop a running scan gracefully |
-| `export_report` | Get scan report (summary, critical findings, or full) |
+| Tool              | Description                                           |
+| ----------------- | ----------------------------------------------------- |
+| `start_scan`      | Start a security scan on a target URL                 |
+| `get_scan_status` | Check scan progress and current phase                 |
+| `query_findings`  | Retrieve vulnerability findings with filtering        |
+| `stop_scan`       | Stop a running scan gracefully                        |
+| `export_report`   | Get scan report (summary, critical findings, or full) |
 
 ### Prerequisites
 
@@ -364,10 +384,10 @@ Once connected, your AI assistant can use these tools:
 
 ### Ports
 
-| Service | Port | Description |
-|---------|------|-------------|
-| API | 8000 | REST API + health check |
-| MCP | 8001 | SSE transport for AI assistants |
+| Service | Port | Description                     |
+| ------- | ---- | ------------------------------- |
+| API     | 8000 | REST API + health check         |
+| MCP     | 8001 | SSE transport for AI assistants |
 
 ## ⚙️ Configuration
 
@@ -403,18 +423,23 @@ VISION_MODEL = google/gemini-2.0-flash-thinking-exp:free
 ## 📊 Output
 
 ### Reports
+
 Generated in `/reports/`:
+
 - `report_*.json` - Machine-readable findings
 - `report_*.md` - Markdown summary
 - `report_*.html` - Executive presentation
 
 ### Logs
+
 Located in `/logs/`:
+
 - `execution.log` - Detailed trace
 - `llm_audit.jsonl` - Every AI prompt/response
 - `errors.log` - Error tracking
 
 ### Finding Status Flow
+
 ```
 CANDIDATE → PENDING_VALIDATION → CONFIRMED / FALSE_POSITIVE → PROBE_VALIDATED
 ```
