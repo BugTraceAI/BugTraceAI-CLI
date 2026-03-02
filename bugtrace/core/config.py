@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     """
     # --- Project Metadata ---
     APP_NAME: str = "BugtraceAI-CLI"
-    VERSION: str = "2.3.0"  # Phoenix Edition
+    VERSION: str = "2.3.1"  # Phoenix Edition
     DEBUG: bool = False
     SAFE_MODE: bool = False # Default to False, override via CLI
 
@@ -436,6 +436,10 @@ class Settings(BaseSettings):
             self.MAX_CONCURRENT_URL_AGENTS = config["SCAN"].getint("MAX_CONCURRENT_URL_AGENTS")
         if "GOSPIDER_NO_REDIRECT" in config["SCAN"]:
             self.GOSPIDER_NO_REDIRECT = config["SCAN"].getboolean("GOSPIDER_NO_REDIRECT")
+        if "GOSPIDER_USE_ARCHIVES" in config["SCAN"]:
+            self.GOSPIDER_USE_ARCHIVES = config["SCAN"].getboolean("GOSPIDER_USE_ARCHIVES")
+        if "GOSPIDER_CONCURRENCY" in config["SCAN"]:
+            self.GOSPIDER_CONCURRENCY = config["SCAN"].getint("GOSPIDER_CONCURRENCY")
         if "URL_PATTERN_DEDUP" in config["SCAN"]:
             self.URL_PATTERN_DEDUP = config["SCAN"].getboolean("URL_PATTERN_DEDUP")
 
@@ -1057,6 +1061,8 @@ class Settings(BaseSettings):
     MAX_URLS: int = 20
     MAX_CONCURRENT_URL_AGENTS: int = 10  # Parallel URLMasterAgents (legacy, alias for SPECIALISTS)
     GOSPIDER_NO_REDIRECT: bool = False  # Don't follow redirects (catches .env, .htaccess leaks)
+    GOSPIDER_USE_ARCHIVES: bool = True   # Query external archives (Wayback, CommonCrawl, VirusTotal) — disable for consistent results
+    GOSPIDER_CONCURRENCY: int = 5        # GoSpider thread count (-c flag). Lower = more deterministic, higher = faster
 
     # --- Granular Phase Concurrency (Phase 31: v2.4) ---
     MAX_CONCURRENT_DISCOVERY: int = 1      # GoSpider (single-threaded by design)
