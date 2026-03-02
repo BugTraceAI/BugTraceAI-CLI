@@ -691,13 +691,20 @@ class ExternalToolManager:
     async def run_gospider(self, url: str, cookies: List[Dict] = None, depth: int = 3, max_urls: int = None) -> List[str]:
         """
         Runs GoSpider crawler (native preferred, Docker fallback).
-        Respects max_urls to stop crawling early (Optimization).
+        Respects max_urls by counting unique in-scope URLs in real-time.
+
+        FIX 2026-03-02: Replaced line-based kill limit with URL-counted streaming.
+        Previously, GoSpider was killed after N raw output lines, which produced
+        wildly inconsistent URL counts (14, 20, 50 for the same site) because
+        the raw line count includes duplicates, out-of-scope URLs, and status lines.
+        Now we parse each line in real-time and kill only when we have enough
+        unique in-scope URLs.
 
         Args:
             url: Target URL to crawl
             cookies: Optional session cookies
             depth: Crawl depth
-            max_urls: Stop after finding this many URLs (approximate)
+            max_urls: Stop after finding this many unique in-scope URLs
         """
         native = self._native_tools.get("gospider")
         if not native and not self.docker_cmd:
@@ -709,34 +716,47 @@ class ExternalToolManager:
         dashboard.log(f"[External] Launching GoSpider ({mode}, depth={depth}) against {url}", "INFO")
         dashboard.update_task("gospider", name="GoSpider", status=f"Crawling: {url}")
 
-        cmd = ["-s", url, "-d", str(depth), "-c", "10", "-a", "--sitemap"]
+        from bugtrace.core.config import settings
+        concurrency = str(settings.GOSPIDER_CONCURRENCY)
+        cmd = ["-s", url, "-d", str(depth), "-c", concurrency, "--sitemap"]
+
+        # External archive queries (-a) are a major source of variability;
+        # Wayback/CommonCrawl/VirusTotal return different results per run.
+        if settings.GOSPIDER_USE_ARCHIVES:
+            cmd.append("-a")
 
         if cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             cmd.extend(["--cookie", cookie_str])
 
-        from bugtrace.core.config import settings
         if settings.GOSPIDER_NO_REDIRECT:
             cmd.append("--no-redirect")
-
-        # Use streaming execution if limit is set
-        if max_urls and max_urls > 0:
-            kill_limit = int(max_urls * 2.5) + 10
-            if native:
-                output = await self._run_native_with_limit("gospider", [native] + cmd, line_limit=kill_limit)
-            else:
-                output = await self._run_container_with_limit("trickest/gospider", cmd, line_limit=kill_limit)
-        else:
-            if native:
-                output = await self._run_native("gospider", [native] + cmd)
-            else:
-                output = await self._run_container("trickest/gospider", cmd)
 
         _hostname = urlparse(url).hostname
         if not _hostname:
             logger.warning(f"GoSpider: could not extract hostname from URL: {url}")
             return []
         target_domain = _hostname.lower()
+
+        # Use URL-counted streaming when limit is set (consistent results)
+        if max_urls and max_urls > 0:
+            if native:
+                output = await self._run_gospider_streaming(
+                    [native] + cmd, target_domain, max_urls
+                )
+            else:
+                full_cmd = self._build_docker_command(
+                    "trickest/gospider", cmd, "512m", "1.0", "bridge"
+                )
+                output = await self._run_gospider_streaming(
+                    full_cmd, target_domain, max_urls
+                )
+        else:
+            if native:
+                output = await self._run_native("gospider", [native] + cmd)
+            else:
+                output = await self._run_container("trickest/gospider", cmd)
+
         if output:
             lines = output.splitlines()
             logger.info(f"GoSpider raw output examples:\n{chr(10).join(lines[:5])}")
@@ -755,6 +775,110 @@ class ExternalToolManager:
 
         dashboard.log(f"[External] GoSpider discovered {len(unique_urls)} endpoints.", "INFO")
         return unique_urls
+
+    async def _run_gospider_streaming(
+        self,
+        full_cmd: List[str],
+        target_domain: str,
+        max_urls: int,
+        timeout: int = 600,
+    ) -> str:
+        """
+        Run GoSpider with URL-counted streaming: parse output in real-time,
+        count unique in-scope URLs, and kill when we have enough.
+
+        This replaces the old line-based kill limit which produced inconsistent
+        results because raw line count != unique URL count.
+
+        Args:
+            full_cmd: Complete command to execute (native binary or docker)
+            target_domain: Target domain for scope filtering
+            max_urls: Kill process after finding this many unique in-scope URLs
+            timeout: Maximum execution time in seconds
+
+        Returns:
+            Raw GoSpider output (all lines read before kill)
+        """
+        logger.debug(f"GoSpider URL-counted streaming: target={max_urls} unique URLs")
+
+        process = await asyncio.create_subprocess_exec(
+            *full_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        output_lines = []
+        seen_urls: set = set()
+        # Safety: absolute max lines to prevent infinite reads on pathological output
+        absolute_line_cap = max(max_urls * 20, 2000)
+
+        try:
+            while len(output_lines) < absolute_line_cap:
+                try:
+                    line_bytes = await asyncio.wait_for(
+                        process.stdout.readline(), timeout=30
+                    )
+                    if not line_bytes:
+                        break  # EOF — GoSpider finished naturally
+                    line = line_bytes.decode("utf-8", errors="replace")
+                    output_lines.append(line)
+
+                    # Parse this line for in-scope URLs (same logic as _parse_gospider_urls)
+                    stripped = line.strip()
+                    is_form = stripped.startswith("[form]")
+                    parts = stripped.replace("[", "").replace("]", "").split(" - ")
+                    for p in parts:
+                        p = p.strip()
+                        if not p.startswith("http"):
+                            continue
+                        parsed_url = self._parse_url_if_in_scope(p, target_domain)
+                        if parsed_url:
+                            # Reject MIME-type paths
+                            path = urlparse(parsed_url).path.lower()
+                            if any(seg in path for seg in self._INVALID_PATH_SEGMENTS):
+                                continue
+                            seen_urls.add(parsed_url)
+
+                    # Check if we've found enough unique in-scope URLs
+                    if len(seen_urls) >= max_urls:
+                        logger.info(
+                            f"GoSpider URL limit reached: {len(seen_urls)} unique "
+                            f"in-scope URLs found (from {len(output_lines)} output lines). "
+                            f"Terminating crawler."
+                        )
+                        break
+
+                except asyncio.TimeoutError:
+                    if output_lines:
+                        logger.info(
+                            f"GoSpider read timeout after 30s with {len(seen_urls)} "
+                            f"unique URLs from {len(output_lines)} lines. Stopping."
+                        )
+                        break
+                    raise  # Real timeout — no data at all
+
+            if len(output_lines) >= absolute_line_cap:
+                logger.warning(
+                    f"GoSpider hit absolute line cap ({absolute_line_cap}) with "
+                    f"{len(seen_urls)} unique URLs. Force stopping."
+                )
+
+        except Exception as e:
+            logger.error(f"GoSpider streaming error: {e}")
+        finally:
+            # Kill the process if still running
+            try:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+            except (ProcessLookupError, OSError):
+                pass
+
+        logger.info(
+            f"GoSpider streaming complete: {len(seen_urls)} unique in-scope URLs "
+            f"from {len(output_lines)} raw output lines"
+        )
+        return "".join(output_lines)
 
     async def _run_container_with_limit(
         self,
