@@ -222,6 +222,11 @@ class ReportingAgent(BaseAgent):
         categorized["validated"] = self._consolidate_informational(categorized["validated"])
         categorized["manual_review"] = self._consolidate_informational(categorized["manual_review"])
 
+        # Phase 2.6: Upgrade silent payloads to visual PoC for report quality
+        from bugtrace.agents.reporting_mod.finding_processor import upgrade_finding_payloads
+        categorized["validated"] = upgrade_finding_payloads(categorized["validated"])
+        categorized["manual_review"] = upgrade_finding_payloads(categorized["manual_review"])
+
         # Phase 3: Calculate statistics
         stats = self._calculate_scan_stats(all_findings)
 

