@@ -140,9 +140,8 @@ async def sqli_escalation_pipeline(
             result = await _escalation_l0_wet_payload(session, url, param, dry_item, baseline_status_code, agent_name)
             if verbose_emitter:
                 verbose_emitter.emit("exploit.sqli.level.completed", {"level": 0, "param": param, "found": result is not None})
-            if result:
-                logger.info(f"[{agent_name}] L0 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
-                return result
+            
+            best_finding = result
 
             # -- L1: ERROR-BASED --
             if verbose_emitter:
@@ -156,78 +155,86 @@ async def sqli_escalation_pipeline(
                 db_type = error_db
             if verbose_emitter:
                 verbose_emitter.emit("exploit.sqli.level.completed", {"level": 1, "param": param, "found": error_finding is not None})
+            
             if error_finding:
                 logger.info(f"[{agent_name}] L1 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
-                return error_finding
+                # Prefer error over L0 wet if found
+                best_finding = error_finding
 
             # -- DEPTH GATE: quick stops after L1 --
             _depth = scan_depth or settings.SCAN_DEPTH
             if _depth == "quick":
                 logger.info(f"[{agent_name}] Quick depth: stopping at L1 for {param}")
-                return None
+                return best_finding
 
             # -- L2: BOOLEAN + UNION --
             if verbose_emitter:
                 verbose_emitter.emit("exploit.sqli.level.started", {"level": 2, "name": "boolean_union", "param": param})
             dashboard.log(f"[{agent_name}] L2: Boolean + Union for {param}...", "INFO")
 
-            bool_finding = await test_boolean_based(session, url, param, db_type, verbose_emitter, agent_name)
-            if bool_finding:
-                if verbose_emitter:
-                    verbose_emitter.emit("exploit.sqli.level.completed", {"level": 2, "param": param, "found": True})
-                logger.info(f"[{agent_name}] L2 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
-                return bool_finding
-
             union_finding = await test_union_based(session, url, param, filtered_chars, verbose_emitter, agent_name)
             if verbose_emitter:
                 verbose_emitter.emit("exploit.sqli.level.completed", {"level": 2, "param": param, "found": union_finding is not None})
             if union_finding:
-                logger.info(f"[{agent_name}] L2 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
-                return union_finding
+                logger.info(f"[{agent_name}] L2 CONFIRMED (Union): {param} ({time.time() - pipeline_start:.1f}s)")
+                best_finding = union_finding
+            elif not best_finding:
+                bool_finding = await test_boolean_based(session, url, param, db_type, verbose_emitter, agent_name)
+                if bool_finding:
+                    if verbose_emitter:
+                        verbose_emitter.emit("exploit.sqli.level.completed", {"level": 2, "param": param, "found": True})
+                    logger.info(f"[{agent_name}] L2 CONFIRMED (Boolean): {param} ({time.time() - pipeline_start:.1f}s)")
+                    best_finding = bool_finding
 
             # -- L3: OOB + TIME-BASED --
-            if verbose_emitter:
-                verbose_emitter.emit("exploit.sqli.level.started", {"level": 3, "name": "oob_time", "param": param})
-            dashboard.log(f"[{agent_name}] L3: OOB + Time-based for {param}...", "INFO")
+            if not best_finding or _depth == "thorough":
+                if verbose_emitter:
+                    verbose_emitter.emit("exploit.sqli.level.started", {"level": 3, "name": "oob_time", "param": param})
+                dashboard.log(f"[{agent_name}] L3: OOB + Time-based for {param}...", "INFO")
 
-            if interactsh_client:
-                oob_finding = await test_oob_sqli(
-                    session, url, param, interactsh_client, db_type, filtered_chars, verbose_emitter, agent_name
-                )
-                if oob_finding:
+                if interactsh_client and not best_finding:
+                    oob_finding = await test_oob_sqli(
+                        session, url, param, interactsh_client, db_type, filtered_chars, verbose_emitter, agent_name
+                    )
+                    if oob_finding:
+                        if verbose_emitter:
+                            verbose_emitter.emit("exploit.sqli.level.completed", {"level": 3, "param": param, "found": True})
+                        logger.info(f"[{agent_name}] L3 CONFIRMED (OOB): {param} ({time.time() - pipeline_start:.1f}s)")
+                        best_finding = oob_finding
+
+                if not best_finding:
+                    time_finding = await test_time_based(session, url, param, db_type, verbose_emitter, agent_name)
                     if verbose_emitter:
-                        verbose_emitter.emit("exploit.sqli.level.completed", {"level": 3, "param": param, "found": True})
-                    logger.info(f"[{agent_name}] L3 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
-                    return oob_finding
+                        verbose_emitter.emit("exploit.sqli.level.completed", {"level": 3, "param": param, "found": time_finding is not None})
+                    if time_finding:
+                        logger.info(f"[{agent_name}] L3 CONFIRMED (Time): {param} ({time.time() - pipeline_start:.1f}s)")
+                        best_finding = time_finding
 
-            time_finding = await test_time_based(session, url, param, db_type, verbose_emitter, agent_name)
+            # -- DEPTH GATE: only thorough runs SQLMap --
+            if _depth != "thorough":
+                logger.info(f"[{agent_name}] {_depth.title()} depth: skipping SQLMap for {param}")
+                return best_finding
+
+            # If we already have a finding to demonstrate SQLi, SQLmap is generally overkill for pure discovery unless we specifically need extraction, 
+            # but let's just return best finding if we have one and don't want to block for 5 mins
+            if best_finding and best_finding.injection_type in ("union-based", "error-based"):
+                logger.info(f"[{agent_name}] Already have high-confidence exploit ({best_finding.injection_type}), skipping SQLMap.")
+                return best_finding
+
+            # -- L4: SQLMAP DOCKER --
             if verbose_emitter:
-                verbose_emitter.emit("exploit.sqli.level.completed", {"level": 3, "param": param, "found": time_finding is not None})
-            if time_finding:
-                logger.info(f"[{agent_name}] L3 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
-                return time_finding
+                verbose_emitter.emit("exploit.sqli.level.started", {"level": 4, "name": "sqlmap", "param": param})
+            dashboard.log(f"[{agent_name}] L4: SQLMap for {param}...", "INFO")
+            technique_hint = dry_item.get("recommended_technique", "")
+            result = await run_sqlmap_on_param(url, param, technique_hint=get_sqlmap_technique_hint(technique_hint) if technique_hint else "EBUT", verbose_emitter=verbose_emitter, agent_name=agent_name)
+            if verbose_emitter:
+                verbose_emitter.emit("exploit.sqli.level.completed", {"level": 4, "param": param, "found": result is not None})
+            if result:
+                logger.info(f"[{agent_name}] L4 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
+                return result
 
-        # -- DEPTH GATE: only thorough runs SQLMap --
-        _depth = scan_depth or settings.SCAN_DEPTH
-        if _depth != "thorough":
-            logger.info(f"[{agent_name}] {_depth.title()} depth: skipping SQLMap for {param}")
-            return None
-
-        # -- L4: SQLMAP DOCKER --
-        if verbose_emitter:
-            verbose_emitter.emit("exploit.sqli.level.started", {"level": 4, "name": "sqlmap", "param": param})
-        dashboard.log(f"[{agent_name}] L4: SQLMap for {param}...", "INFO")
-        technique_hint = dry_item.get("recommended_technique", "")
-        result = await run_sqlmap_on_param(url, param, technique_hint=get_sqlmap_technique_hint(technique_hint) if technique_hint else "EBUT", verbose_emitter=verbose_emitter, agent_name=agent_name)
-        if verbose_emitter:
-            verbose_emitter.emit("exploit.sqli.level.completed", {"level": 4, "param": param, "found": result is not None})
-        if result:
-            logger.info(f"[{agent_name}] L4 CONFIRMED: {param} ({time.time() - pipeline_start:.1f}s)")
-            return result
-
-        logger.info(f"[{agent_name}] Pipeline exhausted for {param} (no SQLi found, {time.time() - pipeline_start:.1f}s)")
-        return None
-
+            logger.info(f"[{agent_name}] Pipeline exhausted for {param} (no SQLi found, {time.time() - pipeline_start:.1f}s)")
+            return best_finding
     except Exception as e:
         logger.error(f"[{agent_name}] Escalation pipeline failed for {param}: {e}")
         return None

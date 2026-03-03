@@ -863,7 +863,7 @@ Focus on header name-only deduplication UNLESS parameters are different."""
         for idx, finding in enumerate(self._dry_findings, 1):
             url = finding.get("url", "")
             parameter = finding.get("parameter", "")
-            header_name = finding.get("header_name", finding.get("injected_header", "X-Injected"))
+            header_name = finding.get("header_name") or finding.get("injected_header") or "X-Injected"
 
             logger.info(f"[{self.name}] Phase B: [{idx}/{len(self._dry_findings)}] Testing {url} header={header_name}")
 
@@ -1189,15 +1189,16 @@ Focus on header name-only deduplication UNLESS parameters are different."""
             logger.error(f"[{self.name}] Queue item test failed: {e}")
             return None
 
-    def _generate_headerinjection_fingerprint(self, header_name: str) -> tuple:
+    def _generate_headerinjection_fingerprint(self, header_name) -> tuple:
         """
         Generate Header Injection finding fingerprint for expert deduplication.
 
         Returns:
             Tuple fingerprint for deduplication
         """
-        # Header injection is global (same header = same vulnerability)
-        fingerprint = ("HEADER_INJECTION", header_name.lower())
+        # Guard against None/non-string header_name (LLM can return null JSON)
+        safe_name = (header_name or "x-injected").lower()
+        fingerprint = ("HEADER_INJECTION", safe_name)
 
         return fingerprint
 

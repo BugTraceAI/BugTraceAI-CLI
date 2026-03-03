@@ -1319,23 +1319,34 @@ class TeamOrchestrator:
         print(f"📁 Saved to: {report_dir}")
 
     async def _checkpoint(self, phase_name: str):
-        """V4 Feature: Step-by-Step Debugging Checkpoint."""
+        """V4 Feature: Step-by-Step Debugging Checkpoint.
+
+        NEVER blocks when running inside uvicorn/API server.
+        Guards: DEBUG flag + sys.isatty + os.isatty(0) + TERM env + 30s timeout.
+        """
         if not settings.DEBUG:
             return
 
         import sys
-        if not sys.stdin.isatty():
-            logger.debug(f"[V4 DEBUG] Checkpoint '{phase_name}' skipped (no TTY)")
+        import os
+        if not sys.stdin.isatty() or not os.isatty(0) or not os.environ.get("TERM"):
+            logger.debug(f"[V4 DEBUG] Checkpoint '{phase_name}' skipped (no interactive TTY)")
             return
 
         print(f"\n✋ [V4 DEBUG] Phase '{phase_name}' Complete. System PAUSED.")
-        print(f"👉 Press ENTER to continue to next phase... (or Ctrl+C to abort)")
+        print(f"👉 Press ENTER to continue... (auto-continues in 30s)")
         try:
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, input)
+            await asyncio.wait_for(
+                loop.run_in_executor(None, input),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[V4 DEBUG] Checkpoint '{phase_name}' auto-continued after 30s")
         except Exception as e:
             logger.debug(f"User input wait interrupted: {e}")
         print("▶️ Resuming...")
+
 
 
     def _save_checkpoint(self, current_url: str = None):

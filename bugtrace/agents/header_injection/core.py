@@ -473,7 +473,7 @@ def generate_headerinjection_fingerprint(header_name: str) -> Tuple:
     Returns:
         Tuple fingerprint for deduplication
     """
-    return ("HEADER_INJECTION", header_name.lower())
+    return ("HEADER_INJECTION", (header_name or "x-injected").lower())
 
 
 # PURE
@@ -501,7 +501,7 @@ def fallback_fingerprint_dedup(wet_findings: List[Dict]) -> List[Dict]:
             fingerprint = (url, param)
         else:
             # Standard header injection: fingerprint by header name only
-            header_name = finding.get("header_name", finding.get("injected_header", "X-Injected"))
+            header_name = finding.get("header_name") or finding.get("injected_header") or "X-Injected"
             fingerprint = generate_headerinjection_fingerprint(header_name)
 
         if fingerprint not in seen:
