@@ -123,6 +123,13 @@ def meets_report_quality(finding: Dict) -> bool:
 
     # --- Filter 2: XSS without browser-confirmed execution ---
     if vuln_type == "XSS" and level in XSS_UNCONFIRMED_LEVELS:
+        # v3.5 Hotfix: If the agent explicitly confirmed via HTTP smart probe
+        if isinstance(evidence, dict) and evidence.get("http_confirmed") is True:
+            logger.info(
+                f"[ReportingAgent] Report quality gate: XSS/{finding.get('parameter')} "
+                f"is {level} but has http_confirmed=True. Allowing in report."
+            )
+            return True
         logger.info(
             f"[ReportingAgent] Report quality gate: XSS/{finding.get('parameter')} "
             f"validated at {level} (HTTP-only), routing to manual_review"

@@ -591,6 +591,15 @@ class ReportingAgent(BaseAgent):
 
         # --- Filter 2: XSS without browser-confirmed execution ---
         if vuln_type == "XSS" and level in self._XSS_UNCONFIRMED_LEVELS:
+            # v3.5 Hotfix: If the agent explicitly confirmed via HTTP smart probe (e.g., characters survived)
+            # we allow it as a valid finding even without browser execution.
+            if isinstance(evidence, dict) and evidence.get("http_confirmed") is True:
+                logger.info(
+                    f"[{self.name}] Report quality gate: XSS/{finding.get('parameter')} "
+                    f"is {level} but has http_confirmed=True. Allowing in report."
+                )
+                return True
+                
             logger.info(
                 f"[{self.name}] Report quality gate: XSS/{finding.get('parameter')} "
                 f"validated at {level} (HTTP-only), routing to manual_review"

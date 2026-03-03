@@ -4055,6 +4055,33 @@ Return ONLY the payloads, one per line, no explanations."""
 
         return False
 
+    async def _try_early_l5_validation(self, finding, url: str, param: str, payloads: List[str], screenshots_dir: Path):
+        """If HTTP probe confirms XSS, automatically try L5 Browser Validation to get screenshot."""
+        _depth = getattr(self, '_scan_depth', '') or settings.SCAN_DEPTH
+        method = getattr(self, '_current_http_method', 'GET')
+        if _depth != "thorough" or method != "GET":
+            return finding
+            
+        logger.info(f"[{self.name}] Confirmed via HTTP. Elevating to L5 (Browser) for screenshot/PoC on '{param}'...")
+        
+        test_payloads = []
+        if finding.payload and finding.payload not in test_payloads:
+            test_payloads.append(finding.payload)
+            
+        alt = finding.payload.replace("document.title=document.domain", "alert(document.domain)")
+        if alt != finding.payload and alt not in test_payloads:
+            test_payloads.append(alt)
+            
+        for p in payloads:
+            if p not in test_payloads:
+                test_payloads.append(p)
+                
+        l5_res = await self._escalation_l5_browser(url, param, test_payloads[:10], screenshots_dir)
+        if l5_res and l5_res.validated:
+            return l5_res
+            
+        return finding
+
     async def _xss_escalation_pipeline(
         self, url: str, param: str, interactsh_url: str, screenshots_dir: Path,
         context: str = "html", probe_snippet: str = "",
@@ -4089,6 +4116,7 @@ Return ONLY the payloads, one per line, no explanations."""
             self._v.emit("exploit.xss.probe.result", {"param": param, "reflects": reflects, "context": smart_ctx or context})
             self._v.emit("exploit.xss.level.completed", {"level": "L0.5", "param": param, "confirmed": bool(smart_result and smart_result.validated)})
         if smart_result and smart_result.validated:
+            smart_result = await self._try_early_l5_validation(smart_result, url, param, [], screenshots_dir)
             return _tag_method(smart_result)
         if not reflects:
             dashboard.log(f"[{self.name}] Smart probe: no reflection for '{param}', skipping all levels", "INFO")
@@ -4104,6 +4132,7 @@ Return ONLY the payloads, one per line, no explanations."""
         if hasattr(self, '_v'):
             self._v.emit("exploit.xss.level.completed", {"level": "L1", "param": param, "confirmed": bool(result and result.validated)})
         if result and result.validated:
+            result = await self._try_early_l5_validation(result, url, param, [], screenshots_dir)
             return _tag_method(result)
         # L1 may refine the context from live response analysis
         if detected_context and detected_context != "html":
@@ -4119,6 +4148,7 @@ Return ONLY the payloads, one per line, no explanations."""
         if hasattr(self, '_v'):
             self._v.emit("exploit.xss.level.completed", {"level": "L2", "param": param, "confirmed": bool(result and result.validated), "reflecting": len(l2_reflecting)})
         if result and result.validated:
+            result = await self._try_early_l5_validation(result, url, param, l2_reflecting, screenshots_dir)
             return _tag_method(result)
         reflecting_payloads.extend(l2_reflecting)
 
