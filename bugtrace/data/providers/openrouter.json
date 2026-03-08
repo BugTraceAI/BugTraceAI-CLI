@@ -20,7 +20,7 @@
         "WAF_DETECTION_MODELS": "qwen/qwen3-coder,x-ai/grok-4-fast",
         "MUTATION_MODEL": "x-ai/grok-4-fast",
         "SKEPTICAL_MODEL": "qwen/qwen3-coder",
-        "REPORTING_MODEL": "deepseek/deepseek-chat"
+        "REPORTING_MODEL": "qwen/qwen3.5-397b-a17b"
     },
     "pricing": {
         "qwen/qwen3-coder": { "input": 0.22, "output": 1.00 },
