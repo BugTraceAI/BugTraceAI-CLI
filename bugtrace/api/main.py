@@ -216,14 +216,20 @@ async def health_check(
     Health check endpoint for monitoring and deployment orchestration.
 
     Returns:
-        status: Server health status (healthy/degraded)
+        status: Server health status (healthy/degraded/misconfigured)
         version: API version
         docker_available: Whether Docker is available for tool execution
         active_scans: Number of currently running scans
         event_bus_stats: Event bus statistics
+        provider: Active provider name
+        provider_ready: Whether provider preset file exists
+        api_key_configured: Whether the provider's API key is set
+        warnings: List of configuration problems (empty = all good)
 
     Solves INF-04: Health check for container readiness probes
     """
+    warnings: list[str] = []
+
     # Check Docker availability
     docker_available = False
     try:
@@ -232,6 +238,32 @@ async def health_check(
     except Exception as e:
         logger.warning(f"Docker check failed: {e}")
 
+    # Check provider preset availability
+    provider_ready = False
+    api_key_configured = False
+    provider_name = settings.PROVIDER
+    try:
+        providers_dir = settings.BASE_DIR / "bugtrace" / "data" / "providers"
+        preset_path = providers_dir / f"{settings.PROVIDER}.json"
+        if preset_path.exists():
+            provider_ready = True
+            import json as _json
+            preset_data = _json.loads(preset_path.read_text())
+            key_env = preset_data.get("api_key_env", "")
+            key_value = os.environ.get(key_env) or getattr(settings, key_env, None)
+            api_key_configured = bool(key_value)
+            provider_name = preset_data.get("name", settings.PROVIDER)
+            if not api_key_configured:
+                warnings.append(f"API key not configured for provider '{provider_name}'. Set {key_env} in your .env file.")
+        else:
+            warnings.append(f"Provider preset '{settings.PROVIDER}' not found. Check bugtrace/data/providers/ directory.")
+    except Exception as e:
+        logger.warning(f"Provider check failed: {e}")
+        warnings.append(f"Provider check error: {e}")
+
+    if not docker_available:
+        warnings.append("Docker not available. External tools (Nuclei, SQLMap) will be disabled.")
+
     # Get active scan count
     active_scans = scan_service.active_scan_count
 
@@ -239,16 +271,23 @@ async def health_check(
     event_stats = event_bus.get_stats()
 
     # Determine overall status
-    status = "healthy"
-    if not docker_available:
-        status = "degraded"  # Can run API but can't execute scans
+    if not provider_ready or not api_key_configured:
+        status = "misconfigured"  # Engine online but can't run scans
+    elif not docker_available:
+        status = "degraded"  # Can run API but some tools disabled
+    else:
+        status = "healthy"
 
     return {
         "status": status,
         "version": settings.VERSION,
         "docker_available": docker_available,
+        "provider": provider_name,
+        "provider_ready": provider_ready,
+        "api_key_configured": api_key_configured,
         "active_scans": active_scans,
         "event_bus_stats": event_stats,
+        "warnings": warnings,
         "update_available": _update_info.get("update_available", False),
         "latest_version": _update_info.get("latest_version"),
     }

@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     SKEPTICAL_MODEL: str = "qwen/qwen3-coder"
 
     # Model for reporting (PoC enrichment, CVSS scoring - needs uncensored analysis)
-    REPORTING_MODEL: str = "deepseek/deepseek-chat"
+    REPORTING_MODEL: str = "qwen/qwen3.5-397b-a17b"
 
     # Batch PoC enrichment (Phase 6: grouped by vuln type)
     REPORTING_POC_BATCH_SIZE: int = 10       # Max findings per LLM call within a group
