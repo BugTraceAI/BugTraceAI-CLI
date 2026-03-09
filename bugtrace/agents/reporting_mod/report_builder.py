@@ -351,7 +351,10 @@ def generate_standardized_finding(finding: Dict, index: int, template_path: Path
     else:
         cve_reference = "N/A"
 
-    remediation = finding.get("remediation") or get_remediation_for_vuln(vuln_type)
+    # Default to predefined remediation if none provided
+    remediation = finding.get("remediation") or get_remediation_for_type(vuln_type)
+
+    # Get impact for type
     impact = get_impact_for_type(vuln_type)
 
     cvss_score = finding.get("cvss_score")

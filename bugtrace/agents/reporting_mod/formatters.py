@@ -30,6 +30,34 @@ logger = get_logger("agents.reporting.formatters")
 
 
 # PURE
+def normalize_severity(sev) -> str:
+    """
+    Normalize severity to an uppercase string, handling enum objects and string prefixes.
+    
+    Handles:
+    - Severity enum objects (e.g., Severity.HIGH -> "HIGH")
+    - String enums with prefixes (e.g., "SEVERITY.HIGH" -> "HIGH")
+    - Plain strings (e.g., "HIGH" -> "HIGH", "medium" -> "MEDIUM")
+    - None values (defaults to "MEDIUM")
+    
+    Args:
+        sev: Severity value (enum, string, or None)
+    
+    Returns:
+        Normalized uppercase severity string
+    """
+    if sev is None:
+        return "MEDIUM"
+    if hasattr(sev, 'value'):
+        # Handle enum objects like Severity.HIGH
+        return str(sev.value).upper()
+    sev_str = str(sev).upper()
+    # Remove common prefixes like "severity." or "SEVERITY."
+    sev_str = sev_str.replace("SEVERITY.", "")
+    return sev_str
+
+
+# PURE
 def get_impact_for_type(vuln_type: str) -> str:
     """Get standard impact description for vulnerability type."""
     return IMPACT_DESCRIPTIONS.get(vuln_type.upper(), "This vulnerability may compromise the security of the application.")

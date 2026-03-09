@@ -13,7 +13,7 @@ Contents:
 
 Author: BugtraceAI Team
 Date: 2026-03-09
-Version: 3.4.2-beta
+Version: 3.4.3-beta
 """
 
 import logging

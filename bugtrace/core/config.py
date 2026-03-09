@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     """
     # --- Project Metadata ---
     APP_NAME: str = "BgTraceAI-CLI"
-    VERSION: str = "3.4.2-beta"  # Auth & Specialist (Beta)
+    VERSION: str = "3.4.3-beta"  # Auth & Specialist (Beta)
     DEBUG: bool = False
     SAFE_MODE: bool = False # Default to False, override via CLI
 
@@ -78,10 +78,10 @@ class Settings(BaseSettings):
     LLM_REQUEST_TIMEOUT: float = 30.0  # Seconds to wait for LLM API response (fail fast on slow models)
 
     # Model for skeptical analysis in DASTySAST agent
-    SKEPTICAL_MODEL: str = "qwen/qwen3-coder"
+    SKEPTICAL_MODEL: str = "anthropic/claude-haiku-4.5"
 
     # Model for reporting (PoC enrichment, CVSS scoring - needs uncensored analysis)
-    REPORTING_MODEL: str = "qwen/qwen3.5-397b-a17b"
+    REPORTING_MODEL: str = "anthropic/claude-haiku-4.5"
 
     # Batch PoC enrichment (Phase 6: grouped by vuln type)
     REPORTING_POC_BATCH_SIZE: int = 10       # Max findings per LLM call within a group
