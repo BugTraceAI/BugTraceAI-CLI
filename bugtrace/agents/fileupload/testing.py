@@ -148,6 +148,8 @@ async def upload_file(
     content: str,
     content_type: str,
     base_url: str,
+    cookies: List[Dict] = None,
+    headers: Dict[str, str] = None,
 ) -> Tuple[bool, str, str]:  # I/O
     """Perform the actual HTTP multipart upload.
 
@@ -160,6 +162,8 @@ async def upload_file(
         content: File content as string.
         content_type: MIME type for the file.
         base_url: The base URL for predicting uploaded file location.
+        cookies: List of cookie dicts to inject for authentication.
+        headers: Dict of headers to inject for authentication.
 
     Returns:
         Tuple of (success, response_text, predicted_upload_url).
@@ -185,6 +189,13 @@ async def upload_file(
 
     try:
         async with orchestrator.session(DestinationType.TARGET) as session:
+            # Apply authentication (v3.4)
+            if cookies:
+                cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+                session.cookie_jar.update_cookies({"Cookie": cookie_str})
+            if headers:
+                session._default_headers.update(headers)
+            
             async with session.post(action_url, data=data) as resp:
                 text = await resp.text()
                 predicted_url = urljoin(base_url, f"/uploads/{filename}")
@@ -194,17 +205,26 @@ async def upload_file(
         return False, "", ""
 
 
-async def validate_execution(url: str) -> bool:  # I/O
+async def validate_execution(url: str, cookies: List[Dict] = None, headers: Dict[str, str] = None) -> bool:  # I/O
     """Check if the uploaded file actually executes code.
 
     Args:
         url: The URL of the uploaded file.
+        cookies: List of cookie dicts to inject for authentication.
+        headers: Dict of headers to inject for authentication.
 
     Returns:
         True if execution markers are found in the response.
     """
     try:
         async with orchestrator.session(DestinationType.TARGET) as session:
+            # Apply authentication (v3.4)
+            if cookies:
+                cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+                session.cookie_jar.update_cookies({"Cookie": cookie_str})
+            if headers:
+                session._default_headers.update(headers)
+            
             async with session.get(url) as resp:
                 if resp.status == 404:
                     return False
@@ -250,6 +270,8 @@ async def test_form(
     system_prompt: str,
     max_bypass_attempts: int = 5,
     log_fn=None,
+    cookies: List[Dict] = None,
+    headers: Dict[str, str] = None,
 ) -> Optional[Dict]:  # I/O
     """Orchestrate testing for a specific form with bypass loops.
 
@@ -259,6 +281,8 @@ async def test_form(
         system_prompt: The agent's system prompt for LLM calls.
         max_bypass_attempts: Maximum bypass attempts (default 5).
         log_fn: Optional callable(message, level) for logging.
+        cookies: List of cookie dicts to inject for authentication.
+        headers: Dict of headers to inject for authentication.
 
     Returns:
         Finding dict if vulnerable, or None.
@@ -291,13 +315,14 @@ async def test_form(
 
         # Phase 2: Execute Upload
         success, response_text, uploaded_url = await upload_file(
-            form, filename, payload, content_type, base_url
+            form, filename, payload, content_type, base_url,
+            cookies=cookies, headers=headers
         )
         previous_response = response_text
 
         if success:
             # Phase 3: Validate Execution
-            valid_execution = await validate_execution(uploaded_url)
+            valid_execution = await validate_execution(uploaded_url, cookies=cookies, headers=headers)
             valid_upload = (
                 f"Uploaded: {filename}" in response_text
                 or "RCE_FLAG" in response_text

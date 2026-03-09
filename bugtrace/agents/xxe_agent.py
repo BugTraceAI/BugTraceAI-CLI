@@ -51,6 +51,8 @@ class XXEAgent(BaseAgent, TechContextMixin):
         # v3.2.0: Context-aware tech stack (loaded in start_queue_consumer)
         self._tech_stack_context: Dict = {}
         self._xxe_prime_directive: str = ""
+        self.cookies = []
+        self.headers = {}
 
     # =========================================================================
     # FINDING VALIDATION: XXE-specific validation (Phase 1 Refactor)
@@ -146,6 +148,17 @@ class XXEAgent(BaseAgent, TechContextMixin):
         logger.info(f"[{self.name}] XXE anomaly detected - VALIDATED_CONFIRMED (Specialist Trust)")
         return ValidationStatus.VALIDATED_CONFIRMED.value
 
+    def _configure_session(self, session: aiohttp.ClientSession):
+        """Configure session with cookies and headers from authentication."""
+        if hasattr(self, 'cookies') and self.cookies:
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
+            session.cookie_jar.update_cookies({"Cookie": cookie_str})
+            logger.debug(f"[{self.name}] Applied {len(self.cookies)} cookies to session")
+        
+        if hasattr(self, 'headers') and self.headers:
+             # Merge headers
+             session._default_headers.update(self.headers)
+
     def _get_validation_status_from_evidence(self, evidence: Dict) -> str:
         """
         Determine validation status from evidence dictionary.
@@ -214,6 +227,7 @@ class XXEAgent(BaseAgent, TechContextMixin):
 
         # Use orchestrator for lifecycle-tracked connections
         async with orchestrator.session(DestinationType.TARGET) as session:
+            self._configure_session(session)
             # Phase 1: Heuristic Checks
             successful_payloads, best_payload = await self._test_heuristic_payloads(session)
 
@@ -801,6 +815,7 @@ Respect the "_discovered": true flag - these are autonomously discovered endpoin
         try:
             # Use orchestrator for lifecycle-tracked connections
             async with orchestrator.session(DestinationType.TARGET) as session:
+                self._configure_session(session)
                 # Test with heuristic payloads
                 successful_payloads, best_payload = await self._test_heuristic_payloads(session)
 

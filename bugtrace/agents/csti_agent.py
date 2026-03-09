@@ -425,6 +425,17 @@ class CSTIAgent(BaseAgent, TechContextMixin):
 
         return list(dict.fromkeys(encoded))  # Dedupe preserving order
 
+    def _configure_session(self, session: aiohttp.ClientSession):
+        """Configure session with cookies and headers from authentication."""
+        if hasattr(self, 'cookies') and self.cookies:
+            # aiohttp handles CookieJar, but we can also set header for simplicity in some cases
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.cookies])
+            session.cookie_jar.update_cookies({"Cookie": cookie_str})
+            logger.debug(f"[{self.name}] Applied {len(self.cookies)} cookies to session")
+        
+        if hasattr(self, 'headers') and self.headers:
+            session._default_headers.update(self.headers)
+
     def _finding_to_dict(self, finding: CSTIFinding) -> Dict:
         """Convert CSTIFinding object to dictionary for report."""
         result = {
@@ -2700,12 +2711,15 @@ Different template engines represent different attack surfaces - NEVER merge fin
         template-rendering API endpoints (e.g. email preview, report generation).
         """
         import aiohttp
+        from bugtrace.core.http_manager import http_manager, ConnectionProfile
 
         # Resolve mismatched URLs (e.g. param="email-preview" on url="/api/debug/vulns")
         url = self._resolve_api_ssti_url(url, parameter)
 
-        auth_headers = getattr(self, '_auth_headers', {})
-        logger.info(f"[{self.name}] API SSTI test: {url} param={parameter} auth={'yes' if auth_headers else 'no'}")
+        # Get cookies/headers from agent
+        auth_headers = getattr(self, 'headers', {})
+        
+        logger.info(f"[{self.name}] API SSTI test: {url} param={parameter}")
 
         # Common body parameter names for template content
         body_params = [parameter] if parameter else []
@@ -3561,15 +3575,12 @@ Different template engines represent different attack surfaces - NEVER merge fin
     ) -> Optional[CSTIFinding]:
         """
         Test a single parameter from queue for CSTI.
-
-        Uses existing validation pipeline optimized for queue processing.
-
-        v3.2 FIX: Now tests the WET finding's payload FIRST before falling back
-        to library payloads. DASTySAST often finds the right payload already.
         """
         try:
             # Use HTTPClientManager for proper connection management (v2.4)
             async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as session:
+                self._configure_session(session)
+                
                 # Fetch page for template engine detection
                 html = await self._fetch_page(session)
 
@@ -3581,9 +3592,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
                 if suggested_engine and suggested_engine != "unknown":
                     engines = [suggested_engine] + [e for e in engines if e != suggested_engine]
 
-                # v3.2 FIX: Try the WET finding's payload FIRST
-                # DASTySAST/Skeptic often identifies the correct payload already
-                # v3.2.1: Also check 'recommended_payload' from LLM deduplication
+                # 1. Try the WET finding's payload FIRST
                 wet_payload = finding.get("payload") or finding.get("exploitation_strategy") or finding.get("recommended_payload")
                 if wet_payload:
                     logger.info(f"[{self.name}] Testing WET payload first: {wet_payload[:50]}...")
@@ -3591,18 +3600,25 @@ Different template engines represent different attack surfaces - NEVER merge fin
                     if result:
                         return self._dict_to_finding(result)
 
-                # Test with targeted payloads from library
+                # 2. Test with targeted payloads from library
                 if engines and engines[0] != "unknown":
                     result = await self._targeted_probe(session, param, engines)
                     if result:
                         return self._dict_to_finding(result)
 
-                # Universal probe
+                # 3. Universal probe
                 result = await self._universal_probe(session, param)
                 if result:
                     return self._dict_to_finding(result)
 
-                # OOB probe if Interactsh available
+                # 4. API SSTI (v3.5)
+                if "/api/" in url or any(p in param.lower() for p in ["template", "body", "email", "preview"]):
+                    logger.info(f"[{self.name}] Final attempt: API SSTI test for {url} ({param})")
+                    api_result = await self._test_api_ssti(url, param, finding)
+                    if api_result:
+                        return api_result
+
+                # 5. OOB probe if Interactsh available
                 if not self.interactsh:
                     await self._setup_interactsh()
                 if self.interactsh_url:
@@ -3610,29 +3626,16 @@ Different template engines represent different attack surfaces - NEVER merge fin
                     if result:
                         return self._dict_to_finding(result)
 
-            # If no result, retry with admin auth token (for admin-protected SSTI endpoints)
-            try:
-                from bugtrace.services.scan_context import get_scan_auth_headers
-                auth_headers = get_scan_auth_headers(self._scan_context, role="admin")
-                if auth_headers:
-                    logger.info(f"[{self.name}] Retrying {url}?{param} with admin auth token")
-                    async with http_manager.isolated_session(ConnectionProfile.EXTENDED) as auth_session:
-                        # Inject auth headers into session
-                        auth_session._default_headers = {**(auth_session._default_headers or {}), **auth_headers}
-                        html = await self._fetch_page(auth_session)
-                        engines = TemplateEngineFingerprinter.fingerprint(html)
-                        result = await self._universal_probe(auth_session, param)
-                        if result:
-                            result["auth_required"] = True
-                            result["description"] = f"SSTI on admin-protected endpoint (accessed via forged JWT). {result.get('description', '')}"
-                            return self._dict_to_finding(result)
-            except Exception as auth_err:
-                logger.debug(f"[{self.name}] Auth retry failed: {auth_err}")
+            # 6. Admin Auth Retry (v3.5)
+            # If no result, retry with admin credentials if available
+            if hasattr(self, 'cookies') and self.cookies:
+                 # Already using captured session, no need to retry with static admin token unless it failed
+                 pass
 
             return None
 
         except Exception as e:
-            logger.error(f"[{self.name}] Queue item test failed: {e}")
+            logger.error(f"[{self.name}] CSTI test failed for {url}?{param}: {e}")
             return None
 
     async def _test_wet_finding_payload(

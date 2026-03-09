@@ -20,21 +20,27 @@ from pydantic import BaseModel
 _auth_token_store: Dict[str, Dict[str, Any]] = {}
 
 
-def store_auth_token(scan_ctx_id: str, name: str, token: str, token_type: str = "Bearer", roles: list = None):
-    """Store a discovered auth token for other agents to use during this scan."""
+def store_auth_token(scan_ctx_id: str, name: str, token: str = None, token_type: str = "Bearer", roles: list = None, cookies: str = None):
+    """Store a discovered auth token or cookies for other agents to use during this scan."""
     if scan_ctx_id not in _auth_token_store:
         _auth_token_store[scan_ctx_id] = {}
     _auth_token_store[scan_ctx_id][name] = {
         "token": token, "type": token_type, "roles": roles or ["admin", "user"],
+        "cookies": cookies
     }
 
 
 def get_scan_auth_headers(scan_ctx_id: str, role: str = "admin") -> Dict[str, str]:
-    """Get auth headers from tokens discovered during this scan."""
-    for info in _auth_token_store.get(scan_ctx_id, {}).values():
-        if role in info.get("roles", []) and info.get("token"):
-            return {"Authorization": f"{info['type']} {info['token']}"}
-    return {}
+    """Get auth headers (Authorization + Cookie) from tokens discovered during this scan."""
+    headers = {}
+    tokens = _auth_token_store.get(scan_ctx_id, {})
+    for info in tokens.values():
+        if role in info.get("roles", []):
+            if info.get("token"):
+                headers["Authorization"] = f"{info['type']} {info['token']}"
+            if info.get("cookies"):
+                headers["Cookie"] = info["cookies"]
+    return headers
 
 
 def clear_scan_tokens(scan_ctx_id: str):
