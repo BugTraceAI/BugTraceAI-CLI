@@ -10,6 +10,10 @@ Contents:
     - validate_execution: Check if uploaded file executes code
     - llm_get_strategy: Call LLM for upload bypass strategy
     - test_form: Orchestrate testing a single form with bypass loops
+
+Author: BugtraceAI Team
+Date: 2026-03-09
+Version: 3.4.2-beta
 """
 
 import logging
@@ -309,16 +313,19 @@ async def test_form(
         if not strategy_result:
             break
 
-        filename, payload, content_type = strategy_result
+        filename, payload, content_type, strategy_validation_url = strategy_result
         if log_fn:
             log_fn(f"Attempting upload: {filename} ({content_type})", "INFO")
 
         # Phase 2: Execute Upload
-        success, response_text, uploaded_url = await upload_file(
+        success, response_text, predicted_url = await upload_file(
             form, filename, payload, content_type, base_url,
             cookies=cookies, headers=headers
         )
         previous_response = response_text
+
+        # Override predicted URL with strategy validation URL if provided
+        uploaded_url = strategy_validation_url if strategy_validation_url else predicted_url
 
         if success:
             # Phase 3: Validate Execution

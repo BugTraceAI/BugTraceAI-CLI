@@ -10,10 +10,16 @@ from typing import Dict, List, Optional
 from bugtrace.agents.reporting_mod.types import INFORMATIONAL_TYPES
 from bugtrace.core.config import settings
 from bugtrace.core.llm_client import llm_client
-from bugtrace.reporting.standards import get_reference_cve
+from bugtrace.reporting.standards import get_default_severity, get_reference_cve
 from bugtrace.utils.logger import get_logger
 
 logger = get_logger("agents.reporting.cvss")
+
+# Severity ranking: lower number = more severe
+SEVERITY_RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+
+# Minimum CVSS score floors per severity level
+SEVERITY_CVSS_FLOOR = {"CRITICAL": 9.0, "HIGH": 7.0, "MEDIUM": 4.0, "LOW": 0.1, "INFO": 0.0}
 
 
 # PURE
@@ -174,11 +180,20 @@ def cvss_parse_response(response: str) -> Optional[Dict]:
 
 # PURE
 def cvss_update_finding(f: Dict, data: Dict) -> None:
-    """Update finding with CVSS data. Mutates f in-place."""
+    """Update finding with CVSS data. Mutates f in-place.
+
+    Enforces severity floor: LLM can upgrade severity but never
+    downgrade it below the framework's DEFAULT_SEVERITY for the
+    vulnerability type (e.g., SQLi stays CRITICAL, CSTI stays HIGH).
+    """
+    vuln_type = f.get('type', '')
+
+    # --- 1. Apply LLM severity ---
     new_severity = data.get('severity')
     if new_severity:
         f['severity'] = new_severity.upper()
 
+    # --- 2. Apply LLM CVSS score ---
     new_score = data.get('score') or data.get('cvss_score') or data.get('base_score')
     if new_score is not None:
         try:
@@ -186,11 +201,36 @@ def cvss_update_finding(f: Dict, data: Dict) -> None:
         except (ValueError, TypeError):
             pass
 
+    # --- 3. Enforce severity floor (NEVER downgrade below default) ---
+    default_sev = get_default_severity(vuln_type)
+    default_sev_str = default_sev.value if hasattr(default_sev, 'value') else str(default_sev).upper()
+    current_sev = f.get('severity', 'HIGH').upper()
+
+    default_rank = SEVERITY_RANK.get(default_sev_str, 4)
+    current_rank = SEVERITY_RANK.get(current_sev, 4)
+
+    if current_rank > default_rank:
+        # LLM tried to downgrade — enforce the floor
+        logger.warning(
+            f"[CVSS] Severity floor enforced for {vuln_type}: "
+            f"LLM assigned {current_sev} but default is {default_sev_str}. "
+            f"Keeping {default_sev_str}."
+        )
+        f['severity'] = default_sev_str
+
+        # Also enforce minimum CVSS score for the floor severity
+        cvss_floor = SEVERITY_CVSS_FLOOR.get(default_sev_str, 0.0)
+        current_cvss = f.get('cvss_score', 0.0)
+        if isinstance(current_cvss, (int, float)) and current_cvss < cvss_floor:
+            f['cvss_score'] = cvss_floor
+            logger.info(
+                f"[CVSS] Score floor enforced for {vuln_type}: "
+                f"{current_cvss} -> {cvss_floor} (min for {default_sev_str})"
+            )
+
     new_vector = data.get('vector') or data.get('cvss_vector') or data.get('vector_string')
     f['cvss_vector'] = new_vector or f.get('cvss_vector')
     f['cvss_rationale'] = data.get('rationale') or data.get('analysis') or f.get('cvss_rationale')
-
-    vuln_type = f.get('type', '')
 
     # CWE: LLM response first, then framework mapping as fallback
     cwe = data.get('cwe')

@@ -247,7 +247,7 @@ class DatabaseManager:
         if cls._instance is None:
             from bugtrace.core.config import settings
             cls._instance = cls(
-                db_url=f"sqlite:///{settings.BASE_DIR}/bugtrace.db",
+                db_url=f"sqlite:///{settings.BASE_DIR}/data/bugtrace.db",
                 vector_db_path=str(settings.LOG_DIR / "lancedb")
             )
         return cls._instance

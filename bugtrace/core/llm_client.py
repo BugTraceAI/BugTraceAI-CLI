@@ -607,7 +607,7 @@ class LLMClient:
 
     async def _handle_refusal(
         self,
-        text: str,
+        text: Optional[str],
         current_model: str,
         model_override: Optional[str],
         prompt: str,
@@ -617,6 +617,9 @@ class LLMClient:
         max_tokens: int
     ) -> Optional[str]:
         """Handle LLM refusal and attempt fallback to uncensored model."""
+        if not text:
+            return text
+
         if not (any(phrase.lower() in text.lower() for phrase in self.REFUSAL_PHRASES) and len(text) < 300):
             return text
 
