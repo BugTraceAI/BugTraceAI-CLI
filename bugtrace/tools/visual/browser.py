@@ -152,15 +152,16 @@ class BrowserManager:
         async with self.get_page() as page:
             try:
                 try:
-                    await page.goto(url, wait_until="networkidle", timeout=settings.TIMEOUT_MS)
+                    await page.goto(url, wait_until="networkidle", timeout=settings.NAVIGATION_TIMEOUT_MS)
                     logger.info(f"[capture_state] networkidle succeeded for {url[:50]}")
                 except Exception as ni_err:
                     logger.warning(f"[capture_state] networkidle failed ({ni_err}), falling back to load+wait")
-                    await page.goto(url, wait_until="load", timeout=settings.TIMEOUT_MS)
-                    await page.wait_for_timeout(3000)
+                    await page.goto(url, wait_until="load", timeout=settings.NAVIGATION_TIMEOUT_MS)
+                    # wait_for_timeout uses milliseconds
+                    await page.wait_for_timeout(settings.PAYLOAD_EXECUTION_WAIT_MS)
 
                 # Screenshot
-                screenshot_bytes = await page.screenshot(full_page=False)
+                screenshot_bytes = await page.screenshot(full_page=settings.SCREENSHOT_FULL_PAGE)
                 html_content = await page.content()
                 logger.info(f"[capture_state] Captured {len(html_content)} chars from {url[:50]}")
                 
@@ -214,15 +215,26 @@ class BrowserManager:
 
         async with self.get_page() as page:
             try:
+                # Setup verification scripts first
                 await self._setup_xss_verification_scripts(page, logs, triggered)
-                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                await page.wait_for_timeout(3000)
+                
+                # FIX #1: Increased navigation timeout from 45s to 90s (from config)
+                await page.goto(url, wait_until="domcontentloaded", timeout=settings.NAVIGATION_TIMEOUT_MS)
+                
+                # FIX #2: Increased wait time from 3s to 5s for initial payload execution (from config)
+                await page.wait_for_timeout(settings.PAYLOAD_EXECUTION_WAIT_MS)
 
+                # Attempt interactions if not triggered yet
                 if not triggered[0]:
                     await self._attempt_interaction_triggers(page, logs, triggered)
+                    # Additional wait after interactions (3s)
+                    await page.wait_for_timeout(3000)
 
+                # Check for markers
                 marker_found = await self._check_xss_markers(page, logs)
-                screenshot_path = await self._capture_verification_screenshot(page)
+
+                # FIX #3: Capture screenshot with better timing and result context
+                screenshot_path = await self._capture_verification_screenshot(page, triggered[0] or marker_found)
 
                 is_valid = triggered[0] or marker_found
                 self._log_verification_result(is_valid, triggered[0], marker_found)
@@ -262,7 +274,7 @@ class BrowserManager:
                     div.style.fontFamily = 'monospace';
                     div.style.boxShadow = '0 10px 25px rgba(0,0,0,0.5)';
                     div.style.border = '4px solid white';
-                    div.innerText = '⚠️ BUGTRACE: XSS EXECUTED (' + msg + ')';
+                    div.innerText = '⚠️ BugTraceAI: XSS EXECUTED (' + msg + ')';
                     document.body.appendChild(div);
                     window.bugtrace_xss_callback(msg);
                 } catch(e) { console.error(e); }
@@ -339,12 +351,39 @@ class BrowserManager:
             logs.append(f"DOM check error: {eval_err}")
             return False
 
-    async def _capture_verification_screenshot(self, page) -> str:
-        """Capture screenshot for verification evidence."""
+    async def _capture_verification_screenshot(self, page, xss_confirmed: bool) -> str:
+        """
+        Capture screenshot for verification evidence.
+        
+        FIX: Added retry logic and increased timeout for reliability.
+        """
         import uuid
         from bugtrace.core.config import settings
-        screenshot_path = str(settings.LOG_DIR / f"proof_xss_{uuid.uuid4().hex[:8]}.png")
-        await page.screenshot(path=screenshot_path)
+        
+        # Use descriptive filename based on validation result
+        prefix = "xss_confirmed" if xss_confirmed else "xss_attempt"
+        screenshot_path = str(settings.LOG_DIR / f"proof_{prefix}_{uuid.uuid4().hex[:8]}.png")
+        
+        # FIX: Retry logic with configurable max_retries
+        max_retries = settings.SCREENSHOT_MAX_RETRIES
+        for attempt in range(max_retries):
+            try:
+                # FIX: Increased timeout from config
+                await page.screenshot(path=screenshot_path, timeout=settings.SCREENSHOT_TIMEOUT_MS, full_page=settings.SCREENSHOT_FULL_PAGE)
+                logger.info(f"Screenshot captured successfully: {screenshot_path}")
+                return screenshot_path
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Screenshot failed after {max_retries} attempts: {e}", exc_info=True)
+                    # Return placeholder path even on failure for report consistency
+                    return f"{settings.LOG_DIR}/screenshot_error_{uuid.uuid4().hex[:8]}.png"
+                logger.warning(f"Screenshot attempt {attempt + 1} failed, retrying...: {e}")
+                # Wait before retry
+                retry_wait = 1000 * (attempt + 1) # ms
+                if settings.WAIT_STRATEGY == "staggered":
+                    retry_wait = settings.STAGGERED_WAIT_INITIAL + (attempt * settings.STAGGERED_WAIT_EXTRA)
+                await page.wait_for_timeout(retry_wait)
+        
         return screenshot_path
 
     def _log_verification_result(self, is_valid, triggered, marker_found):

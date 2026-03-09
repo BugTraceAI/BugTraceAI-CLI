@@ -200,8 +200,11 @@ class XSSVerifier:
         console_logs = []
         dialog_detected = await self._setup_page_handlers(page, console_logs)
 
-        await self._navigate_to_url(page, url)
-        await asyncio.sleep(min(timeout, 5.0))
+        # FIX: Increased navigation timeout
+        await self._navigate_to_url(page, url, timeout=60000)  # Changed from default 20s
+        
+        # FIX: Increased wait time for payload execution
+        await asyncio.sleep(min(timeout, 8.0))  # Changed from 5.0 to 8.0
 
         if not dialog_detected[0]:
             early_result = await self._simulate_user_interactions(page, url, console_logs, dialog_detected)
@@ -273,13 +276,25 @@ class XSSVerifier:
         page.on("dialog", handle_dialog)
         return dialog_detected
 
-    async def _navigate_to_url(self, page, url: str):
-        """Navigate to target URL."""
+    async def _navigate_to_url(self, page, url: str, timeout: int = 60000):
+        """
+        Navigate to target URL.
+        
+        FIX: Increased default timeout from 20s to 60s.
+        """
         try:
             logger.info(f"[{url}] Navigating to target...")
-            await page.goto(url, timeout=20000, wait_until="load")
+            # FIX: Increased timeout and use domcontentloaded for faster initial load
+            await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            # Wait for network to settle after initial load
+            await page.wait_for_load_state("networkidle", timeout=30000)
         except Exception as e:
             logger.warning(f"Playwright navigation warning: {e}")
+            # Fallback: try with just 'load' event
+            try:
+                await page.goto(url, timeout=timeout, wait_until="load")
+            except Exception as fallback_e:
+                logger.error(f"Navigation failed completely: {fallback_e}")
 
     async def _simulate_user_interactions(self, page, url: str, console_logs: List, dialog_detected: List):
         """Simulate user interactions to trigger XSS."""
@@ -565,12 +580,22 @@ class XSSVerifier:
         prefix = "playwright_xss" if xss_confirmed else "repro_attempt"
         screenshot_path = f"{screenshot_dir}/{prefix}_{int(time.time())}_{os.getpid()}.png"
 
-        try:
-            await page.screenshot(path=screenshot_path, timeout=5000)
-            return screenshot_path
-        except Exception as e:
-            logger.warning(f"Screenshot failed: {e}")
-            return None
+        # FIX: Retry logic with increased timeout
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # FIX: Increased timeout from 5s to 15s
+                await page.screenshot(path=screenshot_path, timeout=15000, full_page=False)
+                logger.info(f"Playwright screenshot captured: {screenshot_path}")
+                return screenshot_path
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.warning(f"Screenshot failed after {max_retries} attempts: {e}")
+                    return None
+                logger.warning(f"Screenshot attempt {attempt + 1} failed, retrying...: {e}")
+                await asyncio.sleep(1.0 * (attempt + 1))
+        
+        return None
 
     async def _cleanup_browser(self, page, context, browser):
         """Clean up browser resources."""

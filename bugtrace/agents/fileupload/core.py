@@ -18,7 +18,7 @@ def get_upload_strategy(
     attempt: int,
     strategy: Optional[Dict],
     form: Dict,
-) -> Optional[Tuple[str, str, str]]:  # PURE
+) -> Optional[Tuple[str, str, str, Optional[str]]]:  # PURE
     """Get upload strategy from LLM response or fallback.
 
     Args:
@@ -27,7 +27,7 @@ def get_upload_strategy(
         form: The upload form metadata dict.
 
     Returns:
-        Tuple of (filename, payload_content, content_type), or None to stop.
+        Tuple of (filename, payload_content, content_type, validation_url), or None to stop.
     """
     if not strategy or not strategy.get('vulnerable') == 'true':
         if attempt == 0:
@@ -36,13 +36,15 @@ def get_upload_strategy(
                 'BT7331_RCE_payload.php',
                 '<?php echo "BT7331_SUCCESS"; ?>',
                 'application/x-php',
+                None,
             )
         return None
 
     filename = strategy.get('filename', 'rce.php')
     payload = strategy.get('payload_content', '<?php echo "BT7331_SUCCESS"; ?>')
     content_type = strategy.get('content_type', 'application/x-php')
-    return (filename, payload, content_type)
+    validation_url = strategy.get('validation_url')
+    return (filename, payload, content_type, validation_url)
 
 
 def create_upload_finding(

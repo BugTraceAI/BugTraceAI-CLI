@@ -5,9 +5,9 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./reports:/app/reports
-      - ./logs:/app/logs
-      - ./data:/app/data
+      - cli-scans:/app/scans
+      - cli-reports:/app/reports
+      - cli-db:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
     env_file:
       - .env

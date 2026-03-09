@@ -31,8 +31,8 @@ class Settings(BaseSettings):
     Loads from .env file and environment variables.
     """
     # --- Project Metadata ---
-    APP_NAME: str = "BugtraceAI-CLI"
-    VERSION: str = "2.3.3"  # Phoenix Edition
+    APP_NAME: str = "BgTraceAI-CLI"
+    VERSION: str = "3.4.2-beta"  # Auth & Specialist (Beta)
     DEBUG: bool = False
     SAFE_MODE: bool = False # Default to False, override via CLI
 
@@ -799,6 +799,29 @@ class Settings(BaseSettings):
                 self.TRACING_ENABLED = config["ADVANCED"].getboolean("TRACING_ENABLED")
             if "INTERACTSH_SERVER" in config["ADVANCED"]:
                 self.INTERACTSH_SERVER = config["ADVANCED"]["INTERACTSH_SERVER"]
+        
+        if "BROWSER_ADVANCED" in config:
+            section = config["BROWSER_ADVANCED"]
+            if "NAVIGATION_TIMEOUT_MS" in section:
+                self.NAVIGATION_TIMEOUT_MS = section.getint("NAVIGATION_TIMEOUT_MS")
+            if "NETWORKIDLE_TIMEOUT_MS" in section:
+                self.NETWORKIDLE_TIMEOUT_MS = section.getint("NETWORKIDLE_TIMEOUT_MS")
+            if "PAYLOAD_EXECUTION_WAIT_MS" in section:
+                self.PAYLOAD_EXECUTION_WAIT_MS = section.getint("PAYLOAD_EXECUTION_WAIT_MS")
+            if "SCREENSHOT_TIMEOUT_MS" in section:
+                self.SCREENSHOT_TIMEOUT_MS = section.getint("SCREENSHOT_TIMEOUT_MS")
+            if "SCREENSHOT_MAX_RETRIES" in section:
+                self.SCREENSHOT_MAX_RETRIES = section.getint("SCREENSHOT_MAX_RETRIES")
+            if "WAIT_STRATEGY" in section:
+                self.WAIT_STRATEGY = section["WAIT_STRATEGY"].strip().lower()
+            if "STAGGERED_WAIT_INITIAL" in section:
+                self.STAGGERED_WAIT_INITIAL = section.getint("STAGGERED_WAIT_INITIAL")
+            if "STAGGERED_WAIT_EXTRA" in section:
+                self.STAGGERED_WAIT_EXTRA = section.getint("STAGGERED_WAIT_EXTRA")
+            if "SCREENSHOT_FULL_PAGE" in section:
+                self.SCREENSHOT_FULL_PAGE = section.getboolean("SCREENSHOT_FULL_PAGE")
+            if "SCREENSHOT_ON_ERROR" in section:
+                self.SCREENSHOT_ON_ERROR = section.getboolean("SCREENSHOT_ON_ERROR")
 
         if "REPORT" in config:
             if "ONLY_VALIDATED" in config["REPORT"]:
@@ -1148,6 +1171,18 @@ class Settings(BaseSettings):
     DOM_CLICK_MAX_TEXT_LINKS: int = 10  # Max text-based navigation links to click
     DOM_CLICK_WAIT_SEC: float = 2.0     # Seconds to wait after each click for JS redirect
     DOM_CLICK_INITIAL_WAIT_SEC: float = 1.0  # Seconds to wait after page load before clicking
+    
+    # Browser Advanced (v3.4)
+    NAVIGATION_TIMEOUT_MS: int = 45000
+    NETWORKIDLE_TIMEOUT_MS: int = 30000
+    PAYLOAD_EXECUTION_WAIT_MS: int = 3000
+    SCREENSHOT_TIMEOUT_MS: int = 5000
+    SCREENSHOT_MAX_RETRIES: int = 3
+    WAIT_STRATEGY: str = "simple"
+    STAGGERED_WAIT_INITIAL: int = 3000
+    STAGGERED_WAIT_EXTRA: int = 2000
+    SCREENSHOT_FULL_PAGE: bool = False
+    SCREENSHOT_ON_ERROR: bool = True
 
     # Crawler
     SPA_WAIT_MS: int = 1000
