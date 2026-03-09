@@ -138,6 +138,8 @@ class TeamOrchestrator:
         # Initialize ThinkingConsolidationAgent for V3 pipeline
         from bugtrace.agents.thinking_consolidation_agent import ThinkingConsolidationAgent
         self.thinking_agent = ThinkingConsolidationAgent(scan_context=self.scan_context)
+        
+        self.captured_session = {"cookies": [], "headers": {}}
         logger.info("ThinkingConsolidationAgent initialized - V3 event-driven pipeline active")
 
         # Specialist worker pools will be initialized async in _run_hunter_core
@@ -163,6 +165,7 @@ class TeamOrchestrator:
         from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
         from bugtrace.agents.header_injection_agent import HeaderInjectionAgent
         from bugtrace.agents.mass_assignment_agent import MassAssignmentAgent
+        from bugtrace.agents.fileupload import FileUploadAgent
 
         # Initialize specialist agents with minimal parameters
         # url parameter required but will be overridden by queue work items
@@ -180,6 +183,8 @@ class TeamOrchestrator:
         self.header_injection_worker_agent = HeaderInjectionAgent(url="", event_bus=self.event_bus)
         self.api_security_worker_agent = APISecurityAgent(url="", event_bus=self.event_bus)
         self.mass_assignment_worker_agent = MassAssignmentAgent(url="", event_bus=self.event_bus)
+        self.fileupload_worker_agent = FileUploadAgent(url="")
+        self.fileupload_worker_agent.event_bus = self.event_bus
 
         # Inject unified report_dir into all specialists (v3.1 - fixes data fragmentation)
         for agent in [
@@ -188,10 +193,18 @@ class TeamOrchestrator:
             self.ssrf_worker_agent, self.xxe_worker_agent, self.open_redirect_worker_agent,
             self.prototype_pollution_worker_agent, self.header_injection_worker_agent,
             self.api_security_worker_agent, self.mass_assignment_worker_agent,
+            self.fileupload_worker_agent,
             self.jwt_agent  # Also inject into JWT agent
         ]:
             agent.report_dir = self.report_dir
-        logger.info(f"Injected unified report_dir into 14 specialist agents")
+            # Inject captured session (cookies/headers) into specialists
+            if self.captured_session and self.captured_session.get("cookies"):
+                agent.cookies = self.captured_session["cookies"]
+                if hasattr(agent, "headers"):
+                    agent.headers.update(self.captured_session.get("headers", {}))
+                logger.debug(f"Injected auth session into {agent.name}")
+
+        logger.info(f"Injected unified report_dir and session into 15 specialist agents")
 
         # Use specialist dispatcher to check queues and start necessary specialists
         from bugtrace.core.specialist_dispatcher import dispatch_specialists
@@ -214,6 +227,7 @@ class TeamOrchestrator:
             "header_injection": self.header_injection_worker_agent,
             "api_security": self.api_security_worker_agent,
             "mass_assignment": self.mass_assignment_worker_agent,
+            "file_upload": self.fileupload_worker_agent,
         }
 
         # Set scan depth on exploitation agents before dispatch
@@ -638,6 +652,14 @@ class TeamOrchestrator:
             success = await browser_manager.login(login_url, self.auth_creds)
             if success:
                 dashboard.log("Authentication Successful. Session captured.", "SUCCESS")
+                # Capture session data for specialists
+                self.captured_session = await browser_manager.get_session_data()
+                logger.debug(f"Captured {len(self.captured_session.get('cookies', []))} cookies")
+                
+                # Store in global scan context for specialists that pull from it
+                from bugtrace.services.scan_context import store_auth_token
+                cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.captured_session.get("cookies", [])])
+                store_auth_token(str(self.scan_id), "browser_session", cookies=cookie_str)
             else:
                 dashboard.log("Authentication Failed. Proceeding as guest.", "WARN")
         except Exception as e:

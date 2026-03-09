@@ -139,6 +139,11 @@ VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
     # Insecure deserialization (explicit — "deserialization" already matches via substring)
     "insecure deserialization": "rce",
 
+    # File upload (dedicated specialist)
+    "file upload": "file_upload",
+    "unrestricted file upload": "file_upload",
+    "upload": "file_upload",
+
     # Misconfiguration types (from NucleiAgent — already validated, route to IDOR for access-control
     # related findings, or drop purely informational ones that are already in the report)
     "broken access control (admin)": "idor",
