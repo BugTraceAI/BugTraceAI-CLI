@@ -15,6 +15,7 @@ from bugtrace.agents.reporting_mod.formatters import (
     generate_curl,
     extract_validation_method,
     parse_nuclei_tech_for_report,
+    normalize_severity,
 )
 from bugtrace.agents.reporting_mod.finding_processor import (
     deduplicate_findings,
@@ -305,7 +306,7 @@ def _md_build_validated_findings(lines: List[str], validated: List[Dict], output
         return
 
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
-    validated_sorted = sorted(validated, key=lambda x: severity_order.get((x.get("severity") or "MEDIUM").upper(), 5))
+    validated_sorted = sorted(validated, key=lambda x: severity_order.get(normalize_severity(x.get("severity") or "MEDIUM").upper(), 5))
 
     template_path = Path(__file__).parent.parent.parent / "reporting" / "templates" / "finding_template.md"
 
@@ -345,7 +346,7 @@ def _md_build_pending_findings(lines: List[str], pending: List[Dict]) -> None:
     lines.append("> They likely represent valid vulnerabilities. Manual verification recommended.\n")
 
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
-    pending_sorted = sorted(pending, key=lambda x: severity_order.get((x.get("severity") or "HIGH").upper(), 5))
+    pending_sorted = sorted(pending, key=lambda x: severity_order.get(normalize_severity(x.get("severity") or "HIGH").upper(), 5))
 
     for i, f in enumerate(pending_sorted, 1):
         vuln_type = f.get('type', 'Unknown')

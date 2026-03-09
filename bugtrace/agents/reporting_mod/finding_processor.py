@@ -16,6 +16,7 @@ from bugtrace.agents.reporting_mod.types import (
     HEADER_READABLE_MAP,
 )
 from bugtrace.core.validation_status import ValidationStatus
+from bugtrace.agents.reporting_mod.formatters import normalize_severity
 from bugtrace.utils.logger import get_logger
 
 logger = get_logger("agents.reporting.finding_processor")
@@ -365,7 +366,7 @@ def deduplicate_findings(findings: List[Dict]) -> List[Dict]:
                 key=lambda x: (
                     x.get("status") == "VALIDATED_CONFIRMED",
                     {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}.get(
-                        (x.get("severity") or "medium").lower(), 2
+                        normalize_severity(x.get("severity") or "medium").lower(), 2
                     )
                 ),
                 reverse=True
@@ -396,7 +397,7 @@ def count_by_severity(validated: List[Dict]) -> Dict[str, int]:
     """Count findings by severity level."""
     by_severity = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
     for f in validated:
-        sev = (f.get("severity") or "medium").lower()
+        sev = normalize_severity(f.get("severity") or "medium").lower()
         if sev in by_severity:
             by_severity[sev] += 1
     return by_severity
@@ -632,7 +633,7 @@ def db_build_finding_dict(f) -> Dict:
     return {
         "id": f.id,
         "type": str(f.type.value if hasattr(f.type, 'value') else f.type),
-        "severity": f.severity,
+        "severity": normalize_severity(f.severity),
         "url": f.attack_url,
         "parameter": f.vuln_parameter,
         "payload": f.payload_used,
