@@ -633,7 +633,7 @@ class TeamOrchestrator:
         from bugtrace.core.diagnostics import diagnostics
         if not await diagnostics.run_all():
             dashboard.log("❌ CRITICAL SYSTEM FAILURE: Diagnostics failed. Aborting.", "CRITICAL")
-            raise RuntimeError("Diagnostics failed — target may be unreachable")
+            raise RuntimeError("Diagnostics failed (AI connectivity or System checks) — check your .env and Internet access")
         return True
 
     async def _handle_authentication(self):

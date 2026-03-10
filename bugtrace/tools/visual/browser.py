@@ -29,25 +29,11 @@ class BrowserManager:
             self._context: Optional[BrowserContext] = None
             self._lock = asyncio.Lock()
             self._initialized = True
-            self._setup_signal_handlers()
+            # REMOVED: Signal handlers here conflict with FastAPI/Worker loops
+            # Cleanup is handled by orchestrator/API lifecycle
 
-    def _setup_signal_handlers(self):
-        """Ensure browser closes on SIGINT/SIGTERM. (Stability Improvement #6)"""
-        import signal
-        try:
-            loop = asyncio.get_event_loop()
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
-        except (NotImplementedError, RuntimeError):
-            # Not supported on all platforms/configurations
-            pass
-            
     async def _kill_orphans(self):
-        """Kill zombie chrome/chromium processes launched by Playwright only.
-
-        Only kills processes with remote-debugging-port (Playwright's Chrome),
-        leaving user's personal Chrome untouched.
-        """
+        """Kill zombie chrome/chromium processes launched by Playwright only."""
         try:
             # Only kill Chrome instances launched with debugging port (Playwright)
             proc = await asyncio.create_subprocess_exec(
@@ -81,25 +67,37 @@ class BrowserManager:
                 )
                 logger.info("Browser started successfully.")
             except asyncio.TimeoutError:
-                logger.error("Playwright start timed out. Headless browser will be unavailable.", exc_info=True)
+                logger.error("Playwright start timed out. Headless browser will be unavailable.")
             except Exception as e:
                 logger.error(f"Failed to start browser: {e}", exc_info=True)
-                # Don't raise, allowing framework to run without browser
 
     async def stop(self):
-        """Stops the browser and cleans up resources."""
+        """Stops the browser and cleans up resources (resilient to loop errors)."""
         async with self._lock:
-            if self._context:
-                await self._context.close()
+            try:
+                if self._context:
+                    await self._context.close()
+            except Exception as e:
+                logger.debug(f"Context close error: {e}")
+            finally:
                 self._context = None
             
-            if self._browser:
-                await self._browser.close()
+            try:
+                if self._browser:
+                    await self._browser.close()
+            except Exception as e:
+                logger.warning(f"Browser stop loop mismatch or error: {e}")
+            finally:
                 self._browser = None
                 
-            if self._playwright:
-                await self._playwright.stop()
+            try:
+                if self._playwright:
+                    await self._playwright.stop()
+            except Exception as e:
+                logger.debug(f"Playwright stop error: {e}")
+            finally:
                 self._playwright = None
+                
             logger.info("Browser stopped.")
 
     @asynccontextmanager
