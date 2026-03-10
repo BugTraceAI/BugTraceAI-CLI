@@ -210,12 +210,44 @@ class ReportingAgent(BaseAgent):
         self._setup_output_directories()
         all_findings, tech_stack = await self._collect_all_findings()
 
-        # Phase 2: Categorize and enrich findings
+        # Phase 2: Categorize findings
         categorized = self._categorize_findings(all_findings)
-        enriched_list = categorized["validated"] + categorized["manual_review"]
-        await self._enrich_findings_batch(enriched_list)
 
-        # Phase 2.1: Persist enriched severity/confidence back to DB
+        # FIX (large-scan reliability): Write raw_findings.json BEFORE enrichment
+        # This ensures users always have data even if enrichment times out or crashes
+        # on large scans (100+ findings). The file will be overwritten below with
+        # the final version, but this acts as a safety checkpoint.
+        try:
+            raw_path = self.output_dir / "raw_findings.json"
+            with open(raw_path, "w", encoding="utf-8") as f:
+                json.dump({"findings": all_findings}, f, default=str, indent=2)
+            logger.info(f"[{self.name}] Safety checkpoint: wrote {len(all_findings)} raw findings before enrichment")
+        except Exception as e:
+            logger.warning(f"[{self.name}] Could not write safety checkpoint: {e}")
+
+        # Phase 2.1: Enrich findings — wrapped in a global timeout to prevent
+        # infinite hangs on large scans when LLM responses are slow.
+        # 20 minutes is generous but protects against truly stuck LLM calls.
+        ENRICHMENT_TIMEOUT = 1200  # 20 minutes
+        enriched_list = categorized["validated"] + categorized["manual_review"]
+        try:
+            await asyncio.wait_for(
+                self._enrich_findings_batch(enriched_list),
+                timeout=ENRICHMENT_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"[{self.name}] Enrichment timed out after {ENRICHMENT_TIMEOUT}s for scan {self.scan_id}. "
+                f"Proceeding with partial enrichment ({self._enrichment_total - self._enrichment_failures} enriched)."
+            )
+            dashboard.log(
+                f"[Reporting] Enrichment timed out — report will use partial CVSS/PoC data.",
+                "WARN"
+            )
+        except Exception as e:
+            logger.error(f"[{self.name}] Enrichment failed with unexpected error: {e}. Proceeding anyway.")
+
+        # Phase 2.2: Persist enriched severity/confidence back to DB
         self.db.update_findings_from_enrichment(self.scan_id, enriched_list)
 
         # Phase 2.5: Consolidate informational findings (group headers, API docs, etc.)
@@ -3446,13 +3478,18 @@ Output STRICT JSON array (no markdown):
             """
 
     async def _cvss_execute_llm(self, prompt: str) -> Optional[str]:
-        """Execute LLM call for CVSS calculation."""
-        # Use uncensored model for detailed security analysis
+        """Execute LLM call for CVSS calculation.
+
+        Note: actual HTTP timeout is 90s (LLM_TOTAL_TIMEOUT in llm_client.py).
+        Large batches (10 findings/chunk) generate bigger prompts that may use
+        most of this budget — the global 20-min enrichment timeout in
+        generate_all_deliverables() protects against true hangs.
+        """
         return await llm_client.generate(
             prompt,
             module_name="Reporting-CVSS",
             model_override=settings.REPORTING_MODEL,
-            temperature=0.3  # Higher temp for more creative/detailed explanations
+            temperature=0.3,
         )
 
     def _cvss_parse_response(self, response: str) -> Optional[Dict]:
