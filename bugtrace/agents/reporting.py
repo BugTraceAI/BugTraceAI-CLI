@@ -1814,6 +1814,9 @@ class ReportingAgent(BaseAgent):
         lines.append(f"| Field | Value |")
         lines.append(f"|-------|-------|")
         lines.append(f"| **Severity** | {finding.get('severity', 'MEDIUM')} |")
+        cvss_score = finding.get("cvss_score")
+        cvss_str = f"{cvss_score:.1f}" if cvss_score else "N/A"
+        lines.append(f"| **CVSS Score** | {cvss_str} |")
         lines.append(f"| **Status** | ✅ CONFIRMED |")
         lines.append(f"| **Validation Method** | {self._extract_validation_method(finding)} |")
         lines.append(f"| **URL** | `{finding.get('url', '')}` |")
@@ -1866,7 +1869,20 @@ class ReportingAgent(BaseAgent):
         lines.append("> These findings have high AI confidence but could not be confirmed via browser automation.\n")
 
         for i, f in enumerate(manual_review, 1):
+            severity = f.get('severity', 'HIGH').upper()
+            severity_badges = {
+                "CRITICAL": "🔴 CRITICAL",
+                "HIGH": "🟠 HIGH",
+                "MEDIUM": "🟡 MEDIUM",
+                "LOW": "🔵 LOW",
+                "INFO": "⚪ INFO"
+            }
+            severity_badge = severity_badges.get(severity, severity)
+            cvss_score = f.get("cvss_score")
+            cvss_str = f"{cvss_score:.1f}" if cvss_score else "N/A"
             lines.append(f"### MR-{i}. {f.get('type', 'Unknown')}\n")
+            lines.append(f"- **Severity:** {severity_badge}")
+            lines.append(f"- **CVSS Score:** {cvss_str}")
             lines.append(f"- **URL:** `{f.get('url', '')}`")
             lines.append(f"- **Parameter:** `{f.get('parameter', '')}`")
             lines.append(f"- **Payload:** `{f.get('payload', '')}`")
@@ -1908,6 +1924,9 @@ class ReportingAgent(BaseAgent):
             lines.append(f"| Field | Value |")
             lines.append(f"|-------|-------|")
             lines.append(f"| **Severity** | {severity_badge} |")
+            cvss_score = f.get("cvss_score")
+            cvss_str = f"{cvss_score:.1f}" if cvss_score else "N/A"
+            lines.append(f"| **CVSS Score** | {cvss_str} |")
             lines.append(f"| **Status** | ⏳ PENDING |")
             lines.append("")
             lines.append(f"**URL:** `{f.get('url', '')}`")

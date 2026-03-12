@@ -121,6 +121,8 @@ class EventType(str, Enum):
     AGENT_STARTED = "agent_started"
     AGENT_STOPPED = "agent_stopped"
     FINDING_VERIFIED = "finding_verified"  # Legacy alias for FINDING_VALIDATED
+    AUTH_TOKEN_DISCOVERED = "auth_token_discovered"
+
 
 
 @dataclass

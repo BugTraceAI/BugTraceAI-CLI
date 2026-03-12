@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     """
     # --- Project Metadata ---
     APP_NAME: str = "BgTraceAI-CLI"
-    VERSION: str = "3.4.3-beta"  # Auth & Specialist (Beta)
+    VERSION: str = "3.4.5-beta"  # Auth & Specialist (Beta)
     DEBUG: bool = False
     SAFE_MODE: bool = False # Default to False, override via CLI
 

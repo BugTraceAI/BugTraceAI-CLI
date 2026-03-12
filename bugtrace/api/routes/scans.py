@@ -60,7 +60,17 @@ async def create_scan(
     Raises:
         429: Too many concurrent scans (limit reached)
         400: Invalid request parameters
+        503: AI models not reachable (API key/credits)
     """
+    from bugtrace.core.llm_client import llm_client
+
+    if llm_client.api_key:
+        is_online = await llm_client.verify_connectivity()
+        if not is_online:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI Models are unresponsive. API Key may be invalid or out of credits."
+            )
     try:
         options = _build_scan_options(request)
         scan_id = await scan_service.create_scan(options, origin="web")

@@ -325,7 +325,13 @@ def _md_build_manual_review(lines: List[str], manual_review: List[Dict]) -> None
     lines.append("> These findings have high AI confidence but could not be confirmed via browser automation.\n")
 
     for i, f in enumerate(manual_review, 1):
+        severity = f.get('severity', 'HIGH').upper()
+        severity_badge = SEVERITY_BADGES.get(severity, severity)
+        cvss_score = f.get("cvss_score")
+        cvss_str = f"{cvss_score:.1f}" if cvss_score else "N/A"
         lines.append(f"### MR-{i}. {f.get('type', 'Unknown')}\n")
+        lines.append(f"- **Severity:** {severity_badge}")
+        lines.append(f"- **CVSS Score:** {cvss_str}")
         lines.append(f"- **URL:** `{f.get('url', '')}`")
         lines.append(f"- **Parameter:** `{f.get('parameter', '')}`")
         lines.append(f"- **Payload:** `{f.get('payload', '')}`")
@@ -357,6 +363,9 @@ def _md_build_pending_findings(lines: List[str], pending: List[Dict]) -> None:
         lines.append(f"| Field | Value |")
         lines.append(f"|-------|-------|")
         lines.append(f"| **Severity** | {severity_badge} |")
+        cvss_score = f.get("cvss_score")
+        cvss_str = f"{cvss_score:.1f}" if cvss_score else "N/A"
+        lines.append(f"| **CVSS Score** | {cvss_str} |")
         lines.append(f"| **Status** | ⏳ PENDING |")
         lines.append("")
         lines.append(f"**URL:** `{f.get('url', '')}`")
