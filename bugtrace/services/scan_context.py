@@ -29,6 +29,28 @@ def store_auth_token(scan_ctx_id: str, name: str, token: str = None, token_type:
         "cookies": cookies
     }
 
+    # Emit event so other agents can re-attack with new credentials
+    try:
+        from bugtrace.core.event_bus import event_bus
+        import asyncio
+        event_data = {
+            "scan_ctx_id": scan_ctx_id,
+            "token_name": name,
+            "token_type": token_type,
+            "roles": roles or ["admin", "user"],
+            "has_token": token is not None,
+            "has_cookies": cookies is not None,
+        }
+        # Fire-and-forget: if no event loop is running, skip silently
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(event_bus.emit("auth_token_discovered", event_data))
+        except RuntimeError:
+            pass  # No event loop running, skip
+    except Exception:
+        pass  # Never crash the token store
+
+
 
 def get_scan_auth_headers(scan_ctx_id: str, role: str = "admin") -> Dict[str, str]:
     """Get auth headers (Authorization + Cookie) from tokens discovered during this scan."""

@@ -35,7 +35,7 @@ Usage:
     health = orchestrator.get_health_report()
 
 Author: BgtraceAI Team
-Version: 3.4.3-beta
+Version: 3.4.4-beta
 Date: 2026-03-09
 """
 

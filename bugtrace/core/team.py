@@ -40,6 +40,8 @@ from bugtrace.agents.api_security_agent import APISecurityAgent
 from bugtrace.agents.chain_discovery_agent import ChainDiscoveryAgent
 from bugtrace.agents.openredirect_agent import OpenRedirectAgent
 from bugtrace.agents.prototype_pollution_agent import PrototypePollutionAgent
+from bugtrace.agents.reattack import ReAttackAgent
+
 
 # Event Bus integration
 from bugtrace.core.event_bus import event_bus
@@ -139,7 +141,11 @@ class TeamOrchestrator:
         from bugtrace.agents.thinking_consolidation_agent import ThinkingConsolidationAgent
         self.thinking_agent = ThinkingConsolidationAgent(scan_context=self.scan_context)
         
+        # Initialize ReAttackAgent for auth chaining (Task 4) - MOVED TO _init_state
+
+        
         self.captured_session = {"cookies": [], "headers": {}}
+
         logger.info("ThinkingConsolidationAgent initialized - V3 event-driven pipeline active")
 
         # Specialist worker pools will be initialized async in _run_hunter_core
@@ -264,7 +270,9 @@ class TeamOrchestrator:
             ('chain_discovery_agent', 'ChainDiscoveryAgent'),
             ('api_security_agent', 'APISecurityAgent'),
             ('agentic_validator', 'AgenticValidator'),
+            ('reattack_agent', 'ReAttackAgent'),
         ]
+
         for attr_name, display_name in auxiliary_agents:
             if hasattr(self, attr_name):
                 agent = getattr(self, attr_name)
@@ -394,6 +402,12 @@ class TeamOrchestrator:
         if hasattr(self, 'thinking_agent'):
             self.thinking_agent.scan_id = self.scan_id
             logger.info(f"Injected Scan ID {self.scan_id} into ThinkingConsolidationAgent")
+
+        # Initialize ReAttackAgent for auth chaining (Task 4)
+        # We do it here because scan_id is now available
+        self.reattack_agent = ReAttackAgent(event_bus=self.event_bus, scan_context=str(self.scan_id))
+        logger.info(f"ReAttackAgent initialized with scan_id: {self.scan_id}")
+
         self.url_queue = []
         self.vulnerabilities_by_url: Dict[str, list] = {}
 
@@ -2591,7 +2605,14 @@ class TeamOrchestrator:
         # Initialize and start pipeline
         self._init_pipeline()
         await self._start_pipeline()
+        
+        # Start ReAttackAgent background task (Task 4)
+        if hasattr(self, 'reattack_agent'):
+            asyncio.create_task(self.reattack_agent.start())
+            logger.info("[Pipeline] ReAttackAgent started (background loops active)")
+
         self._v.emit("pipeline.initializing", {"target": self.target, "scan_id": self.scan_id})
+
         conductor.notify_phase_change("reconnaissance", 0.0, "Pipeline started")
         self._sync_scan_context("RECONNAISSANCE", "ReconAgent")
 

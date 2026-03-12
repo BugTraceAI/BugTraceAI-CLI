@@ -465,7 +465,7 @@ class LLMClient:
                 async with session.post(self.base_url, headers=headers, json=payload, timeout=5) as resp:
                     return self._log_ping_result(model, resp.status)
         except Exception as e:
-            dashboard.log(f"Model {model} unreachable: {e}", "WARN")
+            dashboard.log(f"Model {model} unreachable: {e}. Check API key and limits.", "ERROR")
             return False
 
     def _log_ping_result(self, model: str, status: int) -> bool:
@@ -474,7 +474,7 @@ class LLMClient:
             dashboard.log(f"Model {model} is ONLINE.", "SUCCESS")
             return True
 
-        dashboard.log(f"Model {model} failed health check ({status}).", "WARN")
+        dashboard.log(f"Model {model} failed health check ({status}). API Key may be invalid or out of credits.", "ERROR")
         return False
 
     def _report_connectivity_status(self, valid_models: list) -> bool:

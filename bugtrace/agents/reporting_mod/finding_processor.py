@@ -427,7 +427,11 @@ def event_finding_to_db_format(event_finding: Dict) -> Dict:
         "payload": event_finding.get("payload", ""),
         "description": event_finding.get("description") or evidence.get("description", ""),
         "status": event_finding.get("status", "VALIDATED_CONFIRMED"),
-        "validator_notes": event_finding.get("cdp_reasoning") or event_finding.get("reasoning", ""),
+        "validator_notes": (
+            (event_finding.get("cdp_reasoning") or event_finding.get("reasoning", "")) +
+            (" [EXPLOIT CHAINED]" if event_finding.get("_chain_exploit") else "")
+        ).strip(),
+
         "screenshot_path": event_finding.get("screenshot_path"),
         "validation_method": event_finding.get("validation_method", "event_bus"),
         "source": "event_bus",

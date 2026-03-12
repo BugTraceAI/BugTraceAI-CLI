@@ -424,6 +424,9 @@ def md_build_finding_entry_inline(finding: Dict, index: int) -> str:
     lines.append(f"| Field | Value |")
     lines.append(f"|-------|-------|")
     lines.append(f"| **Severity** | {finding.get('severity', 'MEDIUM')} |")
+    cvss_score = finding.get("cvss_score")
+    cvss_str = f"{cvss_score:.1f}" if cvss_score else "N/A"
+    lines.append(f"| **CVSS Score** | {cvss_str} |")
     lines.append(f"| **Status** | ✅ CONFIRMED |")
     lines.append(f"| **Validation Method** | {extract_validation_method(finding)} |")
     lines.append(f"| **URL** | `{finding.get('url', '')}` |")

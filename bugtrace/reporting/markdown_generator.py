@@ -120,6 +120,10 @@ class MarkdownGenerator:
         f.write(f"| Classification | Detail |\n")
         f.write(f"| :--- | :--- |\n")
         f.write(f"| **Severity** | {vuln.severity.value} |\n")
+        cvss = vuln.cvss_score if vuln.cvss_score else "N/A"
+        if isinstance(cvss, (int, float)):
+            cvss = f"{cvss:.1f}"
+        f.write(f"| **CVSS Score** | {cvss} |\n")
         f.write(f"| **Confidence** | {vuln.confidence.value} |\n")
         ftype = vuln.validation_method or vuln.metadata.get('validation_method', 'Automated Check')
         f.write(f"| **Validation** | {ftype} |\n")
