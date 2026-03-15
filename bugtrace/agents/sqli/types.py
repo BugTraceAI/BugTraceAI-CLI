@@ -187,7 +187,7 @@ class SQLiFinding:
     url: str
     parameter: str
     type: str = "SQLI"
-    severity: str = "CRITICAL"
+    severity: str = "MEDIUM"  # Conservative default - upgrade to CRITICAL only with strong evidence
 
     # Core Classification
     injection_type: str = "unknown"  # UNION-based, boolean-blind, etc.

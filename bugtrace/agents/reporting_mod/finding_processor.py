@@ -274,6 +274,51 @@ def meets_report_quality(finding: Dict) -> bool:
         )
         return False
 
+    # --- Filter 3: SQLi without solid exploitation evidence ---
+    if vuln_type == "SQLI":
+        # Strong evidence indicators
+        has_sqlmap_confirmed = evidence.get("sqlmap_confirmed") is True
+        has_data_extracted = bool(
+            finding.get("extracted_databases") or 
+            finding.get("extracted_tables") or 
+            finding.get("sample_data")
+        )
+        has_oob_callback = evidence.get("oob_callback_received") is True
+        
+        # Error-based requires DB type identified + not just "unknown"
+        has_solid_error = (
+            finding.get("dbms_detected") not in (None, "unknown") and
+            level in ("L1", "L2", "L3")
+        )
+        
+        # Time-based requires triple verification
+        has_verified_time = (
+            evidence.get("time_based_triple_verified") is True
+        )
+        
+        # Boolean requires at least medium confidence
+        has_confirmed_boolean = (
+            finding.get("type") == "SQLI" and
+            evidence.get("boolean_confidence") in ("HIGH", "MAXIMUM")
+        )
+        
+        has_solid_evidence = (
+            has_sqlmap_confirmed or
+            has_data_extracted or
+            has_oob_callback or
+            has_solid_error or
+            has_verified_time or
+            has_confirmed_boolean
+        )
+        
+        if not has_solid_evidence:
+            logger.info(
+                f"[ReportingAgent] Report quality gate: SQLI/{finding.get('parameter')} "
+                f"lacks solid exploitation evidence (status_differential/weak boolean), "
+                f"routing to manual_review"
+            )
+            return False
+
     return True
 
 
