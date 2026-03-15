@@ -9,22 +9,15 @@ info:
     This API provides full scan lifecycle management, real-time WebSocket streaming, report generation,
     and runtime configuration.
 
-    ## Authentication
-
-    No authentication is required. Access is controlled via CORS origins configured in the
-    `BUGTRACE_CORS_ORIGINS` environment variable.
-
-    ## Real-time Events
-
-    Use the WebSocket endpoints (`/ws/scans/{scan_id}` or `/ws/global`) to receive live scan events
-    including progress updates, phase transitions, and new findings as they are discovered.
-  version: 2.0.0
+    **Local deployment only.** No authentication required (access is trusted local/LAN).
+    WebSocket endpoints available for real-time scan events and findings.
+  version: 3.4.6
   contact:
     name: BugTraceAI
     url: https://bugtraceai.com
   license:
-    name: MIT
-    url: https://opensource.org/licenses/MIT
+    name: AGPL-3.0
+    url: https://www.gnu.org/licenses/agpl-3.0.html
 
 servers:
   - url: http://localhost:8000

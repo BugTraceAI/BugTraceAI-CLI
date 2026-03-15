@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv() # Force load .env
 
+from bugtrace import __version__
 from bugtrace.utils.logger import get_logger
 
 logger = get_logger("core.config")
@@ -31,8 +32,8 @@ class Settings(BaseSettings):
     Loads from .env file and environment variables.
     """
     # --- Project Metadata ---
-    APP_NAME: str = "BgTraceAI-CLI"
-    VERSION: str = "3.4.6-beta"  # Auth & Specialist (Beta)
+    APP_NAME: str = "BugTraceAI-CLI"
+    VERSION: str = __version__  # Synced from bugtrace.__version__
     DEBUG: bool = False
     SAFE_MODE: bool = False # Default to False, override via CLI
 
