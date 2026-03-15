@@ -1,0 +1,80 @@
+---
+name: "BugTraceAI-CLI Developer"
+description: |
+  Agent specialized in issue resolution, refactoring, and feature extension for the
+  BugTraceAI-CLI backend: FastAPI REST API, scan pipeline, vulnerability agents, and
+  automated offensive security tooling.
+---
+
+## Project context
+
+- Stack: Python 3.10+, FastAPI, Typer, SQLite/SQLModel/Alembic, LanceDB, Loguru, Pydantic v2.
+- REST API lives in `bugtrace/api/` (port 8000). CLI entry point is `bugtrace/__main__.py` (Typer + Rich).
+- Async-first architecture: all scan logic, HTTP calls, and DB access must be asynchronous.
+- Each vulnerability class has its own agent under `bugtrace/agents/<vuln>/`.
+- The scan pipeline is orchestrated by `bugtrace/core/pipeline.py` and `conductor.py`.
+- All configuration goes in `bugtraceaicli.conf` and `.env`. No hardcoded values in source code.
+
+## Code style
+
+- Mirror the existing codebase style. Do not introduce unrelated style changes.
+- Formatter: Black with `line-length = 120`; imports: isort with `profile = "black"`.
+- Add type hints to every new or modified function. mypy runs with `ignore_missing_imports = true`.
+- Naming: `snake_case` for modules, functions, and variables; `PascalCase` for classes and Pydantic models.
+- Use **Loguru** exclusively for logging (`from loguru import logger`). Never use `print()`.
+- Do not add external dependencies unless strictly required and explicitly justified.
+
+## Architecture and patterns
+
+- **Async first**: use `async/await` in every function that touches I/O (DB, HTTP, filesystem).
+  Never call blocking functions inside async contexts; wrap them with `asyncio.to_thread()` if needed.
+- **New vulnerability agent**: create under `bugtrace/agents/<vuln>/<vuln>_agent.py` implementing
+  the `BaseAgent` interface, then register it in `bugtrace/core/conductor.py`.
+- **Database**: SQLite is the source of truth. Every schema change requires an Alembic migration
+  (`alembic revision --autogenerate`). Never run raw DDL.
+- **Schemas**: request/response models go in `bugtrace/schemas/`. Use Pydantic v2 with explicit
+  validators; never expose ORM models directly in route handlers.
+- **External HTTP**: use `httpx.AsyncClient` with explicit timeouts. Do not instantiate the client
+  at module scope; inject it or create it with a context manager.
+- **Event bus**: propagate scan events through `bugtrace/core/event_bus.py`.
+  Do not couple agents directly to each other.
+
+## Issue resolution
+
+- Identify and fix the root cause, not the symptom.
+- Reproduce the bug with a failing test before making any code change.
+- If the fix changes a module's public API, update the corresponding docstring.
+- Check whether the issue touches the WAF bypass flow (`bugtrace/tools/waf/`) or the
+  false-positive validator (`core/validator_engine.py`) before assuming it is isolated.
+
+## Testing
+
+- Framework: `pytest` with `asyncio_mode = "auto"` and `pytest-cov`.
+- Every bug fix must include a regression test. Every new feature must include unit tests and,
+  if it involves real I/O, an integration test.
+- Mark tests with `@pytest.mark.unit` or `@pytest.mark.integration` as appropriate.
+- Tests live in `tests/` mirroring the structure of `bugtrace/`
+  (e.g. `tests/agents/xss/test_xss_agent.py`).
+- Mock LLM calls with `unittest.mock.AsyncMock`. Never make real calls to paid APIs in tests.
+- Verify minimum coverage for the modified module with `pytest --cov=bugtrace/<module>`.
+
+## Security
+
+- Never hardcode credentials, API keys, or secrets in source code.
+- Sanitize all user-supplied input (scan URLs, payloads) before passing it to subprocesses or SQL queries.
+- Validate URLs with `pydantic.AnyHttpUrl` before starting any scan.
+- Respect `core/instance_lock.py`: never start a scan without checking the instance lock first.
+
+## Git and version control
+
+- **Always push to the `origin` remote (private, BugTraceAI-CLI-DEV)**. Never push to `public` (public repo).
+- Stage only the files relevant to the change. Never use `git add .` or `git add -A`.
+- Commit message format: `feat:`, `fix:`, `refactor:`, `test:`, or `chore:` followed by a concise description.
+- Do not include `Co-Authored-By` in commits.
+- The `tests/` directory, secrets, and the Anthropic OAuth Client ID must never be pushed to `public`.
+
+## Performance
+
+- Identify and resolve blocking calls or N+1 queries in any code being modified.
+- Use semaphores (`core/phase_semaphores.py`) to control parallelism within pipeline phases.
+- Prefer streaming or chunked processing over loading full result sets into memory for large scans.
