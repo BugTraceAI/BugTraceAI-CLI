@@ -143,14 +143,28 @@ check_local_requirements() {
     return 0
 }
 
+check_docker_compose_works() {
+    # Try docker compose (V2) first, then docker-compose (V1)
+    if docker compose version &> /dev/null; then
+        print_success "Docker Compose V2 is installed"
+        return 0
+    elif docker-compose version &> /dev/null; then
+        print_success "Docker Compose V1 is installed"
+        return 0
+    else
+        print_error "Docker Compose is not installed or not working"
+        return 1
+    fi
+}
+
 check_docker_requirements() {
     print_step "Checking Docker installation requirements..."
     echo ""
-    
+
     local all_ok=true
-    
+
     check_command docker "Docker" || all_ok=false
-    check_command docker-compose "Docker Compose" || check_command "docker compose" "Docker Compose" || all_ok=false
+    check_docker_compose_works || all_ok=false
     
     # Check if Docker daemon is running
     if docker info &> /dev/null; then
@@ -366,11 +380,14 @@ install_docker() {
     print_step "Building Docker image..."
     print_info "This may take 5-10 minutes on first build..."
     
-    # Check if docker-compose or docker compose is available
-    if command -v docker-compose &> /dev/null; then
+    # Prefer docker compose (V2) over docker-compose (V1) - V1 has Python 3.12 issues
+    if docker compose version &> /dev/null; then
+        COMPOSE_CMD="docker compose"
+    elif docker-compose version &> /dev/null; then
         COMPOSE_CMD="docker-compose"
     else
-        COMPOSE_CMD="docker compose"
+        print_error "Docker Compose not available"
+        exit 1
     fi
     
     $COMPOSE_CMD build
