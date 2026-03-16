@@ -28,9 +28,9 @@ services:
     ports:
       - "8001:8001"
     volumes:
-      - ./reports:/app/reports
-      - ./logs:/app/logs
-      - ./data:/app/data
+      - cli-reports:/app/reports
+      - cli-logs:/app/logs
+      - cli-db:/app/data
     env_file:
       - .env
     depends_on:
@@ -47,4 +47,5 @@ services:
 volumes:
   cli-scans:
   cli-reports:
+  cli-logs:
   cli-db:
