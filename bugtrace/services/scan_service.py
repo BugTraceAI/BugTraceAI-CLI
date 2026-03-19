@@ -235,6 +235,7 @@ class ScanService:
             output_dir=output_dir,
             scan_id=ctx.scan_id,  # Pass existing scan_id to avoid duplicate creation
             scan_depth=ctx.options.scan_depth or settings.SCAN_DEPTH,
+            url_list=ctx.options.url_list,  # Pre-defined URL list from file upload or Swagger
         )
 
         # CRITICAL: Monkey-patch stop_event for graceful shutdown

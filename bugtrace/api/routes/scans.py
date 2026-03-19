@@ -100,6 +100,7 @@ def _build_scan_options(request: CreateScanRequest) -> ScanOptions:
         scan_depth=request.scan_depth,
         auth_token=request.auth_token,
         auth=request.auth,
+        url_list=request.url_list,
     )
 
 
