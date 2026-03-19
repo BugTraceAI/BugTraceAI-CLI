@@ -83,6 +83,7 @@ def main_callback(ctx: typer.Context):
 def scan(
     target: str = typer.Argument(..., help="The target URL to scan (Hunter phase)"),
     url_list_file: Optional[str] = typer.Option(None, "--url-list-file", "-ul", help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
+    swagger_file: Optional[str] = typer.Option(None, "--swagger", "-sw", help="Swagger/OpenAPI JSON file to import endpoints"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
     clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
@@ -95,7 +96,7 @@ def scan(
     param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
 ):
     """Run the Discovery (Hunter) phase only."""
-    _run_pipeline(target, phase="hunter", url_list_file=url_list_file, safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    _run_pipeline(target, phase="hunter", url_list_file=url_list_file, swagger_file=swagger_file, safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
 
 @app.command(name="audit")
 def audit(
@@ -109,6 +110,7 @@ def audit(
 def full_scan(
     target: str = typer.Argument(..., help="The target URL for full engagement"),
     url_list_file: Optional[str] = typer.Option(None, "--url-list-file", "-ul", help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
+    swagger_file: Optional[str] = typer.Option(None, "--swagger", "-sw", help="Swagger/OpenAPI JSON file to import endpoints"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
     clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
@@ -122,7 +124,7 @@ def full_scan(
     param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
 ):
     """Run Hunter followed by Auditor (The complete professional workflow)."""
-    _run_pipeline(target, phase="all", url_list_file=url_list_file, safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    _run_pipeline(target, phase="all", url_list_file=url_list_file, swagger_file=swagger_file, safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
 
 @app.command(name="serve")
 def serve(
@@ -261,6 +263,156 @@ def tui(
         raise typer.Exit(code=1)
 
 
+def _load_swagger(file_path: str, target: str) -> list:
+    """
+    Load URLs from Swagger/OpenAPI JSON file.
+    Parses endpoints and generates URLs with example parameters.
+
+    Args:
+        file_path: Path to swagger.json or openapi.json
+        target: Base target URL
+
+    Returns:
+        List of URLs generated from API spec
+    """
+    import json
+    from pathlib import Path
+    from urllib.parse import urlparse, urlencode
+
+    if not Path(file_path).exists():
+        raise FileNotFoundError(f"Swagger file not found: {file_path}")
+
+    with open(file_path, 'r') as f:
+        try:
+            spec = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in Swagger file: {e}")
+
+    # Detect OpenAPI version
+    is_openapi3 = spec.get('openapi', '').startswith('3.')
+    is_swagger2 = spec.get('swagger', '').startswith('2.')
+
+    if not is_openapi3 and not is_swagger2:
+        raise ValueError("File is not a valid Swagger 2.0 or OpenAPI 3.x specification")
+
+    # Get base path
+    target_parsed = urlparse(target)
+    base_url = f"{target_parsed.scheme}://{target_parsed.netloc}"
+
+    if is_swagger2:
+        base_path = spec.get('basePath', '')
+    else:
+        # OpenAPI 3.x uses servers array
+        servers = spec.get('servers', [])
+        if servers and 'url' in servers[0]:
+            server_url = servers[0]['url']
+            if server_url.startswith('/'):
+                base_path = server_url
+            elif server_url.startswith('http'):
+                # Full URL in server, extract path
+                base_path = urlparse(server_url).path
+            else:
+                base_path = ''
+        else:
+            base_path = ''
+
+    urls = []
+    paths = spec.get('paths', {})
+
+    for path, methods in paths.items():
+        for method, details in methods.items():
+            if method.lower() not in ['get', 'post', 'put', 'patch', 'delete', 'options', 'head']:
+                continue
+
+            # Build URL with path
+            full_path = f"{base_path}{path}".replace('//', '/')
+            url = f"{base_url}{full_path}"
+
+            # Handle path parameters - replace {param} with example values
+            if '{' in url:
+                url = _replace_path_params(url, details.get('parameters', []))
+
+            # Handle query parameters for GET requests
+            if method.lower() == 'get':
+                query_params = _extract_query_params(details.get('parameters', []))
+                if query_params:
+                    url = f"{url}?{urlencode(query_params)}"
+
+            urls.append(url)
+
+    # Deduplicate
+    urls = list(dict.fromkeys(urls))
+
+    if not urls:
+        raise ValueError(f"No endpoints found in Swagger file: {file_path}")
+
+    console.print(f"[green]✅ Loaded {len(urls)} endpoints from Swagger: {file_path}[/green]")
+    console.print(f"[dim]   Spec: {'OpenAPI 3.x' if is_openapi3 else 'Swagger 2.0'}[/dim]")
+
+    return urls
+
+
+def _replace_path_params(url: str, parameters: list) -> str:
+    """Replace path parameters with example or default values."""
+    import re
+
+    param_values = {}
+    for param in parameters:
+        if param.get('in') == 'path':
+            name = param.get('name', '')
+            # Use example, default, or generate a test value
+            value = param.get('example') or param.get('default') or _generate_param_value(param)
+            param_values[name] = value
+
+    # Replace {param} patterns
+    def replacer(match):
+        param_name = match.group(1)
+        return str(param_values.get(param_name, '1'))
+
+    return re.sub(r'\{(\w+)\}', replacer, url)
+
+
+def _extract_query_params(parameters: list) -> dict:
+    """Extract query parameters with example values."""
+    query_params = {}
+    for param in parameters:
+        if param.get('in') == 'query':
+            name = param.get('name', '')
+            value = param.get('example') or param.get('default') or _generate_param_value(param)
+            query_params[name] = value
+    return query_params
+
+
+def _generate_param_value(param: dict) -> str:
+    """Generate a test value based on parameter type."""
+    param_type = param.get('type') or param.get('schema', {}).get('type', 'string')
+    param_name = param.get('name', '').lower()
+
+    # Common parameter patterns
+    if 'id' in param_name:
+        return '1'
+    if 'page' in param_name:
+        return '1'
+    if 'limit' in param_name or 'size' in param_name:
+        return '10'
+    if 'email' in param_name:
+        return 'test@example.com'
+    if 'name' in param_name:
+        return 'test'
+    if 'search' in param_name or 'query' in param_name or 'q' == param_name:
+        return 'test'
+
+    # Type-based defaults
+    if param_type == 'integer':
+        return '1'
+    if param_type == 'boolean':
+        return 'true'
+    if param_type == 'number':
+        return '1.0'
+
+    return 'test'
+
+
 def _load_url_list(file_path: str, target: str) -> list:
     """
     Load URLs from file, one per line.
@@ -322,14 +474,20 @@ def _load_url_list(file_path: str, target: str) -> list:
 
     return urls
 
-def _run_pipeline(target, phase="all", url_list_file=None, safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
+def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
     """Internal helper to run the pipeline phases."""
     if safe_mode is not None:
         settings.SAFE_MODE = safe_mode
 
-    # Load URL list if provided
+    # Load URL list from file or Swagger
     url_list = None
-    if url_list_file:
+    if swagger_file:
+        try:
+            url_list = _load_swagger(swagger_file, target)
+        except Exception as e:
+            console.print(f"[bold red]Error loading Swagger file:[/bold red] {e}")
+            raise typer.Exit(code=1)
+    elif url_list_file:
         try:
             url_list = _load_url_list(url_list_file, target)
         except Exception as e:

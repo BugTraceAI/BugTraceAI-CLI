@@ -1439,6 +1439,7 @@ class TeamOrchestrator:
 
         # ========== URL List Mode (NEW) ==========
         if self.url_list_provided:
+            logger.info(f"[RECON] URL List Mode: Using {len(self.url_list_provided)} provided URLs")
             dashboard.log(f"📋 URL List Mode: Using {len(self.url_list_provided)} provided URLs", "INFO")
             dashboard.log("⏩ Bypassing GoSpider (list provided)", "INFO")
 
@@ -2930,7 +2931,8 @@ class TeamOrchestrator:
         dashboard.set_phase("👁️ RECON MODE")
         dashboard.set_status("Running", "Discovery in progress...")
 
-        if not await self._check_target_health(dashboard):
+        # Skip health check if URL list provided (user knows what they're doing)
+        if not self.url_list_provided and not await self._check_target_health(dashboard):
             return
 
         self.tech_profile = {"frameworks": [], "server": "unknown"}

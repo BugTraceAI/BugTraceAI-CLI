@@ -34,6 +34,7 @@ class CreateScanRequest(BaseModel):
     param: Optional[str] = Field(default=None, description="Specific parameter to target")
     auth_token: Optional[str] = Field(default=None, description="Pre-authenticated Bearer token (Level 1)")
     auth: Optional[Dict[str, Any]] = Field(default=None, description="Auto-login credentials: {login_url, credentials: {email, password}} (Level 2)")
+    url_list: Optional[List[str]] = Field(default=None, description="Pre-defined URL list (from URL list file or Swagger import)")
 
 
 class ScanStatusResponse(BaseModel):

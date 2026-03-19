@@ -89,6 +89,7 @@ class ScanOptions(BaseModel):
     scan_depth: str = ""  # empty = use settings.SCAN_DEPTH default
     auth_token: Optional[str] = None  # Level 1: pre-authenticated Bearer token
     auth: Optional[Dict[str, Any]] = None  # Level 2: {login_url, credentials: {email, password}}
+    url_list: Optional[List[str]] = None  # Pre-defined URL list (from file upload or Swagger import)
 
 
 class ScanContext:
