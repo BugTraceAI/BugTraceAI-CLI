@@ -11,7 +11,7 @@ info:
 
     **Local deployment only.** No authentication required (access is trusted local/LAN).
     WebSocket endpoints available for real-time scan events and findings.
-  version: 3.4.6
+  version: 3.4.9-beta
   contact:
     name: BugTraceAI
     url: https://bugtraceai.com
