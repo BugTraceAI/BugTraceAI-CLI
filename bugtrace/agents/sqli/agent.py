@@ -735,17 +735,7 @@ class SQLiAgent(BaseAgent, TechContextMixin):
                 result = await self._sqli_escalation_pipeline(url, param, dry_item)
 
             if result:
-                finding_dict = {
-                    "type": "SQLI",
-                    "url": result.url,
-                    "parameter": result.parameter,
-                    "payload": result.working_payload,
-                    "technique": result.injection_type,
-                    "dbms": result.dbms_detected,
-                    "evidence": {"data_extracted": True},
-                    "status": "VALIDATED_CONFIRMED",
-                    "validated": True
-                }
+                finding_dict = self._finding_to_dict(result)
 
                 is_valid, error_msg = self._validate_before_emit(finding_dict)
                 if not is_valid:
@@ -754,7 +744,7 @@ class SQLiAgent(BaseAgent, TechContextMixin):
 
                 self._emit_sqli_finding(
                     finding_dict,
-                    status="VALIDATED_CONFIRMED",
+                    status=finding_dict.get("status", "VALIDATED_CONFIRMED"),
                     needs_cdp=False
                 )
 
@@ -772,7 +762,7 @@ class SQLiAgent(BaseAgent, TechContextMixin):
                 dashboard.add_finding(
                     "SQL Injection",
                     f"{result.url} [{result.parameter}] ({result.injection_type})",
-                    "CRITICAL"
+                    result.severity
                 )
                 dashboard.log(f"[{self.name}] SQLI CONFIRMED: {result.parameter} vulnerable via {result.injection_type}", "SUCCESS")
 
@@ -958,21 +948,11 @@ class SQLiAgent(BaseAgent, TechContextMixin):
 
         self._emitted_findings.add(fingerprint)
 
-        finding_dict = {
-            "type": "SQLI",
-            "url": result.url,
-            "parameter": result.parameter,
-            "payload": result.working_payload,
-            "technique": result.injection_type,
-            "dbms": result.dbms_detected,
-            "evidence": {"data_extracted": True},
-            "status": "VALIDATED_CONFIRMED",
-            "validated": True
-        }
+        finding_dict = self._finding_to_dict(result)
 
         self._emit_sqli_finding(
             finding_dict,
-            status="VALIDATED_CONFIRMED",
+            status=finding_dict.get("status", "VALIDATED_CONFIRMED"),
             needs_cdp=False
         )
 
@@ -981,7 +961,7 @@ class SQLiAgent(BaseAgent, TechContextMixin):
         dashboard.add_finding(
             "SQL Injection",
             f"{result.url} [{result.parameter}] ({result.injection_type})",
-            "CRITICAL"
+            result.severity
         )
         dashboard.log(f"[{self.name}] SQLI CONFIRMED: {result.parameter} vulnerable via {result.injection_type}", "SUCCESS")
 

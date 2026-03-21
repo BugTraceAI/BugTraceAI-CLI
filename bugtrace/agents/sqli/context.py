@@ -339,12 +339,15 @@ def validate_sqli_finding(finding: Dict) -> Tuple[bool, str]:
     evidence = finding.get("evidence", {})
 
     # Check for proof of SQL injection
-    has_error = evidence.get("error_message") or evidence.get("sql_error")
+    has_error = (evidence.get("error_message") or evidence.get("sql_error")
+                 or evidence.get("sql_error_visible"))
     has_time = evidence.get("time_delay") or evidence.get("time_based")
     has_data = evidence.get("data_extracted") or evidence.get("extracted_data")
+    has_sqlmap = evidence.get("sqlmap_confirmed") is True
+    has_oob = evidence.get("oob_callback_received") is True
 
-    if not (has_error or has_time or has_data):
-        return False, "SQLi requires proof: SQL error, time delay, or data extraction"
+    if not (has_error or has_time or has_data or has_sqlmap or has_oob):
+        return False, "SQLi requires proof: SQL error, time delay, data extraction, sqlmap confirm, or OOB callback"
 
     # Payload sanity check (should have SQL syntax or SQL probe chars)
     payload = str(finding.get("payload", ""))
