@@ -112,6 +112,9 @@ class TeamOrchestrator:
         # Legacy compatibility
         self.output_dir = self.report_dir
 
+        # Track last phase completed for scan resumption
+        self._last_phase = None
+
         # Initialize specialist agents
         self._init_specialist_agents()
 
@@ -435,6 +438,33 @@ class TeamOrchestrator:
 
     def set_auth(self, creds: str):
         self.auth_creds = creds
+
+    def _record_phase_complete(self, phase_name: str) -> None:
+        """
+        Record that a phase has completed for scan resumption tracking.
+        
+        Args:
+            phase_name: Name of the phase that completed (e.g., "reconnaissance", "discovery")
+        """
+        self._last_phase = phase_name
+        
+        # Update DB with last completed phase
+        try:
+            from bugtrace.schemas.db_models import ScanTable
+            from sqlmodel import select
+            
+            db = get_db_manager()
+            with db.get_session() as session:
+                scan = session.exec(
+                    select(ScanTable).where(ScanTable.id == self.scan_id)
+                ).first()
+                if scan:
+                    scan.last_phase_completed = phase_name
+                    session.add(scan)
+                    session.commit()
+                    logger.debug(f"Recorded phase complete: {phase_name}")
+        except Exception as e:
+            logger.warning(f"Failed to record phase complete: {e}")
 
     def _sync_scan_context(self, phase: str, agent: str = "System",
                           findings_count: Optional[int] = None,
@@ -2643,6 +2673,7 @@ class TeamOrchestrator:
         conductor.notify_phase_change("reconnaissance", 1.0, f"{len(self.urls_to_scan)} URLs discovered")
         conductor.notify_metrics(urls_discovered=len(self.urls_to_scan))
         self._sync_scan_context("RECONNAISSANCE", "ReconAgent", progress=10)
+        self._record_phase_complete("reconnaissance")
 
         await self._lifecycle.signal_phase_complete(
             PipelinePhase.RECONNAISSANCE,
@@ -2724,6 +2755,7 @@ class TeamOrchestrator:
         errors_count = urls_count - reports_generated  # FIX: count by actual JSON files, not in-memory dict
 
         self._v.emit("pipeline.checkpoint", {"phase": "discovery", "urls": urls_count, "reports": reports_generated, "errors": errors_count})
+        self._record_phase_complete("discovery")
         conductor.verify_integrity("discovery",
             {'urls_count': urls_count},
             {'dast_reports_count': reports_generated, 'errors': errors_count})
@@ -2832,6 +2864,7 @@ class TeamOrchestrator:
             findings_distributed=queue_results.get('items_distributed', 0),
             by_specialist=queue_results.get('by_specialist', {})
         )
+        self._record_phase_complete("exploitation")
 
         # ========== INTEGRITY CHECKPOINT 3: Exploitation (WET → DRY) ==========
         wet_processed = batch_metrics.wet_processed
@@ -2853,6 +2886,7 @@ class TeamOrchestrator:
             self.thinking_agent.log_batch_summary()
 
         await self._checkpoint("Batch Analysis & Queue-based Exploitation")
+        self._record_phase_complete("validation")
 
         # Signal EXPLOITATION complete AFTER queue drain finishes
         self._v.emit("exploit.phase_stats", {
