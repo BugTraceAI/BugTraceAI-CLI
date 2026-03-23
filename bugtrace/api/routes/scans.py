@@ -321,6 +321,12 @@ async def resume_scan(
         result = await scan_service.resume_scan(scan_id)
         logger.info(f"Scan {scan_id} resumed")
         return StopScanResponse(**result)
+    except RuntimeError as e:
+        logger.warning(f"Cannot resume scan {scan_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(e),
+        )
     except ValueError as e:
         logger.error(f"Cannot resume scan {scan_id}: {e}", exc_info=True)
         raise HTTPException(
