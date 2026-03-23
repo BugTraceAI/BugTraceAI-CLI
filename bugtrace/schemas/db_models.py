@@ -49,6 +49,10 @@ class ScanTable(SQLModel, table=True):
     max_depth: Optional[int] = Field(default=None)  # Crawl depth used
     max_urls: Optional[int] = Field(default=None)  # Max URLs configured
     provider: Optional[str] = Field(default=None)  # LLM provider used: "openrouter", "zai", etc.
+    last_phase_completed: Optional[str] = Field(default=None)  # Last successful phase for resume: "reconnaissance", "discovery", etc.
+    retry_count: int = Field(default=0)  # Number of resume attempts
+    last_error: Optional[str] = Field(default=None)  # Last error message if interrupted
+    resumed_from_id: Optional[int] = Field(default=None)  # Previous scan ID if this is a resumed scan
 
     target: Optional[TargetTable] = Relationship(back_populates="scans")
     findings: List["FindingTable"] = Relationship(back_populates="scan")

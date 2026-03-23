@@ -1194,6 +1194,129 @@ class ScanService:
         """Get list of active scan IDs."""
         return list(self._active_scans.keys())
 
+    def find_incomplete_scan(self, target_url: str, scan_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Find the most recent FAILED scan with recovery artifacts for resumption.
+        
+        Args:
+            target_url: URL to find incomplete scan for
+            scan_type: Optional scan type filter ("full", "hunter", etc)
+            
+        Returns:
+            Dict with scan metadata if incomplete scan found, None otherwise
+        """
+        from bugtrace.schemas.db_models import ScanTable, TargetTable, ScanStatus
+        from sqlmodel import select
+        
+        with self.db.get_session() as session:
+            # Find target first
+            target_stmt = select(TargetTable).where(TargetTable.url == target_url)
+            target = session.exec(target_stmt).first()
+            if not target:
+                return None
+            
+            # Find most recent FAILED scan with recovery artifacts
+            query = select(ScanTable).where(
+                (ScanTable.target_id == target.id) &
+                (ScanTable.status == ScanStatus.FAILED)
+            ).order_by(ScanTable.timestamp.desc())
+            
+            if scan_type:
+                query = query.where(ScanTable.scan_type == scan_type)
+            
+            scan = session.exec(query).first()
+            if not scan:
+                return None
+            
+            # Verify it has recovery artifacts
+            if not self._has_recovery_artifacts(
+                Path(settings.REPORT_DIR),
+                scan.id,
+                target_url,
+                scan.timestamp,
+                scan.report_dir
+            ):
+                return None
+            
+            return {
+                "scan_id": scan.id,
+                "target_url": target_url,
+                "scan_type": scan.scan_type,
+                "last_phase": scan.last_phase_completed,
+                "report_dir": scan.report_dir,
+                "retry_count": scan.retry_count,
+            }
+
+    async def resume_scan(self, original_scan_id: int, options: ScanOptions, origin: str = "unknown") -> int:
+        """
+        Create a new scan that resumes from an incomplete previous scan.
+        
+        Args:
+            original_scan_id: ID of the failed scan to resume from
+            options: Updated scan configuration
+            origin: Where the resume was initiated from
+            
+        Returns:
+            New scan_id for the resumed scan
+        """
+        from bugtrace.schemas.db_models import ScanTable
+        from sqlmodel import select
+        
+        # Get original scan metadata
+        with self.db.get_session() as session:
+            original = session.exec(
+                select(ScanTable).where(ScanTable.id == original_scan_id)
+            ).first()
+            if not original:
+                raise ValueError(f"Original scan {original_scan_id} not found")
+            
+            # Increment retry count
+            original.retry_count += 1
+            session.add(original)
+            session.commit()
+        
+        logger.info(
+            f"Resuming scan {original_scan_id} (retry #{original.retry_count})",
+            extra={"scan_id": original_scan_id}
+        )
+        
+        # Create new scan record marked as resumed
+        async with self._lock:
+            self._check_concurrent_limit()
+            new_scan_id = self._create_scan_record(options, origin)
+            
+        # Update new scan to reference original
+        with self.db.get_session() as session:
+            new_scan = session.exec(
+                select(ScanTable).where(ScanTable.id == new_scan_id)
+            ).first()
+            new_scan.resumed_from_id = original_scan_id
+            new_scan.report_dir = original.report_dir  # Reuse same report dir
+            session.add(new_scan)
+            session.commit()
+        
+        # Start the resumed scan
+        try:
+            ctx = self._build_scan_context(new_scan_id, options)
+            self._create_orchestrator(ctx, Path(original.report_dir) if original.report_dir else self._compute_output_dir(options.target_url))
+            
+            async with self._lock:
+                self._active_scans[new_scan_id] = ctx
+            
+            asyncio.create_task(self._run_scan_with_timeout(ctx))
+            self.event_bus.emit("scan.resumed", new_scan_id=new_scan_id, parent_scan_id=original_scan_id)
+            
+            logger.info(f"Resumed scan started: {new_scan_id} (parent: {original_scan_id})")
+            return new_scan_id
+        except Exception as e:
+            logger.error(f"Failed to start resumed scan {new_scan_id}: {e}", exc_info=True)
+            with self.db.get_session() as session:
+                session.exec(
+                    select(ScanTable).where(ScanTable.id == new_scan_id)
+                ).first().status = ScanStatus.FAILED
+                session.commit()
+            raise
+
     def cleanup_orphaned_scans(self) -> int:
         """Mark any RUNNING/PENDING/PAUSED scans as FAILED on startup.
 
