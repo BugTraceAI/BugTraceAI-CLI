@@ -296,6 +296,22 @@ class DatabaseManager:
             self._migrate_scan_config_columns(session)
             # Migration: Add 'provider' column to scan table (v5.4)
             self._migrate_provider_column(session)
+            # Migration: Add scan resumption columns (v5.5)
+            self._migrate_scan_resumption_columns(session)
+
+    def _ensure_scan_column(self, session, column_name: str, column_definition: str):
+        """Add a scan column if it does not exist yet."""
+        try:
+            session.exec(text(f"SELECT {column_name} FROM scan LIMIT 1"))
+        except Exception:
+            session.rollback()
+            try:
+                session.exec(text(f"ALTER TABLE scan ADD COLUMN {column_name} {column_definition}"))
+                session.commit()
+                logger.info(f"Migration: Added '{column_name}' column to scan table")
+            except Exception as e:
+                session.rollback()
+                logger.warning(f"Migration '{column_name}' column skipped: {e}")
 
     def _migrate_origin_column(self, session):
         """Migrate 'origin' column to scan table."""
@@ -375,6 +391,16 @@ class DatabaseManager:
             except Exception as e:
                 session.rollback()
                 logger.warning(f"Migration 'provider' column skipped: {e}")
+
+    def _migrate_scan_resumption_columns(self, session):
+        """Migrate scan resumption columns to existing scan tables."""
+        for column_name, column_definition in [
+            ("last_phase_completed", "VARCHAR DEFAULT NULL"),
+            ("retry_count", "INTEGER DEFAULT 0"),
+            ("last_error", "VARCHAR DEFAULT NULL"),
+            ("resumed_from_id", "INTEGER DEFAULT NULL"),
+        ]:
+            self._ensure_scan_column(session, column_name, column_definition)
 
     def _init_vector_store(self):
         """Initialize vector store with explicit schema for findings_embeddings."""

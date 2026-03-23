@@ -12,6 +12,7 @@ Tests for:
 """
 import os
 import pytest
+import sqlite3
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -221,6 +222,54 @@ class TestDatabaseManager:
         assert result["sql_db"]["status"] == "healthy"
         assert result["vector_db"]["status"] in ("healthy", "disabled")
         assert result["latency_ms"] >= 0
+
+    def test_legacy_scan_table_gets_resumption_columns(self):
+        """Existing SQLite scan tables should be migrated with resumption columns on startup."""
+        from bugtrace.core.database import DatabaseManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "legacy.db")
+            vector_path = os.path.join(tmpdir, "lancedb")
+
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE target (id INTEGER PRIMARY KEY, url VARCHAR UNIQUE, created_at VARCHAR)")
+            conn.execute(
+                """
+                CREATE TABLE scan (
+                    id INTEGER PRIMARY KEY,
+                    target_id INTEGER NOT NULL,
+                    timestamp VARCHAR,
+                    status VARCHAR,
+                    progress_percent INTEGER DEFAULT 0,
+                    origin VARCHAR DEFAULT 'cli',
+                    report_dir VARCHAR,
+                    enrichment_status VARCHAR,
+                    scan_type VARCHAR,
+                    max_depth INTEGER,
+                    max_urls INTEGER,
+                    provider VARCHAR,
+                    FOREIGN KEY(target_id) REFERENCES target(id)
+                )
+                """
+            )
+            conn.execute("CREATE TABLE finding (id INTEGER PRIMARY KEY, scan_id INTEGER)")
+            conn.execute("CREATE TABLE scan_state (id INTEGER PRIMARY KEY, scan_id INTEGER UNIQUE, state_json TEXT, updated_at VARCHAR)")
+            conn.commit()
+            conn.close()
+
+            DatabaseManager(
+                db_url=f"sqlite:///{db_path}",
+                vector_db_path=vector_path,
+            )
+
+            conn = sqlite3.connect(db_path)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(scan)")}
+            conn.close()
+
+            assert "last_phase_completed" in columns
+            assert "retry_count" in columns
+            assert "last_error" in columns
+            assert "resumed_from_id" in columns
 
     def test_get_metrics(self, temp_db):
         """TASK-88: Test metrics collection."""
