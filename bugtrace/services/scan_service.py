@@ -498,8 +498,8 @@ class ScanService:
                 "message": "Scan paused",
             }
 
-    async def resume_scan(self, scan_id: int) -> Dict[str, Any]:
-        """Resume a paused scan."""
+    async def _resume_paused_scan(self, scan_id: int) -> Dict[str, Any]:
+        """Resume an in-memory paused scan."""
         async with self._lock:
             if scan_id not in self._active_scans:
                 raise ValueError(f"Scan {scan_id} is not active")
@@ -523,6 +523,16 @@ class ScanService:
                 "status": "running",
                 "message": "Scan resumed",
             }
+
+    async def resume_scan(self, scan_id: int) -> Dict[str, Any]:
+        """Resume either a paused in-memory scan or recreate a recoverable failed scan."""
+        async with self._lock:
+            ctx = self._active_scans.get(scan_id)
+
+        if ctx is not None:
+            return await self._resume_paused_scan(scan_id)
+
+        return await self._resume_recoverable_scan(scan_id)
 
     async def list_scans(
         self,
@@ -1247,7 +1257,54 @@ class ScanService:
                 "retry_count": scan.retry_count,
             }
 
-    async def resume_scan(self, original_scan_id: int, options: ScanOptions, origin: str = "unknown") -> int:
+    async def _resume_recoverable_scan(self, original_scan_id: int) -> Dict[str, Any]:
+        """Resume a failed scan with preserved recovery artifacts using stored scan config."""
+        from bugtrace.schemas.db_models import ScanTable, TargetTable, ScanStatus
+        from sqlmodel import select
+
+        with self.db.get_session() as session:
+            original = session.exec(
+                select(ScanTable).where(ScanTable.id == original_scan_id)
+            ).first()
+            if not original:
+                raise ValueError(f"Scan {original_scan_id} not found")
+            if original.status != ScanStatus.FAILED:
+                raise ValueError(
+                    f"Scan {original_scan_id} is not resumable (status: {original.status.value})"
+                )
+
+            target = session.exec(
+                select(TargetTable).where(TargetTable.id == original.target_id)
+            ).first()
+            if not target:
+                raise ValueError(f"Target for scan {original_scan_id} not found")
+
+            if not self._has_recovery_artifacts(
+                Path(settings.REPORT_DIR),
+                original.id,
+                target.url,
+                original.timestamp,
+                original.report_dir,
+            ):
+                raise ValueError(f"Scan {original_scan_id} has no recovery artifacts to resume")
+
+            options = ScanOptions(
+                target_url=target.url,
+                scan_type=original.scan_type or "full",
+                max_depth=original.max_depth or 2,
+                max_urls=original.max_urls or 20,
+                resume=True,
+            )
+            origin = original.origin or "unknown"
+
+        new_scan_id = await self._start_resumed_scan(original_scan_id, options, origin=origin)
+        return {
+            "scan_id": new_scan_id,
+            "status": "running",
+            "message": f"Resumed scan {original_scan_id} as new scan {new_scan_id}",
+        }
+
+    async def _start_resumed_scan(self, original_scan_id: int, options: ScanOptions, origin: str = "unknown") -> int:
         """
         Create a new scan that resumes from an incomplete previous scan.
         
@@ -1262,6 +1319,8 @@ class ScanService:
         from bugtrace.schemas.db_models import ScanTable
         from sqlmodel import select
         
+        new_scan_id = None
+
         # Get original scan metadata
         with self.db.get_session() as session:
             original = session.exec(
@@ -1302,19 +1361,27 @@ class ScanService:
             
             async with self._lock:
                 self._active_scans[new_scan_id] = ctx
-            
-            asyncio.create_task(self._run_scan_with_timeout(ctx))
-            self.event_bus.emit("scan.resumed", new_scan_id=new_scan_id, parent_scan_id=original_scan_id)
+
+            ctx._task = asyncio.create_task(self._run_scan(ctx))
+            await self.event_bus.emit("scan.resumed", {
+                "scan_id": new_scan_id,
+                "parent_scan_id": original_scan_id,
+                "target": options.target_url,
+            })
             
             logger.info(f"Resumed scan started: {new_scan_id} (parent: {original_scan_id})")
             return new_scan_id
         except Exception as e:
             logger.error(f"Failed to start resumed scan {new_scan_id}: {e}", exc_info=True)
-            with self.db.get_session() as session:
-                session.exec(
-                    select(ScanTable).where(ScanTable.id == new_scan_id)
-                ).first().status = ScanStatus.FAILED
-                session.commit()
+            if new_scan_id is not None:
+                with self.db.get_session() as session:
+                    failed_scan = session.exec(
+                        select(ScanTable).where(ScanTable.id == new_scan_id)
+                    ).first()
+                    if failed_scan:
+                        failed_scan.status = ScanStatus.FAILED
+                        session.add(failed_scan)
+                        session.commit()
             raise
 
     def cleanup_orphaned_scans(self) -> int:
