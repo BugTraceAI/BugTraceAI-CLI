@@ -14,6 +14,7 @@ class ScanStatus(str, Enum):
     COMPLETED = "COMPLETED"
     STOPPED = "STOPPED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class FindingStatus(str, Enum):
