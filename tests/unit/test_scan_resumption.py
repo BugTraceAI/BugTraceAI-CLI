@@ -1,20 +1,11 @@
-"""
-Tests for scan resumption functionality.
+"""Tests for scan resumption functionality."""
 
-Tests verify that:
-1. Incomplete scans can be detected by target URL and phase
-2. Resume logic preserves report directory and retry count
-3. New scan is created with resumed_from_id reference
-4. Phase completion tracking updates DB correctly
-"""
-
+import asyncio
 import pytest
 from datetime import datetime
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
 from bugtrace.services.scan_service import ScanService
-from bugtrace.services.scan_context import ScanOptions
+from bugtrace.services.scan_context import ScanOptions, ScanContext
 from bugtrace.schemas.db_models import ScanTable, ScanStatus, TargetTable
 from bugtrace.core.database import get_db_manager
 from sqlmodel import select
@@ -33,10 +24,11 @@ def test_record_phase_complete_updates_db(tmp_path):
     from bugtrace.services.scan_context import ScanContext
     
     db = get_db_manager()
+    target_url = f"https://phase-complete-{datetime.utcnow().timestamp()}.example.com"
     
     # Create a test scan in DB
     with db.get_session() as session:
-        target = TargetTable(url="https://test.example.com")
+        target = TargetTable(url=target_url)
         session.add(target)
         session.commit()
         
@@ -126,10 +118,11 @@ def test_recovery_artifacts_detection(tmp_path):
 def test_scan_resumption_preserves_report_dir():
     """Test that resumed scans reuse the original report directory."""
     db = get_db_manager()
+    target_url = f"https://resume-preserve-{datetime.utcnow().timestamp()}.example.com"
     
     # Create original scan
     with db.get_session() as session:
-        target = TargetTable(url="https://test.example.com")
+        target = TargetTable(url=target_url)
         session.add(target)
         session.commit()
         
@@ -165,6 +158,53 @@ def test_scan_resumption_preserves_report_dir():
         ).first()
         assert new.resumed_from_id == original_id
         assert new.report_dir == original_report
+
+
+def test_resume_scan_dispatches_to_paused_context(monkeypatch):
+    """Public resume_scan should still resume in-memory paused scans."""
+    service = ScanService(max_concurrent=1)
+    ctx = ScanContext(
+        scan_id=99,
+        options=ScanOptions(target_url="https://paused.example.com"),
+        event_bus=service.event_bus,
+    )
+    ctx.status = "paused"
+    service._active_scans[99] = ctx
+
+    updates = []
+
+    async def emit(event_type, payload):
+        updates.append((event_type, payload))
+
+    monkeypatch.setattr(service.event_bus, "emit", emit)
+    monkeypatch.setattr(service.db, "update_scan_status", lambda scan_id, status: updates.append(("db", scan_id, status)))
+
+    result = asyncio.run(service.resume_scan(99))
+
+    assert result["scan_id"] == 99
+    assert result["status"] == "running"
+    assert ctx.status == "running"
+    assert any(item[0] == "scan.resumed" for item in updates if isinstance(item, tuple))
+
+
+def test_resume_scan_dispatches_to_recoverable_restart(monkeypatch):
+    """Public resume_scan should restart failed recoverable scans when not active in memory."""
+    service = ScanService(max_concurrent=1)
+
+    async def fake_restart(scan_id):
+        assert scan_id == 7
+        return {
+            "scan_id": 8,
+            "status": "running",
+            "message": "Resumed scan 7 as new scan 8",
+        }
+
+    monkeypatch.setattr(service, "_resume_recoverable_scan", fake_restart)
+
+    result = asyncio.run(service.resume_scan(7))
+
+    assert result["scan_id"] == 8
+    assert result["status"] == "running"
 
 
 if __name__ == "__main__":
