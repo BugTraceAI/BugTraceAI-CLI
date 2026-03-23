@@ -176,6 +176,16 @@ class TestExceptionAttributes:
         assert exc.context["retry_after_seconds"] == 60.0
         assert exc.context["model"] == "gpt-4"
 
+    def test_tool_timeout_attributes(self):
+        """Tool timeout exceptions should preserve timeout metadata on the ToolError path."""
+        docker_exc = DockerTimeoutError("Timed out", tool_name="nuclei", timeout_seconds=45.0)
+        subprocess_exc = SubprocessError("Timed out", tool_name="sqlmap", timeout_seconds=30.0)
+
+        assert docker_exc.context["tool"] == "nuclei"
+        assert docker_exc.context["timeout_seconds"] == 45.0
+        assert subprocess_exc.context["tool"] == "sqlmap"
+        assert subprocess_exc.context["timeout_seconds"] == 30.0
+
     def test_json_parse_error_truncates_data(self):
         """JSONParseError should truncate long raw_data."""
         long_data = "x" * 500

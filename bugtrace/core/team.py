@@ -346,9 +346,9 @@ class TeamOrchestrator:
                 max_urls=self.max_urls,
             )
 
-        # NOTE: report_dir is registered in DB only AFTER ReportingAgent
-        # successfully generates deliverables (see _invoke_reporting_agent).
-        # This prevents has_report=true on empty/nonexistent directories.
+        # Register report_dir in DB early so that even crashed/failed scans
+        # have a trackable output directory for partial artifact recovery.
+        self.db.update_scan_report_dir(self.scan_id, str(self.report_dir))
 
         logger.info(f"TeamOrchestrator initialized for Scan ID: {self.scan_id}")
 

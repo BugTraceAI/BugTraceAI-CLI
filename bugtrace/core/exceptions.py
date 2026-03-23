@@ -86,7 +86,7 @@ class TimeoutError(NetworkError):
         **kwargs
     ):
         context = kwargs.pop("context", {})
-        if timeout_seconds:
+        if timeout_seconds is not None:
             context["timeout_seconds"] = timeout_seconds
         if url:
             context["url"] = url
@@ -232,6 +232,7 @@ class ToolError(BugTraceException):
         tool_name: Optional[str] = None,
         exit_code: Optional[int] = None,
         stderr: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
         **kwargs
     ):
         context = kwargs.pop("context", {})
@@ -241,6 +242,8 @@ class ToolError(BugTraceException):
             context["exit_code"] = exit_code
         if stderr:
             context["stderr"] = stderr[:500] if len(stderr) > 500 else stderr
+        if timeout_seconds is not None:
+            context["timeout_seconds"] = timeout_seconds
         super().__init__(message, context=context, **kwargs)
 
 

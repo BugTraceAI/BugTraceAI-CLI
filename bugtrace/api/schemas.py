@@ -100,6 +100,7 @@ class ScanSummary(BaseModel):
     origin: str = "unknown"  # "cli", "web", or "unknown"
     enrichment_status: Optional[str] = None  # "full", "partial", "none", "pending"
     has_report: bool = True  # Whether report files exist on disk
+    recovery_available: bool = False  # Whether partial or full scan artifacts exist on disk
     scan_type: Optional[str] = None
     max_depth: Optional[int] = None
     max_urls: Optional[int] = None

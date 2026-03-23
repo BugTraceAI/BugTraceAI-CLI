@@ -596,7 +596,15 @@ class ScanService:
         for scan in scans:
             # Use already-loaded relationship (no extra query due to selectinload)
             target_url = scan.target.url if scan.target else None
-            has_report = self._has_report_dir(report_base, scan.id, target_url, scan.timestamp)
+            report_dir = getattr(scan, "report_dir", None)
+            has_report = self._has_report_dir(report_base, scan.id, target_url, scan.timestamp, report_dir)
+            recovery_available = self._has_recovery_artifacts(
+                report_base,
+                scan.id,
+                target_url,
+                scan.timestamp,
+                report_dir,
+            )
 
             results.append({
                 "scan_id": scan.id,
@@ -607,6 +615,7 @@ class ScanService:
                 "origin": getattr(scan, "origin", "cli"),
                 "enrichment_status": getattr(scan, "enrichment_status", None),
                 "has_report": has_report,
+                "recovery_available": recovery_available,
                 "scan_type": scan.scan_type,
                 "max_depth": scan.max_depth,
                 "max_urls": scan.max_urls,
@@ -691,6 +700,7 @@ class ScanService:
         scan_id: int,
         target_url: Optional[str],
         scan_timestamp: Optional[datetime] = None,
+        report_dir: Optional[str] = None,
     ) -> bool:
         """Check if a report directory with actual report files exists for this scan."""
         report_files = {"final_report.md", "validated_findings.json", "raw_findings.json"}
@@ -698,6 +708,9 @@ class ScanService:
         def _has_files(d: Path) -> bool:
             """Check if directory contains at least one known report file."""
             return d.is_dir() and any((d / f).is_file() for f in report_files)
+
+        if report_dir and _has_files(Path(report_dir)):
+            return True
 
         # Pattern 1: API-generated (scan_{id}/)
         if _has_files(report_base / f"scan_{scan_id}"):
@@ -707,6 +720,47 @@ class ScanService:
         return ScanService._check_pipeline_report_dir(
             report_base, target_url, scan_timestamp, _has_files
         )
+
+    @staticmethod
+    def _has_recovery_artifacts(
+        report_base: Path,
+        scan_id: int,
+        target_url: Optional[str],
+        scan_timestamp: Optional[datetime] = None,
+        report_dir: Optional[str] = None,
+    ) -> bool:
+        """Check whether a scan has any persisted artifacts, even without final deliverables."""
+        candidate_dirs: List[Path] = []
+
+        if report_dir:
+            candidate_dirs.append(Path(report_dir))
+
+        candidate_dirs.append(report_base / f"scan_{scan_id}")
+
+        if target_url:
+            hostname = urlparse(target_url).hostname or ""
+            if hostname:
+                if scan_timestamp:
+                    ts_prefix = scan_timestamp.strftime("%Y%m%d_%H%M")
+                    candidate_dirs.extend(report_base.glob(f"{hostname}_{ts_prefix}*"))
+                candidate_dirs.extend(report_base.glob(f"{hostname}_*"))
+
+        seen = set()
+        for directory in candidate_dirs:
+            if directory in seen:
+                continue
+            seen.add(directory)
+
+            if not directory.is_dir():
+                continue
+
+            try:
+                if any(path.is_file() for path in directory.rglob("*")):
+                    return True
+            except OSError as e:
+                logger.debug(f"Error inspecting recovery artifacts in {directory}: {e}")
+
+        return False
 
     @staticmethod
     def _check_pipeline_report_dir(

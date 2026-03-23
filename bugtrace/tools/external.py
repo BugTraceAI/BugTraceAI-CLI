@@ -245,7 +245,7 @@ class ExternalToolManager:
             raise SubprocessError(
                 f"Native {tool_name} timed out after {timeout}s",
                 tool_name=tool_name,
-                context={"timeout_seconds": timeout},
+                timeout_seconds=timeout,
             )
         except SubprocessError:
             raise
@@ -426,7 +426,7 @@ class ExternalToolManager:
             raise DockerTimeoutError(
                 f"Docker container timed out after {timeout}s",
                 tool_name=image,
-                context={"timeout_seconds": timeout}
+                timeout_seconds=timeout
             ) from e
         except DockerError:
             # Re-raise typed Docker exceptions
