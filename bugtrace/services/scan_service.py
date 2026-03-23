@@ -1320,6 +1320,8 @@ class ScanService:
         from sqlmodel import select
         
         new_scan_id = None
+        original_report_dir = None
+        retry_count = 0
 
         # Get original scan metadata
         with self.db.get_session() as session:
@@ -1331,11 +1333,13 @@ class ScanService:
             
             # Increment retry count
             original.retry_count += 1
+            retry_count = original.retry_count
+            original_report_dir = original.report_dir
             session.add(original)
             session.commit()
         
         logger.info(
-            f"Resuming scan {original_scan_id} (retry #{original.retry_count})",
+            f"Resuming scan {original_scan_id} (retry #{retry_count})",
             extra={"scan_id": original_scan_id}
         )
         
@@ -1350,14 +1354,14 @@ class ScanService:
                 select(ScanTable).where(ScanTable.id == new_scan_id)
             ).first()
             new_scan.resumed_from_id = original_scan_id
-            new_scan.report_dir = original.report_dir  # Reuse same report dir
+            new_scan.report_dir = original_report_dir  # Reuse same report dir
             session.add(new_scan)
             session.commit()
         
         # Start the resumed scan
         try:
             ctx = self._build_scan_context(new_scan_id, options)
-            self._create_orchestrator(ctx, Path(original.report_dir) if original.report_dir else self._compute_output_dir(options.target_url))
+            self._create_orchestrator(ctx, Path(original_report_dir) if original_report_dir else self._compute_output_dir(options.target_url))
             
             async with self._lock:
                 self._active_scans[new_scan_id] = ctx
