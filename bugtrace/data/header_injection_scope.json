@@ -1,0 +1,15 @@
+{
+  "version": "1.0",
+  "config": {
+    "always_test_root": true,
+    "description": "Smart Scope for Header Injection (CRLF) testing"
+  },
+  "patterns": {
+    "paths": [
+      "login", "signin", "auth", "logout", "admin", "redirect", "sso", "oauth", "callback"
+    ],
+    "params": [
+      "next", "url", "target", "dest", "goto", "redirect_to", "return_url", "r", "u"
+    ]
+  }
+}

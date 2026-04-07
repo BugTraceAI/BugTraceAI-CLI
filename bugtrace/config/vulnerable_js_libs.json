@@ -1,0 +1,42 @@
+{
+  "_comment": "Known vulnerable JavaScript libraries. Version below threshold = vulnerable. Update this file to add new CVEs or libraries.",
+  "libraries": {
+    "angularjs": {
+      "below": [1, 8, 0],
+      "name": "AngularJS",
+      "cves": ["CVE-2022-25869"],
+      "eol": true,
+      "severity": "low"
+    },
+    "jquery": {
+      "below": [3, 5, 0],
+      "name": "jQuery",
+      "cves": ["CVE-2020-11022", "CVE-2020-11023"],
+      "severity": "low"
+    },
+    "vue": {
+      "below": [2, 7, 0],
+      "name": "Vue.js",
+      "cves": ["CVE-2024-6783"],
+      "severity": "low"
+    },
+    "react": {
+      "below": [16, 13, 0],
+      "name": "React",
+      "cves": ["CVE-2020-7919"],
+      "severity": "info"
+    },
+    "bootstrap": {
+      "below": [4, 3, 1],
+      "name": "Bootstrap",
+      "cves": ["CVE-2019-8331"],
+      "severity": "info"
+    },
+    "lodash": {
+      "below": [4, 17, 21],
+      "name": "Lodash",
+      "cves": ["CVE-2021-23337", "CVE-2020-28500"],
+      "severity": "low"
+    }
+  }
+}

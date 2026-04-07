@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BugTraceAI | Security Assessment Report</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'vuln-critical': '#991b1b',
+                        'vuln-high': '#dc2626',
+                        'vuln-medium': '#d97706',
+                        'vuln-low': '#2563eb',
+                        'vuln-info': '#059669',
+                        'brand-slate': '#0f172a',
+                        'brand-border': '#1e293b'
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace']
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono&display=swap');
+
+        body {
+            background-color: #f8fafc;
+            color: #1e293b;
+            font-family: 'Inter', sans-serif;
+        }
+
+        .sidebar {
+            background-color: #0f172a;
+        }
+
+        .card {
+            background-color: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 0.5rem;
+            transition: border-color 0.2s;
+        }
+
+        .card:hover {
+            border-color: #cbd5e1;
+        }
+
+        .badge {
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.65rem;
+            padding: 0.25rem 0.5rem;
+            letter-spacing: 0.05em;
+            border-radius: 0.25rem;
+        }
+
+        code {
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        pre {
+            background: #0f172a;
+            color: #4ade80;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            overflow-x: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.875rem;
+        }
+    </style>
+</head>
+
+<body class="min-h-screen flex flex-col md:flex-row">
+    <!-- Sidebar -->
+    <aside class="w-full md:w-80 sidebar text-white flex flex-col shrink-0 md:fixed md:h-screen">
+        <div class="p-8">
+            <div class="flex items-center gap-3 mb-8">
+                <div class="w-10 h-10 bg-blue-600 rounded flex items-center justify-center font-bold text-xl">B</div>
+                <h1 class="text-xl font-bold tracking-tight">Bugtrace<span class="text-blue-500">AI</span></h1>
+            </div>
+
+            <nav class="space-y-4">
+                <div class="text-xs uppercase text-slate-500 font-bold tracking-widest mb-4">Assessment Context</div>
+                <div>
+                    <div class="text-sm text-slate-400 mb-1">Target Host</div>
+                    <div id="sidebar-target" class="font-mono text-sm break-all text-blue-400">Loading...</div>
+                </div>
+                <div>
+                    <div class="text-sm text-slate-400 mb-1">Execution Date</div>
+                    <div id="sidebar-date" class="text-sm">...</div>
+                </div>
+                <div>
+                    <div class="text-sm text-slate-400 mb-1">Scan ID</div>
+                    <div id="sidebar-scan-id" class="text-sm">...</div>
+                </div>
+            </nav>
+
+            <div class="mt-12 space-y-4">
+                <div class="text-xs uppercase text-slate-500 font-bold tracking-widest mb-4">Risk Summary</div>
+                <div id="risk-summary" class="space-y-2">
+                    <!-- Dynamic badges here -->
+                </div>
+            </div>
+        </div>
+        <div class="mt-auto p-8 border-t border-slate-800">
+            <div class="text-[10px] text-slate-500 leading-relaxed uppercase tracking-tighter">
+                Highly confidential security assessment. Unauthorized reproduction or distribution is prohibited.
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="flex-1 md:ml-80 p-6 md:p-12">
+        <div class="max-w-5xl mx-auto">
+            <!-- Summary Dashboard -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-12">
+                <div class="lg:col-span-2 card p-8 flex flex-col">
+                    <h2 class="text-lg font-bold mb-6 flex items-center gap-2">
+                        <i class="fas fa-chart-pie text-slate-400"></i>
+                        Vulnerability Distribution
+                    </h2>
+                    <div class="flex flex-1 items-center justify-center p-4">
+                        <div class="w-full max-w-[350px]">
+                            <canvas id="riskChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="space-y-6">
+                    <div id="validation-card" class="card p-6 border-l-4 border-blue-600">
+                        <div class="text-xs text-slate-500 mb-1 font-bold">VALIDATED FINDINGS</div>
+                        <div id="count-validated" class="text-3xl font-bold">0/0</div>
+                        <div id="validation-status" class="text-xs text-blue-600 mt-2">
+                            Awaiting data...
+                        </div>
+                    </div>
+                    <div class="card p-6">
+                        <div class="text-xs text-slate-500 mb-1 font-bold">MANUAL REVIEW</div>
+                        <div id="count-manual" class="text-3xl font-bold">0</div>
+                    </div>
+                    <div class="card p-6">
+                        <div class="text-xs text-slate-500 mb-1 font-bold">FALSE POSITIVES</div>
+                        <div id="count-fp" class="text-3xl font-bold">0</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Findings List -->
+            <div class="mb-8 flex flex-wrap items-center justify-between gap-4 border-b pb-4">
+                <h2 class="text-2xl font-bold">Detailed Technical Findings</h2>
+                <div class="flex items-center gap-2">
+                    <span id="findings-count-label" class="text-sm text-slate-500">
+                        Total Confirmed: <span id="visibleCount" class="font-bold">0</span>
+                    </span>
+                </div>
+            </div>
+
+            <div id="findingsContainer" class="space-y-6">
+                <!-- Dynamic findings here -->
+                <div class="text-center py-20 text-slate-400">
+                    <i class="fas fa-spinner fa-spin text-3xl mb-4"></i>
+                    <p>Loading engagement data...</p>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        async function loadReport() {
+            try {
+                const response = await fetch('./engagement_data.json');
+                const data = await response.json();
+                renderReport(data);
+            } catch (e) {
+                document.getElementById('findingsContainer').innerHTML = `
+                    <div class="bg-red-50 p-8 rounded border border-red-200 text-red-700">
+                        <h3 class="font-bold mb-2">Error Loading Report</h3>
+                        <p>${e.message}</p>
+                        <p class="mt-4 text-sm text-red-500">Ensure this page is served via HTTP or that the engagement_data.json file exists in the same directory.</p>
+                    </div>
+                `;
+            }
+        }
+
+        function renderReport(data) {
+            // Update Sidebar
+            document.getElementById('sidebar-target').innerText = data.meta.target;
+            document.getElementById('sidebar-date').innerText = new Date(data.meta.scan_date).toLocaleString();
+            document.getElementById('sidebar-scan-id').innerText = data.meta.scan_id;
+
+            const counts = data.summary.by_severity;
+            const riskSummary = document.getElementById('risk-summary');
+            riskSummary.innerHTML = `
+                <div class="flex justify-between items-center bg-red-900/20 p-2 rounded">
+                    <span class="text-xs font-bold text-red-500">CRITICAL</span>
+                    <span class="font-bold">${counts.critical || 0}</span>
+                </div>
+                <div class="flex justify-between items-center bg-orange-900/20 p-2 rounded">
+                    <span class="text-xs font-bold text-orange-400">HIGH</span>
+                    <span class="font-bold">${counts.high || 0}</span>
+                </div>
+                <div class="flex justify-between items-center bg-amber-900/20 p-2 rounded">
+                    <span class="text-xs font-bold text-amber-500">MEDIUM</span>
+                    <span class="font-bold">${counts.medium || 0}</span>
+                </div>
+                <div class="flex justify-between items-center bg-blue-900/20 p-2 rounded">
+                    <span class="text-xs font-bold text-blue-400">LOW</span>
+                    <span class="font-bold">${counts.low || 0}</span>
+                </div>
+            `;
+
+            // Update Stats
+            document.getElementById('count-validated').innerText = `${data.summary.validated}/${data.summary.total_findings}`;
+            document.getElementById('count-manual').innerText = data.summary.manual_review;
+            document.getElementById('count-fp').innerText = data.summary.false_positives;
+            document.getElementById('visibleCount').innerText = data.findings.length;
+
+            if (data.summary.validated > 0) {
+                document.getElementById('validation-card').classList.add('border-green-600', 'bg-green-50/20');
+                document.getElementById('validation-status').innerText = '✅ Confirmed via CDP + Vision AI';
+                document.getElementById('validation-status').classList.replace('text-blue-600', 'text-green-600');
+            } else {
+                document.getElementById('validation-status').innerText = '⚠️ No confirmed findings yet.';
+            }
+
+            // Render Findings
+            const container = document.getElementById('findingsContainer');
+            if (data.findings.length === 0) {
+                container.innerHTML = '<div class="text-center py-20 text-slate-400">No confirmed vulnerabilities found.</div>';
+            } else {
+                container.innerHTML = data.findings.map(f => {
+                    const sevColor = {
+                        'CRITICAL': 'bg-vuln-critical',
+                        'HIGH': 'bg-vuln-high',
+                        'MEDIUM': 'bg-vuln-medium',
+                        'LOW': 'bg-vuln-low'
+                    }[f.severity.toUpperCase()] || 'bg-vuln-info';
+
+                    return `
+                        <div class="card overflow-hidden">
+                            <div class="p-6 border-b bg-slate-50/50 flex flex-wrap items-center justify-between gap-4">
+                                <div class="flex items-center gap-4">
+                                    <span class="badge ${sevColor} text-white">${f.severity}</span>
+                                    <span class="badge bg-green-600 text-white">✅ VERIFIED</span>
+                                    <h3 class="font-bold text-lg">${f.type}</h3>
+                                </div>
+                                <div class="text-xs font-mono text-slate-500 bg-white px-3 py-1 border rounded">
+                                    ${f.id}
+                                </div>
+                            </div>
+                            <div class="p-8">
+                                <div class="grid grid-cols-1 md:grid-cols-12 gap-10">
+                                    <div class="md:col-span-7 space-y-8">
+                                        <div>
+                                            <h4 class="text-xs font-black text-slate-400 uppercase mb-3 tracking-widest">Description & Analysis</h4>
+                                            <p class="text-slate-600 leading-relaxed">${f.description}</p>
+                                        </div>
+                                        <div class="bg-blue-50/50 p-6 rounded-lg border border-blue-100">
+                                            <h4 class="text-xs font-black text-blue-600 uppercase mb-4 tracking-widest flex items-center gap-2">
+                                                <i class="fas fa-user-secret"></i> Triager Reproduction Steps
+                                            </h4>
+                                            <ol class="list-decimal list-inside space-y-2 text-sm text-slate-700 font-medium">
+                                                ${f.reproduction.steps.map(s => `<li>${s}</li>`).join('')}
+                                            </ol>
+                                            ${(f.reproduction.poc && !f.reproduction.poc.trim().startsWith('#')) ? `
+                                            <div class="mt-6">
+                                                <h4 class="text-[10px] font-black text-blue-400 uppercase mb-2 tracking-widest">Proof of Concept</h4>
+                                                <pre><code>${f.reproduction.poc}</code></pre>
+                                            </div>` : ''}
+                                        </div>
+                                        <div class="grid grid-cols-2 gap-8">
+                                            <div>
+                                                <h4 class="text-xs font-black text-red-400 uppercase mb-3 tracking-widest">Risk Impact</h4>
+                                                <p class="text-sm text-slate-600">${f.impact}</p>
+                                            </div>
+                                            <div>
+                                                <h4 class="text-xs font-black text-blue-500 uppercase mb-3 tracking-widest">Remediation</h4>
+                                                <p class="text-sm text-slate-600">${f.remediation}</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="md:col-span-5 space-y-8">
+                                        <div>
+                                            <h4 class="text-xs font-black text-slate-400 uppercase mb-3 tracking-widest">Validation Proof</h4>
+                                            <p class="text-sm text-slate-500 mb-2"><b>Method:</b> ${f.validation.method}</p>
+                                            ${f.validation.notes ? `<p class="text-xs text-slate-600 bg-slate-100 p-3 rounded border italic mb-4">"${f.validation.notes}"</p>` : ''}
+                                            ${f.validation.screenshot ? `<img src="${f.validation.screenshot}" class="w-full rounded border shadow-sm" alt="PoC Screenshot">` : '<div class="text-xs text-slate-400 italic">No screenshot available</div>'}
+                                        </div>
+                                        <div>
+                                            <h4 class="text-xs font-black text-slate-400 uppercase mb-2 tracking-widest">Target Context</h4>
+                                            <div class="text-xs font-mono bg-slate-50 p-3 border rounded break-all">
+                                                <p class="mb-1"><b>URL:</b> ${f.url}</p>
+                                                <p><b>Parameter:</b> ${f.parameter || 'N/A'}</p>
+                                                ${f.db_type ? `<p class="mt-1 text-blue-600"><b>DB Type:</b> ${f.db_type}</p>` : ''}
+                                                ${f.tamper_used ? `<p class="mt-1 text-amber-600"><b>Tamper:</b> ${f.tamper_used}</p>` : ''}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            }
+
+            // Init Chart
+            initChart(counts);
+        }
+
+        function initChart(counts) {
+            const chartCtx = document.getElementById('riskChart').getContext('2d');
+            new Chart(chartCtx, {
+                type: 'radar',
+                data: {
+                    labels: ['Critical', 'High', 'Medium', 'Low', 'Info'],
+                    datasets: [{
+                        label: 'Risk Vector',
+                        data: [
+                            counts.critical || 0,
+                            counts.high || 0,
+                            counts.medium || 0,
+                            counts.low || 0,
+                            counts.info || 0
+                        ],
+                        backgroundColor: 'rgba(37, 99, 235, 0.4)',
+                        borderColor: '#2563eb',
+                        borderWidth: 2,
+                        pointBackgroundColor: '#2563eb',
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        r: {
+                            beginAtZero: true,
+                            ticks: { display: false, stepSize: 1 },
+                            grid: { color: '#e2e8f0' },
+                            angleLines: { color: '#e2e8f0' }
+                        }
+                    },
+                    plugins: { legend: { display: false } }
+                }
+            });
+        }
+
+        loadReport();
+    </script>
+</body>
+
+</html>

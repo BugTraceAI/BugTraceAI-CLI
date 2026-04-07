@@ -1,0 +1,1304 @@
+from typing import Optional, List, Dict
+import os
+from datetime import datetime
+from dataclasses import dataclass
+from sqlmodel import SQLModel, create_engine, Session, select
+from sqlalchemy import Engine, text, event, func
+from sqlalchemy.pool import QueuePool, StaticPool
+try:
+    import lancedb
+    LANCEDB_AVAILABLE = True
+except Exception:
+    lancedb = None
+    LANCEDB_AVAILABLE = False
+
+from bugtrace.schemas.db_models import (
+    TargetTable, ScanTable, FindingTable, ScanStateTable,
+    ScanStatus, FindingStatus
+)
+from bugtrace.utils.logger import get_logger
+logger = get_logger("core.database")
+from tenacity import retry, stop_after_attempt, wait_fixed
+
+
+@dataclass
+class ScanInfo:
+    """Metadata about a scan."""
+    scan_id: int
+    target_url: str
+    timestamp: datetime
+    status: ScanStatus
+    progress_percent: int
+
+
+def _build_csti_description(evidence: Dict, param: str, payload: str) -> List[str]:
+    """Build CSTI-specific description parts."""
+    engine = evidence.get("engine", "unknown")
+    method = evidence.get("method", "injection")
+    parts = [
+        f"Client-Side Template Injection (CSTI) detected via {method}.",
+        f"Parameter: {param}",
+        f"Template Engine: {engine}"
+    ]
+    if payload:
+        parts.append(f"Payload: {payload}")
+    if "proof" in evidence:
+        parts.append(f"Evidence: {evidence['proof']}")
+    return parts
+
+
+def _build_sqli_description(evidence: Dict, param: str) -> List[str]:
+    """Build SQLi-specific description parts."""
+    parts = [
+        f"SQL Injection vulnerability confirmed.",
+        f"Parameter: {param}"
+    ]
+    if evidence.get("db_type"):
+        parts.append(f"Database: {evidence['db_type']}")
+    if evidence.get("injection_type"):
+        parts.append(f"Type: {evidence['injection_type']}")
+    return parts
+
+
+def _build_xss_description(evidence: Dict, param: str, payload: str) -> List[str]:
+    """Build XSS-specific description parts."""
+    parts = [
+        f"Cross-Site Scripting (XSS) vulnerability detected.",
+        f"Parameter: {param}"
+    ]
+    if payload:
+        parts.append(f"Payload: {payload}")
+    if evidence.get("context"):
+        parts.append(f"Context: {evidence['context']}")
+    return parts
+
+
+def _convert_evidence_to_description(evidence: Dict, finding_data: Dict) -> str:
+    """Convert evidence dict to readable description."""
+    if isinstance(evidence, str):
+        return evidence
+
+    if not isinstance(evidence, dict):
+        return "Vulnerability detected."
+
+    vuln_type = (finding_data.get("type") or "").upper()
+    param = finding_data.get("parameter", "unknown")
+    payload = finding_data.get("payload", "")
+
+    if vuln_type in ["CSTI", "SSTI"]:
+        parts = _build_csti_description(evidence, param, payload)
+    elif vuln_type in ["SQLI", "SQL"]:
+        parts = _build_sqli_description(evidence, param)
+    elif vuln_type == "XSS":
+        parts = _build_xss_description(evidence, param, payload)
+    else:
+        # Generic fallback
+        parts = [f"{k}: {v}" for k, v in evidence.items() if isinstance(v, str) and v]
+
+    return "\n".join(parts) if parts else "Vulnerability detected."
+
+
+# -- Pure functions for finding field resolution --
+
+SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+
+CONFIDENCE_FLOOR = {
+    FindingStatus.VALIDATED_CONFIRMED: 0.95,
+    FindingStatus.PENDING_VALIDATION: 0.5,
+}
+
+DEFAULT_CONFIDENCE = 0.85
+
+
+def _rank_severity(severity: str) -> int:
+    """# PURE — Map severity string to numeric rank for comparison."""
+    return SEVERITY_RANK.get((severity or "").upper(), -1)
+
+
+def _higher_severity(current: str, candidate: str) -> str:
+    """# PURE — Return the higher of two severity values."""
+    return candidate.upper() if _rank_severity(candidate) > _rank_severity(current) else current
+
+
+def _resolve_confidence(explicit: float | None, status: FindingStatus) -> float:
+    """# PURE — Derive confidence from explicit value + status floor."""
+    floor = CONFIDENCE_FLOOR.get(status, 0.0)
+    base = explicit if explicit is not None else DEFAULT_CONFIDENCE
+    return max(base, floor)
+
+
+def _evidence_to_description(finding_data: Dict) -> str:
+    """Convert finding data to a human-readable description."""
+    # Priority: description > note > evidence (converted) > fallback
+    desc = finding_data.get("description")
+    if desc and isinstance(desc, str) and len(desc) > 10:
+        return desc
+
+    note = finding_data.get("note")
+    if note and isinstance(note, str) and len(note) > 10:
+        return note
+
+    evidence = finding_data.get("evidence")
+    if evidence:
+        return _convert_evidence_to_description(evidence, finding_data)
+
+    # Fallback
+    vuln_type = finding_data.get("type", "Unknown")
+    param = finding_data.get("parameter", "")
+    return f"{vuln_type} vulnerability detected on parameter: {param}" if param else f"{vuln_type} vulnerability detected."
+
+
+class DatabaseManager:
+    _instance: Optional["DatabaseManager"] = None
+
+    # Connection pool configuration
+    POOL_SIZE = 10  # Max connections in pool
+    MAX_OVERFLOW = 20  # Additional connections when pool is full
+    POOL_TIMEOUT = 30  # Seconds to wait for connection
+    POOL_RECYCLE = 3600  # Recycle connections after 1 hour
+    POOL_PRE_PING = True  # Verify connection before use
+
+    def __init__(self, db_url: str = "sqlite:///bugtrace.db", vector_db_path: str = "./data/lancedb"):
+        self.db_url = db_url
+        self.vector_db_path = vector_db_path
+
+        # SQL Engine with connection pooling
+        self.engine: Engine = self._create_engine()
+
+        # Test Connection with Retry
+        self._wait_for_db()
+
+        # LanceDB Connection (optional — graceful degradation if unavailable)
+        if LANCEDB_AVAILABLE:
+            os.makedirs(vector_db_path, exist_ok=True)
+            self.vector_db = lancedb.connect(self.vector_db_path)
+        else:
+            self.vector_db = None
+            logger.warning("LanceDB unavailable (possible AVX2 requirement). Vector search disabled.")
+
+        # Initialize tables
+        self._create_tables()
+        self._init_vector_store()
+
+    def _create_engine(self) -> Engine:
+        """
+        Create SQLAlchemy engine with appropriate connection pooling.
+
+        - SQLite: Uses StaticPool for thread safety (single connection)
+        - PostgreSQL/MySQL: Uses QueuePool with configurable size
+        """
+        is_sqlite = self.db_url.startswith("sqlite")
+        is_memory = ":memory:" in self.db_url or self.db_url == "sqlite://"
+
+        if is_sqlite and is_memory:
+            # SQLite memory: Use StaticPool for thread-safe single connection
+            engine = create_engine(
+                self.db_url,
+                poolclass=StaticPool,
+                connect_args={"check_same_thread": False},
+                echo=False
+            )
+        elif is_sqlite:
+            # SQLite file: Use QueuePool
+            engine = create_engine(
+                self.db_url,
+                poolclass=QueuePool,
+                pool_size=self.POOL_SIZE,
+                max_overflow=self.MAX_OVERFLOW,
+                connect_args={"check_same_thread": False, "timeout": 30.0},
+                echo=False
+            )
+            # Enable SQLite optimizations
+            @event.listens_for(engine, "connect")
+            def set_sqlite_pragma(dbapi_connection, connection_record):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.close()
+        else:
+            # PostgreSQL/MySQL: Use QueuePool with connection pooling
+            engine = create_engine(
+                self.db_url,
+                poolclass=QueuePool,
+                pool_size=self.POOL_SIZE,
+                max_overflow=self.MAX_OVERFLOW,
+                pool_timeout=self.POOL_TIMEOUT,
+                pool_recycle=self.POOL_RECYCLE,
+                pool_pre_ping=self.POOL_PRE_PING,
+                echo=False
+            )
+
+        logger.info(f"Database engine created: {type(engine.pool).__name__}")
+        return engine
+
+    @retry(stop=stop_after_attempt(5), wait=wait_fixed(2))
+    def _wait_for_db(self):
+        try:
+            with Session(self.engine) as session:
+                session.exec(text("SELECT 1"))
+            logger.info("Database connection established.")
+        except Exception as e:
+            logger.warning(f"Waiting for database... {e}")
+            raise
+        
+    @classmethod
+    def get_instance(cls) -> "DatabaseManager":
+        if cls._instance is None:
+            from bugtrace.core.config import settings
+            cls._instance = cls(
+                db_url=f"sqlite:///{settings.BASE_DIR}/data/bugtrace.db",
+                vector_db_path=str(settings.LOG_DIR / "lancedb")
+            )
+        return cls._instance
+
+    def _create_tables(self):
+        try:
+            # Force import models to register with SQLModel metadata
+            from bugtrace.schemas.db_models import TargetTable, ScanTable, FindingTable, ScanStateTable
+
+            # Create all tables
+            SQLModel.metadata.create_all(self.engine)
+
+            # Verify tables were created (especially critical for SQLite after file deletion)
+            self._verify_tables_exist()
+
+            self._run_migrations()
+            logger.info("SQL Tables initialized.")
+        except Exception as e:
+            logger.error(f"Failed to create SQL tables: {e}", exc_info=True)
+            raise  # Don't silently fail - this is critical
+
+    def _verify_tables_exist(self):
+        """Verify critical tables exist, recreate if needed."""
+        required_tables = ['target', 'scan', 'finding', 'scan_state']
+        with Session(self.engine) as session:
+            for table in required_tables:
+                try:
+                    session.exec(text(f"SELECT 1 FROM {table} LIMIT 1"))
+                except Exception:
+                    logger.warning(f"Table '{table}' not found, forcing recreation...")
+                    session.rollback()
+                    # Force recreate - drop metadata cache and recreate
+                    SQLModel.metadata.create_all(self.engine)
+                    break
+
+    def _run_migrations(self):
+        """Run lightweight schema migrations for new columns on existing tables."""
+        with self.get_session() as session:
+            # Migration: Add 'origin' column to scan table (v2.1)
+            self._migrate_origin_column(session)
+            # Migration: Add 'report_dir' column to scan table (v5.1)
+            self._migrate_report_dir_column(session)
+            # Migration: Add 'enrichment_status' column to scan table (v5.2)
+            self._migrate_enrichment_status_column(session)
+            # Migration: Add scan config columns (v5.3)
+            self._migrate_scan_config_columns(session)
+            # Migration: Add 'provider' column to scan table (v5.4)
+            self._migrate_provider_column(session)
+            # Migration: Add scan resumption columns (v5.5)
+            self._migrate_scan_resumption_columns(session)
+
+    def _ensure_scan_column(self, session, column_name: str, column_definition: str):
+        """Add a scan column if it does not exist yet."""
+        try:
+            session.exec(text(f"SELECT {column_name} FROM scan LIMIT 1"))
+        except Exception:
+            session.rollback()
+            try:
+                session.exec(text(f"ALTER TABLE scan ADD COLUMN {column_name} {column_definition}"))
+                session.commit()
+                logger.info(f"Migration: Added '{column_name}' column to scan table")
+            except Exception as e:
+                session.rollback()
+                logger.warning(f"Migration '{column_name}' column skipped: {e}")
+
+    def _migrate_origin_column(self, session):
+        """Migrate 'origin' column to scan table."""
+        try:
+            session.exec(text("SELECT origin FROM scan LIMIT 1"))
+        except Exception:
+            session.rollback()
+            self._add_origin_column(session)
+
+    def _add_origin_column(self, session):
+        """Add origin column to scan table."""
+        try:
+            session.exec(text("ALTER TABLE scan ADD COLUMN origin VARCHAR DEFAULT 'cli'"))
+            session.commit()
+            logger.info("Migration: Added 'origin' column to scan table")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"Migration 'origin' column skipped: {e}")
+
+    def _migrate_report_dir_column(self, session):
+        """Migrate 'report_dir' column to scan table."""
+        try:
+            session.exec(text("SELECT report_dir FROM scan LIMIT 1"))
+        except Exception:
+            session.rollback()
+            self._add_report_dir_column(session)
+
+    def _add_report_dir_column(self, session):
+        """Add report_dir column to scan table."""
+        try:
+            session.exec(text("ALTER TABLE scan ADD COLUMN report_dir VARCHAR"))
+            session.commit()
+            logger.info("Migration: Added 'report_dir' column to scan table")
+        except Exception as e:
+            session.rollback()
+            logger.warning(f"Migration 'report_dir' column skipped: {e}")
+
+    def _migrate_enrichment_status_column(self, session):
+        """Migrate 'enrichment_status' column to scan table."""
+        try:
+            session.exec(text("SELECT enrichment_status FROM scan LIMIT 1"))
+        except Exception:
+            session.rollback()
+            try:
+                session.exec(text("ALTER TABLE scan ADD COLUMN enrichment_status VARCHAR DEFAULT NULL"))
+                session.commit()
+                logger.info("Migration: Added 'enrichment_status' column to scan table")
+            except Exception as e:
+                session.rollback()
+                logger.warning(f"Migration 'enrichment_status' column skipped: {e}")
+
+    def _migrate_scan_config_columns(self, session):
+        """Migrate scan_type, max_depth, max_urls columns to scan table."""
+        for col, col_type in [("scan_type", "VARCHAR"), ("max_depth", "INTEGER"), ("max_urls", "INTEGER")]:
+            try:
+                session.exec(text(f"SELECT {col} FROM scan LIMIT 1"))
+            except Exception:
+                session.rollback()
+                try:
+                    session.exec(text(f"ALTER TABLE scan ADD COLUMN {col} {col_type} DEFAULT NULL"))
+                    session.commit()
+                    logger.info(f"Migration: Added '{col}' column to scan table")
+                except Exception as e:
+                    session.rollback()
+                    logger.warning(f"Migration '{col}' column skipped: {e}")
+
+    def _migrate_provider_column(self, session):
+        """Migrate 'provider' column to scan table."""
+        try:
+            session.exec(text("SELECT provider FROM scan LIMIT 1"))
+        except Exception:
+            session.rollback()
+            try:
+                session.exec(text("ALTER TABLE scan ADD COLUMN provider VARCHAR DEFAULT NULL"))
+                session.commit()
+                logger.info("Migration: Added 'provider' column to scan table")
+            except Exception as e:
+                session.rollback()
+                logger.warning(f"Migration 'provider' column skipped: {e}")
+
+    def _migrate_scan_resumption_columns(self, session):
+        """Migrate scan resumption columns to existing scan tables."""
+        for column_name, column_definition in [
+            ("last_phase_completed", "VARCHAR DEFAULT NULL"),
+            ("retry_count", "INTEGER DEFAULT 0"),
+            ("last_error", "VARCHAR DEFAULT NULL"),
+            ("resumed_from_id", "INTEGER DEFAULT NULL"),
+        ]:
+            self._ensure_scan_column(session, column_name, column_definition)
+
+    def _init_vector_store(self):
+        """Initialize vector store with explicit schema for findings_embeddings."""
+        if not self.vector_db:
+            return
+        try:
+            import pyarrow as pa
+
+            collection = "findings_embeddings"
+            if collection not in self.vector_db.table_names():
+                schema = pa.schema([
+                    pa.field("finding_id", pa.string()),
+                    pa.field("type", pa.string()),
+                    pa.field("url", pa.string()),
+                    pa.field("parameter", pa.string()),
+                    pa.field("payload", pa.string()),
+                    pa.field("severity", pa.string()),
+                    pa.field("confidence", pa.float64()),
+                    pa.field("vector", pa.list_(pa.float32(), 384)),
+                    pa.field("timestamp", pa.string()),
+                ])
+                self.vector_db.create_table(collection, schema=schema)
+                logger.info(f"Created '{collection}' table with explicit schema")
+
+            logger.info("Vector Store initialized.")
+        except Exception as e:
+            logger.error(f"Failed to init vector store: {e}", exc_info=True)
+
+    def get_session(self) -> Session:
+        return Session(self.engine)
+
+    # =========================================================================
+    # PERSISTENCE METHODS - Save and load scan results
+    # =========================================================================
+    
+    def _try_get_existing_target(self, session, url: str) -> Optional[TargetTable]:
+        """Try to get existing target from database."""
+        statement = select(TargetTable).where(TargetTable.url == url)
+        target = session.exec(statement).first()
+        if target:
+            session.expunge(target)
+        return target
+
+    def _try_create_target(self, session, url: str) -> Optional[TargetTable]:
+        """Try to create new target, returns None on IntegrityError."""
+        from sqlalchemy.exc import IntegrityError
+        try:
+            target = TargetTable(url=url)
+            session.add(target)
+            session.commit()
+            session.refresh(target)
+            session.expunge(target)
+            logger.info(f"Created new target: {url}")
+            return target
+        except IntegrityError:
+            session.rollback()
+            logger.debug(f"Race condition: target created by another process")
+            return None
+
+    def _handle_race_condition(self, session, url: str, attempt: int, max_retries: int) -> Optional[TargetTable]:
+        """Handle race condition by fetching target created by another process."""
+        statement = select(TargetTable).where(TargetTable.url == url)
+        target = session.exec(statement).first()
+        if target:
+            session.expunge(target)
+            logger.debug(f"Target fetched after race condition: {url}")
+            return target
+
+        logger.warning(f"Target disappeared after race condition, retrying ({attempt + 1}/{max_retries})")
+        return None
+
+    def get_or_create_target(self, url: str, max_retries: int = 3) -> TargetTable:
+        """Get existing target or create new one with race condition handling."""
+        for attempt in range(max_retries):
+            with self.get_session() as session:
+                # Try to get existing target
+                target = self._try_get_existing_target(session, url)
+                if target:
+                    return target
+
+                # Target not found, try to create
+                target = self._try_create_target(session, url)
+                if target:
+                    return target
+
+                # Race condition occurred, try to fetch it
+                target = self._handle_race_condition(session, url, attempt, max_retries)
+                if target:
+                    return target
+
+        raise RuntimeError(f"Failed to get or create target after {max_retries} attempts: {url}")
+
+    def get_active_scan(self, target_url: str) -> Optional[int]:
+        """Check if there is an interrupted/active scan for this target."""
+        with self.get_session() as session:
+            statement = select(TargetTable).where(TargetTable.url == target_url)
+            target = session.exec(statement).first()
+            if not target: return None
+            
+            # Find most recent non-completed scan
+            scan_query = select(ScanTable).where(
+                ScanTable.target_id == target.id,
+                ScanTable.status != ScanStatus.COMPLETED
+            ).order_by(ScanTable.id.desc())
+            
+            scan = session.exec(scan_query).first()
+            return scan.id if scan else None
+    def get_latest_scan_id(self, target_url: str) -> Optional[int]:
+        """Get the absolute latest scan ID for a target, regardless of status."""
+        with self.get_session() as session:
+            statement = select(TargetTable).where(TargetTable.url == target_url)
+            target = session.exec(statement).first()
+            if not target: return None
+            
+            scan_query = select(ScanTable).where(
+                ScanTable.target_id == target.id
+            ).order_by(ScanTable.id.desc())
+            
+            scan = session.exec(scan_query).first()
+            return scan.id if scan else None
+
+    def get_most_recent_scan_id(self) -> Optional[int]:
+        """Get the most recent scan ID across all targets."""
+        with self.get_session() as session:
+            scan_query = select(ScanTable).order_by(ScanTable.id.desc())
+            scan = session.exec(scan_query).first()
+            return scan.id if scan else None
+
+    def get_scan_info(self, scan_id: int) -> Optional[ScanInfo]:
+        """Get scan metadata including target URL."""
+        with self.get_session() as session:
+            scan = session.get(ScanTable, scan_id)
+            if not scan:
+                return None
+
+            target = session.get(TargetTable, scan.target_id)
+            return ScanInfo(
+                scan_id=scan.id,
+                target_url=target.url if target else "Unknown",
+                timestamp=scan.timestamp,
+                status=scan.status,
+                progress_percent=scan.progress_percent
+            )
+
+    def create_new_scan(
+        self,
+        target_url: str,
+        origin: str = "cli",
+        scan_type: str = None,
+        max_depth: int = None,
+        max_urls: int = None,
+        provider: str = None,
+    ) -> int:
+        """Create a new scan record with RUNNING status.
+
+        Args:
+            target_url: Target URL to scan
+            origin: Where the scan was launched from ('cli' or 'web')
+            scan_type: Scan type ('full', 'hunter', 'manager', etc.)
+            max_depth: Crawl depth configured
+            max_urls: Max URLs configured
+            provider: LLM provider used ('openrouter', 'zai', etc.)
+        """
+        target = self.get_or_create_target(target_url)
+        target_id = target.id  # Extract ID while target is still valid
+        with self.get_session() as session:
+            scan = ScanTable(
+                target_id=target_id,
+                status=ScanStatus.RUNNING,
+                progress_percent=0,
+                origin=origin,
+                scan_type=scan_type,
+                max_depth=max_depth,
+                max_urls=max_urls,
+                provider=provider,
+            )
+            session.add(scan)
+            session.commit()
+            session.refresh(scan)
+            scan_id = scan.id
+        logger.info(f"Created scan {scan_id} in database (target_id={target_id}, origin={origin}, type={scan_type}, depth={max_depth}, urls={max_urls}, provider={provider})")
+        return scan_id
+
+    def update_scan_progress(self, scan_id: int, progress: int, status: Optional[ScanStatus] = None):
+        """Update scan progress and optionally status."""
+        with self.get_session() as session:
+            scan = session.get(ScanTable, scan_id)
+            if scan:
+                scan.progress_percent = progress
+                if status:
+                    scan.status = status
+                session.add(scan)
+                session.commit()
+
+    def update_scan_status(self, scan_id: int, status: ScanStatus):
+        """Update scan status."""
+        with self.get_session() as session:
+            scan = session.get(ScanTable, scan_id)
+            if scan:
+                scan.status = status
+                session.add(scan)
+                session.commit()
+
+    def update_scan_enrichment_status(self, scan_id: int, enrichment_status: str):
+        """Update scan enrichment status."""
+        with self.get_session() as session:
+            scan = session.get(ScanTable, scan_id)
+            if scan:
+                scan.enrichment_status = enrichment_status
+                session.add(scan)
+                session.commit()
+
+    def update_finding_status(self, finding_id: int, status: FindingStatus, notes: Optional[str] = None, screenshot: Optional[str] = None):
+        """Update finding validation status and evidence."""
+        with self.get_session() as session:
+            finding = session.get(FindingTable, finding_id)
+            if finding:
+                finding.status = status
+                if notes: finding.validator_notes = notes
+                if screenshot: finding.proof_screenshot_path = screenshot
+                if status == FindingStatus.VALIDATED_CONFIRMED:
+                    finding.visual_validated = True
+                session.add(finding)
+                session.commit()
+
+    def update_findings_from_enrichment(self, scan_id: int, enriched_findings: List[Dict]):
+        """Persist enriched severity and confidence back to DB after CVSS enrichment."""
+        with self.get_session() as session:
+            db_findings = session.exec(
+                select(FindingTable).where(FindingTable.scan_id == scan_id)
+            ).all()
+
+            lookup = {
+                (str(f.type.value if hasattr(f.type, 'value') else f.type).upper(), (f.vuln_parameter or "").lower()): f
+                for f in db_findings
+            }
+
+            updated = 0
+            for ef in enriched_findings:
+                key = ((ef.get("type") or "").upper(), (ef.get("parameter") or ef.get("param") or "").lower())
+                db_f = lookup.get(key)
+                if not db_f:
+                    continue
+
+                new_sev = _higher_severity(db_f.severity, ef.get("severity") or db_f.severity)
+                new_conf = max(db_f.confidence_score, ef.get("confidence") or 0.0)
+
+                changed = new_sev != db_f.severity or new_conf != db_f.confidence_score
+                db_f.severity = new_sev
+                db_f.confidence_score = new_conf
+
+                if changed:
+                    session.add(db_f)
+                    updated += 1
+
+            if updated:
+                session.commit()
+                logger.info(f"Enrichment persisted: updated {updated} findings in DB for scan {scan_id}")
+
+    def update_scan_report_dir(self, scan_id: int, report_dir: str):
+        """Update scan report directory."""
+        with self.get_session() as session:
+            scan = session.get(ScanTable, scan_id)
+            if scan:
+                scan.report_dir = report_dir
+                session.add(scan)
+                session.commit()
+                logger.info(f"Updated scan {scan_id} report_dir to {report_dir}")
+
+    def get_pending_findings(self, scan_id: Optional[int] = None) -> List[FindingTable]:
+        """Get all findings waiting for validation."""
+        with self.get_session() as session:
+            statement = select(FindingTable).where(FindingTable.status == FindingStatus.PENDING_VALIDATION)
+            if scan_id:
+                statement = statement.where(FindingTable.scan_id == scan_id)
+            results = session.exec(statement).all()
+            # Expunge to prevent DetachedInstanceError
+            for r in results:
+                session.expunge(r)
+            return list(results)
+
+    def save_checkpoint(self, scan_id: int, state_data: str):
+        """Save orchestrator state to DB."""
+        with self.get_session() as session:
+            # Check if exists
+            chk_query = select(ScanStateTable).where(ScanStateTable.scan_id == scan_id)
+            checkpoint = session.exec(chk_query).first()
+            
+            if checkpoint:
+                checkpoint.state_json = state_data
+                checkpoint.updated_at = datetime.utcnow()
+            else:
+                checkpoint = ScanStateTable(scan_id=scan_id, state_json=state_data)
+            
+            session.add(checkpoint)
+            session.commit()
+
+    def get_checkpoint(self, scan_id: int) -> Optional[str]:
+        """Load state from DB."""
+        with self.get_session() as session:
+            chk_query = select(ScanStateTable).where(ScanStateTable.scan_id == scan_id)
+            checkpoint = session.exec(chk_query).first()
+            
+            return checkpoint.state_json if checkpoint else None
+    
+    def _get_or_create_scan(self, session, target_url: str, scan_id: Optional[int]) -> ScanTable:
+        """Get existing scan or create new one."""
+        if scan_id:
+            scan = session.get(ScanTable, scan_id)
+            if scan:
+                return scan
+            # Fallback if scan_id not found
+            target = self.get_or_create_target(target_url)
+            scan = ScanTable(target_id=target.id, status=ScanStatus.RUNNING)
+        else:
+            target = self.get_or_create_target(target_url)
+            scan = ScanTable(target_id=target.id, status=ScanStatus.COMPLETED)
+
+        session.add(scan)
+        session.commit()
+        session.refresh(scan)
+        return scan
+
+    def _normalize_vuln_type(self, vuln_type_str: str):
+        """Normalize vulnerability type string to enum."""
+        from bugtrace.schemas.models import normalize_vuln_type, VulnType
+        try:
+            return normalize_vuln_type(vuln_type_str)
+        except Exception as e:
+            logger.warning(f"Failed to normalize type '{vuln_type_str}': {e}, using MISCONFIG")
+            return VulnType.MISCONFIG
+
+    def _update_existing_finding(self, existing_finding: FindingTable, finding_data: Dict):
+        """Update existing finding with new data."""
+        if finding_data.get("payload"):
+            existing_finding.payload_used = finding_data.get("payload")
+
+        if finding_data.get("validated") or finding_data.get("conductor_validated"):
+            existing_finding.visual_validated = True
+            existing_finding.status = FindingStatus.VALIDATED_CONFIRMED
+
+        existing_finding.confidence_score = max(
+            existing_finding.confidence_score,
+            _resolve_confidence(finding_data.get("confidence"), existing_finding.status),
+        )
+
+        new_severity = finding_data.get("severity")
+        if new_severity:
+            existing_finding.severity = _higher_severity(existing_finding.severity, new_severity)
+
+        new_details = _evidence_to_description(finding_data)
+        if len(new_details) > len(existing_finding.details):
+            existing_finding.details = new_details
+
+        new_screenshot = finding_data.get("screenshot_path") or finding_data.get("screenshot")
+        if new_screenshot and not existing_finding.proof_screenshot_path:
+            existing_finding.proof_screenshot_path = new_screenshot
+
+    def _create_new_finding(self, scan_id: int, vuln_type, finding_data: Dict, target_url: str) -> FindingTable:
+        """Create new finding record from data."""
+        raw_status = finding_data.get("status")
+        if raw_status:
+            try:
+                finding_status = FindingStatus(raw_status)
+            except ValueError:
+                finding_status = FindingStatus.PENDING_VALIDATION
+        else:
+            finding_status = (
+                FindingStatus.VALIDATED_CONFIRMED
+                if finding_data.get("conductor_validated")
+                else FindingStatus.PENDING_VALIDATION
+            )
+
+        return FindingTable(
+            scan_id=scan_id,
+            type=vuln_type,
+            severity=finding_data.get("severity", "MEDIUM"),
+            details=_evidence_to_description(finding_data),
+            payload_used=finding_data.get("payload") or "N/A",
+            confidence_score=_resolve_confidence(finding_data.get("confidence"), finding_status),
+            visual_validated=finding_data.get("validated") or finding_data.get("conductor_validated", False),
+            attack_url=finding_data.get("url", target_url),
+            vuln_parameter=finding_data.get("parameter", finding_data.get("param", "")),
+            reproduction_command=finding_data.get("reproduction") or finding_data.get("reproduction_command"),
+            status=finding_status,
+            proof_screenshot_path=finding_data.get("screenshot_path") or finding_data.get("screenshot")
+        )
+
+    def _is_global_parameter(self, param: str) -> bool:
+        """
+        Check if parameter is global (affects all endpoints, not URL-specific).
+
+        Global parameters include cookies, headers, and auth tokens that persist
+        across all requests to a domain.
+        """
+        param_lower = (param or "").lower()
+        global_indicators = ["cookie", "header", "authorization", "bearer", "token", "session"]
+        return any(indicator in param_lower for indicator in global_indicators)
+
+    def _normalize_parameter_for_lookup(self, param: str) -> str:
+        """Normalize parameter for database lookup (handles variations)."""
+        param_lower = (param or "").lower().strip()
+
+        # Cookie: extract just the cookie name
+        if "cookie" in param_lower:
+            clean = param_lower.replace("cookie:", "").replace("cookie", "").strip()
+            clean = clean.split()[0] if clean else ""
+            return f"cookie:{clean}" if clean else param_lower
+
+        return param_lower
+
+    def _find_existing_finding(self, session, scan_id: int, vuln_type, finding_data: Dict, target_url: str):
+        """
+        Check if finding already exists for this scan.
+
+        For global parameters (cookies, headers), ignores the URL since the
+        vulnerability affects all endpoints equally.
+        """
+        param = finding_data.get("parameter", finding_data.get("param", ""))
+        param_normalized = self._normalize_parameter_for_lookup(param)
+
+        if self._is_global_parameter(param):
+            # Global parameter: match by (scan_id, type, param) - ignore URL
+            # Use LIKE to handle parameter variations
+            results = session.exec(
+                select(FindingTable).where(
+                    FindingTable.scan_id == scan_id,
+                    FindingTable.type == vuln_type
+                )
+            ).all()
+
+            # Check if any existing finding has a matching normalized parameter
+            for existing in results:
+                existing_param_norm = self._normalize_parameter_for_lookup(existing.vuln_parameter)
+                if existing_param_norm == param_normalized:
+                    return existing
+
+            return None
+        else:
+            # URL-specific parameter: full match required
+            return session.exec(
+                select(FindingTable).where(
+                    FindingTable.scan_id == scan_id,
+                    FindingTable.type == vuln_type,
+                    FindingTable.attack_url == finding_data.get("url", target_url),
+                    FindingTable.vuln_parameter == param
+                )
+            ).first()
+
+    def save_scan_result(self, target_url: str, findings: List[Dict], scan_id: Optional[int] = None) -> int:
+        """Save scan results to database."""
+        with self.get_session() as session:
+            scan = self._get_or_create_scan(session, target_url, scan_id)
+
+            for finding_data in findings:
+                vuln_type_str = finding_data.get("type", "Unknown")
+                vuln_type = self._normalize_vuln_type(vuln_type_str)
+
+                existing_finding = self._find_existing_finding(
+                    session, scan.id, vuln_type, finding_data, target_url
+                )
+
+                if existing_finding:
+                    logger.info(f"Updating existing finding: {vuln_type} on {finding_data.get('parameter')}")
+                    self._update_existing_finding(existing_finding, finding_data)
+                    session.add(existing_finding)
+                else:
+                    finding = self._create_new_finding(scan.id, vuln_type, finding_data, target_url)
+                    session.add(finding)
+
+            session.commit()
+            logger.info(f"Updated scan {scan.id} with {len(findings)} findings for {target_url}")
+
+            # Store embeddings in LanceDB for cross-scan learning
+            self._store_embeddings_if_enabled(findings)
+
+            return scan.id
+
+    def _store_embeddings_if_enabled(self, findings: List[Dict]) -> None:
+        """Store finding embeddings in LanceDB if enabled and model is real."""
+        try:
+            from bugtrace.core.config import settings
+            if not getattr(settings, 'LANCEDB_ENABLED', False):
+                return
+
+            from bugtrace.core.embeddings import get_embedding_manager
+            emb_manager = get_embedding_manager()
+            if not emb_manager.is_real_model:
+                logger.debug("LanceDB skipped: MockEmbeddingModel active (no real model)")
+                return
+
+            stored = 0
+            for finding_data in findings:
+                self.store_finding_embedding(finding_data)
+                stored += 1
+            if stored:
+                logger.info(f"Stored {stored} finding embeddings in LanceDB")
+        except Exception as e:
+            logger.warning(f"LanceDB embedding storage failed (non-fatal): {e}")
+
+    def get_findings_for_scan(self, scan_id: int) -> List[FindingTable]:
+        """Get all findings for a specific scan."""
+        with self.get_session() as session:
+            statement = select(FindingTable).where(FindingTable.scan_id == scan_id)
+            results = session.exec(statement).all()
+            for r in results:
+                session.expunge(r)
+            return list(results)
+    
+    def get_findings_for_target(self, target_url: str) -> List[Dict]:
+        """
+        Get all previous findings for a target.
+        
+        Args:
+            target_url: URL to look up
+            
+        Returns:
+            List of finding dictionaries
+        """
+        with self.get_session() as session:
+            statement = select(TargetTable).where(TargetTable.url == target_url)
+            target = session.exec(statement).first()
+            
+            if not target:
+                return []
+            
+            # Get all scans for this target
+            scan_statement = select(ScanTable).where(ScanTable.target_id == target.id)
+            scans = session.exec(scan_statement).all()
+            
+            findings = []
+            for scan in scans:
+                finding_statement = select(FindingTable).where(FindingTable.scan_id == scan.id)
+                scan_findings = session.exec(finding_statement).all()
+                
+                for f in scan_findings:
+                    findings.append({
+                        "type": f.type,
+                        "severity": f.severity,
+                        "details": f.details,
+                        "payload": f.payload_used,
+                        "confidence": f.confidence_score,
+                        "validated": f.visual_validated,
+                        "url": f.attack_url,
+                        "parameter": f.vuln_parameter,
+                        "scan_date": scan.timestamp.isoformat()
+                    })
+            
+            logger.info(f"Found {len(findings)} previous findings for {target_url}")
+            return findings
+    
+    def get_scan_count(self, target_url: str) -> int:
+        """Get number of previous scans for a target."""
+        with self.get_session() as session:
+            statement = select(TargetTable).where(TargetTable.url == target_url)
+            target = session.exec(statement).first()
+            
+            if not target:
+                return 0
+            
+            scan_statement = select(ScanTable).where(ScanTable.target_id == target.id)
+            scans = session.exec(scan_statement).all()
+            return len(scans)
+
+    # =========================================================================
+    # VECTOR OPERATIONS - Semantic search and similarity
+    # =========================================================================
+    
+    def add_vector_embedding(self, collection_name: str, data: List[dict]):
+        """Add data (must contain 'vector' field) to LanceDB collection."""
+        if not self.vector_db:
+            return
+        try:
+            if collection_name in self.vector_db.table_names():
+                tbl = self.vector_db.open_table(collection_name)
+                tbl.add(data)
+            else:
+                self.vector_db.create_table(collection_name, data=data)
+        except Exception as e:
+            logger.error(f"Vector add failed: {e}", exc_info=True)
+    
+    def search_similar_findings(self, query_text: str, limit: int = 5) -> List[Dict]:
+        """
+        Search for similar findings using semantic similarity.
+
+        Args:
+            query_text: Search query (e.g., "SQL injection in id parameter")
+            limit: Max results to return
+
+        Returns:
+            List of similar findings with similarity scores, severity, confidence, and finding_id
+        """
+        if not self.vector_db:
+            return []
+        try:
+            from bugtrace.core.embeddings import get_embedding_manager
+
+            collection = "findings_embeddings"
+
+            if collection not in self.vector_db.table_names():
+                logger.debug("No findings embeddings table exists yet")
+                return []
+
+            emb_manager = get_embedding_manager()
+            query_vector = emb_manager.encode_query(query_text)
+
+            # L2: Guard against failed query encoding
+            if query_vector is None:
+                logger.warning("Query encoding failed, cannot search similar findings")
+                return []
+
+            tbl = self.vector_db.open_table(collection)
+            results = tbl.search(query_vector).limit(limit).to_list()
+
+            similar_findings = []
+            for result in results:
+                similar_findings.append({
+                    "finding_id": result.get("finding_id"),
+                    "type": result.get("type"),
+                    "url": result.get("url"),
+                    "parameter": result.get("parameter"),
+                    "payload": result.get("payload"),
+                    "severity": result.get("severity", ""),
+                    "confidence": result.get("confidence", 0.0),
+                    "distance": result.get("_distance", 0.0),
+                    "timestamp": result.get("timestamp")
+                })
+
+            logger.info(f"Found {len(similar_findings)} similar findings for query: {query_text[:50]}")
+            return similar_findings
+
+        except Exception as e:
+            logger.error(f"Vector search failed: {e}", exc_info=True)
+            return []
+    
+    def store_finding_embedding(self, finding: Dict, embedding: Optional[List[float]] = None):
+        """
+        Store a finding with its vector embedding for future similarity search.
+
+        Includes type normalization (L1), zero-vector guard (L2), and deduplication (L4).
+
+        Args:
+            finding: Finding dictionary
+            embedding: Optional pre-computed embedding. If None, will generate automatically.
+        """
+        if not self.vector_db:
+            return
+        try:
+            from bugtrace.core.embeddings import get_embedding_manager
+            from datetime import datetime
+
+            # Generate embedding if not provided
+            if embedding is None:
+                emb_manager = get_embedding_manager()
+                embedding = emb_manager.encode_finding(finding)
+
+            # L2: Zero-vector guard — skip storage if encoding failed
+            if embedding is None:
+                logger.warning(f"Skipping LanceDB storage for finding (embedding failed): {finding.get('type')}")
+                return
+
+            # L1: Normalize type to consistent string
+            raw_type = finding.get("type", "")
+            try:
+                from bugtrace.schemas.models import normalize_vuln_type
+                normalized_type = normalize_vuln_type(str(raw_type)).value
+            except Exception:
+                normalized_type = str(raw_type).upper().strip()
+
+            collection = "findings_embeddings"
+            finding_url = finding.get("url", "")
+            finding_param = finding.get("parameter", "")
+
+            # L4: Dedup — check if (url, parameter, type) already exists
+            try:
+                if collection in self.vector_db.table_names():
+                    tbl = self.vector_db.open_table(collection)
+                    safe_url = finding_url.replace("'", "''")
+                    safe_param = finding_param.replace("'", "''")
+                    safe_type = normalized_type.replace("'", "''")
+                    existing = tbl.search().where(
+                        f"url = '{safe_url}' AND parameter = '{safe_param}' AND type = '{safe_type}'"
+                    ).limit(1).to_list()
+                    if existing:
+                        logger.debug(f"Dedup: finding already in LanceDB ({normalized_type} on {finding_param})")
+                        return
+            except Exception as dedup_err:
+                logger.debug(f"Dedup check skipped: {dedup_err}")
+
+            data = [{
+                "finding_id": finding.get("id", "unknown"),
+                "type": normalized_type,
+                "url": finding_url,
+                "parameter": finding_param,
+                "payload": str(finding.get("payload", ""))[:200],
+                "severity": finding.get("severity", ""),
+                "confidence": float(finding.get("confidence_score", finding.get("confidence", 0.0))),
+                "vector": embedding,
+                "timestamp": datetime.now().isoformat()
+            }]
+            self.add_vector_embedding(collection, data)
+            logger.debug(f"Stored embedding for finding: {normalized_type}")
+        except Exception as e:
+            logger.error(f"Failed to store finding embedding: {e}", exc_info=True)
+
+    # =========================================================================
+    # HEALTH CHECK & METRICS
+    # =========================================================================
+
+    def health_check(self) -> Dict:
+        """
+        Check database health and connectivity.
+
+        Returns:
+            Dict with status ('healthy' or 'unhealthy'), latency, and error info
+        """
+        import time
+        result = {
+            "status": "unhealthy",
+            "sql_db": {"status": "unknown"},
+            "vector_db": {"status": "unknown"},
+            "latency_ms": 0
+        }
+
+        start = time.perf_counter()
+
+        # Check SQL database
+        try:
+            with self.get_session() as session:
+                session.exec(text("SELECT 1"))
+            result["sql_db"] = {"status": "healthy"}
+        except Exception as e:
+            result["sql_db"] = {"status": "unhealthy", "error": str(e)}
+            logger.error(f"SQL health check failed: {e}", exc_info=True)
+
+        # Check LanceDB
+        if self.vector_db:
+            try:
+                _ = self.vector_db.table_names()
+                result["vector_db"] = {"status": "healthy"}
+            except Exception as e:
+                result["vector_db"] = {"status": "unhealthy", "error": str(e)}
+                logger.error(f"Vector DB health check failed: {e}", exc_info=True)
+        else:
+            result["vector_db"] = {"status": "disabled"}
+
+        result["latency_ms"] = round((time.perf_counter() - start) * 1000, 2)
+
+        # Overall status — healthy if SQL works (vector_db is optional)
+        if result["sql_db"]["status"] == "healthy" and result["vector_db"]["status"] in ("healthy", "disabled"):
+            result["status"] = "healthy"
+
+        return result
+
+    def get_metrics(self) -> Dict:
+        """
+        Get database metrics for monitoring.
+
+        Returns:
+            Dict with pool stats, table counts, and other metrics
+        """
+        metrics = {
+            "pool": {},
+            "tables": {},
+            "vector_collections": []
+        }
+
+        # Connection pool metrics
+        pool = self.engine.pool
+        metrics["pool"] = {
+            "pool_class": type(pool).__name__,
+            "size": getattr(pool, "size", lambda: "N/A")() if callable(getattr(pool, "size", None)) else getattr(pool, "_pool", {}).qsize() if hasattr(pool, "_pool") else "N/A",
+            "checked_in": pool.checkedin() if hasattr(pool, "checkedin") else "N/A",
+            "checked_out": pool.checkedout() if hasattr(pool, "checkedout") else "N/A",
+            "overflow": pool.overflow() if hasattr(pool, "overflow") else "N/A",
+        }
+
+        # Table row counts
+        try:
+            with self.get_session() as session:
+                metrics["tables"]["targets"] = session.exec(select(func.count()).select_from(TargetTable)).one()
+                metrics["tables"]["scans"] = session.exec(select(func.count()).select_from(ScanTable)).one()
+                metrics["tables"]["findings"] = session.exec(select(func.count()).select_from(FindingTable)).one()
+        except Exception as e:
+            logger.warning(f"Failed to get table metrics: {e}")
+            metrics["tables"]["error"] = str(e)
+
+        # Vector DB collections
+        if self.vector_db:
+            try:
+                metrics["vector_collections"] = self.vector_db.table_names()
+            except Exception as e:
+                logger.warning(f"Failed to get vector DB metrics: {e}")
+                metrics["vector_collections_error"] = str(e)
+        else:
+            metrics["vector_collections"] = "disabled"
+
+        return metrics
+
+    def _validate_backup_prerequisites(self) -> tuple[bool, Optional[str], Optional[str]]:
+        """Validate that backup can proceed. Returns (can_proceed, error_msg, db_path)."""
+        if not self.db_url.startswith("sqlite"):
+            logger.warning("Backup attempted on non-SQLite database")
+            return False, "Backup only supported for SQLite databases", None
+
+        db_path = self.db_url.replace("sqlite:///", "")
+        if not os.path.exists(db_path):
+            return False, f"Database file not found: {db_path}", None
+
+        return True, None, db_path
+
+    def _prepare_backup_path(self, db_path: str, backup_dir: Optional[str]) -> str:
+        """Prepare backup directory and generate backup file path."""
+        if backup_dir is None:
+            backup_dir = os.path.join(os.path.dirname(db_path), "backups")
+        os.makedirs(backup_dir, exist_ok=True)
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"bugtrace_backup_{timestamp}.db"
+        return os.path.join(backup_dir, backup_filename)
+
+    def _perform_sqlite_backup(self, db_path: str, backup_path: str) -> int:
+        """Perform actual SQLite backup and return size."""
+        import sqlite3
+        source = sqlite3.connect(db_path)
+        dest = sqlite3.connect(backup_path)
+        try:
+            with dest:
+                source.backup(dest)
+        finally:
+            source.close()
+            dest.close()
+        return os.path.getsize(backup_path)
+
+    def backup_database(self, backup_dir: Optional[str] = None) -> Dict:
+        """Create a backup of the SQLite database and LanceDB knowledge store."""
+        result = {
+            "status": "failed",
+            "path": None,
+            "size_bytes": 0,
+            "lancedb_backup": None,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+        can_proceed, error_msg, db_path = self._validate_backup_prerequisites()
+        if not can_proceed:
+            result["error"] = error_msg
+            return result
+
+        try:
+            backup_path = self._prepare_backup_path(db_path, backup_dir)
+            backup_size = self._perform_sqlite_backup(db_path, backup_path)
+
+            result["status"] = "success"
+            result["path"] = backup_path
+            result["size_bytes"] = backup_size
+
+            logger.info(f"Database backup created: {backup_path} ({backup_size} bytes)")
+            self._cleanup_old_backups(os.path.dirname(backup_path), keep=5)
+
+            # L6: Also backup LanceDB directory
+            try:
+                import shutil
+                lancedb_src = self.vector_db_path
+                if os.path.isdir(lancedb_src):
+                    lancedb_backup_path = backup_path.replace(".db", "_lancedb")
+                    shutil.copytree(lancedb_src, lancedb_backup_path, dirs_exist_ok=True)
+                    result["lancedb_backup"] = lancedb_backup_path
+                    logger.info(f"LanceDB backup created: {lancedb_backup_path}")
+            except Exception as lance_err:
+                logger.warning(f"LanceDB backup failed (SQLite backup OK): {lance_err}")
+
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(f"Database backup failed: {e}", exc_info=True)
+
+        return result
+
+    def _cleanup_old_backups(self, backup_dir: str, keep: int = 5):
+        """Remove old backups, keeping only the most recent ones."""
+        from pathlib import Path
+
+        try:
+            backup_files = sorted(
+                Path(backup_dir).glob("bugtrace_backup_*.db"),
+                key=lambda x: x.stat().st_mtime,
+                reverse=True
+            )
+
+            for old_backup in backup_files[keep:]:
+                old_backup.unlink()
+                logger.debug(f"Removed old backup: {old_backup}")
+
+        except Exception as e:
+            logger.warning(f"Failed to cleanup old backups: {e}")
+
+
+# Lazy initialization - don't create at import time
+def get_db_manager() -> DatabaseManager:
+    """Get or create database manager instance."""
+    return DatabaseManager.get_instance()

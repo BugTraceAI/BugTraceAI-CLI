@@ -1,0 +1,1310 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator, Field
+from typing import Optional, List, Dict, Any
+from pathlib import Path
+import os
+import re
+import json
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv() # Force load .env
+
+from bugtrace import __version__
+from bugtrace.utils.logger import get_logger
+
+logger = get_logger("core.config")
+
+# Known valid providers for OpenRouter
+VALID_PROVIDERS = [
+    'google', 'openai', 'anthropic', 'meta', 'mistral',
+    'qwen', 'deepseek', 'x-ai', 'cohere', 'perplexity',
+    'nvidia', 'ai21', 'together', 'fireworks', 'groq',
+    'moonshotai',
+]
+
+# Placeholder values that should be rejected
+API_KEY_PLACEHOLDERS = ['your-key-here', 'placeholder', 'xxx', 'changeme', 'test', 'sk-xxx']
+
+class Settings(BaseSettings):
+    """
+    Unified Configuration Management using Pydantic Settings.
+    Loads from .env file and environment variables.
+    """
+    # --- Project Metadata ---
+    APP_NAME: str = "BugTraceAI-CLI"
+    VERSION: str = __version__  # Synced from bugtrace.__version__
+    DEBUG: bool = False
+    SAFE_MODE: bool = False # Default to False, override via CLI
+
+    # --- Environment (TASK-124) ---
+    ENV: str = Field(default="production", description="Environment: development, staging, production")
+
+    # --- LLM Provider Selection ---
+    PROVIDER: str = "openrouter"  # Active provider: openrouter, zai
+
+    # --- API Keys (Secrets) with validation (TASK-118) ---
+    OPENROUTER_API_KEY: Optional[str] = Field(default=None, min_length=32, description="OpenRouter API key")
+    GLM_API_KEY: Optional[str] = Field(default=None, min_length=20, description="GLM API key")
+    
+    # --- LLM Models ---
+    DEFAULT_MODEL: str = "qwen/qwen3-coder"
+    CODE_MODEL: str = "qwen/qwen3-coder"
+    ANALYSIS_MODEL: str = "qwen/qwen3-coder"
+    
+    # --- AUTHORITY Configuration ---
+    ENABLE_SELF_VALIDATION: bool = True
+    XSS_SELF_VALIDATE: bool = True
+    SQLI_SELF_VALIDATE: bool = True
+    RCE_SELF_VALIDATE: bool = True
+
+    # Number of models required to agree for "consensus"
+    # 1 = highest sensitivity, 2 = more balanced, 3 = maximum precision
+    CONSENSUS_VOTES: int = 1
+    
+    # Ordered list (Shifts if one fails)
+    PRIMARY_MODELS: str = ""
+    
+    # Vision
+    VISION_MODEL: str = ""
+    
+    # WAF
+    WAF_DETECTION_MODELS: str = ""
+    
+    # Model for payload mutation (DeepSeek has fewer safety restrictions)
+    MUTATION_MODEL: str = "x-ai/grok-4-fast"
+    
+    MIN_CREDITS: float = 2.0
+    MAX_CONCURRENT_REQUESTS: int = 1
+    LLM_REQUEST_TIMEOUT: float = 30.0  # Seconds to wait for LLM API response (fail fast on slow models)
+
+    # Model for skeptical analysis in DASTySAST agent
+    SKEPTICAL_MODEL: str = "anthropic/claude-haiku-4.5"
+
+    # Model for reporting (PoC enrichment, CVSS scoring - needs uncensored analysis)
+    REPORTING_MODEL: str = "anthropic/claude-haiku-4.5"
+
+    # Batch PoC enrichment (Phase 6: grouped by vuln type)
+    REPORTING_POC_BATCH_SIZE: int = 10       # Max findings per LLM call within a group
+    REPORTING_POC_TOKENS_PER_FINDING: int = 600  # Output tokens budget per finding
+    REPORTING_POC_MIN_TOKENS: int = 2000     # Minimum max_tokens per batch call
+    REPORTING_POC_MAX_TOKENS: int = 8000     # Ceiling to prevent overflow
+
+    # Skeptical Review Thresholds (0-10 scale)
+    # CRITICAL vulns have LOWER thresholds to avoid missing them
+    SKEPTICAL_THRESHOLDS: dict = {
+        "RCE": 4,      # Critical - don't miss
+        "SQL": 4,      # Critical - don't miss
+        "XXE": 5,      # High risk
+        "SSRF": 5,     # High risk
+        "LFI": 5,      # High risk
+        "XSS": 5,      # Medium, easy to verify
+        "CSTI": 3,     # v3.2.1: Low threshold - needs specialist validation to confirm
+        "SSTI": 3,     # v3.2.1: Low threshold - needs specialist validation to confirm
+        "TEMPLATE": 3, # v3.2.1: Catch-all for template injection types
+        "JWT": 6,      # Medium
+        "FILE_UPLOAD": 6,  # Medium
+        "IDOR": 6,     # Lower risk
+        "DEFAULT": 5   # Fallback
+    }
+
+    # --- Anthropic OAuth (direct API, $0 on Pro/Max) ---
+    ANTHROPIC_OAUTH_ENABLED: bool = False
+    ANTHROPIC_TOKEN_FILE: str = "~/.bugtrace/auth.json"
+
+    # --- False Positive Filtering (Phase 17: v2.3) ---
+    FP_CONFIDENCE_THRESHOLD: float = 0.5  # Minimum fp_confidence to pass filtering (0.0-1.0)
+    FP_SKEPTICAL_WEIGHT: float = 0.4  # Weight of skeptical_score in fp_confidence calc
+    FP_VOTES_WEIGHT: float = 0.3  # Weight of votes in fp_confidence calc
+    FP_EVIDENCE_WEIGHT: float = 0.3  # Weight of evidence quality in fp_confidence calc
+
+    # --- LanceDB Embeddings ---
+    LANCEDB_ENABLED: bool = True  # Store finding embeddings in LanceDB for cross-scan learning
+
+    # --- DAST Analysis Timeout (Phase 38: v3.2) ---
+    DAST_ANALYSIS_TIMEOUT: float = 180.0  # Seconds per URL analysis (probes + LLM)
+    DAST_MAX_RETRIES: int = 5  # Max retry rounds for URLs missing dastysast JSON (pipeline stops if still missing)
+    DAST_CONSECUTIVE_TIMEOUT_LIMIT: int = 5  # Auto-pause after N consecutive timeouts (target may be down)
+    DAST_TIMEOUT_PERCENT_LIMIT: int = 75  # Auto-pause if >N% of URLs timeout (target unreliable)
+    DAST_AUTO_RESUME_DELAY: int = 300  # Seconds to wait before auto-resuming after pause (0 = wait forever)
+
+    # --- ThinkingConsolidationAgent settings (Phase 18: v2.3) ---
+    THINKING_MODE: str = "streaming"  # "streaming" | "batch"
+    THINKING_BATCH_SIZE: int = 50  # Max findings per batch in batch mode
+    THINKING_BATCH_TIMEOUT: float = 5.0  # Seconds to wait before processing incomplete batch
+    THINKING_DEDUP_WINDOW: int = 1000  # Max dedup keys to track (LRU eviction)
+    THINKING_FP_THRESHOLD: float = 0.5  # Min fp_confidence to forward to specialists (configurable in .conf)
+    THINKING_BACKPRESSURE_RETRIES: int = 3  # Max retries on queue full
+    THINKING_BACKPRESSURE_DELAY: float = 0.5  # Seconds between retries
+    THINKING_EMIT_EVENTS: bool = True  # Emit work_queued events
+
+    # --- Embeddings Classification Configuration (Phase 42: v3.3) ---
+    USE_EMBEDDINGS_CLASSIFICATION: bool = False  # Feature flag (start disabled for safety)
+    EMBEDDINGS_CONFIDENCE_THRESHOLD: float = 0.75  # Min similarity to trust embeddings
+    EMBEDDINGS_MANUAL_REVIEW_THRESHOLD: float = 0.60  # Flag for manual review
+    EMBEDDINGS_LOG_CONFIDENCE: bool = True  # Log classification confidence scores
+
+    # --- Worker Pool Configuration (Phase 19: v2.3) ---
+    WORKER_POOL_DEFAULT_SIZE: int = 5  # Default workers per specialist
+    WORKER_POOL_XSS_SIZE: int = 8  # XSS-specific (high volume)
+    WORKER_POOL_SQLI_SIZE: int = 5  # SQLi-specific
+    WORKER_POOL_SHUTDOWN_TIMEOUT: float = 30.0  # Max seconds to drain on shutdown
+    WORKER_POOL_DEQUEUE_TIMEOUT: float = 5.0  # Seconds to wait for queue item
+    WORKER_POOL_EMIT_EVENTS: bool = True  # Emit vulnerability_detected events
+
+    # --- Specialist Concurrency Control (Phase 20: WET→DRY) ---
+    # REMOVED: SPECIALIST_MAX_CONCURRENT (duplicate of MAX_CONCURRENT_SPECIALISTS)
+    # Use MAX_CONCURRENT_SPECIALISTS from .conf instead (loaded at line 388-389)
+
+    # --- Validation Optimization Configuration (Phase 21: v2.3) ---
+    VALIDATION_METRICS_ENABLED: bool = True  # Track validation load metrics
+    CDP_LOAD_TARGET: float = 0.01  # Target <1% findings go to CDP validation
+    VALIDATION_LOG_INTERVAL: int = 100  # Log metrics every N findings
+
+    # --- Pipeline Orchestration Configuration (Phase 23: v2.3) ---
+    PIPELINE_PHASE_TIMEOUT: int = 600  # 10 min max per phase
+    PIPELINE_DRAIN_TIMEOUT: int = 30  # 30s to drain queues on shutdown
+    PIPELINE_PAUSE_CHECK_INTERVAL: float = 0.5  # Pause check frequency
+    PIPELINE_DISCOVERY_COMPLETION_DELAY: float = 2.0  # Wait for late findings
+    PIPELINE_AUTO_TRANSITION: bool = True  # Automatic phase transitions
+
+    # --- Performance Metrics Configuration (Phase 24: v2.3) ---
+    PERF_CDP_LOG_ENABLED: bool = True  # Log CDP reduction summary after each scan
+    PERF_CDP_LOG_INTERVAL: int = 50  # Log interim CDP metrics every N findings (0 to disable)
+    PERF_DEDUP_LOG_ENABLED: bool = True  # Log deduplication metrics during and after scans
+    PERF_DEDUP_LOG_INTERVAL: int = 25  # Log dedup stats every N duplicates (0 to disable)
+    PERF_PARALLEL_LOG_ENABLED: bool = True  # Log parallelization metrics during and after scans
+    PERF_PARALLEL_LOG_INTERVAL: int = 10  # Log parallelization stats every N worker operations (0 to disable)
+
+    # --- Pipeline V3 Batch Processing Configuration (Phase 31: v2.5) ---
+    BATCH_PROCESSING_ENABLED: bool = True  # Enable batch DAST mode
+    BATCH_DAST_CONCURRENCY: int = 5  # Max concurrent DAST agents
+    BATCH_QUEUE_DRAIN_TIMEOUT: float = 300.0  # Seconds to wait for queues
+    BATCH_QUEUE_CHECK_INTERVAL: float = 2.0  # Seconds between queue depth checks
+
+    def get_threshold_for_type(self, vuln_type: str) -> int:
+        """Get the skeptical threshold for a vulnerability type."""
+        vuln_upper = vuln_type.upper()
+        for key in self.SKEPTICAL_THRESHOLDS:
+            if key in vuln_upper:
+                return self.SKEPTICAL_THRESHOLDS[key]
+        return self.SKEPTICAL_THRESHOLDS.get("DEFAULT", 5)
+
+    # --- Validators (TASK-118, TASK-119) ---
+    @field_validator('OPENROUTER_API_KEY')
+    @classmethod
+    def validate_openrouter_key(cls, v):
+        """Validate OpenRouter API key format."""
+        if v is None:
+            return v
+        # Check for placeholder values
+        if v.lower() in API_KEY_PLACEHOLDERS:
+            raise ValueError("OPENROUTER_API_KEY appears to be a placeholder, not a real key")
+        # OpenRouter keys typically: sk-or-v1-[64 hex chars]
+        if not re.match(r'^sk-or-v1-[a-f0-9]{64}$', v):
+            logger.warning("OPENROUTER_API_KEY format looks incorrect (expected: sk-or-v1-[64 hex])")
+        return v
+
+    @field_validator('GLM_API_KEY')
+    @classmethod
+    def validate_glm_key(cls, v):
+        """Validate GLM API key format."""
+        if v is None:
+            return v
+        # Check for placeholder values
+        if v.lower() in API_KEY_PLACEHOLDERS:
+            raise ValueError("GLM_API_KEY appears to be a placeholder, not a real key")
+        # GLM keys are typically alphanumeric
+        if not re.match(r'^[a-zA-Z0-9_\-]{20,}$', v):
+            logger.warning("GLM_API_KEY format looks incorrect")
+        return v
+
+    @field_validator('DEFAULT_MODEL', 'CODE_MODEL', 'ANALYSIS_MODEL', 'MUTATION_MODEL',
+                     'SKEPTICAL_MODEL', 'VISION_MODEL', 'ANALYSIS_PENTESTER_MODEL',
+                     'ANALYSIS_BUG_BOUNTY_MODEL', 'ANALYSIS_AUDITOR_MODEL',
+                     'ANALYSIS_RED_TEAM_MODEL', 'ANALYSIS_RESEARCHER_MODEL',
+                     'VALIDATION_VISION_MODEL')
+    @classmethod
+    def validate_model_name(cls, v, info):
+        """Validate model name format (TASK-119)."""
+        if not v:
+            return v  # Allow empty for optional models
+        # OpenRouter format: provider/model-name
+        if '/' not in v:
+            raise ValueError(f"Invalid model name format: {v} (expected: provider/model)")
+        provider, model = v.split('/', 1)
+        # Warn about unknown providers (don't fail - new providers may appear)
+        if provider not in VALID_PROVIDERS:
+            logger.warning(f"Unknown provider '{provider}' in {info.field_name}")
+        # Validate model name format (alphanumeric, dashes, dots)
+        if not re.match(r'^[a-zA-Z0-9\-\.]+$', model):
+            raise ValueError(f"Invalid model name format: {model}")
+        return v
+
+    @field_validator('PRIMARY_MODELS', 'WAF_DETECTION_MODELS')
+    @classmethod
+    def validate_model_list(cls, v):
+        """Validate comma-separated model list (TASK-119)."""
+        if not v:
+            return v
+        models = [m.strip() for m in v.split(',')]
+        for model in models:
+            if model and '/' not in model:
+                raise ValueError(f"Invalid model in list: {model} (expected: provider/model)")
+        return v
+
+    @field_validator('QUEUE_PERSISTENCE_MODE')
+    @classmethod
+    def validate_queue_mode(cls, v):
+        """Validate queue persistence mode."""
+        valid_modes = ['memory', 'redis']
+        if v not in valid_modes:
+            raise ValueError(f"QUEUE_PERSISTENCE_MODE must be one of: {valid_modes}")
+        return v
+
+    @field_validator('FP_CONFIDENCE_THRESHOLD')
+    @classmethod
+    def validate_fp_threshold(cls, v):
+        """Validate FP confidence threshold is between 0 and 1."""
+        if not 0.0 <= v <= 1.0:
+            raise ValueError("FP_CONFIDENCE_THRESHOLD must be between 0.0 and 1.0")
+        return v
+
+    @field_validator('THINKING_MODE')
+    @classmethod
+    def validate_thinking_mode(cls, v):
+        """Validate thinking mode is valid."""
+        if v not in ("streaming", "batch"):
+            raise ValueError("THINKING_MODE must be 'streaming' or 'batch'")
+        return v
+
+    @field_validator('PIPELINE_PHASE_TIMEOUT', 'PIPELINE_DRAIN_TIMEOUT')
+    @classmethod
+    def validate_pipeline_timeouts(cls, v, info):
+        """Validate pipeline timeout values are positive."""
+        if v <= 0:
+            raise ValueError(f"{info.field_name} must be positive (got {v})")
+        return v
+
+    @field_validator('PIPELINE_PAUSE_CHECK_INTERVAL', 'PIPELINE_DISCOVERY_COMPLETION_DELAY')
+    @classmethod
+    def validate_pipeline_intervals(cls, v, info):
+        """Validate pipeline interval values are positive."""
+        if v <= 0:
+            raise ValueError(f"{info.field_name} must be positive (got {v})")
+        return v
+
+    # --- OpenRouter Configuration ---
+    OPENROUTER_ONLINE: bool = True  # Enable internet access for models
+    
+    # --- Conductor V2 Anti-Hallucination Configuration ---
+    CONDUCTOR_DISABLE_VALIDATION: bool = False
+    CONDUCTOR_CONTEXT_REFRESH_INTERVAL: int = 300  # seconds
+    CONDUCTOR_MIN_CONFIDENCE: float = 0.6
+    CONDUCTOR_ENABLE_FP_DETECTION: bool = True
+    
+    # --- CRAWLER Configuration (URL Filtering) ---
+    CRAWLER_EXCLUDE_EXTENSIONS: str = ".js,.css,.jpg,.jpeg,.png,.gif,.svg,.ico,.woff,.woff2,.ttf,.eot,.pdf,.zip,.rar,.mp3,.mp4,.webm,.webp"
+    CRAWLER_INCLUDE_EXTENSIONS: str = ""  # Empty = analyze any URL not in EXCLUDE
+    
+    # --- SCANNING Configuration (Stop-on-Critical) ---
+    STOP_ON_CRITICAL: bool = True
+    CRITICAL_TYPES: str = "SQLi,RCE,XXE"
+    MANDATORY_SQLMAP_VALIDATION: bool = True
+    SKIP_VALIDATED_PARAMS: bool = True
+    SCAN_DEPTH: str = "standard"  # quick, standard, thorough
+
+    # --- ANALYSIS Configuration (Multi-Model URL Analysis) ---
+    ANALYSIS_ENABLE: bool = True
+    ANALYSIS_APPROACH_PENTESTER: bool = True
+    ANALYSIS_APPROACH_BUG_BOUNTY: bool = True
+    ANALYSIS_APPROACH_CODE_AUDITOR: bool = True
+    ANALYSIS_APPROACH_RED_TEAM: bool = True
+    ANALYSIS_APPROACH_RESEARCHER: bool = True
+    APPROACH_MODE: str = "ALL"  # ALL = run all enabled, AUTO = wave-based (2+2, skip researcher)
+    ANALYSIS_PENTESTER_MODEL: str = "qwen/qwen3-coder"
+    ANALYSIS_BUG_BOUNTY_MODEL: str = "qwen/qwen3-coder"
+    ANALYSIS_AUDITOR_MODEL: str = "qwen/qwen3-coder"
+    ANALYSIS_RED_TEAM_MODEL: str = "google/gemini-3-flash-preview"
+    ANALYSIS_RESEARCHER_MODEL: str = "google/gemini-3-flash-preview"
+    ANALYSIS_CONFIDENCE_THRESHOLD: float = 0.7
+    ANALYSIS_SKIP_THRESHOLD: float = 0.3
+    ANALYSIS_CONSENSUS_VOTES: int = 2
+    
+    # --- VALIDATION Configuration (Vision-Based XSS Validation) ---
+    VALIDATION_VISION_MODEL: str = "google/gemini-3-flash-preview"
+    VALIDATION_VISION_ENABLED: bool = True
+    VALIDATION_VISION_ONLY_FOR_XSS: bool = True
+    VALIDATION_MAX_VISION_CALLS_PER_URL: int = 3
+
+    # --- CDP Configuration (Chrome DevTools Protocol for XSS Validation) ---
+    # Use CDP instead of Playwright for more reliable XSS detection
+    CDP_ENABLED: bool = True  # Enable CDP as primary verification method
+    CDP_PORT: int = 9222  # Chrome remote debugging port
+    CDP_TIMEOUT: float = 5.0  # Time to wait for XSS execution (seconds)
+
+    # --- JWT Agent Rate Limiting ---
+    JWT_RATE_LIMIT_DELAY: float = 0.5  # Seconds to wait between JWT attack requests (prevents WAF triggers)
+
+    # --- Queue Configuration (Phase 16: v2.3) ---
+    QUEUE_PERSISTENCE_MODE: str = "memory"  # "memory" or "redis"
+    QUEUE_DEFAULT_MAX_DEPTH: int = 1000  # Max items per queue
+    QUEUE_DEFAULT_RATE_LIMIT: float = 100.0  # Max items/second (0 = unlimited)
+    QUEUE_REDIS_URL: str = "redis://localhost:6379/0"  # For future Redis mode
+
+    # --- SSL/TLS Configuration (TASK-66) ---
+    # Enable SSL certificate verification by default for security
+    VERIFY_SSL_CERTIFICATES: bool = True
+    # Allow self-signed certs only for authorized testing environments
+    ALLOW_SELF_SIGNED_CERTS: bool = False
+
+    # --- WAF Q-Learning Configuration (TASK-68, TASK-75) ---
+    # Epsilon-greedy exploration parameters
+    WAF_QLEARNING_INITIAL_EPSILON: float = 0.3  # Initial exploration rate
+    WAF_QLEARNING_MIN_EPSILON: float = 0.05  # Minimum exploration rate
+    WAF_QLEARNING_DECAY_RATE: float = 0.995  # Epsilon decay per episode
+    # UCB exploration constant (higher = more exploration)
+    WAF_QLEARNING_UCB_CONSTANT: float = 2.0
+    # Backup settings
+    WAF_QLEARNING_MAX_BACKUPS: int = 5
+
+    # --- REPORT Configuration ---
+    # Only include validated findings in final report (per report_quality_evaluation.md)
+    REPORT_ONLY_VALIDATED: bool = True
+
+    # --- OPTIMIZATION Configuration ---
+    # Early exit after first finding per URL (saves 70%+ scan time)
+    # When True: Stop testing remaining params after first vuln found
+    # When False: Test ALL params for comprehensive coverage
+    # CHANGED (2026-02-01): Default to False for Burp-equivalent coverage
+    EARLY_EXIT_ON_FINDING: bool = False
+
+    # --- TRACING & OOB Configuration (v1.6) ---
+    TRACING_ENABLED: bool = True
+    INTERACTSH_SERVER: str = "oast.fun"
+    INTERACTSH_POLL_INTERVAL: int = 60 # seconds
+
+    # --- ANALYSIS STRATEGY Configuration (v2.7) ---
+    # When True: Include raw reflection probe results in analysis reports
+    # This forces analysis to be based on CONCRETE evidence, not speculation
+    RAW_REFLECTIONS_IN_STRATEGY: bool = True
+
+    # Run active reconnaissance probes BEFORE LLM analysis
+    # Sends Omni-Probe to each parameter to detect reflection context
+    ACTIVE_RECON_PROBES: bool = True
+
+    # Omni-Probe marker for detecting reflections (unique string unlikely to exist)
+    OMNI_PROBE_MARKER: str = "bugtraceomni7x9z"
+
+    # Require evidence in analysis reports (prohibit vague statements)
+    REQUIRE_EVIDENCE_IN_ANALYSIS: bool = True
+
+
+
+    def _load_core_config(self, config):
+        """Load CORE section config (DEBUG, SAFE_MODE)."""
+        if "CORE" not in config:
+            return
+        section = config["CORE"]
+        if "DEBUG" in section:
+            self.DEBUG = section.getboolean("DEBUG")
+        if "SAFE_MODE" in section:
+            self.SAFE_MODE = section.getboolean("SAFE_MODE")
+
+    def _load_crawler_config(self, config):
+        """Load CRAWLER section config."""
+        if "CRAWLER" not in config:
+            return
+        section = config["CRAWLER"]
+        if "EXCLUDE_EXTENSIONS" in section:
+            self.CRAWLER_EXCLUDE_EXTENSIONS = section["EXCLUDE_EXTENSIONS"]
+        if "INCLUDE_EXTENSIONS" in section:
+            self.CRAWLER_INCLUDE_EXTENSIONS = section["INCLUDE_EXTENSIONS"]
+        if "SPA_WAIT_MS" in section:
+            self.SPA_WAIT_MS = section.getint("SPA_WAIT_MS")
+        if "MAX_QUEUE_SIZE" in section:
+            self.MAX_QUEUE_SIZE = section.getint("MAX_QUEUE_SIZE")
+
+    def _load_scan_config(self, config):
+        """Load SCAN section config."""
+        if "SCAN" not in config:
+            return
+        if "MAX_DEPTH" in config["SCAN"]:
+            self.MAX_DEPTH = config["SCAN"].getint("MAX_DEPTH")
+        if "MAX_URLS" in config["SCAN"]:
+            self.MAX_URLS = config["SCAN"].getint("MAX_URLS")
+        if "MAX_CONCURRENT_URL_AGENTS" in config["SCAN"]:
+            self.MAX_CONCURRENT_URL_AGENTS = config["SCAN"].getint("MAX_CONCURRENT_URL_AGENTS")
+        if "GOSPIDER_NO_REDIRECT" in config["SCAN"]:
+            self.GOSPIDER_NO_REDIRECT = config["SCAN"].getboolean("GOSPIDER_NO_REDIRECT")
+        if "GOSPIDER_USE_ARCHIVES" in config["SCAN"]:
+            self.GOSPIDER_USE_ARCHIVES = config["SCAN"].getboolean("GOSPIDER_USE_ARCHIVES")
+        if "GOSPIDER_CONCURRENCY" in config["SCAN"]:
+            self.GOSPIDER_CONCURRENCY = config["SCAN"].getint("GOSPIDER_CONCURRENCY")
+        if "URL_PATTERN_DEDUP" in config["SCAN"]:
+            self.URL_PATTERN_DEDUP = config["SCAN"].getboolean("URL_PATTERN_DEDUP")
+
+    def _load_parallelization_config(self, config):
+        """Load PARALLELIZATION section config for granular per-phase concurrency."""
+        if "PARALLELIZATION" not in config:
+            return
+        section = config["PARALLELIZATION"]
+        if "MAX_CONCURRENT_DISCOVERY" in section:
+            self.MAX_CONCURRENT_DISCOVERY = section.getint("MAX_CONCURRENT_DISCOVERY")
+        if "MAX_CONCURRENT_ANALYSIS" in section:
+            self.MAX_CONCURRENT_ANALYSIS = section.getint("MAX_CONCURRENT_ANALYSIS")
+        if "MAX_CONCURRENT_SPECIALISTS" in section:
+            self.MAX_CONCURRENT_SPECIALISTS = section.getint("MAX_CONCURRENT_SPECIALISTS")
+        if "LANCEDB_ENABLED" in section:
+            self.LANCEDB_ENABLED = section.getboolean("LANCEDB_ENABLED")
+        if "DAST_ANALYSIS_TIMEOUT" in section:
+            self.DAST_ANALYSIS_TIMEOUT = section.getfloat("DAST_ANALYSIS_TIMEOUT")
+        if "DAST_MAX_RETRIES" in section:
+            self.DAST_MAX_RETRIES = section.getint("DAST_MAX_RETRIES")
+        if "DAST_CONSECUTIVE_TIMEOUT_LIMIT" in section:
+            self.DAST_CONSECUTIVE_TIMEOUT_LIMIT = section.getint("DAST_CONSECUTIVE_TIMEOUT_LIMIT")
+        if "DAST_TIMEOUT_PERCENT_LIMIT" in section:
+            self.DAST_TIMEOUT_PERCENT_LIMIT = section.getint("DAST_TIMEOUT_PERCENT_LIMIT")
+        if "DAST_AUTO_RESUME_DELAY" in section:
+            self.DAST_AUTO_RESUME_DELAY = section.getint("DAST_AUTO_RESUME_DELAY")
+        # NOTE: MAX_CONCURRENT_VALIDATION is NOT loaded from config
+        # CDP client only supports 1 concurrent session - hardcoded in defaults
+
+    def _load_url_prioritization_config(self, config):
+        """Load URL_PRIORITIZATION section config for intelligent URL ordering."""
+        if "URL_PRIORITIZATION" not in config:
+            return
+        section = config["URL_PRIORITIZATION"]
+        if "ENABLED" in section:
+            self.URL_PRIORITIZATION_ENABLED = section.getboolean("ENABLED")
+        if "LOG_SCORES" in section:
+            self.URL_PRIORITIZATION_LOG_SCORES = section.getboolean("LOG_SCORES")
+        if "CUSTOM_PATHS" in section:
+            self.URL_PRIORITIZATION_CUSTOM_PATHS = section["CUSTOM_PATHS"].strip()
+        if "CUSTOM_PARAMS" in section:
+            self.URL_PRIORITIZATION_CUSTOM_PARAMS = section["CUSTOM_PARAMS"].strip()
+
+    def _load_thinking_config(self, config):
+        """Load THINKING section config for ThinkingConsolidationAgent."""
+        if "THINKING" not in config:
+            return
+        section = config["THINKING"]
+        if "FP_THRESHOLD" in section:
+            self.THINKING_FP_THRESHOLD = section.getfloat("FP_THRESHOLD")
+        if "MODE" in section:
+            self.THINKING_MODE = section["MODE"].strip()
+        if "BATCH_SIZE" in section:
+            self.THINKING_BATCH_SIZE = section.getint("BATCH_SIZE")
+        if "DEDUP_WINDOW" in section:
+            self.THINKING_DEDUP_WINDOW = section.getint("DEDUP_WINDOW")
+        # NEW: Embeddings classification settings
+        if "USE_EMBEDDINGS_CLASSIFICATION" in section:
+            self.USE_EMBEDDINGS_CLASSIFICATION = section.getboolean("USE_EMBEDDINGS_CLASSIFICATION")
+        if "EMBEDDINGS_CONFIDENCE_THRESHOLD" in section:
+            self.EMBEDDINGS_CONFIDENCE_THRESHOLD = section.getfloat("EMBEDDINGS_CONFIDENCE_THRESHOLD")
+        if "EMBEDDINGS_MANUAL_REVIEW_THRESHOLD" in section:
+            self.EMBEDDINGS_MANUAL_REVIEW_THRESHOLD = section.getfloat("EMBEDDINGS_MANUAL_REVIEW_THRESHOLD")
+        if "EMBEDDINGS_LOG_CONFIDENCE" in section:
+            self.EMBEDDINGS_LOG_CONFIDENCE = section.getboolean("EMBEDDINGS_LOG_CONFIDENCE")
+
+    def _load_provider_section(self, config):
+        """Load [PROVIDER] section — sets self.PROVIDER."""
+        if "PROVIDER" not in config:
+            return
+        section = config["PROVIDER"]
+        if "ACTIVE" in section:
+            self.PROVIDER = section["ACTIVE"].strip().lower()
+
+    def _load_provider_preset(self):
+        """Load provider preset JSON and set model defaults.
+
+        Called BEFORE _load_llm_models_config so user overrides in
+        [LLM_MODELS] take precedence over preset defaults.
+        """
+        preset_path = self.BASE_DIR / "bugtrace" / "data" / "providers" / f"{self.PROVIDER}.json"
+        if not preset_path.exists():
+            logger.warning(f"Provider preset not found: {preset_path} — using defaults")
+            self._provider_config = {}
+            return
+
+        try:
+            preset = json.loads(preset_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"Failed to load provider preset {preset_path}: {e}")
+            self._provider_config = {}
+            return
+
+        self._provider_config = preset
+
+        # Apply model defaults from preset
+        models = preset.get("models", {})
+        for field, value in models.items():
+            if hasattr(self, field):
+                object.__setattr__(self, field, value)
+
+        logger.info(f"Provider preset loaded: {preset.get('name', self.PROVIDER)} ({len(models)} model defaults)")
+
+    def _load_llm_models_config(self, config):
+        """Load LLM_MODELS section config.
+
+        When a non-default provider is active, model overrides from [LLM_MODELS]
+        are skipped — the provider preset already set the correct models.
+        Only numeric/non-model settings (MIN_CREDITS, batch sizes) still apply.
+        """
+        if "LLM_MODELS" not in config:
+            return
+        section = config["LLM_MODELS"]
+
+        # Skip model overrides when a provider preset is active —
+        # the preset already configured the right models for this provider.
+        # Users can still override via env vars if needed.
+        if not self._provider_config:
+            # No preset loaded, apply conf overrides as before
+            model_fields = [
+                "DEFAULT_MODEL", "PRIMARY_MODELS", "VISION_MODEL",
+                "WAF_DETECTION_MODELS", "CODE_MODEL", "MUTATION_MODEL",
+                "ANALYSIS_MODEL", "SKEPTICAL_MODEL", "REPORTING_MODEL",
+            ]
+            for field in model_fields:
+                if field in section:
+                    setattr(self, field, section[field])
+        else:
+            logger.debug(f"Skipping [LLM_MODELS] overrides — provider preset '{self.PROVIDER}' is active")
+        if "MIN_CREDITS" in section:
+            self.MIN_CREDITS = section.getfloat("MIN_CREDITS")
+        if "MAX_CONCURRENT_REQUESTS" in section:
+            self.MAX_CONCURRENT_REQUESTS = section.getint("MAX_CONCURRENT_REQUESTS")
+        if "REPORTING_POC_BATCH_SIZE" in section:
+            self.REPORTING_POC_BATCH_SIZE = section.getint("REPORTING_POC_BATCH_SIZE")
+        if "REPORTING_POC_TOKENS_PER_FINDING" in section:
+            self.REPORTING_POC_TOKENS_PER_FINDING = section.getint("REPORTING_POC_TOKENS_PER_FINDING")
+        if "REPORTING_POC_MIN_TOKENS" in section:
+            self.REPORTING_POC_MIN_TOKENS = section.getint("REPORTING_POC_MIN_TOKENS")
+        if "REPORTING_POC_MAX_TOKENS" in section:
+            self.REPORTING_POC_MAX_TOKENS = section.getint("REPORTING_POC_MAX_TOKENS")
+
+    def _load_conductor_and_scanning_config(self, config):
+        """Load CONDUCTOR and SCANNING sections."""
+        if "OPENROUTER" in config:
+            if "ONLINE" in config["OPENROUTER"]:
+                self.OPENROUTER_ONLINE = config["OPENROUTER"].getboolean("ONLINE")
+
+        if "CONDUCTOR" in config:
+            section = config["CONDUCTOR"]
+            if "DISABLE_VALIDATION" in section:
+                self.CONDUCTOR_DISABLE_VALIDATION = section.getboolean("DISABLE_VALIDATION")
+            if "CONTEXT_REFRESH_INTERVAL" in section:
+                self.CONDUCTOR_CONTEXT_REFRESH_INTERVAL = section.getint("CONTEXT_REFRESH_INTERVAL")
+            if "MIN_CONFIDENCE" in section:
+                self.CONDUCTOR_MIN_CONFIDENCE = section.getfloat("MIN_CONFIDENCE")
+            if "ENABLE_FP_DETECTION" in section:
+                self.CONDUCTOR_ENABLE_FP_DETECTION = section.getboolean("ENABLE_FP_DETECTION")
+
+        if "SCANNING" in config:
+            section = config["SCANNING"]
+            if "STOP_ON_CRITICAL" in section:
+                self.STOP_ON_CRITICAL = section.getboolean("STOP_ON_CRITICAL")
+            if "CRITICAL_TYPES" in section: self.CRITICAL_TYPES = section["CRITICAL_TYPES"]
+            if "MANDATORY_SQLMAP_VALIDATION" in section:
+                self.MANDATORY_SQLMAP_VALIDATION = section.getboolean("MANDATORY_SQLMAP_VALIDATION")
+            if "SKIP_VALIDATED_PARAMS" in section:
+                self.SKIP_VALIDATED_PARAMS = section.getboolean("SKIP_VALIDATED_PARAMS")
+            if "SCAN_DEPTH" in section:
+                val = section["SCAN_DEPTH"].strip().lower()
+                if val in ("quick", "standard", "thorough"):
+                    self.SCAN_DEPTH = val
+
+    def _load_authority_config(self, config):
+        """Load AUTHORITY section config."""
+        if "AUTHORITY" not in config:
+            return
+        section = config["AUTHORITY"]
+        if "ENABLE_SELF_VALIDATION" in section:
+            self.ENABLE_SELF_VALIDATION = section.getboolean("ENABLE_SELF_VALIDATION")
+        if "XSS_SELF_VALIDATE" in section:
+            self.XSS_SELF_VALIDATE = section.getboolean("XSS_SELF_VALIDATE")
+        if "SQLI_SELF_VALIDATE" in section:
+            self.SQLI_SELF_VALIDATE = section.getboolean("SQLI_SELF_VALIDATE")
+        if "RCE_SELF_VALIDATE" in section:
+            self.RCE_SELF_VALIDATE = section.getboolean("RCE_SELF_VALIDATE")
+
+    def _load_lonewolf_config(self, config):
+        """Load LONEWOLF section config."""
+        if "LONEWOLF" not in config:
+            return
+        section = config["LONEWOLF"]
+        if "ENABLED" in section:
+            self.LONEWOLF_ENABLED = section.getboolean("ENABLED")
+        if "MODEL" in section:
+            self.LONEWOLF_MODEL = section["MODEL"]
+        if "RATE_LIMIT" in section:
+            self.LONEWOLF_RATE_LIMIT = section.getfloat("RATE_LIMIT")
+        if "MAX_CONTEXT" in section:
+            self.LONEWOLF_MAX_CONTEXT = section.getint("MAX_CONTEXT")
+        if "RESPONSE_TRUNCATE" in section:
+            self.LONEWOLF_RESPONSE_TRUNCATE = section.getint("RESPONSE_TRUNCATE")
+
+    def _load_anthropic_config(self, config):
+        """Load ANTHROPIC section config for direct Claude API via OAuth."""
+        if "ANTHROPIC" not in config:
+            return
+        section = config["ANTHROPIC"]
+        if "ENABLED" in section:
+            self.ANTHROPIC_OAUTH_ENABLED = section.getboolean("ENABLED")
+        if "TOKEN_FILE" in section:
+            self.ANTHROPIC_TOKEN_FILE = section["TOKEN_FILE"].strip()
+
+
+    def _load_validation_config(self, config):
+        """Load VALIDATION section config for Vision-Based XSS Validation."""
+        if "VALIDATION" not in config:
+            return
+        section = config["VALIDATION"]
+        if "VISION_MODEL" in section:
+            self.VALIDATION_VISION_MODEL = section["VISION_MODEL"]
+        if "VISION_ENABLED" in section:
+            self.VALIDATION_VISION_ENABLED = section.getboolean("VISION_ENABLED")
+        if "VISION_ONLY_FOR_XSS" in section:
+            self.VALIDATION_VISION_ONLY_FOR_XSS = section.getboolean("VISION_ONLY_FOR_XSS")
+        if "MAX_VISION_CALLS_PER_URL" in section:
+            self.VALIDATION_MAX_VISION_CALLS_PER_URL = section.getint("MAX_VISION_CALLS_PER_URL")
+
+    def _load_qlearning_config(self, config):
+        """Load QLEARNING section config for WAF bypass system."""
+        if "QLEARNING" not in config:
+            return
+        section = config["QLEARNING"]
+        if "INITIAL_EPSILON" in section:
+            self.WAF_QLEARNING_INITIAL_EPSILON = section.getfloat("INITIAL_EPSILON")
+        if "MIN_EPSILON" in section:
+            self.WAF_QLEARNING_MIN_EPSILON = section.getfloat("MIN_EPSILON")
+        if "DECAY_RATE" in section:
+            self.WAF_QLEARNING_DECAY_RATE = section.getfloat("DECAY_RATE")
+        if "UCB_CONSTANT" in section:
+            self.WAF_QLEARNING_UCB_CONSTANT = section.getfloat("UCB_CONSTANT")
+        if "MAX_BACKUPS" in section:
+            self.WAF_QLEARNING_MAX_BACKUPS = section.getint("MAX_BACKUPS")
+
+    def _load_manipulator_config(self, config):
+        """Load MANIPULATOR section config for HTTP Exploitation Tool."""
+        if "MANIPULATOR" not in config:
+            return
+        section = config["MANIPULATOR"]
+        if "GLOBAL_RATE_LIMIT" in section:
+            self.MANIPULATOR_GLOBAL_RATE_LIMIT = section.getfloat("GLOBAL_RATE_LIMIT")
+        if "USE_GLOBAL_RATE_LIMITER" in section:
+            self.MANIPULATOR_USE_GLOBAL_RATE_LIMITER = section.getboolean("USE_GLOBAL_RATE_LIMITER")
+        if "ENABLE_LLM_EXPANSION" in section:
+            self.MANIPULATOR_ENABLE_LLM_EXPANSION = section.getboolean("ENABLE_LLM_EXPANSION")
+        if "ENABLE_AGENTIC_FALLBACK" in section:
+            self.MANIPULATOR_ENABLE_AGENTIC_FALLBACK = section.getboolean("ENABLE_AGENTIC_FALLBACK")
+        if "BREAKOUT_PRIORITY_LEVEL" in section:
+            self.MANIPULATOR_BREAKOUT_PRIORITY_LEVEL = section.getint("BREAKOUT_PRIORITY_LEVEL")
+        if "MAX_LLM_PAYLOADS" in section:
+            self.MANIPULATOR_MAX_LLM_PAYLOADS = section.getint("MAX_LLM_PAYLOADS")
+
+    def _load_asset_discovery_config(self, config):
+        """Load ASSET_DISCOVERY section config."""
+        if "ASSET_DISCOVERY" not in config:
+            return
+        section = config["ASSET_DISCOVERY"]
+        if "ENABLE_ASSET_DISCOVERY" in section:
+            self.ENABLE_ASSET_DISCOVERY = section.getboolean("ENABLE_ASSET_DISCOVERY")
+        if "ENABLE_DNS_ENUMERATION" in section:
+            self.ENABLE_DNS_ENUMERATION = section.getboolean("ENABLE_DNS_ENUMERATION")
+        if "ENABLE_CERTIFICATE_TRANSPARENCY" in section:
+            self.ENABLE_CERTIFICATE_TRANSPARENCY = section.getboolean("ENABLE_CERTIFICATE_TRANSPARENCY")
+        if "ENABLE_WAYBACK_DISCOVERY" in section:
+            self.ENABLE_WAYBACK_DISCOVERY = section.getboolean("ENABLE_WAYBACK_DISCOVERY")
+        if "ENABLE_CLOUD_STORAGE_ENUM" in section:
+            self.ENABLE_CLOUD_STORAGE_ENUM = section.getboolean("ENABLE_CLOUD_STORAGE_ENUM")
+        if "ENABLE_COMMON_PATHS" in section:
+            self.ENABLE_COMMON_PATHS = section.getboolean("ENABLE_COMMON_PATHS")
+        if "MAX_SUBDOMAINS" in section:
+            self.MAX_SUBDOMAINS = section.getint("MAX_SUBDOMAINS")
+
+    def _load_paths_config(self, config):
+        """Load PATHS section config for LOG_DIR and REPORT_DIR.
+
+        This ensures paths defined in bugtraceaicli.conf are properly loaded.
+        Without this, LOG_DIR and REPORT_DIR from [PATHS] section are ignored.
+        """
+        if "PATHS" not in config:
+            return
+        section = config["PATHS"]
+        if "LOG_DIR" in section:
+            self.LOG_DIR_PATH = section["LOG_DIR"].strip()
+        if "REPORT_DIR" in section:
+            self.REPORT_DIR_PATH = section["REPORT_DIR"].strip()
+
+    def _load_analysis_and_misc_config(self, config):
+        """Load ANALYSIS, BROWSER, ADVANCED, REPORT, OPTIMIZATION sections."""
+        if "ANALYSIS" in config:
+            section = config["ANALYSIS"]
+            if "ENABLE_ANALYSIS" in section:
+                self.ANALYSIS_ENABLE = section.getboolean("ENABLE_ANALYSIS")
+            if "APPROACH_PENTESTER" in section:
+                self.ANALYSIS_APPROACH_PENTESTER = section.getboolean("APPROACH_PENTESTER")
+            if "APPROACH_BUG_BOUNTY" in section:
+                self.ANALYSIS_APPROACH_BUG_BOUNTY = section.getboolean("APPROACH_BUG_BOUNTY")
+            if "APPROACH_CODE_AUDITOR" in section:
+                self.ANALYSIS_APPROACH_CODE_AUDITOR = section.getboolean("APPROACH_CODE_AUDITOR")
+            if "APPROACH_RED_TEAM" in section:
+                self.ANALYSIS_APPROACH_RED_TEAM = section.getboolean("APPROACH_RED_TEAM")
+            if "APPROACH_RESEARCHER" in section:
+                self.ANALYSIS_APPROACH_RESEARCHER = section.getboolean("APPROACH_RESEARCHER")
+            if "APPROACH_MODE" in section:
+                self.APPROACH_MODE = section["APPROACH_MODE"].strip().upper()
+            if "PENTESTER_MODEL" in section:
+                self.ANALYSIS_PENTESTER_MODEL = section["PENTESTER_MODEL"]
+            if "BUG_BOUNTY_MODEL" in section:
+                self.ANALYSIS_BUG_BOUNTY_MODEL = section["BUG_BOUNTY_MODEL"]
+            if "AUDITOR_MODEL" in section:
+                self.ANALYSIS_AUDITOR_MODEL = section["AUDITOR_MODEL"]
+            if "RED_TEAM_MODEL" in section:
+                self.ANALYSIS_RED_TEAM_MODEL = section["RED_TEAM_MODEL"]
+            if "RESEARCHER_MODEL" in section:
+                self.ANALYSIS_RESEARCHER_MODEL = section["RESEARCHER_MODEL"]
+            if "CONFIDENCE_THRESHOLD" in section:
+                self.ANALYSIS_CONFIDENCE_THRESHOLD = section.getfloat("CONFIDENCE_THRESHOLD")
+            if "SKIP_THRESHOLD" in section:
+                self.ANALYSIS_SKIP_THRESHOLD = section.getfloat("SKIP_THRESHOLD")
+            if "CONSENSUS_VOTES" in section:
+                self.ANALYSIS_CONSENSUS_VOTES = section.getint("CONSENSUS_VOTES")
+            if "DAST_ANALYSIS_TIMEOUT" in section:
+                self.DAST_ANALYSIS_TIMEOUT = section.getfloat("DAST_ANALYSIS_TIMEOUT")
+
+        if "BROWSER" in config:
+            section = config["BROWSER"]
+            if "HEADLESS" in section:
+                self.HEADLESS_BROWSER = section.getboolean("HEADLESS")
+            if "USER_AGENT" in section:
+                self.USER_AGENT = section["USER_AGENT"]
+            if "VIEWPORT_WIDTH" in section:
+                self.VIEWPORT_WIDTH = section.getint("VIEWPORT_WIDTH")
+            if "VIEWPORT_HEIGHT" in section:
+                self.VIEWPORT_HEIGHT = section.getint("VIEWPORT_HEIGHT")
+            if "TIMEOUT_MS" in section:
+                self.TIMEOUT_MS = section.getint("TIMEOUT_MS")
+            if "DOM_CLICK_MAX_LINKS" in section:
+                self.DOM_CLICK_MAX_LINKS = section.getint("DOM_CLICK_MAX_LINKS")
+            if "DOM_CLICK_MAX_TEXT_LINKS" in section:
+                self.DOM_CLICK_MAX_TEXT_LINKS = section.getint("DOM_CLICK_MAX_TEXT_LINKS")
+            if "DOM_CLICK_WAIT_SEC" in section:
+                self.DOM_CLICK_WAIT_SEC = section.getfloat("DOM_CLICK_WAIT_SEC")
+            if "DOM_CLICK_INITIAL_WAIT_SEC" in section:
+                self.DOM_CLICK_INITIAL_WAIT_SEC = section.getfloat("DOM_CLICK_INITIAL_WAIT_SEC")
+
+        if "ADVANCED" in config:
+            if "TRACING_ENABLED" in config["ADVANCED"]:
+                self.TRACING_ENABLED = config["ADVANCED"].getboolean("TRACING_ENABLED")
+            if "INTERACTSH_SERVER" in config["ADVANCED"]:
+                self.INTERACTSH_SERVER = config["ADVANCED"]["INTERACTSH_SERVER"]
+        
+        if "BROWSER_ADVANCED" in config:
+            section = config["BROWSER_ADVANCED"]
+            if "NAVIGATION_TIMEOUT_MS" in section:
+                self.NAVIGATION_TIMEOUT_MS = section.getint("NAVIGATION_TIMEOUT_MS")
+            if "NETWORKIDLE_TIMEOUT_MS" in section:
+                self.NETWORKIDLE_TIMEOUT_MS = section.getint("NETWORKIDLE_TIMEOUT_MS")
+            if "PAYLOAD_EXECUTION_WAIT_MS" in section:
+                self.PAYLOAD_EXECUTION_WAIT_MS = section.getint("PAYLOAD_EXECUTION_WAIT_MS")
+            if "SCREENSHOT_TIMEOUT_MS" in section:
+                self.SCREENSHOT_TIMEOUT_MS = section.getint("SCREENSHOT_TIMEOUT_MS")
+            if "SCREENSHOT_MAX_RETRIES" in section:
+                self.SCREENSHOT_MAX_RETRIES = section.getint("SCREENSHOT_MAX_RETRIES")
+            if "WAIT_STRATEGY" in section:
+                self.WAIT_STRATEGY = section["WAIT_STRATEGY"].strip().lower()
+            if "STAGGERED_WAIT_INITIAL" in section:
+                self.STAGGERED_WAIT_INITIAL = section.getint("STAGGERED_WAIT_INITIAL")
+            if "STAGGERED_WAIT_EXTRA" in section:
+                self.STAGGERED_WAIT_EXTRA = section.getint("STAGGERED_WAIT_EXTRA")
+            if "SCREENSHOT_FULL_PAGE" in section:
+                self.SCREENSHOT_FULL_PAGE = section.getboolean("SCREENSHOT_FULL_PAGE")
+            if "SCREENSHOT_ON_ERROR" in section:
+                self.SCREENSHOT_ON_ERROR = section.getboolean("SCREENSHOT_ON_ERROR")
+
+        if "REPORT" in config:
+            if "ONLY_VALIDATED" in config["REPORT"]:
+                self.REPORT_ONLY_VALIDATED = config["REPORT"].getboolean("ONLY_VALIDATED")
+
+        if "OPTIMIZATION" in config:
+            if "EARLY_EXIT_ON_FINDING" in config["OPTIMIZATION"]:
+                self.EARLY_EXIT_ON_FINDING = config["OPTIMIZATION"].getboolean("EARLY_EXIT_ON_FINDING")
+
+        if "SKEPTICAL_THRESHOLDS" in config:
+            for key in config["SKEPTICAL_THRESHOLDS"]:
+                self.SKEPTICAL_THRESHOLDS[key.upper()] = config["SKEPTICAL_THRESHOLDS"].getint(key)
+
+    def load_from_conf(self):
+        """Overrides settings with values from bugtraceaicli.conf"""
+        import configparser
+        config = configparser.ConfigParser()
+        conf_path = self.BASE_DIR / "bugtraceaicli.conf"
+
+        if not conf_path.exists():
+            return
+
+        config.read(conf_path)
+        # Load CORE first (DEBUG, SAFE_MODE)
+        self._load_core_config(config)
+        # Load paths early - other sections may depend on LOG_DIR/REPORT_DIR
+        self._load_paths_config(config)
+        self._load_provider_section(config)  # Read [PROVIDER] → sets self.PROVIDER
+        self._load_provider_preset()          # Load JSON → sets model defaults
+        self._load_crawler_config(config)
+        self._load_scan_config(config)
+        self._load_parallelization_config(config)
+        self._load_url_prioritization_config(config)
+        self._load_thinking_config(config)
+        self._load_llm_models_config(config)  # User overrides from [LLM_MODELS]
+        self._load_conductor_and_scanning_config(config)
+        self._load_analysis_and_misc_config(config)
+        self._load_authority_config(config)
+        self._load_lonewolf_config(config)
+        self._load_anthropic_config(config)
+        self._load_validation_config(config)
+        self._load_qlearning_config(config)
+        self._load_manipulator_config(config)
+        self._load_asset_discovery_config(config)
+
+    # --- Configuration Validation (TASK-120) ---
+    def validate_config(self) -> List[str]:
+        """
+        Validate entire configuration.
+        Returns list of errors (empty if valid).
+        Raises ValueError if critical errors found.
+        """
+        errors = []
+        warnings = []
+
+        # Check required API key for active provider
+        provider_cfg = getattr(self, '_provider_config', {})
+        provider_key_env = provider_cfg.get("api_key_env", "OPENROUTER_API_KEY")
+        provider_key = getattr(self, provider_key_env, None) or os.environ.get(provider_key_env)
+        if not provider_key:
+            errors.append(f"{provider_key_env} is required for provider '{self.PROVIDER}'")
+
+        # Check numeric bounds
+        if self.MAX_DEPTH < 1:
+            errors.append("MAX_DEPTH must be >= 1")
+        if self.MAX_URLS < 1:
+            errors.append("MAX_URLS must be >= 1")
+        if self.MAX_CONCURRENT_REQUESTS < 1:
+            errors.append("MAX_CONCURRENT_REQUESTS must be >= 1")
+        if self.MAX_CONCURRENT_URL_AGENTS < 1:
+            errors.append("MAX_CONCURRENT_URL_AGENTS must be >= 1")
+
+        # Granular phase concurrency validators
+        if self.MAX_CONCURRENT_DISCOVERY < 1:
+            errors.append("MAX_CONCURRENT_DISCOVERY must be >= 1")
+        if self.MAX_CONCURRENT_ANALYSIS < 1:
+            errors.append("MAX_CONCURRENT_ANALYSIS must be >= 1")
+        if self.MAX_CONCURRENT_SPECIALISTS < 1:
+            errors.append("MAX_CONCURRENT_SPECIALISTS must be >= 1")
+        # MAX_CONCURRENT_VALIDATION is hardcoded to 1 (CDP limitation) - no validation needed
+
+        # Check confidence thresholds (0.0 - 1.0)
+        if not 0.0 <= self.CONDUCTOR_MIN_CONFIDENCE <= 1.0:
+            errors.append("CONDUCTOR_MIN_CONFIDENCE must be 0.0-1.0")
+        if not 0.0 <= self.ANALYSIS_CONFIDENCE_THRESHOLD <= 1.0:
+            errors.append("ANALYSIS_CONFIDENCE_THRESHOLD must be 0.0-1.0")
+        if not 0.0 <= self.ANALYSIS_SKIP_THRESHOLD <= 1.0:
+            errors.append("ANALYSIS_SKIP_THRESHOLD must be 0.0-1.0")
+
+        # Check file paths
+        if not self.BASE_DIR.exists():
+            errors.append(f"BASE_DIR does not exist: {self.BASE_DIR}")
+
+        # Log warnings
+        for w in warnings:
+            logger.warning(f"Config warning: {w}")
+
+        if errors:
+            error_msg = "Configuration errors:\n" + "\n".join(f"  - {e}" for e in errors)
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        return warnings
+
+    # --- Secret Masking (TASK-118 additional) ---
+    def mask_secrets(self) -> Dict[str, Any]:
+        """Return config dict with masked secrets for safe logging."""
+        masked = self.model_dump()
+        secret_fields = ['OPENROUTER_API_KEY', 'GLM_API_KEY']
+        for key in secret_fields:
+            if masked.get(key):
+                val = masked[key]
+                if len(val) > 12:
+                    masked[key] = val[:8] + '...' + val[-4:]
+                else:
+                    masked[key] = '***'
+        return masked
+
+    # --- Debug Logging (TASK-122) ---
+    def log_config(self):
+        """Log configuration with masked secrets (only in DEBUG mode)."""
+        if not self.DEBUG:
+            return
+        logger.debug("Configuration loaded:")
+        for key, value in self.mask_secrets().items():
+            if not key.startswith('_') and key != 'model_config':
+                logger.debug(f"  {key}: {value}")
+
+    # --- Config Schema Documentation (TASK-123) ---
+    def generate_config_docs(self) -> str:
+        """Generate markdown documentation for all configuration fields."""
+        docs = ["# BugTraceAI Configuration Reference\n"]
+        docs.append(f"Generated: {datetime.now().isoformat()}\n")
+        docs.append("---\n")
+
+        for field_name, field_info in self.model_fields.items():
+            if field_name.startswith('_'):
+                continue
+            docs.append(f"## {field_name}")
+            docs.append(f"- **Type**: `{field_info.annotation}`")
+            docs.append(f"- **Default**: `{field_info.default}`")
+            if field_info.description:
+                docs.append(f"- **Description**: {field_info.description}")
+            docs.append("")
+
+        return "\n".join(docs)
+
+    # --- Config Export/Import (TASK-125) ---
+    def export_config(self, path: Path = None) -> str:
+        """Export configuration to JSON file."""
+        config_data = {
+            '_meta': {
+                'version': self.VERSION,
+                'exported_at': datetime.now().isoformat(),
+                'env': self.ENV
+            },
+            'config': self.mask_secrets()  # Never export real secrets
+        }
+        json_str = json.dumps(config_data, indent=2, default=str)
+
+        if path:
+            path.write_text(json_str)
+            logger.info(f"Config exported to {path}")
+
+        return json_str
+
+    def import_config(self, path: Path) -> Dict[str, Any]:
+        """
+        Import configuration from JSON file.
+        Returns dict of changes that would be applied.
+        Does NOT auto-apply - caller must decide.
+        """
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+
+        data = json.loads(path.read_text())
+        config_data = data.get('config', data)
+
+        changes = {}
+        for key, value in config_data.items():
+            if hasattr(self, key) and not key.startswith('_'):
+                current = getattr(self, key)
+                if current != value:
+                    changes[key] = {'from': current, 'to': value}
+
+        return changes
+
+    # --- Config Diffing (TASK-126) ---
+    def diff_config(self, other: 'Settings') -> Dict[str, Dict[str, Any]]:
+        """Compare two configurations and return differences."""
+        diff = {}
+        for field_name in self.model_fields:
+            if field_name.startswith('_'):
+                continue
+            self_val = getattr(self, field_name)
+            other_val = getattr(other, field_name)
+            if self_val != other_val:
+                diff[field_name] = {
+                    'self': self_val,
+                    'other': other_val
+                }
+        return diff
+
+    # --- Provider Config (loaded from preset JSON) ---
+    _provider_config: Dict[str, Any] = {}
+
+    # --- Config Versioning (TASK-127) ---
+    _config_history: List[Dict[str, Any]] = []
+
+    def snapshot(self, label: str = None) -> Dict[str, Any]:
+        """Take a snapshot of current configuration for versioning."""
+        snapshot_data = {
+            'timestamp': datetime.now().isoformat(),
+            'label': label or f"snapshot_{len(self._config_history)}",
+            'config': self.model_dump()
+        }
+        self._config_history.append(snapshot_data)
+        logger.debug(f"Config snapshot taken: {snapshot_data['label']}")
+        return snapshot_data
+
+    def get_config_history(self) -> List[Dict[str, Any]]:
+        """Get all configuration snapshots."""
+        return self._config_history.copy()
+
+    def restore_snapshot(self, index: int) -> Dict[str, str]:
+        """
+        Restore configuration from a snapshot.
+        Returns dict of fields that were changed.
+        """
+        if index >= len(self._config_history):
+            raise IndexError(f"Snapshot index {index} not found")
+
+        snapshot = self._config_history[index]
+        changes = {}
+
+        for key, value in snapshot['config'].items():
+            if hasattr(self, key) and not key.startswith('_'):
+                current = getattr(self, key)
+                if current != value:
+                    changes[key] = f"{current} -> {value}"
+                    object.__setattr__(self, key, value)
+
+        logger.info(f"Restored config from snapshot: {snapshot['label']}")
+        return changes
+
+    # --- Environment-Specific Config Loading (TASK-124) ---
+    def load_env_specific(self):
+        """Load environment-specific .env file if exists."""
+        env_file = f".env.{self.ENV}"
+        env_path = self.BASE_DIR / env_file
+
+        if env_path.exists():
+            load_dotenv(env_path, override=True)
+            logger.info(f"Loaded environment config: {env_file}")
+        elif self.ENV != "production":
+            logger.debug(f"No environment-specific config found: {env_file}")
+
+    # --- Scan Configuration (Mapped from [SCAN] in conf) ---
+    MAX_DEPTH: int = 2
+    MAX_URLS: int = 20
+    MAX_CONCURRENT_URL_AGENTS: int = 10  # Parallel URLMasterAgents (legacy, alias for SPECIALISTS)
+    GOSPIDER_NO_REDIRECT: bool = False  # Don't follow redirects (catches .env, .htaccess leaks)
+    GOSPIDER_USE_ARCHIVES: bool = True   # Query external archives (Wayback, CommonCrawl, VirusTotal) — disable for consistent results
+    GOSPIDER_CONCURRENCY: int = 5        # GoSpider thread count (-c flag). Lower = more deterministic, higher = faster
+
+    # --- Granular Phase Concurrency (Phase 31: v2.4) ---
+    MAX_CONCURRENT_DISCOVERY: int = 1      # GoSpider (single-threaded by design)
+    MAX_CONCURRENT_ANALYSIS: int = 5       # DAST/SAST per URL
+    MAX_CONCURRENT_SPECIALISTS: int = 10   # SQLi, XSS, CSTI paralelos
+    # HARDCODED: CDP client only supports 1 concurrent session (crashes with more)
+    # Playwright can handle multiple, but AgenticValidator uses CDP exclusively
+    MAX_CONCURRENT_VALIDATION: int = 1     # DO NOT CHANGE - CDP limitation
+
+    # --- Asset Discovery Configuration ---
+    ENABLE_ASSET_DISCOVERY: bool = False
+    ENABLE_DNS_ENUMERATION: bool = True
+    ENABLE_CERTIFICATE_TRANSPARENCY: bool = True
+    ENABLE_WAYBACK_DISCOVERY: bool = True
+    ENABLE_CLOUD_STORAGE_ENUM: bool = True
+    ENABLE_COMMON_PATHS: bool = True
+    MAX_SUBDOMAINS: int = 50
+
+    # --- URL Pattern Dedup ---
+    URL_PATTERN_DEDUP: bool = True  # Collapse /products/1, /products/2 → keep 1 per pattern
+
+    # --- URL Prioritization (Phase 38: v3.0) ---
+    URL_PRIORITIZATION_ENABLED: bool = True   # Enable/disable URL prioritization
+    URL_PRIORITIZATION_LOG_SCORES: bool = True  # Log priority scores for each URL
+    URL_PRIORITIZATION_CUSTOM_PATHS: str = ""   # Custom high-priority paths (comma-separated)
+    URL_PRIORITIZATION_CUSTOM_PARAMS: str = ""  # Custom high-priority params (comma-separated)
+
+    # --- Visual / Browser ---
+    HEADLESS_BROWSER: bool = True
+    
+    # --- Paths ---
+    # Calculated relative to this file: bugtrace/core/config.py -> bugtrace/core -> bugtrace -> Root
+    BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent
+    
+    # These can be overridden by env vars, but default to standard relative paths
+    LOG_DIR_PATH: str = "logs"
+    REPORT_DIR_PATH: str = "reports"
+    
+    # Database
+    DATABASE_URL: str = "sqlite:///bugtrace.db"
+    VECTOR_DB_PATH: str = "logs/lancedb"
+
+    @property
+    def LOG_DIR(self) -> Path:
+        start = Path(self.LOG_DIR_PATH)
+        if start.is_absolute(): return start
+        return self.BASE_DIR / start
+
+    @property
+    def REPORT_DIR(self) -> Path:
+        start = Path(self.REPORT_DIR_PATH)
+        if start.is_absolute(): return start
+        return self.BASE_DIR / start
+        
+    @property
+    def database(self):
+        """Compat helper for legacy access"""
+        class DBConfig:
+            url = self.DATABASE_URL
+            vector_path = str(self.BASE_DIR / self.VECTOR_DB_PATH)
+        return DBConfig()
+        
+    @property
+    def global_config(self):
+        """Self-reference for legacy compatibility where settings.global_config was used"""
+        return self
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore"
+    )
+
+    # Browser Advanced
+    USER_AGENT: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    VIEWPORT_WIDTH: int = 1280
+    VIEWPORT_HEIGHT: int = 720
+    TIMEOUT_MS: int = 15000
+
+    # --- DOM Click Strategy (Open Redirect Phase B.2) ---
+    DOM_CLICK_MAX_LINKS: int = 5       # Max onclick/hash links to click per strategy
+    DOM_CLICK_MAX_TEXT_LINKS: int = 10  # Max text-based navigation links to click
+    DOM_CLICK_WAIT_SEC: float = 2.0     # Seconds to wait after each click for JS redirect
+    DOM_CLICK_INITIAL_WAIT_SEC: float = 1.0  # Seconds to wait after page load before clicking
+    
+    # Browser Advanced (v3.4)
+    NAVIGATION_TIMEOUT_MS: int = 45000
+    NETWORKIDLE_TIMEOUT_MS: int = 30000
+    PAYLOAD_EXECUTION_WAIT_MS: int = 3000
+    SCREENSHOT_TIMEOUT_MS: int = 5000
+    SCREENSHOT_MAX_RETRIES: int = 3
+    WAIT_STRATEGY: str = "simple"
+    STAGGERED_WAIT_INITIAL: int = 3000
+    STAGGERED_WAIT_EXTRA: int = 2000
+    SCREENSHOT_FULL_PAGE: bool = False
+    SCREENSHOT_ON_ERROR: bool = True
+
+    # Crawler
+    SPA_WAIT_MS: int = 1000
+    MAX_QUEUE_SIZE: int = 100
+
+    # --- MANIPULATOR Configuration (Intelligent Breakouts System) ---
+    # Global rate limiting across XSS/CSTI Skills
+    MANIPULATOR_GLOBAL_RATE_LIMIT: float = 2.0  # req/s total
+    MANIPULATOR_RATE_LIMIT_MIN: float = 0.2  # Minimum req/s floor when throttled by 429
+    MANIPULATOR_RATE_RECOVERY_THRESHOLD: int = 10  # Successful requests before rate recovery
+    MANIPULATOR_USE_GLOBAL_RATE_LIMITER: bool = True
+    MANIPULATOR_ENABLE_LLM_EXPANSION: bool = True
+    MANIPULATOR_ENABLE_AGENTIC_FALLBACK: bool = False
+    MANIPULATOR_BREAKOUT_PRIORITY_LEVEL: int = 3
+    MANIPULATOR_MAX_LLM_PAYLOADS: int = 100
+
+    # --- LONEWOLF Autonomous Agent Configuration ---
+    LONEWOLF_ENABLED: bool = True            # Override via .conf [LONEWOLF] ENABLED
+    LONEWOLF_MODEL: str = "moonshotai/kimi-k2.5"  # LLM for reasoning
+    LONEWOLF_RATE_LIMIT: float = 1.0       # HTTP requests per second
+    LONEWOLF_MAX_CONTEXT: int = 20         # Sliding window size (actions remembered)
+    LONEWOLF_RESPONSE_TRUNCATE: int = 2000 # Max chars kept from HTTP responses
+
+    # --- IDOR Agent Configuration ---
+    IDOR_ID_RANGE: str = "1-1000"  # Range of IDs to test (e.g., "1-1000", "1-500", "100-200")
+    IDOR_CUSTOM_IDS: str = ""  # Comma-separated list of custom IDs (UUIDs, hashes, etc.)
+    IDOR_QUEUE_BATCH_SIZE: int = 100  # Max items to process in one batch (streaming queue drain)
+    IDOR_QUEUE_MAX_WAIT: float = 300.0  # Max seconds to wait for queue items
+    IDOR_ENABLE_COOKIE_TAMPERING: bool = False  # Enable horizontal privilege escalation tests
+    IDOR_SMART_ID_DETECTION: bool = True  # Auto-detect ID format and generate similar IDs
+    IDOR_ENABLE_LLM_PREDICTION: bool = True  # Use LLM to predict likely IDOR target IDs
+    IDOR_LLM_PREDICTION_COUNT: int = 20  # Number of IDs to generate via LLM
+    IDOR_PREDICTION_PRIORITY: str = "llm_first"  # "llm_first" | "fuzzing_first" | "parallel"
+    IDOR_ENABLE_LLM_VALIDATION: bool = True  # Use LLM to validate MEDIUM severity findings
+
+    # --- IDOR Deep Exploitation Configuration ---
+    IDOR_ENABLE_DEEP_EXPLOITATION: bool = True
+    """Enable deep exploitation analysis for CRITICAL/HIGH IDOR findings."""
+
+    IDOR_EXPLOITER_MODE: str = "full"
+    """Exploitation mode: 'full' (phases 1-6), 'quick' (phases 1-3), 'safe' (phase 1 only)."""
+
+    IDOR_EXPLOITER_ENABLE_WRITE_TESTS: bool = False
+    """⚠️ DANGEROUS: Allow PUT/PATCH tests (can modify server data)."""
+
+    IDOR_EXPLOITER_ENABLE_DELETE_TESTS: bool = False
+    """⚠️ DANGEROUS: Allow DELETE tests (can delete server data)."""
+
+    IDOR_EXPLOITER_MAX_HORIZONTAL_ENUM: int = 50
+    """Maximum number of IDs to enumerate in horizontal escalation."""
+
+    IDOR_EXPLOITER_SEVERITY_THRESHOLD: str = "HIGH"
+    """Only exploit findings >= this severity. Options: CRITICAL, HIGH, MEDIUM."""
+
+    IDOR_EXPLOITER_RATE_LIMIT: float = 0.5
+    """Seconds between requests during exploitation (avoid WAF)."""
+
+    IDOR_EXPLOITER_TIMEOUT: float = 10.0
+    """HTTP request timeout during exploitation phases."""
+
+
+# Singleton Instance
+settings = Settings()
+# Load environment-specific config first (TASK-124)
+settings.load_env_specific()
+# Load configuration from bugtraceaicli.conf
+settings.load_from_conf()
+# Log config in debug mode (TASK-122)
+settings.log_config()
+
+
+# --- Config File Watcher (TASK-121) ---
+# Optional: Enable config hot-reload by setting BUGTRACE_WATCH_CONFIG=1
+_config_watcher = None
+
+def start_config_watcher():
+    """Start watching config file for changes (requires watchdog package)."""
+    global _config_watcher
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+
+        class ConfigFileHandler(FileSystemEventHandler):
+            def __init__(self, config_path, callback):
+                self.config_path = str(config_path)
+                self.callback = callback
+
+            def on_modified(self, event):
+                if event.src_path == self.config_path:
+                    logger.info("Config file changed, reloading...")
+                    self.callback()
+
+        def reload_config():
+            settings.load_from_conf()
+            settings.log_config()
+            logger.info("Configuration reloaded successfully")
+
+        conf_path = settings.BASE_DIR / "bugtraceaicli.conf"
+        observer = Observer()
+        observer.schedule(
+            ConfigFileHandler(conf_path, reload_config),
+            path=str(settings.BASE_DIR),
+            recursive=False
+        )
+        observer.start()
+        _config_watcher = observer
+        logger.info("Config file watcher started")
+        return observer
+    except ImportError:
+        logger.debug("watchdog not installed, config hot-reload disabled")
+        return None
+
+def stop_config_watcher():
+    """Stop the config file watcher."""
+    global _config_watcher
+    if _config_watcher:
+        _config_watcher.stop()
+        _config_watcher.join()
+        _config_watcher = None
+        logger.info("Config file watcher stopped")
+
+# Auto-start watcher if enabled
+if os.environ.get('BUGTRACE_WATCH_CONFIG', '').lower() in ('1', 'true', 'yes'):
+    start_config_watcher()

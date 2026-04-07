@@ -1,0 +1,158 @@
+{
+  "_doc": "Maps Nuclei misconfiguration tags/template_ids to correct vulnerability types. Used by team.py to classify findings from tech_profile.misconfigurations[].",
+  "_format": "Each rule has: match (tags or template_id patterns), type, default_severity, and action (classify=pre-validated misconfig, route=send to specialist queue, skip=already handled elsewhere).",
+
+  "rules": [
+    {
+      "name": "LFI / Path Traversal",
+      "match_tags": ["lfi", "path-traversal"],
+      "match_template_id_contains": ["traversal", "path-traversal", "lfi"],
+      "type": "LFI",
+      "default_severity": "high",
+      "action": "route"
+    },
+    {
+      "name": "SSRF",
+      "match_tags": ["ssrf"],
+      "match_template_id_contains": ["ssrf"],
+      "type": "SSRF",
+      "default_severity": "high",
+      "action": "route"
+    },
+    {
+      "name": "RCE / Command Injection",
+      "match_tags": ["rce", "command-injection"],
+      "match_template_id_contains": ["rce", "command-injection", "code-execution"],
+      "type": "RCE",
+      "default_severity": "critical",
+      "action": "route"
+    },
+    {
+      "name": "SQL Injection",
+      "match_tags": ["sqli", "sql-injection"],
+      "match_template_id_contains": ["sqli", "sql-injection"],
+      "type": "SQLI",
+      "default_severity": "critical",
+      "action": "route"
+    },
+    {
+      "name": "XSS",
+      "match_tags": ["xss"],
+      "match_template_id_contains": ["xss", "cross-site-scripting"],
+      "type": "XSS",
+      "default_severity": "high",
+      "action": "route"
+    },
+    {
+      "name": "XXE",
+      "match_tags": ["xxe"],
+      "match_template_id_contains": ["xxe", "xml-external-entity"],
+      "type": "XXE",
+      "default_severity": "high",
+      "action": "route"
+    },
+    {
+      "name": "SSTI / CSTI",
+      "match_tags": ["ssti", "csti", "template-injection"],
+      "match_template_id_contains": ["ssti", "csti", "template-injection"],
+      "type": "CSTI",
+      "default_severity": "high",
+      "action": "route"
+    },
+    {
+      "name": "Open Redirect",
+      "match_tags": ["redirect", "open-redirect"],
+      "match_template_id_contains": ["open-redirect", "redirect"],
+      "type": "OPEN_REDIRECT",
+      "default_severity": "medium",
+      "action": "route"
+    },
+    {
+      "name": "Insecure Deserialization",
+      "match_tags": ["deserialization"],
+      "match_template_id_contains": ["deserialization", "deserialize"],
+      "type": "Insecure Deserialization",
+      "default_severity": "critical",
+      "action": "route"
+    },
+    {
+      "name": "Broken Access Control",
+      "match_tags": ["access-control"],
+      "match_template_id_starts_with": ["broken-access-control"],
+      "type": "Broken Access Control",
+      "default_severity": "high",
+      "action": "skip",
+      "_reason": "Already handled by BAC detection block in team.py"
+    },
+    {
+      "name": "Insecure Cookies",
+      "match_tags": ["cookies"],
+      "match_template_id_contains": [],
+      "type": "Insecure Cookie Configuration",
+      "default_severity": "medium",
+      "action": "classify"
+    },
+    {
+      "name": "Vulnerable JS Dependencies",
+      "match_tags": ["js-dependency", "vulnerable-library"],
+      "match_template_id_starts_with": ["js-vulnerable-"],
+      "type": "Vulnerable Dependency",
+      "default_severity": "medium",
+      "action": "classify"
+    },
+    {
+      "name": "Missing Rate Limiting",
+      "match_tags": ["rate-limiting"],
+      "match_template_id_contains": ["rate-limit"],
+      "type": "Missing Rate Limiting",
+      "default_severity": "medium",
+      "action": "classify"
+    },
+    {
+      "name": "API Documentation Exposure",
+      "match_tags": ["swagger", "openapi", "redoc"],
+      "match_template_id_contains": ["swagger", "openapi", "redoc"],
+      "type": "API Documentation Exposure",
+      "default_severity": "info",
+      "action": "classify"
+    },
+    {
+      "name": "Information Disclosure",
+      "match_tags": ["info-disclosure", "information-disclosure"],
+      "match_template_id_contains": ["info-disclosure", "information-disclosure"],
+      "type": "Information Disclosure",
+      "default_severity": "low",
+      "action": "classify"
+    },
+    {
+      "name": "CORS Misconfiguration",
+      "match_tags": ["cors"],
+      "match_template_id_contains": ["cors"],
+      "type": "CORS Misconfiguration",
+      "default_severity": "medium",
+      "action": "classify"
+    },
+    {
+      "name": "TLS / Crypto Issues",
+      "match_tags": ["tls", "ssl", "crypto", "encryption"],
+      "match_template_id_contains": ["tls", "ssl", "crypto"],
+      "type": "Weak Cryptography",
+      "default_severity": "medium",
+      "action": "classify"
+    },
+    {
+      "name": "CSRF",
+      "match_tags": ["csrf"],
+      "match_template_id_contains": ["csrf"],
+      "type": "CSRF",
+      "default_severity": "medium",
+      "action": "classify"
+    }
+  ],
+
+  "fallback": {
+    "type": "MISSING_SECURITY_HEADER",
+    "default_severity": "info",
+    "action": "classify"
+  }
+}

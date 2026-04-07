@@ -1,0 +1,51 @@
+{
+    "id": "zai",
+    "name": "Z.ai",
+    "base_url": "https://api.z.ai/api/coding/paas/v4/chat/completions",
+    "base_url_regular": "https://api.z.ai/api/paas/v4/chat/completions",
+    "api_key_env": "GLM_API_KEY",
+    "api_key_hint": "...",
+    "features": {
+        "description": "Z.ai direct API. Single-provider option using GLM model family.",
+        "online_mode": false,
+        "balance_check": false,
+        "model_discovery": false,
+        "coding_plan": true
+    },
+    "models": {
+        "DEFAULT_MODEL": "glm-4.5",
+        "CODE_MODEL": "glm-4.5",
+        "ANALYSIS_MODEL": "glm-4.5",
+        "PRIMARY_MODELS": "glm-4.7,glm-4.5,glm-5,glm-4.7-flash,glm-4.5-flash",
+        "VISION_MODEL": "glm-4.6v",
+        "WAF_DETECTION_MODELS": "glm-4.5",
+        "MUTATION_MODEL": "glm-4.5",
+        "SKEPTICAL_MODEL": "glm-4.7",
+        "REPORTING_MODEL": "glm-4.7",
+        "ANALYSIS_PENTESTER_MODEL": "glm-4.5",
+        "ANALYSIS_BUG_BOUNTY_MODEL": "glm-4.5",
+        "ANALYSIS_AUDITOR_MODEL": "glm-4.5"
+    },
+    "headers": {
+        "Accept-Language": "en-US,en"
+    },
+    "concurrency": {
+        "glm-4.7-flash": 1,
+        "glm-4.5-flash": 2,
+        "glm-5": 2,
+        "glm-4.7": 3,
+        "glm-4.5-air": 3,
+        "glm-4.5-airx": 3,
+        "glm-4.5": 4,
+        "glm-4.6v": 4,
+        "glm-4.5v": 4,
+        "default": 2
+    },
+    "pricing": {
+        "glm-5": { "input": 0.60, "output": 2.20 },
+        "glm-4.7": { "input": 0.15, "output": 0.60 },
+        "glm-4.7-flash": { "input": 0.07, "output": 0.40 },
+        "glm-4.5": { "input": 0.30, "output": 0.90 },
+        "glm-4.6v": { "input": 0.30, "output": 0.90 }
+    }
+}

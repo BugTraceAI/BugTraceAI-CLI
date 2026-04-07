@@ -1,0 +1,26 @@
+# SPA/content routes for frontend vulnerability discovery
+# Lines starting with # are comments
+# One route per line (probed against origin, not API prefix)
+# GoSpider can't crawl JavaScript SPAs, so common frontend
+# routes must be probed directly to discover client-side vulns
+
+# Blog/Content
+blog
+blog/1
+blog?legacy_q=test
+
+# Search
+search
+search?q=test
+
+# Products
+products
+products?filter=test
+
+# Community
+forum
+community
+
+# Admin/Settings
+admin
+settings
