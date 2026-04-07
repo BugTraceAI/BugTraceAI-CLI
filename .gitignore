@@ -70,6 +70,10 @@ bugtrace/data/xss_proven_payloads.lock
 
 # Claude Code config (private)
 .claude/
+CLAUDE.md
+
+# Tests (internal only)
+tests/
 
 # Dev scripts and archives (local-only)
 scripts/
