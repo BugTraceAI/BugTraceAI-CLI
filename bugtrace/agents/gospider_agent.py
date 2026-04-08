@@ -29,45 +29,57 @@ class GoSpiderAgent(BaseAgent):
     IMPROVED 2026-01-30: Extract ALL testable parameters, not just URLs.
     """
 
-    def __init__(self, target: str, report_dir: Path, max_depth: int = 2, max_urls: int = 10, event_bus: Any = None):
+    def __init__(self, target: str, report_dir: Path, max_depth: int = 2, max_urls: int = 10, event_bus: Any = None, scope_path: str = None):
         super().__init__("GoSpiderAgent", "URL Discovery", event_bus=event_bus, agent_id="gospider_agent")
         self.target = target
         self.report_dir = report_dir
         self.max_depth = max_depth
         self.max_urls = max_urls
         self.target_domain = urlparse(target).hostname.lower() if urlparse(target).hostname else ""
+        self.scope_path = scope_path  # Optional: restrict URLs to this path (e.g., "/WebPA/")
 
         # Load extension filters from config
         self.exclude_extensions = [ext.strip().lower() for ext in settings.CRAWLER_EXCLUDE_EXTENSIONS.split(",") if ext.strip()]
         self.include_extensions = [ext.strip().lower() for ext in settings.CRAWLER_INCLUDE_EXTENSIONS.split(",") if ext.strip()]
+
+        if scope_path:
+            logger.info(f"[GoSpiderAgent] URL scope restricted to: {scope_path}")
         
     def _should_analyze_url(self, url: str) -> bool:
         """
-        Determines if a URL should be analyzed based on extension filtering.
+        Determines if a URL should be analyzed based on extension filtering and scope_path.
         Excludes static files like .js, .css, .jpg, etc.
         """
         try:
             parsed = urlparse(url)
             path = parsed.path.lower()
-            
+
+            # Check scope_path restriction first
+            if self.scope_path:
+                normalized_scope = "/" + self.scope_path.strip("/").lower()
+                url_path = (parsed.path or "/").lower()
+                if not url_path.startswith(normalized_scope):
+                    logger.debug(f"[GoSpiderAgent] URL excluded (out of scope): {url}")
+                    return False
+
             # Extract extension from path
             if '.' in path.split('/')[-1]:
                 ext = '.' + path.rsplit('.', 1)[-1]
             else:
                 ext = ''  # No extension (likely dynamic endpoint)
-            
+
             # If include_extensions is set, only allow those
             if self.include_extensions:
                 if ext and ext not in self.include_extensions:
                     return False
                 return True
-            
+
             # Otherwise, exclude the excluded extensions
             if ext and ext in self.exclude_extensions:
                 return False
-            
+
             return True
-            
+
         except Exception:
             return True  # If parsing fails, include the URL
         
