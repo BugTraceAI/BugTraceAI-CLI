@@ -87,6 +87,11 @@ async def create_scan(
 
 def _build_scan_options(request: CreateScanRequest) -> ScanOptions:
     """Convert API request to ScanOptions."""
+    # Extract scope_path from auth config if present
+    scope_path = None
+    if request.auth and isinstance(request.auth, dict):
+        scope_path = request.auth.get("scope_path")
+
     return ScanOptions(
         target_url=request.target_url,
         scan_type=request.scan_type,
@@ -101,6 +106,7 @@ def _build_scan_options(request: CreateScanRequest) -> ScanOptions:
         auth_token=request.auth_token,
         auth=request.auth,
         url_list=request.url_list,
+        scope_path=scope_path,
     )
 
 

@@ -43,38 +43,56 @@ class VisualCrawler:
             logger.debug(f"URL normalization error: {e}")
             return ""
 
-    def _is_in_scope(self, url: str, start_url: str) -> bool:
+    def _is_in_scope(self, url: str, start_url: str, scope_path: str = None) -> bool:
         """
         Checks if the URL is within the scope of the start URL.
-        Relaxed check: Same Domain (ignoring subdomains? No, strict usually).
+        If scope_path is provided, URL must also be under that path.
         """
         try:
             target = urlparse(url)
             start = urlparse(start_url)
-            
+
             # Check domain match
             if target.netloc != start.netloc:
                 return False
-                
-            # Check if path is under start path (optional, maybe too strict for typical crawling)
-            # usually we just want same domain.
+
+            # If scope_path is set, enforce path prefix matching
+            if scope_path:
+                # Normalize scope path (ensure leading slash, no trailing slash for matching)
+                normalized_scope = "/" + scope_path.strip("/")
+                target_path = target.path or "/"
+
+                # URL must start with the scope path
+                if not target_path.startswith(normalized_scope):
+                    logger.debug(f"URL {url} excluded - not under scope {normalized_scope}")
+                    return False
+
             return True
         except Exception as e:
             logger.debug(f"Scope check error: {e}")
             return False
 
-    async def crawl(self, start_url: str, max_pages: int = 25, max_depth: int = 2) -> Dict[str, Any]:
+    async def crawl(self, start_url: str, max_pages: int = 25, max_depth: int = 2, scope_path: str = None) -> Dict[str, Any]:
         """
         Crawls the target visually, extracting links and identifying attack surface (inputs).
+
+        Args:
+            start_url: URL to start crawling from
+            max_pages: Maximum number of pages to crawl
+            max_depth: Maximum link depth to follow
+            scope_path: If set, only crawl URLs under this path (e.g., "/WebPA/")
         """
-        logger.info(f"Starting Visual Crawl on {start_url}...")
+        if scope_path:
+            logger.info(f"Starting Visual Crawl on {start_url} (scope: {scope_path})...")
+        else:
+            logger.info(f"Starting Visual Crawl on {start_url}...")
 
         results = self._initialize_results(start_url)
         pages_crawled = 0
 
         async with browser_manager.get_page(use_auth=True) as page:
             queue = [(start_url, 0)]
-            pages_crawled = await self._crawl_queue(page, queue, start_url, max_pages, max_depth, results)
+            pages_crawled = await self._crawl_queue(page, queue, start_url, max_pages, max_depth, results, scope_path)
 
         dashboard.log(f"Crawl finished. Visited {pages_crawled} pages.", "SUCCESS")
         return results
@@ -89,7 +107,7 @@ class VisualCrawler:
             "tokens": []
         }
 
-    async def _crawl_queue(self, page, queue, start_url, max_pages, max_depth, results) -> int:
+    async def _crawl_queue(self, page, queue, start_url, max_pages, max_depth, results, scope_path=None) -> int:
         """Process crawl queue until max pages or queue empty."""
         from bugtrace.core.config import settings
         pages_crawled = 0
@@ -108,7 +126,7 @@ class VisualCrawler:
                 await page.wait_for_timeout(settings.SPA_WAIT_MS)
                 pages_crawled += 1
 
-                await self._extract_links(page, current_url, current_depth, start_url, max_depth, queue, results, settings)
+                await self._extract_links(page, current_url, current_depth, start_url, max_depth, queue, results, settings, scope_path)
                 await self._extract_inputs(page, current_url, results)
                 await self._extract_tokens(page, current_url, results)
 
@@ -117,7 +135,7 @@ class VisualCrawler:
 
         return pages_crawled
 
-    async def _extract_links(self, page, current_url, current_depth, start_url, max_depth, queue, results, settings):
+    async def _extract_links(self, page, current_url, current_depth, start_url, max_depth, queue, results, settings, scope_path=None):
         """Extract and queue links from current page."""
         hrefs = await page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => a.href)")
 
@@ -126,7 +144,7 @@ class VisualCrawler:
             if not normalized:
                 continue
 
-            if self._is_in_scope(href, start_url) and normalized not in self.visited_urls:
+            if self._is_in_scope(href, start_url, scope_path) and normalized not in self.visited_urls:
                 self.visited_urls.add(normalized)
                 results["urls"].add(href)
 

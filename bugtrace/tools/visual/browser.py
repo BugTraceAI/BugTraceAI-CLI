@@ -131,7 +131,8 @@ class BrowserManager:
                 
                 local_context = await self._browser.new_context(
                     viewport={'width': vp_width, 'height': vp_height},
-                    user_agent=ua
+                    user_agent=ua,
+                    ignore_https_errors=True  # Accept self-signed certs
                 )
                 page = await local_context.new_page()
             
@@ -415,8 +416,8 @@ class BrowserManager:
             if not self._browser:
                 await self.start()
                 
-            # Create persistent context
-            self._context = await self._browser.new_context()
+            # Create persistent context (accept self-signed certs)
+            self._context = await self._browser.new_context(ignore_https_errors=True)
             
             page = await self._context.new_page()
             try:

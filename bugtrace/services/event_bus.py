@@ -89,6 +89,7 @@ class ServiceEventBus:
 
     # Verbose event prefixes bridged via wildcard pattern matching
     _VERBOSE_PREFIXES = [
+        "auth.*",  # Authentication phase events
         "pipeline.*", "recon.*", "discovery.*", "strategy.*",
         "exploit.*", "validation.*", "reporting.*",
     ]

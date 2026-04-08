@@ -84,6 +84,7 @@ def scan(
     target: str = typer.Argument(..., help="The target URL to scan (Hunter phase)"),
     url_list_file: Optional[str] = typer.Option(None, "--url-list-file", "-ul", help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
     swagger_file: Optional[str] = typer.Option(None, "--swagger", "-sw", help="Swagger/OpenAPI JSON file to import endpoints"),
+    auth_config: Optional[str] = typer.Option(None, "--auth-config", "-ac", help="YAML file with authentication config (supports TOTP)"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
     clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
@@ -96,7 +97,7 @@ def scan(
     param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
 ):
     """Run the Discovery (Hunter) phase only."""
-    _run_pipeline(target, phase="hunter", url_list_file=url_list_file, swagger_file=swagger_file, safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    _run_pipeline(target, phase="hunter", url_list_file=url_list_file, swagger_file=swagger_file, auth_config=auth_config, safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
 
 @app.command(name="audit")
 def audit(
@@ -111,6 +112,7 @@ def full_scan(
     target: str = typer.Argument(..., help="The target URL for full engagement"),
     url_list_file: Optional[str] = typer.Option(None, "--url-list-file", "-ul", help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
     swagger_file: Optional[str] = typer.Option(None, "--swagger", "-sw", help="Swagger/OpenAPI JSON file to import endpoints"),
+    auth_config: Optional[str] = typer.Option(None, "--auth-config", "-ac", help="YAML file with authentication config (supports TOTP)"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
     clean: bool = typer.Option(False, "--clean", help="Clean previous scan data before starting"),
@@ -124,7 +126,7 @@ def full_scan(
     param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
 ):
     """Run Hunter followed by Auditor (The complete professional workflow)."""
-    _run_pipeline(target, phase="all", url_list_file=url_list_file, swagger_file=swagger_file, safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    _run_pipeline(target, phase="all", url_list_file=url_list_file, swagger_file=swagger_file, auth_config=auth_config, safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
 
 @app.command(name="serve")
 def serve(
@@ -474,7 +476,7 @@ def _load_url_list(file_path: str, target: str) -> list:
 
     return urls
 
-def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
+def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, auth_config=None, safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
     """Internal helper to run the pipeline phases."""
     if safe_mode is not None:
         settings.SAFE_MODE = safe_mode
@@ -494,6 +496,22 @@ def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, sa
             console.print(f"[bold red]Error loading URL list:[/bold red] {e}")
             raise typer.Exit(code=1)
 
+    # Load authentication config from YAML
+    auth_data = None
+    if auth_config:
+        try:
+            from bugtrace.utils.auth_config import load_auth_config, convert_to_scan_auth
+            config, error = load_auth_config(auth_config)
+            if error:
+                console.print(f"[bold red]Error loading auth config:[/bold red] {error}")
+                raise typer.Exit(code=1)
+            auth_data = convert_to_scan_auth(config)
+            totp_status = "[green]TOTP enabled[/green]" if config.get("credentials", {}).get("totp_secret") else "[dim]No TOTP[/dim]"
+            console.print(f"[bold green]Auth config loaded:[/bold green] {auth_config} ({totp_status})")
+        except Exception as e:
+            console.print(f"[bold red]Error loading auth config:[/bold red] {e}")
+            raise typer.Exit(code=1)
+
     # Check for focused mode
     if xss or sqli or lfi or jwt or idor or ssrf:
         _run_focused_mode(target, xss=xss, sqli=sqli, lfi=lfi, jwt=jwt, idor=idor, ssrf=ssrf, param=param)
@@ -508,7 +526,7 @@ def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, sa
 
     # Execute phases
     try:
-        asyncio.run(_execute_phases(target, phase, resume, clean, scan_id, continuous, url_list))
+        asyncio.run(_execute_phases(target, phase, resume, clean, scan_id, continuous, url_list, auth_data))
     except KeyboardInterrupt:
         console.print("\n[yellow]Engagement aborted by user.[/yellow]")
     except Exception as e:
@@ -550,7 +568,7 @@ def _display_framework_info(target: str):
     console.print(f"[bold cyan]Architecture:[/bold cyan] Sequential Pipeline (V2 Architecture)")
 
 
-async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, scan_id: int, continuous: bool, url_list: Optional[list] = None):
+async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, scan_id: int, continuous: bool, url_list: Optional[list] = None, auth_data: Optional[dict] = None):
     """Execute scan phases with dashboard UI."""
     from bugtrace.core.database import get_db_manager
     from bugtrace.core.ui import dashboard
@@ -583,7 +601,7 @@ async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, sc
             # Execute Hunter phase
             orchestrator = None
             if phase in ["hunter", "all"]:
-                orchestrator = await _run_hunter_phase(target, db, resume, common_output_dir, url_list)
+                orchestrator = await _run_hunter_phase(target, db, resume, common_output_dir, url_list, auth_data)
 
             # Execute Auditor phase
             if phase in ["manager", "all"]:
@@ -639,7 +657,7 @@ def _perform_emergency_shutdown():
         os._exit(1)
 
 
-async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Path, url_list: Optional[list] = None):
+async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Path, url_list: Optional[list] = None, auth_data: Optional[dict] = None):
     """Run Hunter (Discovery) phase."""
     # Check for active scan and auto-resume
     resume = await _check_and_resume_scan(target, db, resume)
@@ -653,7 +671,8 @@ async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Pa
         max_urls=settings.MAX_URLS,
         use_vertical_agents=True,
         output_dir=common_output_dir,
-        url_list=url_list
+        url_list=url_list,
+        auth=auth_data
     )
 
     # Display mode info
