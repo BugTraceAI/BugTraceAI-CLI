@@ -688,7 +688,7 @@ class ExternalToolManager:
             logger.debug(f"URL parsing error in GoSpider output: {e}")
         return None
 
-    async def run_gospider(self, url: str, cookies: List[Dict] = None, depth: int = 3, max_urls: int = None) -> List[str]:
+    async def run_gospider(self, url: str, cookies: List[Dict] = None, depth: int = 3, max_urls: int = None, extra_headers: Dict[str, str] = None) -> List[str]:
         """
         Runs GoSpider crawler (native preferred, Docker fallback).
         Respects max_urls by counting unique in-scope URLs in real-time.
@@ -712,7 +712,7 @@ class ExternalToolManager:
 
         self._record_tool_run("gospider")
         mode = "native" if native else "Docker"
-        logger.info(f"Starting GoSpider ({mode}) on {url} (depth={depth}, limit={max_urls})...")
+        logger.info(f"Starting GoSpider ({mode}) on {url} (depth={depth}, limit={max_urls}, cookies={'yes' if cookies else 'no'})...")
         dashboard.log(f"[External] Launching GoSpider ({mode}, depth={depth}) against {url}", "INFO")
         dashboard.update_task("gospider", name="GoSpider", status=f"Crawling: {url}")
 
@@ -728,6 +728,10 @@ class ExternalToolManager:
         if cookies:
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             cmd.extend(["--cookie", cookie_str])
+
+        if extra_headers:
+            for header_name, header_value in extra_headers.items():
+                cmd.extend(["-H", f"{header_name}: {header_value}"])
 
         if settings.GOSPIDER_NO_REDIRECT:
             cmd.append("--no-redirect")

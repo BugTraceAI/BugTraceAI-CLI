@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Optional
 from loguru import logger
 from bugtrace.tools.external import external_tools
 from bugtrace.core.ui import dashboard
@@ -29,12 +29,13 @@ class GoSpiderAgent(BaseAgent):
     IMPROVED 2026-01-30: Extract ALL testable parameters, not just URLs.
     """
 
-    def __init__(self, target: str, report_dir: Path, max_depth: int = 2, max_urls: int = 10, event_bus: Any = None):
+    def __init__(self, target: str, report_dir: Path, max_depth: int = 2, max_urls: int = 10, event_bus: Any = None, scan_ctx_id: Optional[str] = None):
         super().__init__("GoSpiderAgent", "URL Discovery", event_bus=event_bus, agent_id="gospider_agent")
         self.target = target
         self.report_dir = report_dir
         self.max_depth = max_depth
         self.max_urls = max_urls
+        self.scan_ctx_id = scan_ctx_id
         self.target_domain = urlparse(target).hostname.lower() if urlparse(target).hostname else ""
 
         # Load extension filters from config
@@ -73,11 +74,27 @@ class GoSpiderAgent(BaseAgent):
         
     async def _discover_urls(self) -> List[str]:
         """Run GoSpider and fallback discovery if needed."""
+        cookies: List[Dict[str, str]] = []
+        auth_extra_headers: Dict[str, str] = {}
+        if self.scan_ctx_id:
+            from bugtrace.services.scan_context import get_scan_auth_headers
+            auth_headers = get_scan_auth_headers(self.scan_ctx_id)
+            if "Cookie" in auth_headers:
+                cookie_str = auth_headers["Cookie"]
+                cookies = [{"name": p.split("=")[0], "value": "=".join(p.split("=")[1:])}
+                           for p in cookie_str.split("; ") if "=" in p]
+                dashboard.log(f"[{self.name}] Using {len(cookies)} auth cookies for crawling", "INFO")
+            if "Authorization" in auth_headers:
+                auth_extra_headers["Authorization"] = auth_headers["Authorization"]
+                dashboard.log(f"[{self.name}] Using Authorization header for crawling", "INFO")
+
         # Pass max_urls to support early exit (optimization)
         gospider_urls = await external_tools.run_gospider(
             self.target, 
+            cookies=cookies,
             depth=self.max_depth,
-            max_urls=self.max_urls
+            max_urls=self.max_urls,
+            extra_headers=auth_extra_headers if auth_extra_headers else None,
         )
 
         # If GoSpider only returns 1 URL (the target itself), trigger fallback

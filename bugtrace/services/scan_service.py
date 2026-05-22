@@ -273,14 +273,30 @@ class ScanService:
             if login_url.startswith("/"):
                 login_url = options.target_url.rstrip("/") + login_url
 
-            logger.info(f"Auth Level 2: Attempting login at {login_url}")
+            auth_format = (options.auth_format or "json").lower()
+            logger.info(f"Auth Level 2: Attempting login at {login_url} (format={auth_format})")
 
             try:
                 import httpx
+                import re
                 async with httpx.AsyncClient(verify=False, timeout=15) as client:
-                    resp = await client.post(login_url, json=credentials)
+                    post_data = dict(credentials)
 
-                    if resp.status_code not in (200, 201):
+                    if auth_format == "form":
+                        login_page = await client.get(login_url)
+                        for match in re.finditer(r'<input[^>]+>', login_page.text, re.IGNORECASE):
+                            name_match = re.search(r'name=["\']([^"\']+)["\']', match.group(0), re.IGNORECASE)
+                            value_match = re.search(r'value=["\']([^"\']*)["\']', match.group(0), re.IGNORECASE)
+                            if name_match and value_match:
+                                field_name = name_match.group(1)
+                                if any(marker in field_name.lower() for marker in ("csrf", "token", "_token")):
+                                    post_data[field_name] = value_match.group(1)
+
+                        resp = await client.post(login_url, data=post_data)
+                    else:
+                        resp = await client.post(login_url, json=credentials)
+
+                    if resp.status_code not in (200, 201, 302, 303):
                         logger.warning(
                             f"Auth Level 2: Login failed (HTTP {resp.status_code})"
                         )
@@ -291,7 +307,17 @@ class ScanService:
                     if token:
                         store_auth_token(scan_ctx_id, "auto_login", token)
                         logger.info("Auth Level 2: JWT extracted and stored from login response")
-                    else:
+
+                    # Capture session cookies regardless of JWT presence
+                    # Use client.cookies (jar) not resp.cookies — resp only has cookies
+                    # from the last response; the jar accumulates across GET + POST + redirects.
+                    all_cookies = client.cookies
+                    if all_cookies:
+                        cookie_str = "; ".join([f"{name}={value}" for name, value in all_cookies.items()])
+                        store_auth_token(scan_ctx_id, "session_cookies", token=None, token_type="Cookie", cookies=cookie_str)  # pyright: ignore[reportArgumentType]
+                        logger.info(f"Auth Level 2: Captured {len(all_cookies)} session cookies from login ({cookie_str[:80]}...)")
+
+                    if not token:
                         logger.warning("Auth Level 2: Login succeeded but no JWT found in response")
 
             except Exception as e:
@@ -424,33 +450,72 @@ class ScanService:
             statement = select(ScanTable).where(ScanTable.id == scan_id)
             scan = session.exec(statement).first()
 
-            if not scan:
-                raise ValueError(f"Scan {scan_id} not found")
+            if scan:
+                # Get target info
+                target = session.get(TargetTable, scan.target_id)
 
-            # Get target info
-            target = session.get(TargetTable, scan.target_id)
+                # Count findings
+                from bugtrace.schemas.db_models import FindingTable
+                findings_statement = select(FindingTable).where(FindingTable.scan_id == scan_id)
+                findings = session.exec(findings_statement).all()
 
-            # Count findings
-            from bugtrace.schemas.db_models import FindingTable
-            findings_statement = select(FindingTable).where(FindingTable.scan_id == scan_id)
-            findings = session.exec(findings_statement).all()
+                return {
+                    "scan_id": scan_id,
+                    "target": target.url if target else "unknown",
+                    "status": scan.status.value,
+                    "progress": scan.progress_percent,
+                    "uptime_seconds": None,  # No longer running
+                    "findings_count": len(findings),
+                    "active_agent": None,
+                    "phase": None,
+                    "origin": getattr(scan, "origin", "cli"),
+                    "enrichment_status": getattr(scan, "enrichment_status", None),
+                    "scan_type": scan.scan_type,
+                    "max_depth": scan.max_depth,
+                    "max_urls": scan.max_urls,
+                    "provider": getattr(scan, "provider", None),
+                }
+
+        # Fallback: scan not in DB - try to build status from filesystem
+        import json
+        report_dir = self._find_report_dir_for_scan(scan_id)
+        if report_dir:
+            # Try to extract target from directory name (format: {domain}_{timestamp})
+            dir_name = report_dir.name
+            parts = dir_name.rsplit("_", 1)
+            target_url = parts[0] if len(parts) >= 2 else "unknown"
+
+            # Count findings from files
+            findings_count = 0
+            vf = report_dir / "validated_findings.json"
+            if vf.is_file():
+                try:
+                    data = json.loads(vf.read_text())
+                    findings_count = len(data.get("findings", [])) if isinstance(data, dict) else len(data) if isinstance(data, list) else 0
+                except Exception:
+                    pass
+
+            # Check if final report exists (means completed)
+            has_final = (report_dir / "final_report.md").is_file()
 
             return {
                 "scan_id": scan_id,
-                "target": target.url if target else "unknown",
-                "status": scan.status.value,
-                "progress": scan.progress_percent,
-                "uptime_seconds": None,  # No longer running
-                "findings_count": len(findings),
+                "target": target_url,
+                "status": "COMPLETED" if has_final else "STOPPED",
+                "progress": 100 if has_final else 50,
+                "uptime_seconds": None,
+                "findings_count": findings_count,
                 "active_agent": None,
                 "phase": None,
-                "origin": getattr(scan, "origin", "cli"),
-                "enrichment_status": getattr(scan, "enrichment_status", None),
-                "scan_type": scan.scan_type,
-                "max_depth": scan.max_depth,
-                "max_urls": scan.max_urls,
-                "provider": getattr(scan, "provider", None),
+                "origin": "cli",
+                "enrichment_status": None,
+                "scan_type": "full",
+                "max_depth": 2,
+                "max_urls": 20,
+                "provider": None,
             }
+
+        raise ValueError(f"Scan {scan_id} not found")
 
     async def stop_scan(self, scan_id: int) -> Dict[str, Any]:
         """Stop a running or paused scan gracefully."""
@@ -929,13 +994,17 @@ class ScanService:
         Returns:
             Dictionary with findings, total, page, per_page
         """
-        # Verify scan exists before loading findings
-        with self.db.get_session() as session:
-            from sqlmodel import select
-            from bugtrace.schemas.db_models import ScanTable
-            scan = session.exec(select(ScanTable).where(ScanTable.id == scan_id)).first()
-            if not scan:
-                raise ValueError(f"Scan {scan_id} not found")
+        # Verify scan exists in DB, but don't fail - filesystem may have results
+        scan_found_in_db = False
+        try:
+            with self.db.get_session() as session:
+                from sqlmodel import select
+                from bugtrace.schemas.db_models import ScanTable
+                scan = session.exec(select(ScanTable).where(ScanTable.id == scan_id)).first()
+                if scan:
+                    scan_found_in_db = True
+        except Exception:
+            pass
 
         # Load all findings from files (source of truth)
         all_findings = self._load_findings_from_files(scan_id)
@@ -981,36 +1050,84 @@ class ScanService:
             with self.db.get_session() as session:
                 from bugtrace.schemas.db_models import ScanTable, TargetTable
                 scan = session.get(ScanTable, scan_id)
-                if not scan:
-                    return None
-                target = session.get(TargetTable, scan.target_id)
-                if not target:
-                    return None
+                if scan:
+                    target = session.get(TargetTable, scan.target_id)
 
-                # Pattern 0: Direct DB match (v5.1 architecture)
-                if hasattr(scan, 'report_dir') and scan.report_dir:
-                    db_dir = Path(scan.report_dir)
-                    if db_dir.is_dir() and self._dir_has_report_files(db_dir):
-                        return db_dir
+                    # Pattern 0: Direct DB match (v5.1 architecture)
+                    if hasattr(scan, 'report_dir') and scan.report_dir:
+                        db_dir = Path(scan.report_dir)
+                        if db_dir.is_dir() and self._dir_has_report_files(db_dir):
+                            return db_dir
 
-                # Pattern 1: Pipeline-generated reports ({domain}_{timestamp})
-                domain = urlparse(target.url).hostname or ""
-                matches = sorted(
-                    report_base.glob(f"{domain}_*"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                for match in matches:
-                    if self._dir_has_report_files(match):
-                        return match
+                    # Pattern 1: Pipeline-generated reports ({domain}_{timestamp})
+                    if target:
+                        domain = urlparse(target.url).hostname or ""
+                        matches = sorted(
+                            report_base.glob(f"{domain}_*"),
+                            key=lambda p: p.stat().st_mtime,
+                            reverse=True,
+                        )
+                        for match in matches:
+                            if self._dir_has_report_files(match):
+                                return match
 
-                # Pattern 2: API-generated reports (fallback)
-                api_dir = report_base / f"scan_{scan_id}"
-                if api_dir.is_dir() and self._dir_has_report_files(api_dir):
-                    return api_dir
+                    # Pattern 2: API-generated reports (fallback)
+                    api_dir = report_base / f"scan_{scan_id}"
+                    if api_dir.is_dir() and self._dir_has_report_files(api_dir):
+                        return api_dir
+
+                # DB has no scan record - fall through to filesystem scan below
 
         except Exception as e:
             logger.warning(f"Error resolving report dir for scan {scan_id}: {e}")
+
+        # Filesystem fallback: scan ALL report dirs for scan_id in metadata
+        for report_dir in sorted(
+            report_base.glob("*_*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        ):
+            if not report_dir.is_dir():
+                continue
+            if not self._dir_has_report_files(report_dir):
+                continue
+            # Check validated_findings.json for scan_id match
+            vf = report_dir / "validated_findings.json"
+            if vf.is_file():
+                try:
+                    import json
+                    data = json.loads(vf.read_text())
+                    # Check root-level scan_id, meta.scan_id, or list items
+                    if isinstance(data, dict):
+                        if data.get("scan_id") == scan_id:
+                            return report_dir
+                        meta = data.get("meta", {})
+                        if isinstance(meta, dict) and meta.get("scan_id") == scan_id:
+                            return report_dir
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict) and item.get("scan_id") == scan_id:
+                                return report_dir
+                except Exception:
+                    pass
+            # Also check raw_findings.json
+            rf = report_dir / "raw_findings.json"
+            if rf.is_file():
+                try:
+                    import json
+                    data = json.loads(rf.read_text())
+                    if isinstance(data, dict):
+                        if data.get("scan_id") == scan_id:
+                            return report_dir
+                        meta = data.get("meta", {})
+                        if isinstance(meta, dict) and meta.get("scan_id") == scan_id:
+                            return report_dir
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict) and item.get("scan_id") == scan_id:
+                                return report_dir
+                except Exception:
+                    pass
 
         # Last resort without DB
         api_dir = report_base / f"scan_{scan_id}"

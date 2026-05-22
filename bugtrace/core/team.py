@@ -1502,7 +1502,7 @@ class TeamOrchestrator:
         """Run GoSpider agent for URL discovery."""
         logger.info(f"Triggering GoSpiderAgent for {self.target}")
         self._v.emit("recon.gospider.started", {"target": self.target})
-        gospider = GoSpiderAgent(self.target, recon_dir, max_depth=self.max_depth, max_urls=self.max_urls)
+        gospider = GoSpiderAgent(self.target, recon_dir, max_depth=self.max_depth, max_urls=self.max_urls, scan_ctx_id=self.scan_context)
         urls_to_scan = await gospider.run()
         self._v.emit("recon.gospider.completed", {"urls_found": len(urls_to_scan)})
         logger.info(f"GoSpiderAgent finished. Found {len(urls_to_scan)} URLs")
