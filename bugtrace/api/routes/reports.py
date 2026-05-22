@@ -150,45 +150,81 @@ def _find_report_dir(scan_id: int) -> FilePath | None:
         with db.get_session() as session:
             from bugtrace.schemas.db_models import ScanTable, TargetTable
             scan = session.get(ScanTable, scan_id)
-            if not scan:
-                return None
-            target = session.get(TargetTable, scan.target_id)
-            if not target:
-                return None
+            if scan:
+                target = session.get(TargetTable, scan.target_id)
 
-            # Pattern 0: Direct DB match (new v5.1 architecture)
-            if hasattr(scan, 'report_dir') and scan.report_dir:
-                db_dir = FilePath(scan.report_dir)
-                if db_dir.is_dir() and _has_report_files(db_dir):
-                    return db_dir
+                # Pattern 0: Direct DB match (new v5.1 architecture)
+                if hasattr(scan, 'report_dir') and scan.report_dir:
+                    db_dir = FilePath(scan.report_dir)
+                    if db_dir.is_dir() and _has_report_files(db_dir):
+                        return db_dir
 
-            # Pattern 1: Pipeline-generated reports ({domain}_{timestamp})
-            from urllib.parse import urlparse
-            domain = urlparse(target.url).hostname or ""
-            scan_ts = scan.timestamp.strftime("%Y%m%d_%H%M%S")
+                # Pattern 1: Pipeline-generated reports ({domain}_{timestamp})
+                from urllib.parse import urlparse
+                if target:
+                    domain = urlparse(target.url).hostname or ""
+                    scan_ts = scan.timestamp.strftime("%Y%m%d_%H%M%S")
 
-            # Priority 1a: Exact timestamp match
-            exact_match = report_base / f"{domain}_{scan_ts}"
-            if exact_match.is_dir() and _has_report_files(exact_match):
-                return exact_match
+                    # Priority 1a: Exact timestamp match
+                    exact_match = report_base / f"{domain}_{scan_ts}"
+                    if exact_match.is_dir() and _has_report_files(exact_match):
+                        return exact_match
 
-            # Priority 1b: Fuzzy match (latest for domain)
-            matches = sorted(
-                report_base.glob(f"{domain}_*"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            for match in matches:
-                if _has_report_files(match):
-                    return match
+                    # Priority 1b: Fuzzy match (latest for domain)
+                    matches = sorted(
+                        report_base.glob(f"{domain}_*"),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    for match in matches:
+                        if _has_report_files(match):
+                            return match
 
-            # Pattern 2: API-generated reports (fallback)
-            api_dir = report_base / f"scan_{scan_id}"
-            if api_dir.is_dir() and _has_report_files(api_dir):
-                return api_dir
+                # Pattern 2: API-generated reports (fallback)
+                api_dir = report_base / f"scan_{scan_id}"
+                if api_dir.is_dir() and _has_report_files(api_dir):
+                    return api_dir
+
+            # DB has no scan record - fall through to filesystem scan below
 
     except Exception as e:
         logger.warning(f"Error resolving report dir for scan {scan_id}: {e}")
+
+    # Filesystem fallback: scan ALL report dirs for scan_id in metadata
+    import json as _json
+    for report_dir in sorted(
+        report_base.glob("*_*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    ):
+        if not report_dir.is_dir():
+            continue
+        if not _has_report_files(report_dir):
+            continue
+        vf = report_dir / "validated_findings.json"
+        if vf.is_file():
+            try:
+                data = _json.loads(vf.read_text())
+                if isinstance(data, dict):
+                    if data.get("scan_id") == scan_id:
+                        return report_dir
+                    meta = data.get("meta", {})
+                    if isinstance(meta, dict) and meta.get("scan_id") == scan_id:
+                        return report_dir
+            except Exception:
+                pass
+        rf = report_dir / "raw_findings.json"
+        if rf.is_file():
+            try:
+                data = _json.loads(rf.read_text())
+                if isinstance(data, dict):
+                    if data.get("scan_id") == scan_id:
+                        return report_dir
+                    meta = data.get("meta", {})
+                    if isinstance(meta, dict) and meta.get("scan_id") == scan_id:
+                        return report_dir
+            except Exception:
+                pass
 
     # Last resort: check scan_{id} without DB access
     api_dir = report_base / f"scan_{scan_id}"
