@@ -56,12 +56,18 @@ def get_scan_auth_headers(scan_ctx_id: str, role: str = "admin") -> Dict[str, st
     """Get auth headers (Authorization + Cookie) from tokens discovered during this scan."""
     headers = {}
     tokens = _auth_token_store.get(scan_ctx_id, {})
-    for info in tokens.values():
+    for name, info in tokens.items():
         if role in info.get("roles", []):
             if info.get("token"):
                 headers["Authorization"] = f"{info['type']} {info['token']}"
             if info.get("cookies"):
                 headers["Cookie"] = info["cookies"]
+    # Log when auth headers are retrieved (helps debug auth usage)
+    if headers:
+        from bugtrace.utils.logger import get_logger
+        logger = get_logger("scan_context")
+        cookie_preview = headers.get("Cookie", "")[:40] + "..." if headers.get("Cookie") else "None"
+        logger.info(f"[AUTH-USE] Agent using session cookies for {scan_ctx_id[:20]}...")
     return headers
 
 
@@ -88,8 +94,9 @@ class ScanOptions(BaseModel):
     param: Optional[str] = None  # for focused mode parameter targeting
     scan_depth: str = ""  # empty = use settings.SCAN_DEPTH default
     auth_token: Optional[str] = None  # Level 1: pre-authenticated Bearer token
-    auth: Optional[Dict[str, Any]] = None  # Level 2: {login_url, credentials: {email, password}}
+    auth: Optional[Dict[str, Any]] = None  # Level 2/3: {login_url, credentials: {email, password, totp_secret?}, login_flow?: [...]}
     url_list: Optional[List[str]] = None  # Pre-defined URL list (from file upload or Swagger import)
+    scope_path: Optional[str] = None  # Restrict crawling to URLs under this path (e.g., "/WebPA/")
 
 
 class ScanContext:

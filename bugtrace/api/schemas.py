@@ -33,7 +33,7 @@ class CreateScanRequest(BaseModel):
     focused_agents: List[str] = Field(default_factory=list, description="List of focused agent names")
     param: Optional[str] = Field(default=None, description="Specific parameter to target")
     auth_token: Optional[str] = Field(default=None, description="Pre-authenticated Bearer token (Level 1)")
-    auth: Optional[Dict[str, Any]] = Field(default=None, description="Auto-login credentials: {login_url, credentials: {email, password}} (Level 2)")
+    auth: Optional[Dict[str, Any]] = Field(default=None, description="Auto-login credentials: {login_url, credentials: {email, password, totp_secret?}, login_flow?: [...]} (Level 2/3)")
     url_list: Optional[List[str]] = Field(default=None, description="Pre-defined URL list (from URL list file or Swagger import)")
 
 
