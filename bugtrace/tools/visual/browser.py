@@ -207,6 +207,8 @@ class BrowserManager:
 
         Returns: (screenshot_path, logs, is_valid)
         """
+        from bugtrace.core.config import settings
+
         triggered = [False]  # Use list for mutability in closure
         logs = []
         screenshot_path = ""

@@ -1,0 +1,46 @@
+{
+    "id": "openrouter-v2",
+    "name": "OpenRouter v2",
+    "base_url": "https://openrouter.ai/api/v1/chat/completions",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "api_key_hint": "sk-or-v1-...",
+    "recommended": true,
+    "features": {
+        "description": "OpenRouter v2 — model selection based on anti-hallucination benchmark (BullshitBench v2, Software domain) + empirical latency+refusing tests. Haiku 4.5 for all high-volume analytical slots, Gemini Flash for speed-only tasks, DeepSeek V3 for code.",
+        "online_mode": true,
+        "balance_check": true,
+        "model_discovery": true
+    },
+    "models": {
+        "DEFAULT_MODEL":    "anthropic/claude-haiku-4.5",
+        "CODE_MODEL":       "deepseek/deepseek-chat-v3-0324",
+        "ANALYSIS_MODEL":   "anthropic/claude-haiku-4.5",
+        "PRIMARY_MODELS":   "anthropic/claude-haiku-4.5,deepseek/deepseek-chat-v3-0324",
+        "VISION_MODEL":     "google/gemini-2.5-flash",
+        "WAF_DETECTION_MODELS": "anthropic/claude-haiku-4.5,deepseek/deepseek-chat-v3-0324",
+        "MUTATION_MODEL":   "google/gemini-2.5-flash",
+        "SKEPTICAL_MODEL":  "anthropic/claude-haiku-4.5",
+        "REPORTING_MODEL":  "anthropic/claude-haiku-4.5",
+        "VALIDATION_VISION_MODEL": "google/gemini-2.5-flash"
+    },
+    "model_selection_rationale": {
+        "anthropic/claude-haiku-4-5": "BullshitBench v2 Software: 67-75% pushback. Empirical test: TTFT 0.9s, BS:1/4, Refused:0/4, Pushback:1/4. Best anti-hallucination/cost tradeoff. Used for all slots where honesty is critical (ANALYSIS, SKEPTICAL, REPORTING, DEFAULT).",
+        "deepseek/deepseek-chat-v3-0324": "Empirical test: TTFT 1.8s, BS:1/4, Refused:0/4. Good technical quality for code/payload generation. Does not refuse offensive security prompts.",
+        "google/gemini-2.5-flash": "Empirical test: TTFT 0.4s (fastest), Total 1.6s. BS:2/4 but used only for vision tasks and payload mutation where hallucination risk is lower. Do NOT use for analysis or skeptical review.",
+        "REJECTED_qwen3-coder": "BS:2/4, no pushback. Confirms false vulnerabilities too often.",
+        "REJECTED_qwen3-235b": "TTFT 13.4s — unusable for high-volume slots.",
+        "REJECTED_grok-4-fast": "Deprecated by xAI as of 2026-06.",
+        "REJECTED_gemini-flash-lite": "Refused:1/4 + BS:2/4 — worst of both worlds.",
+        "REJECTED_kimi-k2": "TTFT 1.6s, Total 8.5s, BS:2/4 — slow and hallucinates."
+    },
+    "pricing": {
+        "anthropic/claude-haiku-4.5": { "input": 1.00, "output": 5.00 },
+        "deepseek/deepseek-chat-v3-0324": { "input": 0.20, "output": 0.77 },
+        "google/gemini-2.5-flash": { "input": 0.30, "output": 2.50 }
+    },
+    "cost_per_scan_estimate": {
+        "urls_150": 0.44,
+        "urls_50":  0.15,
+        "note": "Estimated at 150 URLs. ANALYSIS_MODEL (high volume) is the main cost driver."
+    }
+}

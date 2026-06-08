@@ -4233,18 +4233,30 @@ Return ONLY the payloads, one per line, no explanations."""
         Returns:
             (XSSFinding or None, reflects: bool, detected_context: str or None)
         """
-        # Send char-testing probe
-        probe = 'BT7331"\'<>`\\'
+        # Send char-testing probe with interleaved sub-markers.
+        # Each special char is bracketed by its own unique marker pair so its
+        # survival is tested independently of the others.  This eliminates:
+        #   - false positives: chars from surrounding HTML counted as surviving
+        #   - false negatives: HTML-encoding of an earlier char (e.g. < → &lt;)
+        #     shifting subsequent chars out of a fixed-size window
+        # Format: BT7331A"BT7331B'BT7331C<BT7331D>BT7331E`BT7331F\BT7331G
+        _CHAR_MARKERS = [
+            ('"',  'A', 'B'),
+            ("'",  'B', 'C'),
+            ('<',  'C', 'D'),
+            ('>',  'D', 'E'),
+            ('`',  'E', 'F'),
+            ('\\', 'F', 'G'),
+        ]
+        probe = 'BT7331A"BT7331B\'BT7331C<BT7331D>BT7331E`BT7331F\\BT7331G'
         response = await self._send_payload(param, probe)
         if not response or "BT7331" not in response:
             return None, False, None
 
-        # Detect surviving chars from reflected snippet (precise: adjacent to marker only)
-        idx = response.find("BT7331")
-        snippet = response[idx:idx + 30]
+        # Each char survives only if its exact bracketed substring is in the response.
         surviving = ""
-        for char in ['"', "'", '<', '>', '`', '\\']:
-            if char in snippet:
+        for char, before, after in _CHAR_MARKERS:
+            if f"BT7331{before}{char}BT7331{after}" in response:
                 surviving += char
 
         # Detect context via existing analysis

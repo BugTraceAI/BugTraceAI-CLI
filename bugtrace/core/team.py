@@ -451,6 +451,7 @@ class TeamOrchestrator:
         # Update DB with last completed phase
         try:
             from bugtrace.schemas.db_models import ScanTable
+            from bugtrace.core.database import get_db_manager
             from sqlmodel import select
             
             db = get_db_manager()
