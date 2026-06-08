@@ -81,7 +81,7 @@ async def run_agent_with_semaphore(semaphore: asyncio.Semaphore, agent, process_
 
 class TeamOrchestrator:
 
-    def __init__(self, target: str, resume: bool = False, max_depth: int = 2, max_urls: int = 15, use_vertical_agents: bool = False, output_dir: Optional[Path] = None, scan_id: Optional[int] = None, url_list: Optional[List[str]] = None, scan_depth: str = "standard"):
+    def __init__(self, target: str, resume: bool = False, max_depth: int = 2, max_urls: int = 15, use_vertical_agents: bool = False, output_dir: Optional[Path] = None, scan_id: Optional[int] = None, url_list: Optional[List[str]] = None, scan_depth: str = "standard", auth: Optional[Dict[str, Any]] = None):
         self.target = target
         self.resume = resume
         self.max_depth = max_depth
@@ -92,6 +92,8 @@ class TeamOrchestrator:
         self.agents: List[BaseAgent] = []
         self._stop_event = asyncio.Event()
         self.auth_creds: Optional[str] = None
+        self.auth_config: Optional[Dict[str, Any]] = auth  # Auth config from YAML (supports TOTP)
+        self._auth_required: bool = False  # Set to True after successful YAML auth - forces session usage
 
         # Scan context for event correlation (V3 pipeline)
         self.scan_context = f"scan_{id(self)}_{int(__import__('time').time())}"
@@ -558,6 +560,17 @@ class TeamOrchestrator:
         # Configure logging
         self._configure_logging()
 
+        # Register scan context early for WebSocket event routing (auth events need this)
+        conductor.set_scan_context(self.scan_id)
+
+        # Execute authentication if config provided
+        if self.auth_config:
+            logger.info(f"[TeamOrchestrator] Auth config detected, starting authentication...")
+            await self._perform_authentication()
+            logger.info(f"[TeamOrchestrator] Authentication phase completed")
+        else:
+            logger.info(f"[TeamOrchestrator] No auth config provided, skipping authentication")
+
         # Run main logic
         if not dashboard.active:
             import sys
@@ -605,7 +618,7 @@ class TeamOrchestrator:
                 dashboard.log("Forced Shutdown initiated by user.", "CRITICAL")
                 sys.exit(1)
             elif self.sigint_count == 2:
-                dashboard.log("Press Ctrl+C again to force quit.", "WARN")
+                logger.warning("Press Ctrl+C again to force quit.")
             else:
                 self.hitl_active = True
                 asyncio.create_task(self._enter_hitl_mode())
@@ -662,7 +675,7 @@ class TeamOrchestrator:
         await self._handle_authentication()
 
         # Sequential pipeline execution
-        dashboard.log("🔒 Enforcing Sequential Hunter Loop for stability", "INFO")
+        logger.info("🔒 Enforcing Sequential Hunter Loop for stability")
 
         if await self._check_stop_requested(dashboard):
             return
@@ -688,7 +701,7 @@ class TeamOrchestrator:
 
         dashboard.set_phase("🔐 BREACHING GATES")
         dashboard.current_agent = "AuthAgent"
-        dashboard.log(f"Initiating authenticated session for {self.auth_creds.split(':')[0]}...", "INFO")
+        logger.info(f"Initiating authenticated session for {self.auth_creds.split(':')[0]}...")
 
         from bugtrace.tools.visual.browser import browser_manager
         login_url = f"{self.target.rstrip('/')}/login"
@@ -696,7 +709,7 @@ class TeamOrchestrator:
         try:
             success = await browser_manager.login(login_url, self.auth_creds)
             if success:
-                dashboard.log("Authentication Successful. Session captured.", "SUCCESS")
+                logger.info("Authentication Successful. Session captured.")
                 # Capture session data for specialists
                 self.captured_session = await browser_manager.get_session_data()
                 logger.debug(f"Captured {len(self.captured_session.get('cookies', []))} cookies")
@@ -706,16 +719,457 @@ class TeamOrchestrator:
                 cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in self.captured_session.get("cookies", [])])
                 store_auth_token(str(self.scan_id), "browser_session", cookies=cookie_str)
             else:
-                dashboard.log("Authentication Failed. Proceeding as guest.", "WARN")
+                logger.warning("Authentication Failed. Proceeding as guest.")
         except Exception as e:
             logger.error(f"Authentication error: {e}", exc_info=True)
-            dashboard.log(f"Authentication Error: {e}. Proceeding as guest.", "ERROR")
+            logger.error(f"Authentication Error: {e}. Proceeding as guest.")
         finally:
             try:
                 if hasattr(browser_manager, 'cleanup_auth_session'):
                     await browser_manager.cleanup_auth_session()
             except Exception as cleanup_err:
                 logger.debug(f"Auth session cleanup warning: {cleanup_err}")
+
+    async def _perform_authentication(self):
+        """
+        Perform browser-based authentication using YAML config.
+
+        Supports:
+        - Custom login flows with variable substitution ($username, $password, $totp)
+        - TOTP-based 2FA authentication
+        - Success condition verification
+        - Pre-scan verification with detailed logging
+        """
+        if not self.auth_config:
+            return
+
+        dashboard.set_phase("🔐 AUTHENTICATING")
+        dashboard.current_agent = "AuthAgent"
+
+        # Create verbose event emitter for auth phase (WebSocket streaming)
+        self._auth_emitter = create_emitter("AuthAgent", str(self.scan_id))
+
+        login_url = self.auth_config.get("login_url", "")
+        credentials = self.auth_config.get("credentials", {})
+        login_flow = self.auth_config.get("login_flow", [])
+        success_condition = self.auth_config.get("success_condition", {})
+
+        # Resolve relative login_url (support both relative and absolute URLs)
+        # Avoid doubling path if target already includes the login_url path
+        from urllib.parse import urlparse
+        target_path = urlparse(self.target).path.rstrip("/")
+        login_path = login_url.lstrip("/") if login_url.startswith("/") else login_url
+
+        if login_url.startswith("http"):
+            # Already absolute URL, use as-is
+            pass
+        elif target_path and target_path.endswith("/" + login_path.rstrip("/")):
+            # Target already includes the login path (e.g., target=/WebPA/UserOverview, login_url=/WebPA/UserOverview)
+            login_url = self.target.rstrip("/")
+            logger.debug(f"[AUTH] Login path already in target, using: {login_url}")
+        elif login_url.startswith("/"):
+            # Relative URL starting with /
+            base_url = self.target.split(target_path)[0].rstrip("/") if target_path else self.target.rstrip("/")
+            login_url = base_url + login_url
+        else:
+            login_url = self.target.rstrip("/") + "/" + login_url
+
+        # Convert natural language instructions to commands if needed
+        from bugtrace.utils.auth_flow_parser import is_natural_language_flow, convert_natural_flow_to_commands
+        if login_flow and is_natural_language_flow(login_flow):
+            logger.info("[AUTH] Detected natural language flow, converting to commands...")
+            login_flow = convert_natural_flow_to_commands(login_flow, credentials, login_url)
+            logger.info(f"[AUTH] Converted to {len(login_flow)} executable steps")
+
+        totp_enabled = bool(credentials.get("totp_secret"))
+        username = credentials.get("username", credentials.get("email", ""))
+
+        # Log auth start with details (use logger for server logs)
+        logger.info("=" * 50)
+        logger.info("AUTHENTICATION PHASE STARTING")
+        logger.info(f"  Target: {login_url}")
+        logger.info(f"  User: {username}")
+        logger.info(f"  TOTP: {'Enabled' if totp_enabled else 'Disabled'}")
+        logger.info(f"  Flow steps: {len(login_flow)}")
+        logger.info("=" * 50)
+
+        # Emit auth phase started for WebSocket
+        self._auth_emitter.emit("auth.phase.started", {
+            "target": login_url,
+            "user": username,
+            "totp_enabled": totp_enabled,
+            "total_steps": len(login_flow),
+        })
+
+        from bugtrace.tools.visual.browser import browser_manager
+        from bugtrace.services.scan_context import store_auth_token
+
+        try:
+            await browser_manager.start()
+            logger.info("[AUTH] Browser started")
+
+            async with browser_manager.get_page() as page:
+                # Navigate to login page
+                logger.info(f"[AUTH] Navigating to {login_url}...")
+                await page.goto(login_url, wait_until="networkidle", timeout=30000)
+                logger.info(f"[AUTH] Page loaded: {page.url[:60]}...")
+
+                # Execute login flow with detailed logging
+                if login_flow:
+                    success = await self._execute_auth_flow(page, credentials, login_flow)
+                else:
+                    logger.info("[AUTH] No login_flow defined, using auto-detect")
+                    success = await self._auto_detect_auth(page, credentials)
+
+                if not success:
+                    logger.error("[AUTH] Login flow FAILED - steps did not complete")
+                    logger.warning("[AUTH] Scan will proceed WITHOUT authentication")
+                    self._auth_emitter.emit("auth.failed", {"reason": "Login flow did not complete"})
+                    # Save error screenshot
+                    await self._save_auth_screenshot(page, "auth_failed")
+                    return
+
+                # Verify success condition
+                logger.info("[AUTH] Verifying login success...")
+                if success_condition:
+                    cond_type = success_condition.get("type", "")
+                    cond_value = success_condition.get("value", "")
+                    logger.info(f"[AUTH] Checking: {cond_type} = '{cond_value}'")
+
+                    if not await self._check_auth_success(page, success_condition):
+                        logger.error(f"[AUTH] VERIFICATION FAILED!")
+                        logger.error(f"[AUTH] Current URL: {page.url}")
+                        logger.warning("[AUTH] Scan will proceed WITHOUT authentication")
+                        self._auth_emitter.emit("auth.failed", {"reason": "Success condition not met", "url": page.url})
+                        await self._save_auth_screenshot(page, "auth_verify_failed")
+                        return
+
+                    logger.info("[AUTH] Success condition VERIFIED!")
+                    self._auth_emitter.emit("auth.verified", {"condition": cond_type, "value": cond_value})
+                else:
+                    logger.warning("[AUTH] No success_condition defined, assuming success")
+
+                # Extract and store cookies
+                cookies = await page.context.cookies()
+                if cookies:
+                    cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+
+                    # Store with BOTH IDs so all agents can find them
+                    # scan_id (numeric) - used by some agents
+                    # scan_context (string) - used by other agents
+                    store_auth_token(str(self.scan_id), "browser_auth", cookies=cookie_str)
+                    store_auth_token(self.scan_context, "browser_auth", cookies=cookie_str)
+                    self.captured_session["cookies"] = cookies
+
+                    # Mark that this scan requires authenticated session
+                    self._auth_required = True
+
+                    # Log important cookies
+                    session_cookies = [c for c in cookies if 'session' in c['name'].lower() or c['name'] in ['JSESSIONID', 'PHPSESSID', 'ASP.NET_SessionId']]
+                    logger.info(f"[AUTH] Captured {len(cookies)} cookies")
+                    logger.info(f"[AUTH] Stored for scan_id={self.scan_id} AND scan_context={self.scan_context[:30]}...")
+                    for sc in session_cookies[:3]:
+                        logger.info(f"[AUTH]   - {sc['name']}: {sc['value'][:20]}...")
+                else:
+                    logger.warning("[AUTH] WARNING: No cookies captured!")
+
+                # Try to extract JWT from storage
+                token = await page.evaluate("""
+                    () => {
+                        const keys = ['token', 'access_token', 'jwt', 'authToken', 'auth_token'];
+                        for (const key of keys) {
+                            let val = localStorage.getItem(key) || sessionStorage.getItem(key);
+                            if (val && val.startsWith('eyJ')) return val;
+                        }
+                        return null;
+                    }
+                """)
+                if token:
+                    store_auth_token(str(self.scan_id), "browser_jwt", token)
+                    store_auth_token(self.scan_context, "browser_jwt", token)
+                    logger.info(f"[AUTH] JWT extracted: {token[:30]}...")
+
+                # Save success screenshot
+                await self._save_auth_screenshot(page, "auth_success")
+
+                # Final summary
+                logger.info("=" * 50)
+                logger.info("AUTHENTICATION SUCCESSFUL")
+                logger.info(f"  Session cookies: {len(cookies)}")
+                logger.info(f"  JWT token: {'Yes' if token else 'No'}")
+                logger.info("  Scan will use authenticated session")
+                logger.info("=" * 50)
+
+                # Emit success event for WebSocket
+                self._auth_emitter.emit("auth.success", {
+                    "cookies_count": len(cookies) if cookies else 0,
+                    "jwt_captured": bool(token),
+                })
+
+        except Exception as e:
+            logger.error(f"YAML auth error: {e}", exc_info=True)
+            logger.error(f"[AUTH] EXCEPTION: {e}")
+            logger.warning("[AUTH] Scan will proceed WITHOUT authentication")
+            if hasattr(self, '_auth_emitter'):
+                self._auth_emitter.emit("auth.failed", {"reason": str(e)})
+
+    async def _save_auth_screenshot(self, page, prefix: str):
+        """Save authentication screenshot for verification."""
+        try:
+            import uuid
+            screenshot_path = self.report_dir / "logs" / f"{prefix}_{uuid.uuid4().hex[:8]}.png"
+            screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path=str(screenshot_path))
+            logger.info(f"[AUTH] Screenshot saved: {screenshot_path.name}")
+        except Exception as e:
+            logger.debug(f"Failed to save auth screenshot: {e}")
+
+    async def _execute_auth_flow(self, page, credentials: dict, login_flow: list) -> bool:
+        """Execute custom login flow with variable substitution and detailed logging."""
+        from bugtrace.utils.totp import get_totp_code
+
+        username = credentials.get("username", credentials.get("email", ""))
+        password = credentials.get("password", "")
+        totp_secret = credentials.get("totp_secret", "")
+
+        total_steps = len(login_flow)
+        logger.info(f"[AUTH] Executing {total_steps} login steps...")
+
+        for i, step in enumerate(login_flow, 1):
+            try:
+                step_resolved = step
+                step_resolved = step_resolved.replace("$username", username)
+                step_resolved = step_resolved.replace("$email", username)
+                step_resolved = step_resolved.replace("$password", "***")  # Don't log password
+
+                totp_code = None
+                # Generate TOTP if needed
+                if "$totp" in step:
+                    if not totp_secret:
+                        logger.error(f"[AUTH] Step {i}: FAILED - $totp required but no totp_secret")
+                        self._auth_emitter.emit("auth.step.failed", {"step": i, "total": total_steps, "error": "TOTP required but no secret"})
+                        return False
+                    totp_code = get_totp_code(totp_secret)
+                    if not totp_code:
+                        logger.error(f"[AUTH] Step {i}: FAILED - Could not generate TOTP")
+                        self._auth_emitter.emit("auth.step.failed", {"step": i, "total": total_steps, "error": "Could not generate TOTP"})
+                        return False
+                    step_resolved = step.replace("$totp", totp_code)
+                    step_resolved = step_resolved.replace("$username", username)
+                    step_resolved = step_resolved.replace("$password", "***")
+                    logger.info(f"[AUTH] Step {i}/{total_steps}: {step_resolved} (TOTP: {totp_code})")
+                else:
+                    # Log step (mask password)
+                    log_step = step_resolved[:60] + "..." if len(step_resolved) > 60 else step_resolved
+                    logger.info(f"[AUTH] Step {i}/{total_steps}: {log_step}")
+
+                # Emit step event for WebSocket
+                self._auth_emitter.emit("auth.step", {
+                    "step": i,
+                    "total": total_steps,
+                    "action": step_resolved[:80],
+                    "totp": totp_code if totp_code else None,
+                })
+
+                # Execute the actual step (with real password)
+                actual_step = step.replace("$username", username).replace("$email", username).replace("$password", password)
+                if "$totp" in actual_step:
+                    actual_step = actual_step.replace("$totp", totp_code)
+
+                await self._execute_auth_step(page, actual_step)
+                await page.wait_for_timeout(500)
+
+            except Exception as e:
+                logger.error(f"[AUTH] Step {i}: FAILED - {e}")
+                logger.error(f"Auth step failed: {step} -> {e}")
+                self._auth_emitter.emit("auth.step.failed", {"step": i, "total": total_steps, "error": str(e)})
+                return False
+
+        logger.info(f"[AUTH] All {total_steps} steps completed")
+        self._auth_emitter.emit("auth.steps.complete", {"total": total_steps})
+        return True
+
+    async def _execute_auth_step(self, page, step: str):
+        """Execute a single login step instruction with Microsoft SSO support."""
+        import re
+        step_lower = step.lower()
+
+        if step_lower.startswith("type ") or step_lower.startswith("enter "):
+            # Parse: "Type <value> into the <field> field"
+            match = re.match(r"(?:type|enter)\s+['\"]?(.+?)['\"]?\s+(?:into|in)\s+(?:the\s+)?(.+?)(?:\s+field)?$", step, re.IGNORECASE)
+            if match:
+                value, field_desc = match.groups()
+                field_lower = field_desc.lower()
+
+                # Build selectors - include Microsoft SSO and generic form selectors
+                selectors = [
+                    f"input[name='{field_desc}']",  # Exact match first (loginfmt, passwd, otc)
+                    f"input#idTxtBx_SAOTCC_OTC" if 'otc' in field_lower else None,  # MS TOTP
+                    f"input[name*='{field_desc}' i]", f"input[id*='{field_desc}' i]",
+                    f"input[placeholder*='{field_desc}' i]", f"input[type='{field_desc}']",
+                    f"[aria-label*='{field_desc}' i]",
+                ]
+
+                # Add flexible selectors for common field types
+                if any(x in field_lower for x in ['user', 'email', 'login', 'loginfmt']):
+                    selectors.extend([
+                        "input[type='email']", "input[type='text'][name*='user' i]",
+                        "input[type='text'][name*='email' i]", "input[type='text'][name*='login' i]",
+                        "input[name='username']", "input[name='email']", "input[name='login']",
+                        "input[id*='user' i]", "input[id*='email' i]", "input[id*='login' i]",
+                        "input[placeholder*='user' i]", "input[placeholder*='email' i]",
+                        "input[autocomplete='username']", "input[autocomplete='email']",
+                    ])
+                elif 'pass' in field_lower or 'pwd' in field_lower:
+                    selectors.extend([
+                        "input[type='password']", "input[name='password']", "input[name='passwd']",
+                        "input[id*='pass' i]", "input[autocomplete='current-password']",
+                    ])
+                elif any(x in field_lower for x in ['totp', 'otp', 'code', 'otc', 'mfa', '2fa']):
+                    selectors.extend([
+                        "input[name*='totp' i]", "input[name*='otp' i]", "input[name*='code' i]",
+                        "input[maxlength='6']", "input[type='text'][inputmode='numeric']",
+                        "input[id*='totp' i]", "input[id*='otp' i]", "input[id*='code' i]",
+                    ])
+
+                selectors = [s for s in selectors if s]  # Remove None
+                for selector in selectors:
+                    try:
+                        el = await page.query_selector(selector)
+                        if el:
+                            await el.fill(value)
+                            return
+                    except Exception:
+                        continue
+                raise Exception(f"Could not find input field: {field_desc}")
+
+        elif step_lower.startswith("click "):
+            match = re.search(r"['\"](.+?)['\"]", step)
+            if match:
+                button_text = match.group(1)
+                # Microsoft SSO button IDs
+                ms_button_ids = {
+                    "next": "input#idSIButton9",
+                    "sign in": "input#idSIButton9",
+                    "signin": "input#idSIButton9",
+                    "verify": "input#idSubmit_SAOTCC_Continue",
+                    "no": "input#idBtn_Back",
+                    "yes": "input#idSIButton9",
+                }
+                # Check for Microsoft-specific button first
+                ms_selector = ms_button_ids.get(button_text.lower())
+                if ms_selector:
+                    try:
+                        el = await page.query_selector(ms_selector)
+                        if el:
+                            await el.click()
+                            await page.wait_for_load_state("networkidle", timeout=10000)
+                            return
+                    except Exception:
+                        pass
+
+                selectors = [
+                    f"button:has-text('{button_text}')", f"input[type='submit'][value*='{button_text}' i]",
+                    f"a:has-text('{button_text}')", f"[role='button']:has-text('{button_text}')",
+                    f"input[type='submit']",  # Fallback to any submit
+                ]
+                for selector in selectors:
+                    try:
+                        el = await page.query_selector(selector)
+                        if el:
+                            await el.click()
+                            await page.wait_for_load_state("networkidle", timeout=10000)
+                            return
+                    except Exception:
+                        continue
+                raise Exception(f"Could not find button: {button_text}")
+
+        elif "wait" in step_lower:
+            match = re.search(r"(\d+)", step)
+            if match:
+                seconds = int(match.group(1))
+                await page.wait_for_timeout(seconds * 1000)
+
+        else:
+            logger.warning(f"Unknown auth step: {step}")
+
+    async def _auto_detect_auth(self, page, credentials: dict) -> bool:
+        """Auto-detect and fill login form."""
+        from bugtrace.utils.totp import get_totp_code
+
+        username = credentials.get("username", credentials.get("email", ""))
+        password = credentials.get("password", "")
+        totp_secret = credentials.get("totp_secret", "")
+
+        try:
+            # Fill username/email
+            for sel in ["input[type='email']", "input[name*='email' i]", "input[name*='user' i]"]:
+                el = await page.query_selector(sel)
+                if el:
+                    await el.fill(username)
+                    break
+
+            # Fill password
+            password_el = await page.query_selector("input[type='password']")
+            if password_el:
+                await password_el.fill(password)
+
+            # Submit
+            for sel in ["button[type='submit']", "input[type='submit']", "button:has-text('Sign in')", "button:has-text('Login')"]:
+                el = await page.query_selector(sel)
+                if el:
+                    await el.click()
+                    break
+
+            await page.wait_for_load_state("networkidle", timeout=15000)
+
+            # Handle TOTP if secret provided
+            if totp_secret:
+                for sel in ["input[name*='otp' i]", "input[name*='totp' i]", "input[name*='code' i]", "input[maxlength='6']"]:
+                    el = await page.query_selector(sel)
+                    if el:
+                        totp_code = get_totp_code(totp_secret)
+                        if totp_code:
+                            await el.fill(totp_code)
+                            logger.info("Entered TOTP code for 2FA")
+                            for submit_sel in ["button[type='submit']", "input[type='submit']"]:
+                                submit_el = await page.query_selector(submit_sel)
+                                if submit_el:
+                                    await submit_el.click()
+                                    break
+                            await page.wait_for_load_state("networkidle", timeout=10000)
+                        break
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Auto-detect auth failed: {e}")
+            return False
+
+    async def _check_auth_success(self, page, condition: dict) -> bool:
+        """Check if login success condition is met."""
+        cond_type = condition.get("type", "")
+        value = condition.get("value", "")
+
+        try:
+            current_url = page.url
+
+            if cond_type == "url_contains":
+                return value in current_url
+            elif cond_type == "url_equals_exactly":
+                return current_url == value
+            elif cond_type == "element_present":
+                el = await page.query_selector(value)
+                return el is not None
+            elif cond_type == "text_contains":
+                content = await page.content()
+                return value in content
+            else:
+                return True
+
+        except Exception as e:
+            logger.error(f"Success condition check failed: {e}")
+            return False
 
     async def _generate_vertical_report(self, findings: list, urls_scanned: list, metadata: dict = None):
         """Generate consolidated report for vertical mode using ReportingAgent."""
@@ -746,7 +1200,7 @@ class TeamOrchestrator:
             logger.error(f"Failed to generate vertical report: {e}", exc_info=True)
             # import traceback
             # logger.debug(traceback.format_exc())
-            dashboard.log(f"❌ Report generation failed: {e}", "ERROR")
+            logger.error(f"❌ Report generation failed: {e}")
 
     def _create_report_directory(self) -> Path:
         """Return unified report directory (created in __init__)."""
@@ -844,7 +1298,7 @@ class TeamOrchestrator:
 
     async def _invoke_reporting_agent(self, findings: list, urls_scanned: list, metadata: dict, report_dir: Path):
         """Invoke ReportingAgent for final report."""
-        dashboard.log(f"🤖 Deploying ReportingAgent for final assessment...", "INFO")
+        logger.info(f"🤖 Deploying ReportingAgent for final assessment...")
         
         from bugtrace.agents.reporting import ReportingAgent
         
@@ -867,9 +1321,9 @@ class TeamOrchestrator:
             # Register report_dir in DB only NOW, after files are confirmed on disk.
             # This ensures has_report is never true for empty directories.
             self.db.update_scan_report_dir(self.scan_id, str(report_dir))
-            dashboard.log(f"✅ ReportingAgent finished. Reports saved to {report_dir}", "SUCCESS")
+            logger.info(f"✅ ReportingAgent finished. Reports saved to {report_dir}")
         else:
-            dashboard.log("⚠️ ReportingAgent completed but returned no paths.", "WARN")
+            logger.warning("⚠️ ReportingAgent completed but returned no paths.")
 
     def _cleanup_redundant_folders(self, report_dir: Path):
         """Cleanup redundant artifact folders."""
@@ -929,7 +1383,7 @@ class TeamOrchestrator:
         """Generate technical assessment report."""
         from bugtrace.core.llm_client import llm_client
 
-        dashboard.log("🤖 Generating Technical Report (AI)...", "INFO")
+        logger.info("🤖 Generating Technical Report (AI)...")
 
         tech_prompt = self._build_technical_prompt(report_data, findings_summary, meta_summary, screenshots)
         tech_report = await llm_client.generate(tech_prompt, "Report-Tech")
@@ -938,7 +1392,7 @@ class TeamOrchestrator:
             tech_report = self._embed_screenshots(tech_report, screenshots)
             with open(self.scan_dir / "TECHNICAL_REPORT.md", "w") as f:
                 f.write(tech_report)
-            dashboard.log("✅ Technical Report generated", "SUCCESS")
+            logger.info("✅ Technical Report generated")
 
         return tech_report
 
@@ -1019,7 +1473,7 @@ class TeamOrchestrator:
         from bugtrace.core.llm_client import llm_client
         import json
 
-        dashboard.log("🤖 Generating Executive Summary (AI)...", "INFO")
+        logger.info("🤖 Generating Executive Summary (AI)...")
 
         exec_prompt = self._build_executive_prompt(report_data)
         exec_report = await llm_client.generate(exec_prompt, "Report-Exec")
@@ -1027,7 +1481,7 @@ class TeamOrchestrator:
         if exec_report:
             with open(self.scan_dir / "EXECUTIVE_SUMMARY.md", "w") as f:
                 f.write(exec_report)
-            dashboard.log("✅ Executive Summary generated", "SUCCESS")
+            logger.info("✅ Executive Summary generated")
 
         return exec_report
 
@@ -1129,7 +1583,7 @@ class TeamOrchestrator:
         with open(report_dir / "REPORT.html", "w") as f:
             f.write(html_content)
 
-        dashboard.log("✅ HTML Report generated", "SUCCESS")
+        logger.info("✅ HTML Report generated")
 
     def _calculate_severity_counts(self, findings: list) -> dict:
         """Calculate severity counts from findings."""
@@ -1453,17 +1907,17 @@ class TeamOrchestrator:
             try:
                 resp = await client.get(self.target, timeout=10.0)
                 if resp.status_code >= 500:
-                    dashboard.log(f"Target {self.target} is unstable (HTTP {resp.status_code}). Aborting scan.", "ERROR")
+                    logger.error(f"Target {self.target} is unstable (HTTP {resp.status_code}). Aborting scan.")
                     return False
                 return True
             except Exception as e:
-                dashboard.log(f"Target {self.target} is unreachable. Skipping engagement. Error: {e}", "ERROR")
+                logger.error(f"Target {self.target} is unreachable. Skipping engagement. Error: {e}")
                 return False
 
     async def _run_reconnaissance(self, dashboard, recon_dir) -> list:
         """Run reconnaissance phase and return discovered URLs."""
         if self.resume and self.url_queue:
-            dashboard.log(f"⏩ Skipping Recon: Resuming with {len(self.url_queue)} URLs found in DB.", "INFO")
+            logger.info(f"⏩ Skipping Recon: Resuming with {len(self.url_queue)} URLs found in DB.")
             loaded_state = self.state_manager.load_state()
             self.tech_profile = loaded_state.get("tech_profile", self.tech_profile)
             return self.url_queue
@@ -1471,8 +1925,8 @@ class TeamOrchestrator:
         # ========== URL List Mode (NEW) ==========
         if self.url_list_provided:
             logger.info(f"[RECON] URL List Mode: Using {len(self.url_list_provided)} provided URLs")
-            dashboard.log(f"📋 URL List Mode: Using {len(self.url_list_provided)} provided URLs", "INFO")
-            dashboard.log("⏩ Bypassing GoSpider (list provided)", "INFO")
+            logger.info(f"📋 URL List Mode: Using {len(self.url_list_provided)} provided URLs")
+            logger.info("⏩ Bypassing GoSpider (list provided)")
 
             # NOTE: Nuclei and AuthDiscovery moved to Phase 2
 
@@ -1483,7 +1937,7 @@ class TeamOrchestrator:
             return self._normalize_urls(urls_to_scan)
 
         # ========== Normal Mode (GoSpider) ==========
-        dashboard.log("Starting Phase 1: URL Discovery (GoSpider only)", "INFO")
+        logger.info("Starting Phase 1: URL Discovery (GoSpider only)")
 
         try:
             # Run GoSpider ONLY
@@ -1503,8 +1957,38 @@ class TeamOrchestrator:
         """Run GoSpider agent for URL discovery."""
         logger.info(f"Triggering GoSpiderAgent for {self.target}")
         self._v.emit("recon.gospider.started", {"target": self.target})
+
         gospider = GoSpiderAgent(self.target, recon_dir, max_depth=self.max_depth, max_urls=self.max_urls)
         urls_to_scan = await gospider.run()
+
+        # If YAML auth config is present, seed URL list with login_url and its parent paths
+        # Example: login_url=/WebPA/UserOverview → add /WebPA/UserOverview AND /WebPA/
+        if self.auth_config and isinstance(self.auth_config, dict):
+            from urllib.parse import urlparse
+            base_url = urlparse(self.target)
+            base = f"{base_url.scheme}://{base_url.netloc}"
+
+            login_url = self.auth_config.get("login_url", "")
+            if login_url:
+                # Normalize login path
+                login_path = login_url if login_url.startswith("/") else "/" + login_url
+
+                # Extract path segments and build parent paths
+                # /WebPA/UserOverview → ["/WebPA/UserOverview", "/WebPA"]
+                segments = [s for s in login_path.split("/") if s]
+                paths_to_add = []
+
+                for i in range(len(segments), 0, -1):
+                    path = "/" + "/".join(segments[:i])
+                    paths_to_add.append(path)
+
+                # Add each path to URL list (most specific first)
+                for path in paths_to_add:
+                    full_url = base + path
+                    if full_url not in urls_to_scan:
+                        urls_to_scan.insert(0, full_url)
+                        logger.info(f"[Auth] Added auth path to scan list: {full_url}")
+
         self._v.emit("recon.gospider.completed", {"urls_found": len(urls_to_scan)})
         logger.info(f"GoSpiderAgent finished. Found {len(urls_to_scan)} URLs")
         return urls_to_scan
@@ -1614,12 +2098,12 @@ class TeamOrchestrator:
 
     async def _scan_for_tokens(self, urls_to_scan: list):
         """Scan discovered URLs for authentication tokens."""
-        dashboard.log("🔍 Scanning discovery artifacts for authentication tokens...", "INFO")
+        logger.info("🔍 Scanning discovery artifacts for authentication tokens...")
         combined_recon_data = " ".join(urls_to_scan) + " " + json.dumps(self.tech_profile)
         found_jwts = find_jwts(combined_recon_data)
 
         if found_jwts:
-            dashboard.log(f"🔑 Found {len(found_jwts)} potential JWT(s) in recon data!", "WARN")
+            logger.warning(f"🔑 Found {len(found_jwts)} potential JWT(s) in recon data!")
             for token in found_jwts:
                 self.event_bus.publish("auth_token_found", {
                     "token": token,
@@ -2342,7 +2826,7 @@ class TeamOrchestrator:
 
         if detected_csti_framework:
             specialist_dispatches.add("CSTI_AGENT")
-            dashboard.log(f"🔧 Auto-dispatch: CSTI_AGENT (detected {detected_csti_framework} in tech_profile)", "INFO")
+            logger.info(f"🔧 Auto-dispatch: CSTI_AGENT (detected {detected_csti_framework} in tech_profile)")
 
             # Add all URL params to CSTI_AGENT for probing
             if "CSTI_AGENT" not in params_map:
@@ -2363,7 +2847,7 @@ class TeamOrchestrator:
     ):
         """Process a single vulnerability and update dispatch info."""
         specialist_type = await self._decide_specialist(vuln)
-        dashboard.log(f"🤖 Dispatcher chose: {specialist_type} for {vuln.get('parameter')}", "INFO")
+        logger.info(f"🤖 Dispatcher chose: {specialist_type} for {vuln.get('parameter')}")
         specialist_dispatches.add(specialist_type)
 
         param = vuln.get("parameter")
@@ -2527,7 +3011,7 @@ class TeamOrchestrator:
             if _ctx is not None:
                 await _ctx.wait_if_paused()
             if dashboard.stop_requested or self._stop_event.is_set():
-                dashboard.log("🛑 Stop requested. Cancelling running agents...", "WARN")
+                logger.warning("🛑 Stop requested. Cancelling running agents...")
                 for task in pending:
                     task.cancel()
                 if pending:
@@ -2538,7 +3022,7 @@ class TeamOrchestrator:
     async def _process_url(self, url: str, url_index: int, total_urls: int, analysis_dir: Path, dashboard) -> list:
         """Process a single URL for vulnerabilities."""
         if url in self.processed_urls:
-            dashboard.log(f"⏩ Skipping already processed URL: {url[:60]}", "INFO")
+            logger.info(f"⏩ Skipping already processed URL: {url[:60]}")
             return []
 
         self._log_url_processing(url, url_index, total_urls, dashboard)
@@ -2569,7 +3053,7 @@ class TeamOrchestrator:
             if all_validated_findings is None:  # Scan stopped
                 return []
 
-        dashboard.log(f"🎯 Intelligent dispatch complete for {url[:50]}", "SUCCESS")
+        logger.info(f"🎯 Intelligent dispatch complete for {url[:50]}")
 
         # Phase 3: Persistence
         self._persist_findings(all_validated_findings, url)
@@ -2578,7 +3062,7 @@ class TeamOrchestrator:
 
     def _log_url_processing(self, url: str, url_index: int, total_urls: int, dashboard) -> None:
         """Log URL processing start."""
-        dashboard.log(f"🚀 Processing URL {url_index+1}/{total_urls}: {url[:60]}", "INFO")
+        logger.info(f"🚀 Processing URL {url_index+1}/{total_urls}: {url[:60]}")
         dashboard.update_task("Orchestrator", status=f"Processing {url[:40]}")
 
     async def _run_dast_analysis(self, url: str, url_dir: Path, dashboard) -> list:
@@ -2595,7 +3079,7 @@ class TeamOrchestrator:
         self, vulnerabilities: list, url: str, url_dir: Path, seen_keys: set, dashboard
     ) -> Optional[list]:
         """Orchestrate specialist agents for found vulnerabilities."""
-        dashboard.log(f"🧠 Orchestrator deciding on {len(vulnerabilities)} potential vulnerabilities...", "INFO")
+        logger.info(f"🧠 Orchestrator deciding on {len(vulnerabilities)} potential vulnerabilities...")
 
         all_validated_findings = []
         process_result = self._create_finding_processor(seen_keys, all_validated_findings, dashboard)
@@ -2650,7 +3134,7 @@ class TeamOrchestrator:
 
         # Setup directories
         scan_dir, recon_dir, analysis_dir, captures_dir = self._setup_scan_directory(start_time)
-        dashboard.log(f"Scan directory created: {scan_dir.name}", "INFO")
+        logger.info(f"Scan directory created: {scan_dir.name}")
 
         # Update ThinkingConsolidationAgent with correct scan_dir
         self.thinking_agent.scan_dir = scan_dir
@@ -2740,7 +3224,7 @@ class TeamOrchestrator:
         logger.info("=== PHASE 2: DISCOVERY (Batch DAST) ===")
         self._v.emit("pipeline.phase_transition", {"phase": "discovery", "urls_count": len(self.urls_to_scan)})
         self._v.emit("discovery.started", {"urls_count": len(self.urls_to_scan)})
-        dashboard.log(f"🔬 Running batch DAST on {len(self.urls_to_scan)} URLs", "INFO")
+        logger.info(f"🔬 Running batch DAST on {len(self.urls_to_scan)} URLs")
         dashboard.set_phase("🔬 HUNTING VULNS")
         dashboard.set_status("Running", "Analysis in progress...")
         conductor.notify_phase_change("discovery", 0.0, f"Analyzing {len(self.urls_to_scan)} URLs")
@@ -2797,7 +3281,7 @@ class TeamOrchestrator:
         logger.info("=== PHASE 3: STRATEGY (Deduplication & Queue Distribution) ===")
         self._v.emit("pipeline.phase_transition", {"phase": "strategy"})
         self._v.emit("strategy.started", {})
-        dashboard.log("🧠 ThinkingAgent processing findings batch", "INFO")
+        logger.info("🧠 ThinkingAgent processing findings batch")
         dashboard.set_phase("🧠 STRATEGY")
         dashboard.set_status("Running", "Deduplication in progress...")
         conductor.notify_phase_change("strategy", 0.0, "Deduplication in progress")
@@ -2826,7 +3310,7 @@ class TeamOrchestrator:
                 'auth_findings': auth_findings
             },
             {'wet_queue_count': wet_queue_count}):
-            dashboard.log("❌ Integrity mismatch: Strategy phase", "WARN")
+            logger.warning("❌ Integrity mismatch: Strategy phase")
             logger.warning(
                 f"[Pipeline] Integrity check FAILED for Strategy. "
                 f"DAST: {dast_findings}, Auth: {auth_findings}, Total: {total_raw}, WET: {wet_queue_count}"
@@ -2848,7 +3332,7 @@ class TeamOrchestrator:
         # Specialists consume from queues in true parallel
         logger.info("=== PHASE 4: EXPLOITATION (Specialist Queue Processing) ===")
         self._v.emit("pipeline.phase_transition", {"phase": "exploitation"})
-        dashboard.log(f"⚡ Specialists processing findings from queues", "INFO")
+        logger.info(f"⚡ Specialists processing findings from queues")
         conductor.notify_phase_change("exploitation", 0.0, "Specialists attacking")
         self._sync_scan_context("EXPLOITATION", "Specialists", findings_count=findings_count, progress=55)
 
@@ -2994,7 +3478,7 @@ class TeamOrchestrator:
         check_interval = 3.0  # 1-2 checks within 5s timeout
         last_log_time = start_time
 
-        dashboard.log("Collecting specialist queue stats...", "INFO")
+        logger.info("Collecting specialist queue stats...")
         conductor.notify_log("INFO", "[EXPLOITATION] Collecting final specialist stats...")
 
         while (time.monotonic() - start_time) < timeout:
@@ -3041,15 +3525,15 @@ class TeamOrchestrator:
                             for s in queue_stats if queue_stats[s]['depth'] > 0]
                 if non_empty:
                     breakdown = ", ".join(non_empty)
-                    dashboard.log(f"Queues pending: {breakdown} ({total_pending} total)", "INFO")
+                    logger.info(f"Queues pending: {breakdown} ({total_pending} total)")
                     conductor.notify_log("INFO", f"[EXPLOITATION] Queues pending: {breakdown} ({total_pending} total)")
                 else:
-                    dashboard.log(f"Queues: {total_pending} items pending", "INFO")
+                    logger.info(f"Queues: {total_pending} items pending")
                     conductor.notify_log("INFO", f"[EXPLOITATION] {total_pending} items pending")
                 last_log_time = time.monotonic()
 
             if total_pending == 0:
-                dashboard.log("All specialist queues drained", "SUCCESS")
+                logger.info("All specialist queues drained")
                 conductor.notify_log("INFO", "[EXPLOITATION] All specialist queues drained")
                 break
 
@@ -3058,7 +3542,7 @@ class TeamOrchestrator:
         elapsed = time.monotonic() - start_time
 
         if total_pending > 0:
-            dashboard.log(f"Queue drain timeout after {elapsed:.1f}s, {total_pending} items remaining", "WARN")
+            logger.warning(f"Queue drain timeout after {elapsed:.1f}s, {total_pending} items remaining")
             conductor.notify_log("WARNING", f"[EXPLOITATION] Queue drain timeout after {elapsed:.1f}s, {total_pending} items remaining")
 
         # Collect ThinkingAgent stats
@@ -3115,7 +3599,7 @@ class TeamOrchestrator:
         except asyncio.TimeoutError:
             # Auto-resume: nobody touched it in time
             logger.info(f"[DAST] Auto-resuming after {mins}min pause.")
-            dashboard.log(f"▶ Auto-resuming after {mins}min pause.", "INFO")
+            logger.info(f"▶ Auto-resuming after {mins}min pause.")
             scan_ctx.request_resume()
             self.db.update_scan_status(self.scan_id, ScanStatus.RUNNING)
             return False
@@ -3128,7 +3612,7 @@ class TeamOrchestrator:
 
         # 4. Manual resume — DB already updated to RUNNING by scan_service.resume_scan()
         logger.info("[DAST] Pipeline resumed manually. Retrying timed-out URLs.")
-        dashboard.log("▶ Scan resumed. Retrying timed-out URLs.", "INFO")
+        logger.info("▶ Scan resumed. Retrying timed-out URLs.")
         return False
 
     async def _phase_2_batch_dast(self, dashboard, analysis_dir, recon_dir=None) -> Dict[str, list]:
@@ -3230,16 +3714,16 @@ class TeamOrchestrator:
 
         # ========== TASK 2-4: Reconnaissance in Parallel ==========
         async def run_nuclei_parallel():
-            dashboard.log("🔬 Running Nuclei tech profiling...", "INFO")
+            logger.info("🔬 Running Nuclei tech profiling...")
             tech_profile = await self._run_nuclei_tech_profile(recon_dir)
             self.tech_profile = tech_profile
-            dashboard.log(f"✓ Nuclei: {len(tech_profile.get('frameworks', []))} frameworks", "INFO")
+            logger.info(f"✓ Nuclei: {len(tech_profile.get('frameworks', []))} frameworks")
 
             # Emit misconfigurations as findings (HSTS, cookie flags, etc.)
             from bugtrace.core.event_bus import EventType
             misconfigs = tech_profile.get("misconfigurations", [])
             if misconfigs:
-                dashboard.log(f"Misconfigurations: {len(misconfigs)} detected (HSTS, cookies, etc.)", "INFO")
+                logger.info(f"Misconfigurations: {len(misconfigs)} detected (HSTS, cookies, etc.)")
                 for misconfig in misconfigs:
                     finding_data = {
                         "type": "MISCONFIGURATION",
@@ -3268,7 +3752,7 @@ class TeamOrchestrator:
             # Emit JS vulnerabilities as findings
             js_vulns = tech_profile.get("js_vulnerabilities", [])
             if js_vulns:
-                dashboard.log(f"Vulnerable JS: {len(js_vulns)} libraries detected", "WARN")
+                logger.warning(f"Vulnerable JS: {len(js_vulns)} libraries detected")
                 for vuln in js_vulns:
                     # Build fix version string from 'below' threshold
                     below = vuln.get("below", [0, 0, 0])
@@ -3312,14 +3796,14 @@ class TeamOrchestrator:
             return tech_profile
 
         async def run_auth_discovery_parallel():
-            dashboard.log("🔑 Running authentication discovery...", "INFO")
+            logger.info("🔑 Running authentication discovery...")
             auth_results = await self._run_auth_discovery(recon_dir, self.urls_to_scan)
-            dashboard.log(f"✓ AuthDiscovery: {len(auth_results['jwts'])} JWTs, {len(auth_results['cookies'])} cookies", "INFO")
+            logger.info(f"✓ AuthDiscovery: {len(auth_results['jwts'])} JWTs, {len(auth_results['cookies'])} cookies")
             return auth_results
 
         async def run_asset_discovery_parallel():
             if getattr(settings, 'ENABLE_ASSET_DISCOVERY', False):
-                dashboard.log("🌐 Running asset discovery...", "INFO")
+                logger.info("🌐 Running asset discovery...")
                 return await self._run_asset_discovery(recon_dir)
             return {"subdomains": [], "endpoints": []}
 
@@ -3511,7 +3995,7 @@ class TeamOrchestrator:
         if not json_files:
             logger.warning(f"No JSON files found in {analysis_json_dir}")
 
-        dashboard.log(f"Found {len(json_files)} DAST JSON files to process", "INFO")
+        logger.info(f"Found {len(json_files)} DAST JSON files to process")
 
         # Load all findings from DAST JSON files
         all_findings = []
@@ -3548,7 +4032,7 @@ class TeamOrchestrator:
             if auth_findings:
                 all_findings.extend(auth_findings)
                 logger.info(f"Loaded {len(auth_findings)} AuthDiscovery findings")
-                dashboard.log(f"🔑 Loaded {len(auth_findings)} authentication artifacts", "INFO")
+                logger.info(f"🔑 Loaded {len(auth_findings)} authentication artifacts")
 
                 # Track in batch metrics for integrity check
                 batch_metrics.add_auth_findings(len(auth_findings))
@@ -3755,7 +4239,7 @@ class TeamOrchestrator:
                     "framework": detected_csti_framework,
                 })
                 logger.info(f"[Auto-Dispatch] Injected {injected_count} synthetic CSTI findings with real params (detected: {detected_csti_framework})")
-                dashboard.log(f"Auto-dispatch: {injected_count} CSTI findings injected ({detected_csti_framework.upper()} detected)", "INFO")
+                logger.info(f"Auto-dispatch: {injected_count} CSTI findings injected ({detected_csti_framework.upper()} detected)")
 
         # Auto-dispatch SSTI for template-related admin/API endpoints.
         # DASTySAST often filters server-side SSTI as FP (low fp_confidence).
@@ -3823,7 +4307,7 @@ class TeamOrchestrator:
                     logger.info(f"[Auto-Dispatch] SSTI from scanned URL: {base_url}")
 
         if ssti_injected_urls:
-            dashboard.log(f"Auto-dispatch: {len(ssti_injected_urls)} SSTI target(s) injected", "INFO")
+            logger.info(f"Auto-dispatch: {len(ssti_injected_urls)} SSTI target(s) injected")
 
         # Auto-dispatch LFI for file/path/download parameters.
         # DASTySAST sometimes rejects path traversal findings (score 0/10) when the
@@ -3872,7 +4356,7 @@ class TeamOrchestrator:
 
         if lfi_injected:
             logger.info(f"[Auto-Dispatch] LFI: {len(lfi_injected)} path-traversal target(s) injected")
-            dashboard.log(f"Auto-dispatch: {len(lfi_injected)} LFI target(s) injected", "INFO")
+            logger.info(f"Auto-dispatch: {len(lfi_injected)} LFI target(s) injected")
 
         # FIX (2026-02-08): Auto-dispatch SQLiAgent when reflecting params exist but no SQLi finding
         # SQLi is the most common web vuln - if DASTySAST found ANY parameter, SQLi should be tested.
@@ -3918,7 +4402,7 @@ class TeamOrchestrator:
             all_findings.append(synthetic_sqli)
             self._v.emit("strategy.auto_dispatch", {"specialist": "SQLi", "param": sqli_param})
             logger.info(f"[Auto-Dispatch] Added synthetic SQLi finding: param='{sqli_param}' (reflecting params detected)")
-            dashboard.log(f"Auto-dispatch: SQLi finding injected for param='{sqli_param}'", "INFO")
+            logger.info(f"Auto-dispatch: SQLi finding injected for param='{sqli_param}'")
 
         # Gap 2 Fix: Auto-dispatch HeaderInjectionAgent when header reflection detected or params exist
         # CRLF/Header Injection is often missed because DASTySAST only checks body reflection.
@@ -3964,7 +4448,7 @@ class TeamOrchestrator:
             }
             all_findings.append(synthetic_header)
             logger.info(f"[Auto-Dispatch] Added synthetic Header Injection finding (header_reflection={has_header_reflection})")
-            dashboard.log(f"🔧 Auto-dispatch: Header Injection finding injected", "INFO")
+            logger.info(f"🔧 Auto-dispatch: Header Injection finding injected")
 
         # Auto-dispatch XSSAgent when no XSS finding from DASTySAST.
         # XSSAgent handles DOM XSS (Phase B.2) which requires Playwright.
@@ -3997,7 +4481,7 @@ class TeamOrchestrator:
             }
             all_findings.append(synthetic_xss)
             logger.info("[Auto-Dispatch] Added synthetic XSS finding for DOM XSS coverage")
-            dashboard.log("🔧 Auto-dispatch: XSS finding injected (DOM XSS coverage)", "INFO")
+            logger.info("🔧 Auto-dispatch: XSS finding injected (DOM XSS coverage)")
 
         # Auto-dispatch OpenRedirectAgent when recon URLs contain redirect-like params.
         # Open redirects are commonly missed because DASTySAST focuses on reflection,
@@ -4061,7 +4545,7 @@ class TeamOrchestrator:
                 }
                 all_findings.append(synthetic_redir)
                 logger.info(f"[Auto-Dispatch] Added synthetic Open Redirect finding: param='{redirect_param}' on {redirect_url}")
-                dashboard.log(f"Auto-dispatch: Open Redirect finding injected for param='{redirect_param}'", "INFO")
+                logger.info(f"Auto-dispatch: Open Redirect finding injected for param='{redirect_param}'")
 
         # FIX (2026-02-16): Auto-dispatch IDORAgent for recon URLs with numeric path segments.
         # DASTySAST LLM is non-deterministic about classifying /api/reviews/1, /api/orders/1 as IDOR.
@@ -4157,7 +4641,7 @@ class TeamOrchestrator:
             if idor_injected > 0:
                 self._v.emit("strategy.auto_dispatch", {"specialist": "IDOR", "count": idor_injected})
                 logger.info(f"[Auto-Dispatch] Injected {idor_injected} synthetic IDOR findings from recon URLs with numeric paths")
-                dashboard.log(f"Auto-dispatch: {idor_injected} IDOR findings injected (numeric path IDs)", "INFO")
+                logger.info(f"Auto-dispatch: {idor_injected} IDOR findings injected (numeric path IDs)")
 
         # Auto-dispatch PrototypePollutionAgent when JS frameworks detected and reflecting params exist.
         # PP is common in AngularJS/React apps but DASTySAST pre-filters PP findings as FP (low skeptical).
@@ -4202,7 +4686,7 @@ class TeamOrchestrator:
             all_findings.append(synthetic_pp)
             self._v.emit("strategy.auto_dispatch", {"specialist": "PROTOTYPE_POLLUTION", "count": 1})
             logger.info(f"[Auto-Dispatch] Added synthetic Prototype Pollution finding: param='{pp_param}' (JS framework detected)")
-            dashboard.log(f"Auto-dispatch: Prototype Pollution (JS framework detected)", "INFO")
+            logger.info(f"Auto-dispatch: Prototype Pollution (JS framework detected)")
 
         # Auto-dispatch LFIAgent when file-like parameters found in recon URLs.
         # LFI is commonly missed by DASTySAST when params look benign (e.g., "file", "page").
@@ -4256,7 +4740,7 @@ class TeamOrchestrator:
                 }
                 all_findings.append(synthetic_lfi)
                 logger.info(f"[Auto-Dispatch] Added synthetic LFI finding: param='{lfi_param}' on {lfi_url}")
-                dashboard.log(f"Auto-dispatch: LFI finding injected for param='{lfi_param}'", "INFO")
+                logger.info(f"Auto-dispatch: LFI finding injected for param='{lfi_param}'")
 
         # Auto-dispatch RCEAgent when command-like parameters found in recon URLs.
         # RCE auto-dispatch: Always scan for command-like params in recon URLs AND findings.
@@ -4324,7 +4808,7 @@ class TeamOrchestrator:
                     rce_injected_urls.add(f_url)
 
         if rce_injected_urls:
-            dashboard.log(f"Auto-dispatch: {len(rce_injected_urls)} RCE target(s) injected", "INFO")
+            logger.info(f"Auto-dispatch: {len(rce_injected_urls)} RCE target(s) injected")
 
         # Auto-dispatch SSRFAgent when URL-accepting parameters found in recon URLs.
         # SSRF params (callback, webhook, import) differ from open redirect params.
@@ -4387,7 +4871,7 @@ class TeamOrchestrator:
                 }
                 all_findings.append(synthetic_ssrf)
                 logger.info(f"[Auto-Dispatch] Added synthetic SSRF finding: param='{ssrf_param}' on {ssrf_url}")
-                dashboard.log(f"Auto-dispatch: SSRF finding injected for param='{ssrf_param}'", "INFO")
+                logger.info(f"Auto-dispatch: SSRF finding injected for param='{ssrf_param}'")
 
         # ===== Auto-dispatch MassAssignmentAgent for PUT/PATCH/POST endpoints =====
         # Mass assignment tests all writable endpoints — doesn't depend on DASTySAST detecting it
@@ -4434,7 +4918,7 @@ class TeamOrchestrator:
             if ma_injected > 0:
                 self._v.emit("strategy.auto_dispatch", {"specialist": "MASS_ASSIGNMENT", "count": ma_injected})
                 logger.info(f"[Auto-Dispatch] Injected {ma_injected} mass assignment findings for writable endpoints")
-                dashboard.log(f"Auto-dispatch: {ma_injected} mass assignment targets injected", "INFO")
+                logger.info(f"Auto-dispatch: {ma_injected} mass assignment targets injected")
 
         # ===== BAC Detection: Admin endpoints accessible without authentication =====
         admin_bac_findings = []
@@ -4598,9 +5082,9 @@ class TeamOrchestrator:
 
             self._v.emit("strategy.nuclei_injected", {"count": len(misconfigs)})
             logger.info(f"[Nuclei] Processed {len(misconfigs)} misconfiguration findings ({len(pre_validated_misconfigs)} pre-validated)")
-            dashboard.log(f"Nuclei: {len(misconfigs)} security misconfigurations detected", "INFO")
+            logger.info(f"Nuclei: {len(misconfigs)} security misconfigurations detected")
 
-        dashboard.log(f"Processing {len(all_findings)} findings...", "INFO")
+        logger.info(f"Processing {len(all_findings)} findings...")
 
         # Pass to ThinkingAgent for batch processing
         processed_count = 0
@@ -4809,7 +5293,7 @@ class TeamOrchestrator:
         logger.info("=== PHASE 3: GLOBAL REVIEW ===")
         dashboard.set_phase("🎯 CONFIRMING HITS")
         dashboard.set_status("Running", "Review in progress...")
-        dashboard.log("🔍 Phase 3: Global Review and Chaining Analysis", "INFO")
+        logger.info("🔍 Phase 3: Global Review and Chaining Analysis")
 
         all_findings_for_review = self.state_manager.get_findings()
         await self._global_review(all_findings_for_review, scan_dir, dashboard)
@@ -4822,8 +5306,8 @@ class TeamOrchestrator:
         logger.info("=== PHASE 4: REPORTING ===")
         dashboard.set_phase("📋 COMPILING INTEL")
         dashboard.set_status("Running", "Generating reports...")
-        dashboard.log("📊 Phase 4: Generating Final Reports", "INFO")
-        dashboard.log("Generating final consolidated reports...", "INFO")
+        logger.info("📊 Phase 4: Generating Final Reports")
+        logger.info("Generating final consolidated reports...")
 
         all_findings = self.state_manager.get_findings()
         logger.info(f"Retrieved {len(all_findings)} findings from state manager")
@@ -4832,7 +5316,7 @@ class TeamOrchestrator:
         await self._generate_specialist_reports(scan_dir)  # v3.1: Generate specialists/ directory structure
         await self._generate_initial_report(scan_dir)
 
-        dashboard.log(f"📄 Final report in {scan_dir}", "INFO")
+        logger.info(f"📄 Final report in {scan_dir}")
 
         from bugtrace.schemas.db_models import ScanStatus
         self.db.update_scan_status(self.scan_id, ScanStatus.COMPLETED)
@@ -4848,7 +5332,7 @@ class TeamOrchestrator:
             await scan_ctx.wait_if_paused()
 
         if dashboard.stop_requested or self._stop_event.is_set():
-            dashboard.log("🛑 Stop requested. Skipping remaining phases.", "WARN")
+            logger.warning("🛑 Stop requested. Skipping remaining phases.")
             from bugtrace.schemas.db_models import ScanStatus
             self.db.update_scan_status(self.scan_id, ScanStatus.STOPPED)
             return True
@@ -5191,7 +5675,7 @@ class TeamOrchestrator:
         if not findings:
             return
 
-        dashboard.log("🔍 Starting Global Review and Chaining Analysis...", "INFO")
+        logger.info("🔍 Starting Global Review and Chaining Analysis...")
 
         from bugtrace.core.llm_client import llm_client
 
@@ -5223,7 +5707,7 @@ class TeamOrchestrator:
             chains = self._extract_attack_chains(response)
 
             if chains:
-                dashboard.log(f"🔗 Detected {len(chains)} potential attack chains!", "WARN")
+                logger.warning(f"🔗 Detected {len(chains)} potential attack chains!")
                 with open(scan_dir / "attack_chains.json", "w") as f:
                     json.dump({"chains": chains, "findings_reviewed": len(findings)}, f, indent=4)
         except Exception as e:
@@ -5252,7 +5736,7 @@ class TeamOrchestrator:
             findings = self._load_findings_from_files()
 
             logger.info(f"Starting report generation with {len(findings)} findings")
-            dashboard.log(f"📊 Generating final reports with {len(findings)} findings...", "INFO")
+            logger.info(f"📊 Generating final reports with {len(findings)} findings...")
 
             # Collect and deduplicate findings
             collector = self._build_data_collector(findings, urls, tech_profile, start_time)
@@ -5260,11 +5744,11 @@ class TeamOrchestrator:
             # Generate reports
             await self._generate_all_reports(collector, scan_dir)
 
-            dashboard.log(f"✅ Reports generated in {scan_dir}", "SUCCESS")
+            logger.info(f"✅ Reports generated in {scan_dir}")
 
         except Exception as e:
             logger.error(f"Failed to generate V2 report: {e}", exc_info=True)
-            dashboard.log(f"❌ Report generation failed: {e}", "ERROR")
+            logger.error(f"❌ Report generation failed: {e}")
 
     def _load_findings_from_files(self) -> list:
         """Load findings from specialist JSON files (source of truth). DB = write-only."""

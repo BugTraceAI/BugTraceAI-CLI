@@ -1,0 +1,50 @@
+# BugTraceAI Authentication Configuration
+# Use this file to configure authenticated scanning with TOTP support.
+#
+# Usage:
+#   bugtrace scan https://example.com --auth-config auth-config.yaml
+#
+# Variables available in login_flow:
+#   $username / $email - Your login identifier
+#   $password - Your password
+#   $totp - Auto-generated 6-digit TOTP code (requires totp_secret)
+
+authentication:
+  # Login type: form (default), sso, api, or basic
+  login_type: form
+
+  # URL of the login page (can be relative to target URL)
+  login_url: "/login"
+
+  # Login credentials
+  credentials:
+    # Username or email
+    username: "testuser@example.com"
+
+    # Password
+    password: "your-secure-password"
+
+    # Optional: TOTP secret for 2FA (Base32 encoded)
+    # Get this from your authenticator app setup QR code or account security settings
+    # Common format: 16-32 uppercase letters and digits 2-7
+    totp_secret: "JBSWY3DPEHPK3PXP"
+
+  # Custom login flow - executed step by step
+  # Supported actions:
+  #   - "Type <value> into the <field> field"
+  #   - "Click the '<button text>' button"
+  #   - "Enter <value> in the <field> field"
+  #   - "Wait for <N> seconds"
+  login_flow:
+    - "Type $username into the email field"
+    - "Type $password into the password field"
+    - "Click the 'Sign In' button"
+    - "Wait for 2 seconds"
+    - "Enter $totp in the verification code field"
+    - "Click the 'Verify' button"
+
+  # How to verify login succeeded
+  success_condition:
+    # type options: url_contains, url_equals_exactly, element_present, text_contains
+    type: url_contains
+    value: "/dashboard"
