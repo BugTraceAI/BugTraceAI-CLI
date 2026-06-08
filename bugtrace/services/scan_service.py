@@ -280,27 +280,58 @@ class ScanService:
             totp_secret = credentials.get("totp_secret", "")
             has_login_flow = bool(login_flow)
 
-            if totp_secret or has_login_flow:
-                # Level 3: Browser-based login with TOTP - handled by TeamOrchestrator
-                # This allows proper logging and verification before scan starts
-                logger.info(f"Auth Level 3: Will be handled by TeamOrchestrator (TOTP: {bool(totp_secret)})")
+            if has_login_flow:
+                # Level 3: Browser-based login with custom multi-step flow
+                # Only use browser when a custom login_flow is explicitly defined
+                logger.info(f"Auth Level 3: Will be handled by TeamOrchestrator (login_flow steps: {len(login_flow)})")
                 return
             else:
-                # Level 2: Simple POST login
-                logger.info(f"Auth Level 2: Attempting login at {login_url}")
+                # Level 2: Simple POST login (supports TOTP via code generation)
+                # Works for both plain credentials and TOTP-enabled APIs
+                logger.info(f"Auth Level 2: Attempting login at {login_url} (TOTP: {bool(totp_secret)})")
                 await self._simple_post_login(scan_ctx_id, login_url, credentials)
 
     async def _simple_post_login(self, scan_ctx_id: str, login_url: str, credentials: dict):
-        """Level 2: Simple POST request login."""
+        """
+        Level 2: POST request login with optional TOTP support.
+
+        Builds the payload by:
+        1. Copying username/password from credentials
+        2. If totp_secret present: generates current TOTP code and tries common
+           field names (totp_code, totp, code, otp, mfa_code) — sends all of them
+           so the API can pick whichever it expects.
+        """
         from bugtrace.services.scan_context import store_auth_token
 
         try:
             import httpx
+
+            # Build login payload — exclude totp_secret (never sent as-is)
+            payload = {
+                k: v for k, v in credentials.items()
+                if k not in ("totp_secret",)
+            }
+
+            # Generate TOTP code if secret provided and inject with all common field names
+            totp_secret = credentials.get("totp_secret", "")
+            if totp_secret:
+                from bugtrace.utils.totp import get_totp_code
+                totp_code = get_totp_code(totp_secret)
+                if not totp_code:
+                    logger.error("Auth Level 2: Failed to generate TOTP code")
+                    return
+                # Inject with multiple common field names — server will use whichever matches
+                for field_name in ("totp_code", "totp", "code", "otp", "mfa_code", "verification_code"):
+                    payload[field_name] = totp_code
+                logger.info(f"Auth Level 2: Generated TOTP code and added to payload")
+
             async with httpx.AsyncClient(verify=False, timeout=15) as client:
-                resp = await client.post(login_url, json=credentials)
+                resp = await client.post(login_url, json=payload)
 
                 if resp.status_code not in (200, 201):
-                    logger.warning(f"Auth Level 2: Login failed (HTTP {resp.status_code})")
+                    logger.warning(
+                        f"Auth Level 2: Login failed (HTTP {resp.status_code}): {resp.text[:200]}"
+                    )
                     return
 
                 # Extract JWT from response
@@ -309,7 +340,13 @@ class ScanService:
                     store_auth_token(scan_ctx_id, "auto_login", token)
                     logger.info("Auth Level 2: JWT extracted and stored from login response")
                 else:
-                    logger.warning("Auth Level 2: Login succeeded but no JWT found in response")
+                    # Fallback: store session cookies if no JWT
+                    if resp.cookies:
+                        cookie_str = "; ".join([f"{k}={v}" for k, v in resp.cookies.items()])
+                        store_auth_token(scan_ctx_id, "auto_login_cookies", cookie_str)
+                        logger.info(f"Auth Level 2: No JWT found, stored {len(resp.cookies)} cookies")
+                    else:
+                        logger.warning("Auth Level 2: Login succeeded but no JWT or cookies found in response")
 
         except Exception as e:
             logger.error(f"Auth Level 2: Login request failed: {e}")
