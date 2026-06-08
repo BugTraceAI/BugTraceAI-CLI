@@ -17,6 +17,7 @@ with intelligent fallbacks and enhancement strategies.
 """
 
 import asyncio
+import aiohttp
 import re
 import json
 import hashlib

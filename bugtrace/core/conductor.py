@@ -13,7 +13,7 @@ import asyncio
 import os
 import time
 import threading
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 from datetime import datetime
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.config import settings
@@ -65,6 +65,10 @@ class ConductorV2:
                          If provided, UI updates are routed via callbacks.
                          If None, uses legacy dashboard (backward compatible).
         """
+        # Resolve protocol dir to an absolute path anchored at the CLI root
+        # (settings.BASE_DIR), so it is independent of the current working dir.
+        self.PROTOCOL_DIR = str(settings.BASE_DIR / self.PROTOCOL_DIR)
+
         self._ensure_protocol_exists()
 
         # UI callback for TUI integration (Phase 2)
@@ -283,13 +287,14 @@ class ConductorV2:
 
     def get_context_summary(self) -> str:
         """Get a text summary of current context for agent prompts."""
-        summary = []
-        if self.shared_context.get("discovered_urls"):
-            summary.append(f"URLs discovered: {len(self.shared_context['discovered_urls'])}")
-        if self.shared_context.get("confirmed_vulns"):
-            summary.append(f"Confirmed vulns: {len(self.shared_context['confirmed_vulns'])}")
-        if self.shared_context.get("tested_params"):
-            summary.append(f"Tested params: {len(self.shared_context['tested_params'])}")
+        with self._context_lock:
+            summary = []
+            if self.shared_context.get("discovered_urls"):
+                summary.append(f"URLs discovered: {len(self.shared_context['discovered_urls'])}")
+            if self.shared_context.get("confirmed_vulns"):
+                summary.append(f"Confirmed vulns: {len(self.shared_context['confirmed_vulns'])}")
+            if self.shared_context.get("tested_params"):
+                summary.append(f"Tested params: {len(self.shared_context['tested_params'])}")
         return " | ".join(summary) if summary else "No shared context yet"
 
     # =========================================================
@@ -421,12 +426,14 @@ class ConductorV2:
         Safe to call from sync context. If no event loop is running,
         the emission is silently skipped.
         """
+        # Copy to avoid mutating the caller's dict (scan_context is metadata).
+        payload = dict(data)
         if self._scan_context:
-            data["scan_context"] = self._scan_context
+            payload["scan_context"] = self._scan_context
         try:
             from bugtrace.core.event_bus import event_bus
             loop = asyncio.get_running_loop()
-            loop.create_task(event_bus.emit(event, data))
+            loop.create_task(event_bus.emit(event, payload))
         except RuntimeError:
             pass  # No event loop running, skip
 
