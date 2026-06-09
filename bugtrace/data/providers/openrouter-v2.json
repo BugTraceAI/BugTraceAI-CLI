@@ -15,13 +15,19 @@
         "DEFAULT_MODEL":    "anthropic/claude-haiku-4.5",
         "CODE_MODEL":       "deepseek/deepseek-chat-v3-0324",
         "ANALYSIS_MODEL":   "anthropic/claude-haiku-4.5",
+        "ANALYSIS_PENTESTER_MODEL": "anthropic/claude-haiku-4.5",
+        "ANALYSIS_BUG_BOUNTY_MODEL": "anthropic/claude-haiku-4.5",
+        "ANALYSIS_AUDITOR_MODEL": "anthropic/claude-haiku-4.5",
+        "ANALYSIS_RED_TEAM_MODEL": "google/gemini-2.5-flash",
+        "ANALYSIS_RESEARCHER_MODEL": "anthropic/claude-haiku-4.5",
         "PRIMARY_MODELS":   "anthropic/claude-haiku-4.5,deepseek/deepseek-chat-v3-0324",
         "VISION_MODEL":     "google/gemini-2.5-flash",
         "WAF_DETECTION_MODELS": "anthropic/claude-haiku-4.5,deepseek/deepseek-chat-v3-0324",
         "MUTATION_MODEL":   "google/gemini-2.5-flash",
         "SKEPTICAL_MODEL":  "anthropic/claude-haiku-4.5",
         "REPORTING_MODEL":  "anthropic/claude-haiku-4.5",
-        "VALIDATION_VISION_MODEL": "google/gemini-2.5-flash"
+        "VALIDATION_VISION_MODEL": "google/gemini-2.5-flash",
+        "LONEWOLF_MODEL":   "anthropic/claude-haiku-4.5"
     },
     "model_selection_rationale": {
         "anthropic/claude-haiku-4-5": "BullshitBench v2 Software: 67-75% pushback. Empirical test: TTFT 0.9s, BS:1/4, Refused:0/4, Pushback:1/4. Best anti-hallucination/cost tradeoff. Used for all slots where honesty is critical (ANALYSIS, SKEPTICAL, REPORTING, DEFAULT).",
