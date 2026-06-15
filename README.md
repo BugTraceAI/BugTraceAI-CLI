@@ -33,6 +33,13 @@ BugTraceAI-CLI is an autonomous offensive security framework that combines LLM-d
 
 The core philosophy is **"Think like a pentester, execute like a machine, validate like an auditor"** - using AI for intelligent hypothesis generation, but relying on real tools for exploitation and validation.
 
+## What's New in v3.5.7-beta
+
+- **YAML Authentication + TOTP**: `--auth-config` loads login flows, credentials, environment-variable substitutions, and optional TOTP/2FA secrets for authenticated scans.
+- **Scan Resumption**: `--resume` and recoverable scan state tracking allow interrupted scans to continue without losing context or duplicating completed work.
+- **Model Evaluation Tool**: `tools/model_eval.py` benchmarks configured OpenRouter models and writes ranked results to `tools/model_eval_results.json`.
+- **Lifecycle Reliability**: scan origin tracking, orphan cleanup, smart delete behavior, and safer resume state transitions improve WEB/CLI coordination.
+
 ## 🚨 Disclaimer
 
 This tool is for **authorized security testing only**.
@@ -310,7 +317,7 @@ docker-compose logs -f
 ./bugtraceai-cli serve --port 8000
 
 # Evaluate model performance
-./bugtraceai-cli model_eval --provider openrouter-v2
+python tools/model_eval.py
 ```
 
 **Docker Users:**
