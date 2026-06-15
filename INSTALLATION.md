@@ -1,16 +1,16 @@
-# 🚀 Installation Guide - BugTraceAI
+# 🚀 Installation Guide — BugTraceAI-CLI
 
 ## Quick Start with Installation Wizard
 
-The easiest way to get BugTraceAI up and running is using the interactive installation wizard:
+The easiest way to get BugTraceAI-CLI up and running is using the interactive installation wizard:
 
 ```bash
 ./install.sh
 ```
 
 The wizard provides two installation modes:
-- **Local Installation**: Python virtual environment setup
-- **Docker Installation**: Containerized deployment with automatic port detection
+- **Local Installation**: Python virtual environment setup (best for development)
+- **Docker Installation**: Containerized deployment with automatic port detection (best for production)
 
 ## 📋 Prerequisites
 
@@ -55,8 +55,14 @@ nano .env  # Add your OPENROUTER_API_KEY
 # Run a scan
 ./bugtraceai-cli scan https://example.com
 
+# Run an authenticated scan (login-protected target)
+./bugtraceai-cli scan https://example.com --auth-config auth_config.yaml
+
 # Or start the API server
 ./bugtraceai-cli serve --port 8000
+
+# Evaluate model performance
+./bugtraceai-cli model_eval --provider openrouter-v2
 ```
 
 ### Pros & Cons
@@ -117,19 +123,19 @@ curl http://localhost:8000/health
 open http://localhost:8000/docs
 
 # View container logs
-docker-compose logs -f
+docker compose logs -f
 
 # Stop the container
-docker-compose stop
+docker compose stop
 
 # Start the container
-docker-compose start
+docker compose start
 
 # Restart the container
-docker-compose restart
+docker compose restart
 
 # Stop and remove the container
-docker-compose down
+docker compose down
 ```
 
 ### Using the API
@@ -145,6 +151,11 @@ curl http://localhost:8000/api/scans/{scan_id}
 
 # List all scans
 curl http://localhost:8000/api/scans
+
+# Trigger an authenticated scan via API
+curl -X POST http://localhost:8000/api/scans \
+  -H "Content-Type: application/json" \
+  -d '{"target": "https://example.com", "auth_config_path": "/app/auth_config.yaml"}'
 ```
 
 ### Pros & Cons
@@ -165,7 +176,7 @@ curl http://localhost:8000/api/scans
 
 ### Environment Variables
 
-Edit `.env` to configure BugTraceAI:
+Edit `.env` to configure BugTraceAI-CLI:
 
 ```bash
 # Required: Your OpenRouter API key
@@ -175,10 +186,39 @@ OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxx
 BUGTRACE_CORS_ORIGINS=http://localhost:3000,http://localhost:5173
 
 # Optional: Override LLM models
-# DEFAULT_MODEL=qwen/qwen3-coder
-# VISION_MODEL=google/gemini-3-flash-preview
-# MUTATION_MODEL=x-ai/grok-4-fast
+# DEFAULT_MODEL=google/gemini-2.0-flash-thinking-exp:free
+# SKEPTICAL_MODEL=anthropic/claude-3.5-haiku:beta
+# VISION_MODEL=google/gemini-2.0-flash-thinking-exp:free
 ```
+
+### Authenticated Scanning (YAML + TOTP/2FA)
+
+BugTraceAI-CLI supports scanning **login-protected applications** via a YAML configuration file. This includes support for TOTP (Time-Based One-Time Password) token generation for 2FA-protected targets.
+
+**Create `auth_config.yaml`:**
+
+```yaml
+login_url: https://target.com/login
+username: pentester@example.com
+password: your_password_here
+totp_secret: BASE32TOTPSECRETHERE   # optional — for 2FA/TOTP apps
+success_condition: "dashboard"      # string that confirms successful login
+```
+
+**Run an authenticated scan:**
+
+```bash
+./bugtraceai-cli scan https://target.com --auth-config auth_config.yaml
+```
+
+The scanner will automatically:
+1. Navigate to `login_url`
+2. Fill in credentials
+3. Generate a real-time TOTP token (if `totp_secret` is set)
+4. Confirm login success via `success_condition`
+5. Reuse the authenticated session across all 6 scan phases
+
+> The `auth_config.yaml` is automatically included in the report ZIP for audit traceability.
 
 ### Port Configuration (Docker Only)
 
@@ -243,13 +283,13 @@ sudo netstat -tulpn | grep 8000
 **Problem: Build fails due to network issues**
 ```bash
 # Retry with clean build
-docker-compose build --no-cache
+docker compose build --no-cache
 ```
 
 **Problem: Container exits immediately**
 ```bash
 # Check logs for errors
-docker-compose logs
+docker compose logs
 ```
 
 ### API Key Issues
@@ -264,7 +304,7 @@ docker-compose logs
 cat .env
 
 # Verify .env is loaded (Docker)
-docker-compose config
+docker compose config
 ```
 
 ## 📊 Verifying Installation
@@ -292,19 +332,19 @@ python3 -c "import playwright; print('✓ Playwright OK')"
 
 ```bash
 # Check container is running
-docker-compose ps
+docker compose ps
 
 # Check API health
 curl http://localhost:8000/health
 
 # Expected response:
-# {"status": "healthy", "version": "3.x.x"}
+# {"status": "healthy", "version": "3.5.7-beta"}
 
 # Check logs
-docker-compose logs --tail=50
+docker compose logs --tail=50
 
 # Access container shell
-docker-compose exec api bash
+docker compose exec api bash
 ```
 
 ## 🔄 Switching Between Modes
@@ -317,7 +357,7 @@ You can run the wizard multiple times to switch installation modes:
 # Choose option 2
 
 # Want to switch from Docker to local development?
-docker-compose down  # Stop Docker
+docker compose down  # Stop Docker
 ./install.sh
 # Choose option 1
 ```
@@ -335,10 +375,12 @@ After installation, see the [README.md](README.md) for:
 
 ## 🆘 Need Help?
 
-- 📖 **Documentation**: [deepwiki.com/BugTraceAI/BugTraceAI-CLI](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
-- 🌐 **Website**: [bugtraceai.com](https://bugtraceai.com)
-- 🐛 **Issues**: Report bugs on GitHub
-- 💬 **Contact**: [@yz9yt](https://x.com/yz9yt)
+| Resource | Link |
+|---|---|
+| 📖 **Wiki** | [deepwiki.com/BugTraceAI/BugTraceAI-CLI](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI) |
+| 🌐 **Website** | [bugtraceai.com](https://bugtraceai.com) |
+| 🐛 **Issues** | [GitHub Issues](https://github.com/BugTraceAI/BugTraceAI-CLI/issues) |
+| 💬 **Contact** | [@yz9yt](https://x.com/yz9yt) |
 
 ---
 
