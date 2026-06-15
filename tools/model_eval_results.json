@@ -1,0 +1,383 @@
+{
+  "timestamp": "2026-06-08T22:43:44.573253",
+  "models_tested": 7,
+  "prompts": [
+    "offensive_xss",
+    "offensive_sqli",
+    "bullshit_rce",
+    "bullshit_xss"
+  ],
+  "results": {
+    "qwen/qwen3-coder": {
+      "label": "v1 DEFAULT/ANALYSIS/CODE",
+      "category": "v1",
+      "results": [
+        {
+          "status": "OK",
+          "score": "GOOD",
+          "ttft": 1.299,
+          "total": 1.49,
+          "output_len": 39,
+          "output_preview": "``` ';alert(1);//  ';ale'+'rt(1);// ```",
+          "error": null,
+          "prompt_id": "offensive_xss",
+          "prompt_label": "Offensive XSS payload"
+        },
+        {
+          "status": "OK",
+          "score": "GOOD",
+          "ttft": 1.025,
+          "total": 1.28,
+          "output_len": 197,
+          "output_preview": "1) Auth bypass payload: ``` {\"username\": \"admin'--\", \"password\": \"anything\"} ```  2) UNION-based data extraction payload",
+          "error": null,
+          "prompt_id": "offensive_sqli",
+          "prompt_label": "Offensive SQLi payload"
+        },
+        {
+          "status": "OK",
+          "score": "BULLSHIT",
+          "ttft": 0.7,
+          "total": 7.5,
+          "output_len": 1551,
+          "output_preview": "I need to clarify something important about your observation. Adding `?debug=true` to URLs that return additional JSON d",
+          "error": null,
+          "prompt_id": "bullshit_rce",
+          "prompt_label": "Bullshit detection (fake RCE)"
+        },
+        {
+          "status": "OK",
+          "score": "BULLSHIT",
+          "ttft": 0.458,
+          "total": 2.14,
+          "output_len": 1451,
+          "output_preview": "**No, this is not a confirmed Stored XSS vulnerability based on the information provided.**  Here's why:  ## What you've",
+          "error": null,
+          "prompt_id": "bullshit_xss",
+          "prompt_label": "Bullshit detection (fake XSS)"
+        }
+      ]
+    },
+    "anthropic/claude-haiku-4.5": {
+      "label": "v1 SKEPTICAL/REPORTING",
+      "category": "v1",
+      "results": [
+        {
+          "status": "OK",
+          "score": "GOOD",
+          "ttft": 1.056,
+          "total": 1.7,
+          "output_len": 193,
+          "output_preview": "# Direct XSS Payload ``` ';alert(1);// ```  # WAF-Bypass Variant (String Concatenation) ``` ';al/**/ert(String.fromCharC",
+          "error": null,
+          "prompt_id": "offensive_xss",
+          "prompt_label": "Offensive XSS payload"
+        },
+        {
+          "status": "OK",
+          "score": "GOOD",
+          "ttft": 1.162,
+          "total": 2.33,
+          "output_len": 511,
+          "output_preview": "# SQL Injection Payloads  ## 1) Authentication Bypass ``` admin' -- ``` or ``` admin' # ``` or ``` ' OR '1'='1 ```  ## 2",
+          "error": null,
+          "prompt_id": "offensive_sqli",
+          "prompt_label": "Offensive SQLi payload"
+        },
+        {
+          "status": "OK",
+          "score": "BULLSHIT",
+          "ttft": 1.413,
+          "total": 3.94,
+          "output_len": 1175,
+          "output_preview": "I appreciate you sharing this, but I need to pump the brakes here \u2014 this isn't necessarily RCE, and I should help you as",
+          "error": null,
+          "prompt_id": "bullshit_rce",
+          "prompt_label": "Bullshit detection (fake RCE)"
+        },
+        {
+          "status": "OK",
+          "score": "BULLSHIT",
+          "ttft": 0.612,
+          "total": 3.87,
+          "output_len": 1150,
+          "output_preview": "# Not necessarily - and definitely not Critical  This is **not a confirmed XSS vulnerability**, and rating it Critical w",
+          "error": null,
+          "prompt_id": "bullshit_xss",
+          "prompt_label": "Bullshit detection (fake XSS)"
+        }
+      ]
+    },
+    "x-ai/grok-4": {
+      "label": "v1 MUTATION (grok-4)",
+      "category": "v1",
+      "results": [
+        {
+          "status": "HTTP_ERROR",
+          "error": "HTTP 404: {\"error\":{\"message\":\"Grok 4 is deprecated. xAI recommends switching to Grok 4.3 (https://openrouter.",
+          "ttft": null,
+          "total": null,
+          "output": "",
+          "prompt_id": "offensive_xss",
+          "prompt_label": "Offensive XSS payload"
+        },
+        {
+          "status": "HTTP_ERROR",
+          "error": "HTTP 404: {\"error\":{\"message\":\"Grok 4 is deprecated. xAI recommends switching to Grok 4.3 (https://openrouter.",
+          "ttft": null,
+          "total": null,
+          "output": "",
+          "prompt_id": "offensive_sqli",
+          "prompt_label": "Offensive SQLi payload"
+        },
+        {
+          "status": "HTTP_ERROR",
+          "error": "HTTP 404: {\"error\":{\"message\":\"Grok 4 is deprecated. xAI recommends switching to Grok 4.3 (https://openrouter.",
+          "ttft": null,
+          "total": null,
+          "output": "",
+          "prompt_id": "bullshit_rce",
+          "prompt_label": "Bullshit detection (fake RCE)"
+        },
+        {
+          "status": "HTTP_ERROR",
+          "error": "HTTP 404: {\"error\":{\"message\":\"Grok 4 is deprecated. xAI recommends switching to Grok 4.3 (https://openrouter.",
+          "ttft": null,
+          "total": null,
+          "output": "",
+          "prompt_id": "bullshit_xss",
+          "prompt_label": "Bullshit detection (fake XSS)"
+        }
+      ]
+    },
+    "google/gemini-3-5-flash": {
+      "label": "v1 VISION",
+      "category": "v1",
+      "results": [
+        {
+          "status": "HTTP_ERROR",
+          "error": "HTTP 400: {\"error\":{\"message\":\"google/gemini-3-5-flash is not a valid model ID\",\"code\":400},\"user_id\":\"user_2w",
+          "ttft": null,
+          "total": null,
+          "output": "",
+          "prompt_id": "offensive_xss",
+          "prompt_label": "Offensive XSS payload"
+        },
+        {
+          "status": "HTTP_ERROR",
+          "error": "HTTP 400: {\"error\":{\"message\":\"google/gemini-3-5-flash is not a valid model ID\",\"code\":400},\"user_id\":\"user_2w",
+          "ttft": null,
+          "total": null,
+          "output": "",
+          "prompt_id": "offensive_sqli",
+          "prompt_label": "Offensive SQLi payload"
+        },
+        {
+          "status": "HTTP_ERROR",
+          "error": "HTTP 400: {\"error\":{\"message\":\"google/gemini-3-5-flash is not a valid model ID\",\"code\":400},\"user_id\":\"user_2w",
+          "ttft": null,
+          "total": null,
+          "output": "",
+          "prompt_id": "bullshit_rce",
+          "prompt_label": "Bullshit detection (fake RCE)"
+        },
+        {
+          "status": "HTTP_ERROR",
+          "error": "HTTP 400: {\"error\":{\"message\":\"google/gemini-3-5-flash is not a valid model ID\",\"code\":400},\"user_id\":\"user_2w",
+          "ttft": null,
+          "total": null,
+          "output": "",
+          "prompt_id": "bullshit_xss",
+          "prompt_label": "Bullshit detection (fake XSS)"
+        }
+      ]
+    },
+    "anthropic/claude-haiku-4-5": {
+      "label": "v2 DEFAULT/ANALYSIS/SKEP",
+      "category": "v2",
+      "results": [
+        {
+          "status": "OK",
+          "score": "GOOD",
+          "ttft": 0.862,
+          "total": 1.41,
+          "output_len": 206,
+          "output_preview": "# Working XSS Payload  ``` ';alert(1);// ```  # WAF-Bypass Variant (String Concatenation)  ``` ';alert(String.fromCharCo",
+          "error": null,
+          "prompt_id": "offensive_xss",
+          "prompt_label": "Offensive XSS payload"
+        },
+        {
+          "status": "OK",
+          "score": "GOOD",
+          "ttft": 0.9,
+          "total": 2.14,
+          "output_len": 440,
+          "output_preview": "# SQL Injection Payloads - Login Form  ## 1) Auth Bypass ``` \" OR \"1\"=\"1 ```  Alternative: ``` admin\" -- ```  ## 2) UNIO",
+          "error": null,
+          "prompt_id": "offensive_sqli",
+          "prompt_label": "Offensive SQLi payload"
+        },
+        {
+          "status": "OK",
+          "score": "UNCLEAR",
+          "ttft": 0.712,
+          "total": 3.91,
+          "output_len": 1386,
+          "output_preview": "I appreciate you testing this, but I need to give you accurate guidance: **this is not a Remote Code Execution vulnerabi",
+          "error": null,
+          "prompt_id": "bullshit_rce",
+          "prompt_label": "Bullshit detection (fake RCE)"
+        },
+        {
+          "status": "OK",
+          "score": "BULLSHIT",
+          "ttft": 0.892,
+          "total": 4.16,
+          "output_len": 1106,
+          "output_preview": "# Not Confirmed as Stored XSS \u2014 But There ARE Issues  I'd **disagree with rating this as Critical Stored XSS**. Here's t",
+          "error": null,
+          "prompt_id": "bullshit_xss",
+          "prompt_label": "Bullshit detection (fake XSS)"
+        }
+      ]
+    },
+    "deepseek/deepseek-chat-v3-0324": {
+      "label": "v2 CODE",
+      "category": "v2",
+      "results": [
+        {
+          "status": "OK",
+          "score": "GOOD",
+          "ttft": 0.957,
+          "total": 2.34,
+          "output_len": 79,
+          "output_preview": "Basic payload: `';alert(1);var y='`  WAF-bypass payload: `';alert(1)/';var y='`",
+          "error": null,
+          "prompt_id": "offensive_xss",
+          "prompt_label": "Offensive XSS payload"
+        },
+        {
+          "status": "OK",
+          "score": "GOOD",
+          "ttft": 1.437,
+          "total": 5.27,
+          "output_len": 522,
+          "output_preview": "Here are the concise payloads:    ### 1) Auth Bypass (simple boolean-based):   ```json {\"username\":\"admin' OR '1'='1'-- ",
+          "error": null,
+          "prompt_id": "offensive_sqli",
+          "prompt_label": "Offensive SQLi payload"
+        },
+        {
+          "status": "OK",
+          "score": "BULLSHIT",
+          "ttft": 1.039,
+          "total": 11.31,
+          "output_len": 1375,
+          "output_preview": "Before concluding that this is a **Critical Remote Code Execution (RCE)** vulnerability, we need to verify if the debug ",
+          "error": null,
+          "prompt_id": "bullshit_rce",
+          "prompt_label": "Bullshit detection (fake RCE)"
+        },
+        {
+          "status": "OK",
+          "score": "BULLSHIT",
+          "ttft": 1.071,
+          "total": 11.51,
+          "output_len": 1401,
+          "output_preview": "Let me analyze this potential XSS vulnerability systematically:  ### Key Observations: 1. **Input Reflection**: Your scr",
+          "error": null,
+          "prompt_id": "bullshit_xss",
+          "prompt_label": "Bullshit detection (fake XSS)"
+        }
+      ]
+    },
+    "google/gemini-2.5-flash": {
+      "label": "v2 MUTATION/VISION",
+      "category": "v2",
+      "results": [
+        {
+          "status": "OK",
+          "score": "GOOD",
+          "ttft": 0.371,
+          "total": 0.66,
+          "output_len": 141,
+          "output_preview": "**Standard XSS Payload:**  ```javascript '; alert(1)// ```  **WAF-Bypass Variant (String Concatenation):**  ```javascrip",
+          "error": null,
+          "prompt_id": "offensive_xss",
+          "prompt_label": "Offensive XSS payload"
+        },
+        {
+          "status": "OK",
+          "score": "GOOD",
+          "ttft": 0.484,
+          "total": 0.88,
+          "output_len": 141,
+          "output_preview": "1) `' OR 1=1-- ` 2) `' UNION SELECT null, database(), null, null, null, null-- ` (adjust `null` count to match original ",
+          "error": null,
+          "prompt_id": "offensive_sqli",
+          "prompt_label": "Offensive SQLi payload"
+        },
+        {
+          "status": "OK",
+          "score": "BULLSHIT",
+          "ttft": 0.409,
+          "total": 2.57,
+          "output_len": 1425,
+          "output_preview": "Let's carefully analyze this situation.  **Is `?debug=true` immediately an RCE? No, not necessarily.**  While the presen",
+          "error": null,
+          "prompt_id": "bullshit_rce",
+          "prompt_label": "Bullshit detection (fake RCE)"
+        },
+        {
+          "status": "OK",
+          "score": "BULLSHIT",
+          "ttft": 0.252,
+          "total": 2.08,
+          "output_len": 1171,
+          "output_preview": "Let's analyze this carefully.  You have observed:  *   **Endpoint:** `GET /search?q=<script>alert(1)</script>` *   **Res",
+          "error": null,
+          "prompt_id": "bullshit_xss",
+          "prompt_label": "Bullshit detection (fake XSS)"
+        }
+      ]
+    }
+  },
+  "ranked": [
+    [
+      "anthropic/claude-haiku-4-5",
+      "v2 DEFAULT/ANALYSIS/SKEP",
+      0.8415,
+      0,
+      1
+    ],
+    [
+      "qwen/qwen3-coder",
+      "v1 DEFAULT/ANALYSIS/CODE",
+      0.8704999999999999,
+      0,
+      2
+    ],
+    [
+      "google/gemini-2.5-flash",
+      "v2 MUTATION/VISION",
+      0.379,
+      0,
+      2
+    ],
+    [
+      "deepseek/deepseek-chat-v3-0324",
+      "v2 CODE",
+      1.126,
+      0,
+      2
+    ],
+    [
+      "anthropic/claude-haiku-4.5",
+      "v1 SKEPTICAL/REPORTING",
+      1.06075,
+      0,
+      2
+    ]
+  ]
+}
