@@ -11,7 +11,13 @@ info:
 
     **Local deployment only.** No authentication required (access is trusted local/LAN).
     WebSocket endpoints available for real-time scan events and findings.
-  version: 3.4.9-beta
+
+    **Note:** The following endpoints are documented in code but not yet in this spec:
+    - POST /api/tools/model-eval (LLM model evaluation benchmarking)
+    - POST /api/auth/validate (YAML auth configuration validation)
+    - PATCH /api/scans/{scan_id}/auth-config (Update scan authentication)
+    - POST /api/tools/totp-verify (TOTP/2FA verification)
+  version: 3.5.7-beta
   contact:
     name: BugTraceAI
     url: https://bugtraceai.com
