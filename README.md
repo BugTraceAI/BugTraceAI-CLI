@@ -3,6 +3,7 @@
 [![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white)](https://bugtraceai.com)
 [![Wiki Documentation](https://img.shields.io/badge/Wiki%20Documentation-000?logo=wikipedia&logoColor=white)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 ![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)
+![Version](https://img.shields.io/badge/Version-3.5.7--beta-orange)
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Required-blue?logo=docker)
@@ -302,8 +303,14 @@ docker-compose logs -f
 # Resume interrupted scan
 ./bugtraceai-cli scan https://target.com --resume
 
+# Authenticated scan (YAML config with optional TOTP)
+./bugtraceai-cli scan https://target.com --auth-config auth_config.yaml
+
 # Start API server (for Web UI)
 ./bugtraceai-cli serve --port 8000
+
+# Evaluate model performance
+./bugtraceai-cli model_eval --provider openrouter-v2
 ```
 
 **Docker Users:**
@@ -375,6 +382,8 @@ Once connected, your AI assistant can use these tools:
 | `query_findings`  | Retrieve vulnerability findings with filtering        |
 | `stop_scan`       | Stop a running scan gracefully                        |
 | `export_report`   | Get scan report (summary, critical findings, or full) |
+| `explain_finding` | Get detailed explanation and remediation for a finding|
+| `model_eval`      | Evaluate model performance against security benchmarks|
 
 ### Prerequisites
 
@@ -419,6 +428,35 @@ DEFAULT_MODEL = google/gemini-2.0-flash-thinking-exp:free
 SKEPTICAL_MODEL = anthropic/claude-3.5-haiku:beta
 VISION_MODEL = google/gemini-2.0-flash-thinking-exp:free
 ```
+
+### Authenticated Scanning (YAML + TOTP/2FA)
+
+BugTraceAI-CLI supports authenticated scans via a YAML configuration file. This enables scanning login-protected applications with optional TOTP (Time-Based One-Time Password) token generation.
+
+**`auth_config.yaml` example:**
+
+```yaml
+login_url: https://target.com/login
+username: pentester@example.com
+password: your_password_here
+totp_secret: BASE32TOTPSECRETHERE   # optional — for 2FA/TOTP protected logins
+success_condition: "Welcome"        # string that confirms successful login
+```
+
+**Usage:**
+
+```bash
+./bugtraceai-cli scan https://target.com --auth-config auth_config.yaml
+```
+
+The scanner will:
+1. Navigate to `login_url`
+2. Fill in credentials automatically
+3. Generate a TOTP token in real-time if `totp_secret` is provided
+4. Confirm login success via `success_condition`
+5. Reuse the authenticated session across all scan phases
+
+> The `auth_config.yaml` file is automatically included in the report download ZIP for audit traceability.
 
 ## 📊 Output
 
