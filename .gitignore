@@ -117,3 +117,4 @@ bugtrace/data/xss_proven_payloads.json
 
 # Backup files
 *.backup
+AUDIT_P0_FIXES.md
