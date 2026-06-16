@@ -67,11 +67,10 @@ description: |
 
 ## Git and version control
 
-- **Always push to the `origin` remote (private, BugTraceAI-CLI-DEV)**. Never push to `public` (public repo).
 - Stage only the files relevant to the change. Never use `git add .` or `git add -A`.
 - Commit message format: `feat:`, `fix:`, `refactor:`, `test:`, or `chore:` followed by a concise description.
 - Do not include `Co-Authored-By` in commits.
-- The `tests/` directory, secrets, and the Anthropic OAuth Client ID must never be pushed to `public`.
+- The `tests/` directory, secrets, and API keys must never be committed.
 
 ## Performance
 
