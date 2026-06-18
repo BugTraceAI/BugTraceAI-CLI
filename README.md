@@ -88,7 +88,7 @@ BugTraceAI-CLI implements a 6-phase pipeline that mirrors a professional penetra
 
 ### Phase 4: Exploitation
 
-Real tools, real payloads, real results — 14 autonomous specialist agents:
+Real tools, real payloads, real results — 15 autonomous specialist agents:
 
 | Agent                          | Target                                | Method                                                            |
 | ------------------------------ | ------------------------------------- | ----------------------------------------------------------------- |
@@ -106,8 +106,7 @@ Real tools, real payloads, real results — 14 autonomous specialist agents:
 | 💀 **RCEAgent**                | Remote Code Execution                 | Command injection + deserialization testing                       |
 | 📨 **HeaderInjectionAgent**    | Header Injection                      | CRLF injection + response splitting                               |
 | 📦 **MassAssignmentAgent**     | Mass Assignment                       | Parameter pollution + privilege escalation                        |
-| 💀 **KaliAgent**               | Advanced Exploitation                 | Full Kali Linux terminal toolset via MCP (Nmap, Metasploit, etc.) |
-| 🕵️ **ReconAgent**              | Automated Recon                       | Fully automated ReconFTW orchestration for deep reconnaissance    |
+| 📤 **FileUploadAgent**         | Unrestricted File Upload              | Extension/content-type bypass, path-based write to RCE            |
 
 ### Phase 5: Validation
 
@@ -124,7 +123,7 @@ Real tools, real payloads, real results — 14 autonomous specialist agents:
 
 ### Intelligence Systems
 
-- 🔀 **LLM Shifting**: Automatic fallback through model tiers (Gemini → DeepSeek → Claude → Qwen)
+- 🔀 **LLM Shifting**: Automatic fallback through model tiers (Qwen primary → DeepSeek → Claude → Gemini)
 - 🛡️ **WAF Detection**: Identifies Cloudflare, Akamai, AWS WAF, ModSecurity
 - 🎯 **Adaptive Bypass**: Encoding, chunking, and case mixing strategies per WAF type
 - 🛡️ **Ecosystem Robustness**: Built-in circuit breakers for infinite loops, adaptive rate-limiting, and cross-interface (LAN/Remote) compatibility.
@@ -431,9 +430,9 @@ VISION_ENABLED = True
 
 ```ini
 [LLM_MODELS]
-DEFAULT_MODEL = google/gemini-2.0-flash-thinking-exp:free
-SKEPTICAL_MODEL = anthropic/claude-3.5-haiku:beta
-VISION_MODEL = google/gemini-2.0-flash-thinking-exp:free
+DEFAULT_MODEL = qwen/qwen3-coder
+SKEPTICAL_MODEL = anthropic/claude-haiku-4.5
+VISION_MODEL = google/gemini-3-flash-preview
 ```
 
 ### Authenticated Scanning (YAML + TOTP/2FA)
