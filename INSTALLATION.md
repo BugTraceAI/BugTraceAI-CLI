@@ -60,9 +60,6 @@ nano .env  # Add your OPENROUTER_API_KEY
 
 # Or start the API server
 ./bugtraceai-cli serve --port 8000
-
-# Evaluate model performance
-./bugtraceai-cli model_eval --provider openrouter-v2
 ```
 
 ### Pros & Cons

@@ -9,12 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.5.7-beta] - 2026-06-15
 
-### Added
-- **Model Evaluation Tool** - New specialized tool for evaluating LLM performance across different models
-  - Compares Haiku 4.5, Sonnet 4, and OpenRouter v2 performance metrics
-  - Generates `model_eval_results.json` with detailed benchmarking data
-  - Helps optimize model selection for different vulnerability types
-
 ### Changed
 - **Agent Architecture Improvements** - Refined model migration to v2 across all agent slots
   - All specialist agents now use consistent model assignment

@@ -37,7 +37,6 @@ The core philosophy is **"Think like a pentester, execute like a machine, valida
 
 - **YAML Authentication + TOTP**: `--auth-config` loads login flows, credentials, environment-variable substitutions, and optional TOTP/2FA secrets for authenticated scans.
 - **Scan Resumption**: `--resume` and recoverable scan state tracking allow interrupted scans to continue without losing context or duplicating completed work.
-- **Model Evaluation Tool**: `tools/model_eval.py` benchmarks configured OpenRouter models and writes ranked results to `tools/model_eval_results.json`.
 - **Lifecycle Reliability**: scan origin tracking, orphan cleanup, smart delete behavior, and safer resume state transitions improve WEB/CLI coordination.
 
 ## 🚨 Disclaimer
@@ -314,9 +313,6 @@ docker-compose logs -f
 
 # Start API server (for Web UI)
 ./bugtraceai-cli serve --port 8000
-
-# Evaluate model performance
-python tools/model_eval.py
 ```
 
 **Docker Users:**
@@ -389,7 +385,6 @@ Once connected, your AI assistant can use these tools:
 | `stop_scan`       | Stop a running scan gracefully                        |
 | `export_report`   | Get scan report (summary, critical findings, or full) |
 | `explain_finding` | Get detailed explanation and remediation for a finding|
-| `model_eval`      | Evaluate model performance against security benchmarks|
 
 ### Prerequisites
 
