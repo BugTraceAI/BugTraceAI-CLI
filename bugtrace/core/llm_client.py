@@ -214,6 +214,8 @@ class LLMClient:
         self.provider_id = settings.PROVIDER
         api_key_env = provider_cfg.get('api_key_env', 'OPENROUTER_API_KEY')
         self.api_key = api_key or os.environ.get(api_key_env) or settings.OPENROUTER_API_KEY
+        if not self.api_key and provider_cfg.get('api_key_optional', False):
+            self.api_key = "ollama"
         self.base_url = provider_cfg.get('base_url', "https://openrouter.ai/api/v1/chat/completions")
         self.req_count = 0
 
@@ -226,7 +228,7 @@ class LLMClient:
             logger.critical("No PRIMARY_MODELS found in configuration. Please check bugtraceaicli.conf.")
             self.models = []
 
-        if not self.api_key:
+        if not self.api_key and not provider_cfg.get('api_key_optional', False):
             logger.warning(f"{api_key_env} is not set. LLM features will be disabled.")
 
         # Anthropic OAuth token cache (lazy-loaded on first anthropic/ model call)
@@ -777,7 +779,9 @@ class LLMClient:
         """
         # No global semaphore - each agent runs independently
         # Rate limiting handled by retry with exponential backoff (tenacity)
-        if not self.api_key and not settings.ANTHROPIC_OAUTH_ENABLED:
+        provider_cfg = getattr(settings, '_provider_config', {})
+        provider_optional = provider_cfg.get('api_key_optional', False)
+        if not self.api_key and not provider_optional and not settings.ANTHROPIC_OAUTH_ENABLED:
             logger.warning(f"LLM Client: No API Key found for {module_name}. Skipping generation.")
             await self._audit_log(module_name, "NONE", prompt, "SKIPPED: Missing API Key")
             return None
@@ -1121,7 +1125,9 @@ class LLMClient:
         from bugtrace.core.conversation_thread import ConversationThread
 
         # No global semaphore - each agent runs independently
-        if not self.api_key:
+        provider_cfg = getattr(settings, '_provider_config', {})
+        provider_optional = provider_cfg.get('api_key_optional', False)
+        if not self.api_key and not provider_optional:
             logger.warning(f"LLM Client: No API Key for {module_name}")
             return None
 

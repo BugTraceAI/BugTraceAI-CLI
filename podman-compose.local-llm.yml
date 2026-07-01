@@ -1,0 +1,14 @@
+# Run with: podman-compose -f podman-compose.local-llm.yml up -d
+# Or Docker: docker compose -f podman-compose.local-llm.yml up -d
+services:
+  ollama:
+    image: docker.io/ollama/ollama:latest
+    container_name: bugtrace_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama-models:

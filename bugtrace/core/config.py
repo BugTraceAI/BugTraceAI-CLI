@@ -20,7 +20,7 @@ VALID_PROVIDERS = [
     'google', 'openai', 'anthropic', 'meta', 'mistral',
     'qwen', 'deepseek', 'x-ai', 'cohere', 'perplexity',
     'nvidia', 'ai21', 'together', 'fireworks', 'groq',
-    'moonshotai',
+    'moonshotai', 'local',
 ]
 
 # Placeholder values that should be rejected
@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     # --- API Keys (Secrets) with validation (TASK-118) ---
     OPENROUTER_API_KEY: Optional[str] = Field(default=None, min_length=32, description="OpenRouter API key")
     GLM_API_KEY: Optional[str] = Field(default=None, min_length=20, description="GLM API key")
+    LOCAL_LLM_API_KEY: Optional[str] = Field(default="ollama", description="Local LLM API key (optional)")
     
     # --- LLM Models ---
     DEFAULT_MODEL: str = "qwen/qwen3-coder"
@@ -231,7 +232,9 @@ class Settings(BaseSettings):
             return v  # Allow empty for optional models
         # OpenRouter format: provider/model-name
         if '/' not in v:
-            raise ValueError(f"Invalid model name format: {v} (expected: provider/model)")
+            if ':' in v or re.match(r'^[a-zA-Z0-9_\-\.]+$', v):
+                return v
+            raise ValueError(f"Invalid model name format: {v} (expected: provider/model or local model name)")
         provider, model = v.split('/', 1)
         # Warn about unknown providers (don't fail - new providers may appear)
         if provider not in VALID_PROVIDERS:
@@ -249,8 +252,11 @@ class Settings(BaseSettings):
             return v
         models = [m.strip() for m in v.split(',')]
         for model in models:
-            if model and '/' not in model:
-                raise ValueError(f"Invalid model in list: {model} (expected: provider/model)")
+            if model:
+                if '/' not in model:
+                    if ':' in model or re.match(r'^[a-zA-Z0-9_\-\.]+$', model):
+                        continue
+                    raise ValueError(f"Invalid model in list: {model} (expected: provider/model or local model name)")
         return v
 
     @field_validator('QUEUE_PERSISTENCE_MODE')
@@ -535,6 +541,11 @@ class Settings(BaseSettings):
             return
 
         self._provider_config = preset
+
+        # Override base_url if LOCAL_LLM_BASE_URL is set in environment
+        if self.PROVIDER == "local-llm" and os.environ.get("LOCAL_LLM_BASE_URL"):
+            preset["base_url"] = os.environ.get("LOCAL_LLM_BASE_URL")
+            logger.info(f"Using local LLM base_url override from env: {preset['base_url']}")
 
         # Apply model defaults from preset
         models = preset.get("models", {})
@@ -882,7 +893,8 @@ class Settings(BaseSettings):
         provider_cfg = getattr(self, '_provider_config', {})
         provider_key_env = provider_cfg.get("api_key_env", "OPENROUTER_API_KEY")
         provider_key = getattr(self, provider_key_env, None) or os.environ.get(provider_key_env)
-        if not provider_key:
+        provider_optional = provider_cfg.get("api_key_optional", False)
+        if not provider_key and not provider_optional:
             errors.append(f"{provider_key_env} is required for provider '{self.PROVIDER}'")
 
         # Check numeric bounds
@@ -931,7 +943,7 @@ class Settings(BaseSettings):
     def mask_secrets(self) -> Dict[str, Any]:
         """Return config dict with masked secrets for safe logging."""
         masked = self.model_dump()
-        secret_fields = ['OPENROUTER_API_KEY', 'GLM_API_KEY']
+        secret_fields = ['OPENROUTER_API_KEY', 'GLM_API_KEY', 'LOCAL_LLM_API_KEY']
         for key in secret_fields:
             if masked.get(key):
                 val = masked[key]

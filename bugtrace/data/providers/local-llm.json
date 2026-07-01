@@ -1,0 +1,39 @@
+{
+    "id": "local-llm",
+    "name": "Local LLM (Ollama / llama.cpp / vLLM)",
+    "base_url": "http://localhost:11434/v1/chat/completions",
+    "api_key_env": "LOCAL_LLM_API_KEY",
+    "api_key_optional": true,
+    "api_key_hint": "ollama (any string, or leave empty)",
+    "features": {
+        "description": "Any OpenAI-compatible local inference server. Works with Ollama, llama.cpp-server, vLLM. Runs under Docker, Podman, or bare metal.",
+        "online_mode": false,
+        "balance_check": false,
+        "model_discovery": false,
+        "local": true
+    },
+    "models": {
+        "DEFAULT_MODEL":               "qwen2.5-coder:7b",
+        "CODE_MODEL":                  "qwen2.5-coder:7b",
+        "ANALYSIS_MODEL":              "qwen2.5-coder:7b",
+        "ANALYSIS_PENTESTER_MODEL":    "qwen2.5-coder:7b",
+        "ANALYSIS_BUG_BOUNTY_MODEL":   "qwen2.5-coder:7b",
+        "ANALYSIS_AUDITOR_MODEL":      "qwen2.5-coder:7b",
+        "ANALYSIS_RED_TEAM_MODEL":     "qwen2.5-coder:7b",
+        "ANALYSIS_RESEARCHER_MODEL":   "qwen2.5-coder:7b",
+        "PRIMARY_MODELS":              "qwen2.5-coder:7b",
+        "VISION_MODEL":                "qwen2.5-coder:7b",
+        "WAF_DETECTION_MODELS":        "qwen2.5-coder:7b",
+        "MUTATION_MODEL":              "qwen2.5-coder:7b",
+        "SKEPTICAL_MODEL":             "qwen2.5-coder:7b",
+        "REPORTING_MODEL":             "qwen2.5-coder:7b",
+        "VALIDATION_VISION_MODEL":     "qwen2.5-coder:7b",
+        "LONEWOLF_MODEL":              "qwen2.5-coder:7b"
+    },
+    "concurrency": {
+        "default": 2
+    },
+    "pricing": {
+        "qwen2.5-coder:7b": { "input": 0.0, "output": 0.0 }
+    }
+}
