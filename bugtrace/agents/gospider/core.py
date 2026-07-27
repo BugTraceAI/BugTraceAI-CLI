@@ -230,7 +230,10 @@ SCRIPT_SRC_PATTERN = re.compile(
     r"<script\b[^>]*\bsrc\s*=\s*([\"'])(.*?)\1",
     re.IGNORECASE | re.DOTALL,
 )
-JS_STRING_LITERAL = r"(?P<quote>[\"'`])(?P<url>(?:\\.|(?!(?P=quote)).)*)(?P=quote)"
+# NOTE: the second alternative excludes backslash ([^\\], not `.`) so it never overlaps
+# with `\\.` — an overlapping `.` here caused catastrophic backtracking (ReDoS) that hung
+# the event loop on minified JS with long/unbalanced quoted strings.
+JS_STRING_LITERAL = r"(?P<quote>[\"'`])(?P<url>(?:\\.|(?!(?P=quote))[^\\])*)(?P=quote)"
 JS_ENDPOINT_PATTERNS = (
     re.compile(r"\bfetch\s*\(\s*" + JS_STRING_LITERAL, re.IGNORECASE),
     re.compile(r"\baxios\s*\.\s*(?:get|post|put|patch|delete|head|options)\s*\(\s*" + JS_STRING_LITERAL, re.IGNORECASE),
