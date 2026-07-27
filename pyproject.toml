@@ -1,0 +1,167 @@
+[project]
+name = "bugtraceai-cli"
+dynamic = ["version"]
+description = "AI-Driven Professional Penetration Testing Framework - Autonomous offensive security scanner with LLM-powered analysis"
+authors = [
+    { name = "BugTraceAI Team", email = "hello@bugtraceai.com" }
+]
+license = { text = "AGPL-3.0" }
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["security", "penetration-testing", "vulnerability-scanning", "bug-bounty", "ai-driven"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: System :: Networking",
+]
+
+# Core runtime dependencies
+dependencies = [
+    # CLI Framework
+    "typer>=0.9.0,<1.0",
+    "rich>=13.0.0,<14.0",
+    
+    # HTTP & Async
+    "httpx>=0.25.0,<1.0",
+    "aiohttp>=3.9.0,<4.0",
+    "aiofiles>=23.0.0,<25.0",
+    
+    # Configuration
+    "pydantic>=2.0.0,<3.0",
+    "pydantic-settings>=2.0.0,<3.0",
+    "python-dotenv>=1.0.0,<2.0",
+    
+    # Logging
+    "loguru>=0.7.0,<1.0",
+    
+    # Database
+    "sqlmodel>=0.0.16,<1.0",
+    "sqlalchemy>=2.0.0,<3.0",
+    "sqlparse>=0.4.4,<1.0",
+    
+    # LLM Providers
+    "openai>=1.0.0,<3.0",
+    "google-generativeai>=0.8.0,<1.0",
+    
+    # Security
+    "PyJWT>=2.8.0,<3.0",
+    "cryptography>=41.0.0,<47.0",
+    
+    # Browser Automation (XSS validation)
+    "playwright>=1.40.0,<2.0",
+    
+    # Web API Framework
+    "fastapi>=0.100.0,<1.0",
+    "uvicorn>=0.20.0,<1.0",
+    "websockets>=12.0,<17.0",
+    
+    # MCP (AI Assistant Integration)
+    "mcp>=1.20.0,<2.0",
+    
+    # Vector DB (Embeddings / Cross-scan learning)
+    "lancedb>=0.4.0,<1.0",
+    
+    # Templates & Markdown
+    "jinja2>=3.1.0,<4.0",
+    "markdown>=3.5.0,<4.0",
+    
+    # Parsing & Utilities
+    "beautifulsoup4>=4.12.0,<5.0",
+    "PyYAML>=6.0.0,<7.0",
+    "tenacity>=8.0.0,<10.0",
+    "filelock>=3.12.0,<4.0",
+    "networkx>=3.0,<4.0",
+    "psutil>=5.9.0,<7.0",
+    
+    # Observability
+    "opentelemetry-api>=1.20.0,<2.0",
+    "opentelemetry-sdk>=1.20.0,<2.0",
+    
+    # ML / Embeddings (CPU-only PyTorch to keep size small)
+    # Note: PyTorch must be installed before sentence-transformers
+    "torch>=2.0.0",
+    "sentence-transformers>=2.0.0,<6.0",
+]
+
+# Optional dependencies for development
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0,<10.0",
+    "pytest-asyncio>=0.21.0,<2.0",
+    "pytest-cov>=4.0.0,<5.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/BugTraceAI/BugTraceAI-CLI"
+Documentation = "https://deepwiki.com/BugTraceAI/BugTraceAI-CLI"
+Repository = "https://github.com/BugTraceAI/BugTraceAI-CLI.git"
+Issues = "https://github.com/BugTraceAI/BugTraceAI-CLI/issues"
+
+[project.scripts]
+bugtrace = "bugtrace.__main__:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["bugtrace*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "bugtrace.__version__" }
+
+# Tooling configuration for development
+[tool.black]
+line-length = 120
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+exclude = '''
+    /(
+        \.git
+      | \.hg
+      | \.mypy_cache
+      | \.tox
+      | \.venv
+      | _build
+      | buck-out
+      | build
+      | dist
+    )/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 120
+py_version = 310
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Too strict for initial setup
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+markers = [
+    "integration: integration tests (requires Docker, full setup)",
+    "unit: unit tests (fast, no external dependencies)",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

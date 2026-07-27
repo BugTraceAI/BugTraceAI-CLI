@@ -1,0 +1,57 @@
+# BugTraceAI-CLI MCP Server Dockerfile
+# Exposes BugTraceAI scanning capabilities via MCP
+
+FROM python:3.11-slim
+
+LABEL maintainer="BugTraceAI Team"
+LABEL description="BugTraceAI-CLI MCP Server for AI assistant integration"
+LABEL version="1.0.0"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install MCP dependencies
+RUN pip install --no-cache-dir \
+    mcp[cli]>=1.0.0 \
+    fastmcp>=0.1.0
+
+# Copy the bugtrace package
+COPY bugtrace/ ./bugtrace/
+COPY alembic/ ./alembic/
+COPY alembic.ini .
+COPY pyproject.toml .
+COPY README.md .
+
+# Install the package
+RUN pip install --no-cache-dir -e .
+
+# Create directories for scans and reports
+RUN mkdir -p /app/scans /app/reports /app/logs
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+ENV MCP_PORT=8001
+ENV OUTPUT_DIR=/app/reports
+
+# Expose MCP SSE port
+EXPOSE 8001
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -sS -m 2 http://localhost:8001/sse >/dev/null; res=$?; [ $res -eq 0 ] || [ $res -eq 28 ] || exit 1
+
+# Default entrypoint - run BugTraceAI MCP server in SSE mode
+ENTRYPOINT ["bugtrace"]
+CMD ["mcp", "--sse", "--host", "0.0.0.0", "--port", "8001"]

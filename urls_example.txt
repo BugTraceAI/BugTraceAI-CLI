@@ -1,0 +1,8 @@
+# Test URLs for example.com
+https://example.com/
+https://example.com/login
+https://example.com/search?q=test
+https://example.com/api/users?id=1
+https://example.com/page?p=home&lang=en
+https://example.com/products?category=all
+https://example.com/contact?ref=footer

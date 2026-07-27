@@ -1,0 +1,32 @@
+{
+  "_comment": "Infrastructure cookies that should NOT be tested for SQL injection. These are set by load balancers, CDNs, and cloud providers - not by the application.",
+  "cookies": [
+    "awsalb",
+    "awsalbcors",
+    "awsalbtg",
+    "awsalbtgcors",
+    "__cfduid",
+    "__cf_bm",
+    "cf_clearance",
+    "cf_chl_prog",
+    "cf_chl_seq",
+    "rt",
+    "aka_a2",
+    "bm_sz",
+    "bm_sv",
+    "ak_bmsc",
+    "gclb",
+    "arraffinity",
+    "arraffinitysamesite",
+    "_lb",
+    "_lb_id",
+    "lb-cookie",
+    "serverid",
+    "server-id"
+  ],
+  "prefixes": [
+    "aws",
+    "__cf",
+    "aka_"
+  ]
+}

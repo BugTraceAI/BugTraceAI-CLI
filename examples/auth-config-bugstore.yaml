@@ -1,0 +1,14 @@
+authentication:
+  # BugStore Secure Portal — TOTP/2FA authenticated scan
+  # User: admin2fa (role: admin, 2FA enabled)
+  # Endpoint: POST /api/secure-portal/login
+  #   fields: username, password, totp_code (generated from totp_secret)
+  login_type: api
+  login_url: "https://bugstore.bugtraceai.com/api/secure-portal/login"
+  credentials:
+    username: "admin2fa"
+    password: "admin2fa123"
+    totp_secret: "JBSWY3DPEHPK3PXP"
+  success_condition:
+    type: text_contains
+    value: "access_token"

@@ -1,0 +1,39 @@
+{
+    "id": "anthropic",
+    "name": "Anthropic",
+    "api_format": "anthropic",
+    "base_url": "https://api.anthropic.com/v1/messages",
+    "api_key_env": "ANTHROPIC_API_KEY",
+    "api_key_hint": "sk-ant-...",
+    "failover": [],
+    "features": {
+        "description": "Anthropic direct API (Messages API) using an Anthropic API key (x-api-key). Single-provider option — all slots run on Claude Haiku 4.5. No OpenRouter dependency.",
+        "online_mode": false,
+        "balance_check": false,
+        "model_discovery": false
+    },
+    "models": {
+        "DEFAULT_MODEL": "claude-haiku-4-5-20251001",
+        "CODE_MODEL": "claude-haiku-4-5-20251001",
+        "ANALYSIS_MODEL": "claude-haiku-4-5-20251001",
+        "ANALYSIS_PENTESTER_MODEL": "claude-haiku-4-5-20251001",
+        "ANALYSIS_BUG_BOUNTY_MODEL": "claude-haiku-4-5-20251001",
+        "ANALYSIS_AUDITOR_MODEL": "claude-haiku-4-5-20251001",
+        "ANALYSIS_RESEARCHER_MODEL": "claude-haiku-4-5-20251001",
+        "PRIMARY_MODELS": "claude-haiku-4-5-20251001",
+        "VISION_MODEL": "claude-haiku-4-5-20251001",
+        "WAF_DETECTION_MODELS": "claude-haiku-4-5-20251001",
+        "MUTATION_MODEL": "claude-haiku-4-5-20251001",
+        "SKEPTICAL_MODEL": "claude-haiku-4-5-20251001",
+        "REPORTING_MODEL": "claude-haiku-4-5-20251001",
+        "VALIDATION_VISION_MODEL": "claude-haiku-4-5-20251001",
+        "LONEWOLF_MODEL": "claude-sonnet-4-6"
+    },
+    "concurrency": {
+        "claude-haiku-4-5-20251001": 4,
+        "default": 2
+    },
+    "pricing": {
+        "claude-haiku-4-5-20251001": { "input": 1.00, "output": 5.00 }
+    }
+}
