@@ -4,6 +4,7 @@ Finding processing: normalization, deduplication, categorization, enrichment dat
 All functions are PURE unless marked otherwise.
 """
 
+import re
 from collections import defaultdict
 from typing import Dict, List, Optional
 
@@ -252,6 +253,60 @@ _CSTI_UPGRADE_MAP = {
 
 
 # PURE
+def upgrade_payload(payload: str, vuln_type: str) -> Optional[str]:
+    """Return the visual-PoC upgrade of a silent payload, or None if none applies.
+
+    Single source of truth for the silent → visual "HACKED BY BUGTRACEAI" transform,
+    shared by the reporting upgrade pass (`upgrade_finding_payloads`) and the XSS
+    proof-screenshot capture (`XSSAgentV4._capture_proof_screenshot`). Keeping it
+    here — next to the maps — avoids a second copy of the transform in the agent.
+    """
+    if not payload:
+        return None
+    vt = (vuln_type or "").upper()
+
+    if vt in ("XSS", "DOM-XSS", "REFLECTED_XSS", "STORED_XSS"):
+        upgrade_map = _PAYLOAD_UPGRADE_MAP
+    elif vt in ("CSTI", "SSTI"):
+        upgrade_map = _CSTI_UPGRADE_MAP
+    else:
+        return None
+
+    # Exact match first
+    new_payload = upgrade_map.get(payload)
+
+    # Substring fallback (e.g. an LLM-built payload wrapping document.title=..., or
+    # a confirmed XSS proven via an alert() canary).
+    if not new_payload:
+        if vt in ("XSS", "DOM-XSS", "REFLECTED_XSS", "STORED_XSS") and "HACKED BY BUGTRACEAI" not in payload:
+            banner_block = "{" + _VISUAL_BANNER_JS + "}"
+            if "document.title=document.domain" in payload:
+                new_payload = payload.replace("document.title=document.domain", banner_block)
+            elif "alert(document.domain)" in payload:
+                new_payload = payload.replace("alert(document.domain)", banner_block)
+            else:
+                # Confirmed XSS proven via an alert() canary, e.g.
+                # `onerror=alert('BUGTRACEAI_7x7')`: swap the alert call for the
+                # visible banner so the proof screenshot shows real impact instead
+                # of a fired-and-dismissed dialog. Validated on BugStore that the
+                # banner renders in <img>/<svg> attribute contexts (quoted and
+                # unquoted). Match our own BUGTRACEAI canary only — never a
+                # user/site alert — and upgrade the first occurrence.
+                m = re.search(r"alert\(\s*['\"`]?BUGTRACEAI[^)]*\)", payload)
+                if m:
+                    new_payload = payload[:m.start()] + banner_block + payload[m.end():]
+        elif vt in ("CSTI", "SSTI"):
+            for silent, visual in _CSTI_UPGRADE_MAP.items():
+                if silent in payload:
+                    new_payload = payload.replace(silent, visual)
+                    break
+
+    if new_payload and new_payload != payload:
+        return new_payload
+    return None
+
+
+# PURE
 def upgrade_finding_payloads(findings: List[Dict]) -> List[Dict]:
     """
     Upgrade silent/technical payloads to visual PoC equivalents for reports.
@@ -268,37 +323,7 @@ def upgrade_finding_payloads(findings: List[Dict]) -> List[Dict]:
         if not payload:
             continue
 
-        upgrade_map = {}
-        if vuln_type in ("XSS", "DOM-XSS", "REFLECTED_XSS", "STORED_XSS"):
-            upgrade_map = _PAYLOAD_UPGRADE_MAP
-        elif vuln_type in ("CSTI", "SSTI"):
-            upgrade_map = _CSTI_UPGRADE_MAP
-
-        if not upgrade_map:
-            continue
-
-        # Check for exact match first
-        new_payload = upgrade_map.get(payload)
-
-        # If no exact match, check by substring (e.g. "document.title=document.domain")
-        if not new_payload:
-            if vuln_type in ("XSS", "DOM-XSS", "REFLECTED_XSS", "STORED_XSS"):
-                if "document.title=document.domain" in payload:
-                    # Derive visual payload from the original by replacing the action
-                    new_payload = payload.replace(
-                        "document.title=document.domain",
-                        "{" + _VISUAL_BANNER_JS + "}"
-                    )
-                elif "alert(document.domain)" in payload and "HACKED BY BUGTRACEAI" not in payload:
-                    new_payload = payload.replace(
-                        "alert(document.domain)",
-                        "{" + _VISUAL_BANNER_JS + "}"
-                    )
-            elif vuln_type in ("CSTI", "SSTI"):
-                for silent, visual in _CSTI_UPGRADE_MAP.items():
-                    if silent in payload:
-                        new_payload = payload.replace(silent, visual)
-                        break
+        new_payload = upgrade_payload(payload, vuln_type)
 
         if new_payload and new_payload != payload:
             # Preserve original for traceability

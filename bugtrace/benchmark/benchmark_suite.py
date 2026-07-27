@@ -394,7 +394,8 @@ class BenchmarkSuite:
         # Mark agent features as tested (would check event logs in production)
         features_tested["asset_discovery"] = True
         features_tested["api_security"] = True
-        features_tested["chain_discovery"] = True
+        # chain_discovery stays False: the ChainDiscoveryAgent is disabled in the
+        # orchestrator, so it is never exercised — do not report it as tested.
 
     def _calculate_coverage_percentage(self, completeness_results: Dict):
         """Calculate feature coverage percentage."""

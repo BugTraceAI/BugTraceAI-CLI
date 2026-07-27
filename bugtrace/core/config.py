@@ -172,6 +172,14 @@ class Settings(BaseSettings):
     EMBEDDINGS_MANUAL_REVIEW_THRESHOLD: float = 0.60  # Flag for manual review
     EMBEDDINGS_LOG_CONFIDENCE: bool = True  # Log classification confidence scores
 
+    # --- Semantic Dedup (in-scan near-duplicate collapse via bge embeddings) ---
+    # Second, OPTIONAL dedup pass AFTER the exact-string key cache: collapses
+    # near-duplicate findings the key missed (e.g. "Reflected XSS" vs "XSS",
+    # "q" vs "query"), within the SAME specialist only, keeping the stronger
+    # finding. Additive precision lever — zero behaviour change while OFF.
+    SEMANTIC_DEDUP_ENABLED: bool = False  # Default OFF (skipped entirely on mock model)
+    SEMANTIC_DEDUP_THRESHOLD: float = 0.92  # Cosine sim >= this => near-duplicate (high = only true dups)
+
     # --- Worker Pool Configuration (Phase 19: v2.3) ---
     WORKER_POOL_DEFAULT_SIZE: int = 5  # Default workers per specialist
     WORKER_POOL_XSS_SIZE: int = 8  # XSS-specific (high volume)

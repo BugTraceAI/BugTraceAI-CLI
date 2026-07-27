@@ -288,31 +288,30 @@ def find_matching_templates(
 # =============================================================================
 
 def step_execute_and_validate(step_name: str, guidance: Dict) -> Dict:  # PURE
-    """Execute step action and validate success (simulated).
+    """Record an LLM-proposed chain step (NOT executed).
+
+    This agent generates LLM *guidance* for each step but does not actually
+    execute the exploitation, so it cannot confirm success. Returning a
+    fabricated success here previously caused chains to be reported as
+    "FULL IMPACT ACHIEVED" / emitted as `chain_exploited` with no real
+    exploitation. Until real step execution exists (see the chain-discovery
+    revival plan), report steps as unverified so no fabricated
+    chain-exploitation is ever emitted. code = truth.
 
     Args:
         step_name: Name of exploitation step
         guidance: LLM guidance dict
 
     Returns:
-        Result dict with success/failure
+        Result dict, always success=False/verified=False (honest, unexecuted)
     """
-    # Simulate success based on vulnerability type
-    simulated_success = step_name in ["SQLi", "XSS", "IDOR", "SSRF", "JWT Analysis"]
-
-    if simulated_success:
-        return {
-            "success": True,
-            "step": step_name,
-            "action": guidance.get("action"),
-            "result": "Exploitation successful (simulated)",
-        }
-    else:
-        return {
-            "success": False,
-            "step": step_name,
-            "error": "Exploitation failed - protection detected",
-        }
+    return {
+        "success": False,
+        "verified": False,
+        "step": step_name,
+        "action": guidance.get("action"),
+        "result": "Step guidance generated but not executed (unverified — no fabricated success)",
+    }
 
 
 def step_build_error(step_name: str, error: Exception) -> Dict:  # PURE

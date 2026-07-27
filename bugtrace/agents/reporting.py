@@ -3366,11 +3366,18 @@ class ReportingAgent(BaseAgent):
         src = finding.get("screenshot_path")
         if not src:
             return
-        if not Path(src).exists():
+        # screenshot_path is stored RELATIVE to the report dir (so the WEB can fetch
+        # it via the API file route). Resolve it against the report dir before the
+        # existence check — otherwise a relative path is tested against the process
+        # CWD, silently no-ops the copy, and leaves a broken captures/<name> link.
+        src_path = Path(src)
+        if not src_path.is_absolute():
+            src_path = captures_dir.parent / src
+        if not src_path.exists():
             return
 
         try:
-            shutil.copy(src, captures_dir / Path(src).name)
+            shutil.copy(src_path, captures_dir / src_path.name)
         except Exception as e:
             logger.debug(f"Could not copy screenshot {src}: {e}")
 

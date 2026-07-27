@@ -1288,6 +1288,12 @@ class ThinkingConsolidationAgent(BaseAgent):
                 self._stats.setdefault("unclassified", 0)
                 self._stats["unclassified"] += 1
 
+        # Optional SECOND-pass semantic dedup (default OFF). Collapses near-dup
+        # findings the exact-key cache missed, within the same specialist only.
+        # Additive precision lever; falls back to the exact-key result on any error.
+        if settings.SEMANTIC_DEDUP_ENABLED and len(prioritized_batch) > 1:
+            prioritized_batch = self._semantic_dedup_batch(prioritized_batch)
+
         # Sort by priority (highest first) for optimal specialist utilization
         prioritized_batch.sort(key=lambda p: p.priority, reverse=True)
 
@@ -1299,6 +1305,101 @@ class ThinkingConsolidationAgent(BaseAgent):
                 await self._emit_work_queued_event(prioritized)
 
         logger.info(f"[{self.name}] Batch complete: {len(prioritized_batch)} distributed")
+
+    @staticmethod
+    def _finding_strength(pf: "PrioritizedFinding") -> tuple:
+        """Rank a finding for merge survival: validated > fp_confidence > priority.
+
+        Used so the semantic merge always KEEPS the stronger of two near-dups and
+        drops the weaker — never the other way around.
+        """
+        f = pf.finding
+        validated = 1 if (f.get("validated") or f.get("probe_validated")) else 0
+        try:
+            fp_conf = float(f.get("fp_confidence", 0.5) or 0.5)
+        except (TypeError, ValueError):
+            fp_conf = 0.5
+        return (validated, fp_conf, pf.priority)
+
+    def _semantic_dedup_batch(
+        self, prioritized_batch: List["PrioritizedFinding"]
+    ) -> List["PrioritizedFinding"]:
+        """Collapse near-duplicate findings within a batch using semantic similarity.
+
+        A second, OPTIONAL pass AFTER the exact-string key dedup: findings that are
+        semantically equivalent but escaped the `type:parameter:url_path` key (e.g.
+        "Reflected XSS" vs "XSS", "q" vs "query") are merged. This is a PRECISION
+        lever only — it never merges across specialists and always keeps the
+        stronger finding, so it cannot drop a distinct confirmed vuln. Recall when
+        ON is threshold-dependent, NOT guaranteed by construction: gate it ON only
+        after a BugStore A/B proves the confirmed-vuln set is unchanged.
+
+        Safety: skipped entirely on the mock embedding model (random vectors →
+        random merges), and wrapped so ANY failure returns the input list
+        unchanged (a dedup failure must never drop findings or crash the phase).
+        """
+        if len(prioritized_batch) < 2:
+            return prioritized_batch
+        try:
+            from bugtrace.core.embeddings import EmbeddingManager
+            from bugtrace.core.semantic import build_finding_semantic_text, cosine
+
+            manager = EmbeddingManager.get_instance()
+            if not manager.is_real_model:
+                logger.debug(f"[{self.name}] Semantic dedup skipped: mock embedding model")
+                return prioritized_batch
+
+            threshold = settings.SEMANTIC_DEDUP_THRESHOLD
+
+            # Encode once per finding (skip those with no usable text)
+            vectors: Dict[int, Any] = {}
+            for idx, pf in enumerate(prioritized_batch):
+                text = build_finding_semantic_text(pf.finding)
+                if not text:
+                    continue
+                vec = manager.encode_query(text)
+                if vec is not None:
+                    vectors[idx] = vec
+
+            dropped: set = set()
+            n = len(prioritized_batch)
+            for i in range(n):
+                if i in dropped or i not in vectors:
+                    continue
+                for j in range(i + 1, n):
+                    if j in dropped or j not in vectors:
+                        continue
+                    # Never merge across specialist/type — different queues, different work
+                    if prioritized_batch[i].specialist != prioritized_batch[j].specialist:
+                        continue
+                    sim = cosine(vectors[i], vectors[j])
+                    if sim < threshold:
+                        continue
+                    # Keep the stronger finding, drop the weaker
+                    if self._finding_strength(prioritized_batch[i]) >= self._finding_strength(prioritized_batch[j]):
+                        weaker, stronger = j, i
+                    else:
+                        weaker, stronger = i, j
+                    dropped.add(weaker)
+                    self._stats["semantic_duplicates_filtered"] = (
+                        self._stats.get("semantic_duplicates_filtered", 0) + 1
+                    )
+                    logger.info(
+                        f"[{self.name}] Semantic dedup: merged "
+                        f"{prioritized_batch[weaker].finding.get('type')}/"
+                        f"{prioritized_batch[weaker].finding.get('parameter')} into "
+                        f"{prioritized_batch[stronger].finding.get('type')}/"
+                        f"{prioritized_batch[stronger].finding.get('parameter')} "
+                        f"(sim={sim:.3f} >= {threshold})"
+                    )
+                    if weaker == i:
+                        break  # i is gone; advance the outer loop
+            if not dropped:
+                return prioritized_batch
+            return [pf for idx, pf in enumerate(prioritized_batch) if idx not in dropped]
+        except Exception as e:
+            logger.warning(f"[{self.name}] Semantic dedup failed, using exact-key result: {e}")
+            return prioritized_batch
 
     async def flush_batch(self) -> int:
         """

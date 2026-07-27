@@ -38,12 +38,13 @@ from bugtrace.agents.chain_discovery.core import (
 
 class ChainDiscoveryAgent(BaseAgent):
     """
-    Discovers and exploits multi-step vulnerability chains.
+    Correlates confirmed findings into candidate multi-step attack chains.
 
-    Uses NetworkX graph to model:
-    - Nodes: Vulnerabilities, Resources, States
-    - Edges: Exploitation paths, Dependencies
-    - Weights: Difficulty, Impact, Likelihood
+    Currently DISABLED in the orchestrator (team.py) and does not run during
+    scans. Findings are modelled as graph NODES only — no exploitation edges
+    or weights are added yet, and chain steps are NOT executed (steps are
+    reported as unverified, never as fabricated success). Reviving this into
+    real, evidence-backed chain discovery is a scoped feature, not a bugfix.
     """
 
     def __init__(self, event_bus=None):
@@ -253,7 +254,7 @@ class ChainDiscoveryAgent(BaseAgent):
         from bugtrace.core.ui import dashboard
 
         exploit_log = []
-        success = True
+        success = bool(chain)  # empty chain must NEVER report success (no fabrication)
 
         for i, step in enumerate(chain):
             step_name = step.get("step")

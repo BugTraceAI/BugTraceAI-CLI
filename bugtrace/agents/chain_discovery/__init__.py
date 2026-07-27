@@ -1,19 +1,20 @@
 """
 Chain Discovery Agent Module
 
-Automatically discovers and exploits multi-step vulnerability chains.
-Uses NetworkX graph to model exploitation paths.
+Correlates confirmed specialist findings into candidate multi-step attack
+chains. NOTE: this agent is currently DISABLED in the orchestrator (team.py)
+and does not run during scans. Findings are modelled as graph NODES only — it
+does NOT yet add exploitation edges/weights or execute chain steps (steps are
+reported as unverified, never as fabricated success). Reviving it is a scoped
+feature, not a bugfix.
 
 Modules:
     - core: PURE functions for chain templates, vulnerability conversion,
-            graph operations, Mermaid visualization, report building
+            node building, Mermaid visualization, report building
     - agent: Thin orchestrator (ChainDiscoveryAgent)
 
 Usage:
     from bugtrace.agents.chain_discovery import ChainDiscoveryAgent
-
-For backward compatibility:
-    from bugtrace.agents.chain_discovery_agent import ChainDiscoveryAgent
 """
 
 from bugtrace.agents.chain_discovery.core import (

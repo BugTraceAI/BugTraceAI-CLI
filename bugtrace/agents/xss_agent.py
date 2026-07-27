@@ -1065,12 +1065,37 @@ class XSSAgent(BaseAgent, TechContextMixin):
             if not payload:
                 return
 
-            exploit_url = finding_dict.get("exploit_url")
-            if not exploit_url:
+            # The proof screenshot must show the VISIBLE "HACKED BY BUGTRACEAI"
+            # banner, not the silent document.title/7*7 payload that confirmed the
+            # finding over HTTP (that paints nothing in the body → a plain-page
+            # repro_attempt shot). Translate silent → visual with the SAME
+            # single-source transform the report uses, and screenshot THAT. The
+            # finding is already confirmed, so this is purely additive evidence.
+            vuln_type = finding_dict.get("type") or "XSS"
+            try:
+                from bugtrace.agents.reporting_mod.finding_processor import upgrade_payload
+                visible_payload = upgrade_payload(payload, vuln_type) or payload
+            except Exception:
+                visible_payload = payload
+
+            # Build the exploit URL from the VISIBLE payload against the finding's
+            # OWN url. Any pre-stored exploit_url was built from the silent payload,
+            # so rebuild whenever we have a parameter to inject into.
+            exploit_url = None
+            if param:
                 try:
-                    exploit_url = self._build_attack_url(param, payload) if param else base_url
+                    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+                    _p = urlparse(base_url)
+                    _q = {k: (v[0] if isinstance(v, list) else v)
+                          for k, v in parse_qs(_p.query, keep_blank_values=True).items()}
+                    _q[param] = visible_payload
+                    exploit_url = urlunparse((_p.scheme, _p.netloc, _p.path,
+                                              _p.params, urlencode(_q), _p.fragment))
                 except Exception:
-                    exploit_url = base_url
+                    exploit_url = None
+            if not exploit_url:
+                # No param (e.g. DOM/path sink): fall back to any stored URL, then base.
+                exploit_url = finding_dict.get("exploit_url") or base_url
             if not exploit_url:
                 return
 
@@ -1103,7 +1128,12 @@ class XSSAgent(BaseAgent, TechContextMixin):
                             logger.info(f"[{self.name}] 📸 CDP fallback captured real PoC for {finding_dict.get('parameter')}")
                 except Exception as cdp_err:
                     logger.debug(f"[{self.name}] CDP proof fallback skipped: {cdp_err}")
-            if path:
+            # Only attach a shot where the banner ACTUALLY fired (result.success is
+            # True for a Playwright hit, or reassigned from a successful CDP fallback
+            # above). verify_xss also returns a repro_attempt_*.png when nothing
+            # rendered — shipping that plain page as the PoC would contradict the
+            # finding's own banner payload, so gate the store on success.
+            if path and getattr(result, "success", False):
                 # Store a path RELATIVE to the report dir so the WEB can fetch it
                 # via GET /scans/{id}/files/{relpath} (the serve route is :path).
                 try:
@@ -1115,7 +1145,44 @@ class XSSAgent(BaseAgent, TechContextMixin):
                 if isinstance(finding_dict["evidence"], dict):
                     finding_dict["evidence"]["screenshot"] = rel_path
                     finding_dict["evidence"]["screenshot_captured_post_confirm"] = True
+                    # Record the URL that actually produced the banner shot, so the
+                    # report can present a PoC consistent with the screenshot.
+                    finding_dict["evidence"]["visual_exploit_url"] = exploit_url
                 logger.info(f"[{self.name}] 📸 Captured PoC screenshot for {finding_dict.get('parameter')}: {rel_path}")
+
+                # (a) Align the reproduction to the banner request we ACTUALLY
+                # navigated for this screenshot, so the report's http_request /
+                # repro / WEB AI-Repeater replay demonstrates the SAME visible
+                # banner as the screenshot, curl and (upgraded) payload — instead
+                # of the silent document.title detection probe, which replays to a
+                # blank page. The original probe is preserved as `detection_request`
+                # so no forensic detail is lost. Only for GET-style reflected XSS
+                # (exploit_url was built from `param`); best-effort, never fatal.
+                if param:
+                    try:
+                        repro = finding_dict.get("repro")
+                        det = repro.get("confirming_request") if isinstance(repro, dict) else None
+                        if isinstance(det, dict) and str(det.get("method", "GET")).upper() == "GET":
+                            repro.setdefault("detection_request", det)
+                            banner_cr = dict(det)
+                            banner_cr["url"] = exploit_url
+                            repro["confirming_request"] = banner_cr
+                            repro["capture_method"] = "visual_banner"
+                            finding_dict["http_request"] = _build_raw_http(banner_cr)
+                    except Exception as _repro_err:
+                        logger.debug(f"[{self.name}] repro banner-align skipped: {_repro_err}")
+
+                # Complement: ask Vision AI to confirm the banner is visible in the
+                # captured shot (records evidence.vision_confirmed as double proof).
+                # Best-effort: a Vision failure never affects the already-confirmed
+                # finding.
+                if isinstance(finding_dict.get("evidence"), dict):
+                    try:
+                        await self._run_vision_validation(
+                            str(path), exploit_url, visible_payload, finding_dict["evidence"]
+                        )
+                    except Exception as vis_err:
+                        logger.debug(f"[{self.name}] proof-shot vision check skipped: {vis_err}")
         except Exception as e:
             logger.debug(f"[{self.name}] proof screenshot capture skipped: {e}")
 
@@ -3585,8 +3652,13 @@ Return ONLY the payloads, one per line, no explanations."""
                 temperature=0.2
             )
 
-            dry_data = json.loads(response)
-            dry_list = dry_data.get("findings", wet_findings)
+            from bugtrace.utils.json_parser import extract_json_list, safe_json_loads
+
+            dry_data = safe_json_loads(response)
+            dry_list = extract_json_list(dry_data, "findings")
+            if dry_list is None:
+                logger.warning(f"[XSSAgent] LLM deduplication returned invalid JSON, using fingerprint fallback")
+                dry_list = wet_findings
 
             # Post-LLM merge: ensure deterministic fields are preserved (LLM may drop them)
             wet_meta_map = {}

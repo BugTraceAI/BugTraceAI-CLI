@@ -215,7 +215,6 @@ def agents():
     # Support agents
     table.add_row("CSTIAgent", "Client-Side Template Injection", "CWE-94", "Detects template injection")
     table.add_row("APISecurityAgent", "API Security", "Multiple", "API endpoint security analysis")
-    table.add_row("ChainDiscoveryAgent", "Vulnerability Chaining", "Multiple", "Discovers attack chains")
 
     console.print(table)
     console.print("\n[dim]Run with: bugtrace scan <url> or bugtrace full <url>[/dim]")
