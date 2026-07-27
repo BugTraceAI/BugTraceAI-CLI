@@ -200,15 +200,14 @@ async def switch_provider(req: SwitchProviderRequest):
     # Reload preset (applies model defaults)
     settings._load_provider_preset()
 
-    # Reinitialize LLM client with new provider
+    # Reinitialize LLM client with new provider. Delegate to the client's own
+    # consolidated reconfigure so EVERY provider-scoped attribute moves together
+    # (api_format, base_url, models, headers, concurrency, failover, rate limiters)
+    # — a partial hot-reload here previously left api_format stale, so an Anthropic
+    # provider kept sending OpenAI-format payloads until a full restart.
     try:
         from bugtrace.core.llm_client import llm_client
-        provider_cfg = getattr(settings, '_provider_config', {})
-        api_key_env = provider_cfg.get('api_key_env', 'OPENROUTER_API_KEY')
-        llm_client.api_key = os.environ.get(api_key_env) or getattr(settings, api_key_env, None)
-        llm_client.base_url = provider_cfg.get('base_url', "https://openrouter.ai/api/v1/chat/completions")
-        llm_client.provider_id = req.provider
-        llm_client.models = [m.strip() for m in settings.PRIMARY_MODELS.split(",")]
+        llm_client.reconfigure_from_active_preset()
         logger.info(f"LLM client reinitialized for provider: {req.provider}")
     except ImportError:
         logger.warning("Could not reimport llm_client for hot-reload")
@@ -247,20 +246,35 @@ async def test_provider_key(req: TestProviderRequest):
     if not test_model:
         return {"success": False, "message": "No model configured for this provider."}
 
-    headers: Dict[str, str] = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept-Language": "en-US,en",
-    }
-    # Apply provider-specific headers
-    for k, v in preset.get("headers", {}).items():
-        headers[k] = v
-
-    body = {
-        "model": test_model,
-        "messages": [{"role": "user", "content": "Are you alive? Answer only yes."}],
-        "max_tokens": 5,
-    }
+    # Build headers + body in the provider's wire format. Anthropic uses the
+    # Messages API (x-api-key, model without the anthropic/ prefix); everyone else
+    # uses the OpenAI-compatible /chat/completions shape (Authorization: Bearer).
+    api_format = preset.get("api_format", "openai")
+    if api_format == "anthropic":
+        headers: Dict[str, str] = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        body = {
+            "model": test_model.replace("anthropic/", "", 1),
+            "max_tokens": 5,
+            "messages": [{"role": "user", "content": "Are you alive? Answer only yes."}],
+        }
+    else:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept-Language": "en-US,en",
+        }
+        # Apply provider-specific headers
+        for k, v in preset.get("headers", {}).items():
+            headers[k] = v
+        body = {
+            "model": test_model,
+            "messages": [{"role": "user", "content": "Are you alive? Answer only yes."}],
+            "max_tokens": 5,
+        }
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
