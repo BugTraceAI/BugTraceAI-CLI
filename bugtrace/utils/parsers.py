@@ -99,6 +99,40 @@ class XmlParser:
         matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
         return [m.strip() for m in matches]
 
+
+# PURE
+def extract_sqlmap_verdict(output: str, limit: int = 2000) -> str:
+    """Return the part of a sqlmap run that carries its verdict.
+
+    sqlmap opens with ~700 characters of ASCII logo, legal disclaimer and
+    `[*] starting @ ...`, so slicing from the front keeps the decoration and
+    drops the finding: the stored proof of a CRITICAL ends up being the banner,
+    and every downstream reader (evidence blocks, DBMS detection, the injection
+    -point parser) is handed text that cannot contain what it looks for.
+
+    Anchor on the injection-point block instead, then fall back to the
+    post-banner body and finally to the raw text, so a run that produced any
+    output never yields an empty snippet.
+    """
+    if not output:
+        return ""
+
+    body = output
+    banner_end = output.find("[*] starting")
+    if banner_end >= 0:
+        newline = output.find("\n", banner_end)
+        if newline >= 0:
+            body = output[newline + 1:]
+
+    for anchor in ("sqlmap identified the following injection point", "Parameter:"):
+        start = body.find(anchor)
+        if start >= 0:
+            body = body[start:]
+            break
+
+    return body.strip()[:limit]
+
+
 # Self-test if run directly
 if __name__ == "__main__":
     test_content = r"""

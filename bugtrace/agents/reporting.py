@@ -29,6 +29,7 @@ from bugtrace.core.event_bus import EventType, event_bus
 from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.utils.json_parser import safe_json_loads, extract_json_list
 # ScanTable import removed: DB is write-only from CLI
+from bugtrace.reporting.poc_format import md_document_with_values
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
@@ -358,6 +359,16 @@ class ReportingAgent(BaseAgent):
         from bugtrace.agents.reporting_mod.finding_processor import upgrade_finding_payloads
         categorized["validated"] = upgrade_finding_payloads(categorized["validated"])
         categorized["manual_review"] = upgrade_finding_payloads(categorized["manual_review"])
+
+        # Phase 2.7: make the narrative's quoted values survive the markdown renderer.
+        #
+        # This runs HERE, after the upgrade, and not inside the enrichment producers,
+        # because enrichment happens BEFORE Phase 2.6: the payload the model quoted is
+        # not the payload the report finally ships, so protecting it at write time
+        # protects a string that is about to be replaced. This is the first point where
+        # the prose and the payload are both final, and doing it once covers all three
+        # producers (batch, individual, deterministic fallback) instead of three copies.
+        self._protect_narrative_values(categorized["validated"] + categorized["manual_review"])
 
         # LLM output cannot override evidence-backed classifications or introduce
         # unsupported RCE/CVE claims into client-facing narratives.
@@ -2383,11 +2394,17 @@ class ReportingAgent(BaseAgent):
         source = f.get("source", "database")
         validation_source = "event_bus" if source == "event_bus" else "database"
 
-        # Sanitize FUZZ template markers from gospider URLs
+        # The finding URL is the URL that was actually exercised, and the report's only
+        # job is to let a human reproduce it. This used to strip gospider's FUZZ
+        # placeholder for cosmetics, which was measurably harmful:
+        # `?search=FUZZ&back=<payload>` was rewritten to `?search&back=<payload>` — a
+        # dangling key, i.e. a URL that was never sent — while the SAME finding's
+        # visual_exploit_url still carried the tested value, so one entry contradicted
+        # itself. It also mutated f["url"] in place, propagating the corruption to every
+        # later reader. And the second, unbounded replace corrupted any legitimate value
+        # merely CONTAINING the token ("FUZZY logic" -> "Y logic"). A placeholder that
+        # reaches a confirmed finding is what we actually probed: show it verbatim.
         url = f.get("url", "")
-        if "FUZZ" in url:
-            url = url.replace("=FUZZ", "").replace("FUZZ", "")
-            f["url"] = url
 
         # Fallback description when specialists don't provide one (synthesized from
         # type + parameter + payload so no finding renders with a blank body).
@@ -4160,6 +4177,34 @@ Every factual claim must be traceable to the supplied URL, request, response, pa
     async def _poc_execute_llm(self, prompt: str) -> Tuple[Optional[str], str]:
         """Execute LLM call for PoC enrichment (with scoped reporting failover)."""
         return await self._reporting_generate(prompt, module_name="Reporting-Exploitation", temperature=0.2)
+
+    # PURE apart from the findings it mutates
+    def _protect_narrative_values(self, findings: List[Dict]) -> None:
+        """Fence the finding data that the enrichment narrative quotes inline.
+
+        The model interpolates the payload straight into its sentence, where markdown
+        reads the payload's OWN backticks as code-span delimiters and deletes them:
+        ``d.setAttribute(`style`,…)`` reaches the reader as ``d.setAttribute( style ,…)``,
+        a payload nobody can copy, while the identical bytes sit correct in
+        raw_findings.json. The loss is purely at render time and it lands on the one
+        field the report exists to deliver.
+
+        Both the shipped payload and the probe it was upgraded from are protected: the
+        narrative was written about the latter and may quote either.
+        """
+        for f in findings:
+            details = f.get("exploitation_details")
+            if not details:
+                continue
+            evidence = f.get("evidence")
+            original = evidence.get("original_payload") if isinstance(evidence, dict) else None
+            f["exploitation_details"] = md_document_with_values(
+                details,
+                f.get("payload"),
+                original,
+                f.get("surviving_chars"),
+                f.get("url"),
+            )
 
     def _poc_parse_response(self, finding: Dict, response: str):
         """Parse PoC enrichment response and update finding."""

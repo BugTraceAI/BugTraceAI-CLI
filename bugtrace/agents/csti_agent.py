@@ -346,7 +346,7 @@ class CSTIAgent(BaseAgent, TechContextMixin):
     CSTI Agent V2 - Intelligent Template Injection Specialist.
 
     Feature Set:
-    - Binomial Arithmetic Proof (1000003*1000003=49)
+    - Distinctive Arithmetic Proof (1000003*1000003=1000006000009)
     - WAF Detection & Q-Learning Bypass (UCB1)
     - Template Engine Fingerprinting
     - Targeted & Polyglot Payloads
@@ -476,7 +476,7 @@ class CSTIAgent(BaseAgent, TechContextMixin):
             f"1. Navigate to the verified target: {url}",
             f"2. Locate the parameter `{param}`",
             f"3. Inject the payload: `{payload}`",
-            f"4. Expected observation: The expression is evaluated (e.g., 1000003*1000003 becomes 49).",
+            f"4. Expected observation: The expression is evaluated (1000003*1000003 becomes 1000006000009).",
             f"5. Alternative: Run the provided cURL command:",
             f"   `{curl_cmd}`"
         ]
@@ -1530,12 +1530,12 @@ Response format (XML):
         return None, None
 
     async def _check_arithmetic_evaluation(self, content: str, payload: str, session, final_url: str) -> bool:
-        """Check for arithmetic evaluation (1000003*1000003=49)."""
+        """Check for arithmetic evaluation (1000003*1000003=1000006000009)."""
         if "1000006000009" not in content:
             return False
 
         if "1000003*1000003" in payload:
-            # Payload like {{1000003*1000003}} - check 49 present and payload not reflected
+            # Require the distinctive result and reject literal payload reflection.
             if payload in content:
                 return False
             # CRITICAL: Baseline check
@@ -1552,10 +1552,15 @@ Response format (XML):
         return False
 
     def _check_string_multiplication(self, content: str, payload: str) -> bool:
-        """Check for string multiplication (7777777)."""
+        """Check for string multiplication (7777777).
+
+        Both operand orders are accepted because both evaluate: PAYLOAD_LIBRARY
+        ships `{{7*'7'}}` / `${7*'7'}`, so matching only `'7'*7` rejected the very
+        payloads the agent sends.
+        """
         if "7777777" not in content:
             return False
-        return "'7'*7" in payload and payload not in content
+        return ("'7'*7" in payload or "7*'7'" in payload) and payload not in content
 
     def _check_config_reflection(self, content: str, payload: str) -> bool:
         """Check for Config reflection (Jinja2)."""
@@ -1657,7 +1662,7 @@ Response format (XML):
             reproduction_steps=self._generate_repro_steps(final_url, param, payload, curl_cmd),
             evidence={
                 "method": method,
-                "proof": "Arithmetic evaluation detected (1000003*1000003=49) or specific engine behavior verified.",
+                "proof": "Arithmetic evaluation detected (1000003*1000003=1000006000009) or specific engine behavior verified.",
                 "engine": engine
             }
         )
@@ -2585,13 +2590,13 @@ Different template engines represent different attack surfaces - NEVER merge fin
                 )
                 return None, False
 
-            # Check if template evaluation happened (1000003*1000003 = 49)
+            # Check if template evaluation produced the distinctive long result.
             # "1000006000009" in response AND "1000003*1000003" NOT in response AND not in baseline
             if "1000006000009" in response and "1000003*1000003" not in response and "1000006000009" not in baseline_html:
                 if hasattr(self, '_v'):
                     self._v.emit("exploit.specialist.signature_match", {"agent": "CSTI", "param": param, "payload": probe[:100], "method": "smart_probe"})
                 dashboard.log(
-                    f"[{self.name}] Smart probe: CONFIRMED CSTI on '{param}' ({{{{1000003*1000003}}}}=49)",
+                    f"[{self.name}] Smart probe: CONFIRMED CSTI on '{param}' ({{{{1000003*1000003}}}}=1000006000009)",
                     "INFO",
                 )
                 # Detect which engine evaluated
@@ -2601,7 +2606,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
                 finding = self._create_finding(param, "{{1000003*1000003}}", "smart_probe", verified_url=verified_url)
                 finding.evidence = {
                     "method": "arithmetic_eval",
-                    "proof": "{{1000003*1000003}} evaluated to 49",
+                    "proof": "{{1000003*1000003}} evaluated to 1000006000009",
                     "status": "VALIDATED_CONFIRMED",
                     "level": "smart_probe",
                     "engine": engine,
@@ -2875,16 +2880,16 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
         evidence = {"payload": payload}
 
-        # 1. Arithmetic evaluation (1000003*1000003=49)
+        # 1. Arithmetic evaluation (1000003*1000003=1000006000009)
         if "1000006000009" in response_html and "1000003*1000003" in payload:
             if payload not in response_html:
                 if "1000006000009" not in baseline_html:
                     evidence["method"] = "arithmetic_eval"
-                    evidence["proof"] = "1000003*1000003 evaluated to 49"
+                    evidence["proof"] = "1000003*1000003 evaluated to 1000006000009"
                     evidence["status"] = "VALIDATED_CONFIRMED"
                     return True, evidence
 
-        # 2. Constructor evaluation (return 1000003*1000003 → 49)
+        # 2. Constructor evaluation of the distinctive arithmetic marker
         if "constructor" in payload and "1000006000009" in response_html:
             if payload not in response_html and "1000006000009" not in baseline_html:
                 evidence["method"] = "constructor_eval"
@@ -3148,7 +3153,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
             f"Tech context: {tech_context}\n\n"
             f"Generate 50 advanced CSTI/SSTI payloads for template injection testing. "
             f"Include variations for: Angular, Vue, Jinja2, Twig, Freemarker, Mako, ERB, Velocity. "
-            f"Focus on arithmetic evaluation (1000003*1000003=49), config access, sandbox bypasses, and RCE. "
+            f"Focus on arithmetic evaluation (1000003*1000003=1000006000009), config access, sandbox bypasses, and RCE. "
             f"Include double-quote variants for servers that reject single quotes. "
             f"Return each payload in <payload> tags."
         )

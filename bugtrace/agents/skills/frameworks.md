@@ -19,7 +19,7 @@
 ## AngularJS (Legacy 1.x)
 
 - **Primary Sinks**: Expression interpolation `{{ }}`, `$sce.trustAsHtml`.
-- **CRITICAL**: Template Injection is common. Even if you are inside an attribute like `value="PROBE"`, you can attempt `{{7*7}}`.
+- **CRITICAL**: Template Injection is common. Even if you are inside an attribute like `value="PROBE"`, you can attempt `{{1000003*1000003}}`.
 - **Sandbox Escape**: Older versions require sandbox escapes to access `constructor`.
 - **Example**: `{{constructor.constructor('alert(1)')()}}`
 

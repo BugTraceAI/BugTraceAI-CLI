@@ -6,6 +6,7 @@ import os
 from typing import List, Dict, Optional, Any, Tuple
 from urllib.parse import urlparse, urljoin
 from bugtrace.utils.logger import get_logger
+from bugtrace.utils.parsers import extract_sqlmap_verdict
 logger = get_logger("tools.external")
 from bugtrace.core.config import settings
 from bugtrace.core.ui import dashboard
@@ -619,7 +620,7 @@ class ExternalToolManager:
                 "parameter": param,
                 "type": vuln_type,
                 "reproduction_command": reproduction_cmd,
-                "output_snippet": output[:1000]
+                "output_snippet": extract_sqlmap_verdict(output)
             }
         return None
 

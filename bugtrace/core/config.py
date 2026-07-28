@@ -593,6 +593,14 @@ class Settings(BaseSettings):
             if hasattr(self, field):
                 object.__setattr__(self, field, value)
 
+        # Vision validation must run on a model the ACTIVE provider actually serves:
+        # a slug belonging to another provider is rejected outright (HTTP 404), not
+        # degraded, which silently disables visual XSS proof. Presets that do not pin
+        # VALIDATION_VISION_MODEL inherit their own VISION_MODEL rather than keeping
+        # whatever the previous provider left behind.
+        if "VALIDATION_VISION_MODEL" not in models and "VISION_MODEL" in models:
+            object.__setattr__(self, "VALIDATION_VISION_MODEL", models["VISION_MODEL"])
+
         logger.info(f"Provider preset loaded: {preset.get('name', self.PROVIDER)} ({len(models)} model defaults)")
 
     def _load_llm_models_config(self, config):
@@ -751,7 +759,17 @@ class Settings(BaseSettings):
             return
         section = config["VALIDATION"]
         if "VISION_MODEL" in section:
-            self.VALIDATION_VISION_MODEL = section["VISION_MODEL"]
+            # Mirror _load_llm_models_config: when a provider preset is active it has
+            # already selected a vision model that provider serves, so a conf value
+            # left over from another provider must not overwrite it (it would be a
+            # hard 404 on every vision call). Users can still override via env vars.
+            if not self._provider_config:
+                self.VALIDATION_VISION_MODEL = section["VISION_MODEL"]
+            else:
+                logger.debug(
+                    f"Skipping [VALIDATION] VISION_MODEL override — provider preset "
+                    f"'{self.PROVIDER}' is active (using {self.VALIDATION_VISION_MODEL})"
+                )
         if "VISION_ENABLED" in section:
             self.VALIDATION_VISION_ENABLED = section.getboolean("VISION_ENABLED")
         if "VISION_ONLY_FOR_XSS" in section:

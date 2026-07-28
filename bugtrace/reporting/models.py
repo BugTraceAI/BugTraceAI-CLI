@@ -36,7 +36,12 @@ class Finding(BaseModel):
     impact: Optional[str] = None
     remediation: Optional[str] = None
     cwe_id: Optional[str] = None
-    cvss_score: Optional[str] = None
+    # float, not str: the pipeline computes a numeric score (5.8) and the renderers
+    # format it as one (f"{cvss_score:.1f}"). Declaring it str made Finding fail
+    # validation on every report that carried a score, and the report endpoints turn
+    # that into a 404 — so html/json/markdown were ALL unviewable in the WEB while the
+    # data sat correct on disk and the ZIP downloaded fine.
+    cvss_score: Optional[float] = None
     references: List[str] = Field(default_factory=list)
     http_request: Optional[str] = None
     http_response: Optional[str] = None
