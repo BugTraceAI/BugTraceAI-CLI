@@ -527,18 +527,24 @@ Return JSON array of UNIQUE findings only:
 
 Focus on parameter+file deduplication. Same file via different traversal depths = DUPLICATE."""
 
-        response = await llm_client.generate(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            module_name="LFI_DEDUP",
-            temperature=0.2
-        )
-
         try:
-            result = json.loads(response)
-            return result.get("findings", wet_findings)
-        except json.JSONDecodeError:
-            logger.warning(f"[{self.name}] LLM returned invalid JSON, using fallback")
+            response = await llm_client.generate(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                module_name="LFI_DEDUP",
+                temperature=0.2
+            )
+
+            from bugtrace.utils.json_parser import extract_json_list, safe_json_loads
+
+            result = safe_json_loads(response)
+            findings = extract_json_list(result, "findings")
+            if findings is None:
+                logger.warning(f"[{self.name}] LLM deduplication returned invalid JSON, using fallback")
+                return self._fallback_fingerprint_dedup(wet_findings)
+            return findings
+        except Exception as e:
+            logger.error(f"[{self.name}] LLM deduplication failed: {e}, using fallback")
             return self._fallback_fingerprint_dedup(wet_findings)
 
     def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
@@ -717,9 +723,11 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
-        # Count confirmed vulnerabilities
+        # Count confirmed vulnerabilities. `_dry_findings` is the list of CANDIDATES queued
+        # for testing, NOT confirmations — folding it in here reported non-zero "vulns" on
+        # scans that confirmed nothing (same bug as xss_agent.py, same fix).
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         # REPORTING
         if results or self._dry_findings:
@@ -732,7 +740,7 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
             vulns=vulns_count
         )
 
-        self._v.emit("exploit.specialist.completed", {"agent": "LFI", "processed": len(dry_list), "vulns": vulns_count})
+        self._v.emit("exploit.specialist.completed", {"agent": "LFI", "processed": len(dry_list), "vulns": vulns_count, "candidates": candidates_count})
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 

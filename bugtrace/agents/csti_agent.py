@@ -2322,9 +2322,13 @@ Different template engines represent different attack surfaces - NEVER merge fin
                             "successful_payloads": api_result.successful_payloads,
                         }
                         validated_findings.append(finding_dict)
+                        emitted = True
                         if settings.WORKER_POOL_EMIT_EVENTS:
-                            self._emit_csti_finding(finding_dict, scan_context=self._scan_context)
-                        logger.info(f"[{self.name}] ✅ SSTI confirmed on API endpoint {url} param={parameter}")
+                            emitted = self._emit_csti_finding(finding_dict, scan_context=self._scan_context) is not None
+                        if emitted:
+                            logger.info(f"[{self.name}] ✅ SSTI confirmed on API endpoint {url} param={parameter}")
+                        else:
+                            logger.warning(f"[{self.name}] ⚠️  SSTI NOT emitted (rejected by _validate_before_emit) on API endpoint {url} param={parameter}")
                         if hasattr(self, '_v'):
                             self._v.emit("exploit.specialist.param.completed", {"agent": "CSTI", "param": parameter, "url": url, "idx": idx})
                         continue
@@ -2373,7 +2377,7 @@ Different template engines represent different attack surfaces - NEVER merge fin
 
                     validated_findings.append(finding_dict)
 
-                    self._emit_csti_finding({
+                    emitted = self._emit_csti_finding({
                         "type": "CSTI",
                         "url": result.url,
                         "parameter": result.parameter,
@@ -2383,9 +2387,12 @@ Different template engines represent different attack surfaces - NEVER merge fin
                         "payload": result.payload,
                         "evidence": result.evidence if hasattr(result, 'evidence') else {},
                         "arithmetic_proof": result.arithmetic_proof if hasattr(result, 'arithmetic_proof') else False,
-                    }, scan_context=self._scan_context)
+                    }, scan_context=self._scan_context) is not None
 
-                    logger.info(f"[{self.name}] ✓ CSTI confirmed: {url} param={parameter} engine={template_engine}")
+                    if emitted:
+                        logger.info(f"[{self.name}] ✓ CSTI confirmed: {url} param={parameter} engine={template_engine}")
+                    else:
+                        logger.warning(f"[{self.name}] ⚠️  CSTI NOT emitted (rejected by _validate_before_emit): {url} param={parameter} engine={template_engine}")
                 else:
                     logger.debug(f"[{self.name}] ✗ CSTI not confirmed after 6-level escalation")
 
@@ -3823,8 +3830,9 @@ Different template engines represent different attack surfaces - NEVER merge fin
         self._emitted_findings.add(fingerprint)
 
         # Emit vulnerability_detected event with validation
+        emitted = True
         if settings.WORKER_POOL_EMIT_EVENTS:
-            self._emit_csti_finding({
+            emitted = self._emit_csti_finding({
                 "specialist": "csti",
                 "type": "CSTI",
                 "url": result.url,
@@ -3834,9 +3842,12 @@ Different template engines represent different attack surfaces - NEVER merge fin
                 "evidence": result.evidence if hasattr(result, 'evidence') else {},
                 "status": result.status,
                 "validation_requires_cdp": needs_cdp,
-            }, scan_context=self._scan_context)
+            }, scan_context=self._scan_context) is not None
 
-        logger.info(f"[{self.name}] Confirmed CSTI: {result.url}?{result.parameter} ({result.template_engine})")
+        if emitted:
+            logger.info(f"[{self.name}] Confirmed CSTI: {result.url}?{result.parameter} ({result.template_engine})")
+        else:
+            logger.warning(f"[{self.name}] ⚠️  Confirmed CSTI NOT emitted (rejected by _validate_before_emit): {result.url}?{result.parameter} ({result.template_engine})")
 
     def get_queue_stats(self) -> dict:
         """Get queue consumer statistics."""

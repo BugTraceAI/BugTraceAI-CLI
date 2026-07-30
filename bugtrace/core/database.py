@@ -1,4 +1,4 @@
-from typing import Optional, List, Dict
+from typing import Any, Optional, List, Dict
 import os
 from datetime import datetime
 from dataclasses import dataclass
@@ -118,6 +118,16 @@ def _rank_severity(severity: str) -> int:
 def _higher_severity(current: str, candidate: str) -> str:
     """# PURE — Return the higher of two severity values."""
     return candidate.upper() if _rank_severity(candidate) > _rank_severity(current) else current
+
+
+def _finding_match_key(vuln_type: Any, parameter: str | None, url: str | None = None) -> tuple:
+    """# PURE — Key for matching an enriched finding back to its DB row.
+
+    `url` is optional so callers can build a URL-qualified key and a legacy
+    (type, parameter) key from the same function.
+    """
+    raw_type = vuln_type.value if hasattr(vuln_type, "value") else vuln_type
+    return (str(raw_type or "").upper(), (parameter or "").lower(), (url or "").strip())
 
 
 def _resolve_confidence(explicit: float | None, status: FindingStatus) -> float:
@@ -667,15 +677,27 @@ class DatabaseManager:
                 select(FindingTable).where(FindingTable.scan_id == scan_id)
             ).all()
 
-            lookup = {
-                (str(f.type.value if hasattr(f.type, 'value') else f.type).upper(), (f.vuln_parameter or "").lower()): f
-                for f in db_findings
-            }
+            # Two-tier index. The legacy key was (type, parameter) with no URL component, so
+            # two findings of the same type on the same parameter at DIFFERENT urls collided:
+            # the later row overwrote the earlier one in the dict, the loser was skipped by the
+            # `if not db_f: continue` below and never enriched, and the winner accumulated the
+            # MAX severity/confidence of every finding sharing the key — including other URLs'.
+            # The URL-qualified key is tried first; the legacy key stays as a fallback so rows
+            # whose stored attack_url does not line up with the enriched url still match.
+            lookup_by_url = {}
+            lookup_legacy = {}
+            for f in db_findings:
+                lookup_by_url[_finding_match_key(f.type, f.vuln_parameter, f.attack_url)] = f
+                lookup_legacy[_finding_match_key(f.type, f.vuln_parameter)] = f
 
             updated = 0
             for ef in enriched_findings:
-                key = ((ef.get("type") or "").upper(), (ef.get("parameter") or ef.get("param") or "").lower())
-                db_f = lookup.get(key)
+                ef_type = ef.get("type")
+                ef_param = ef.get("parameter") or ef.get("param")
+                db_f = (
+                    lookup_by_url.get(_finding_match_key(ef_type, ef_param, ef.get("url")))
+                    or lookup_legacy.get(_finding_match_key(ef_type, ef_param))
+                )
                 if not db_f:
                     continue
 

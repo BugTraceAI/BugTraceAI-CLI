@@ -19,6 +19,7 @@ from bugtrace.reporting.standards import (
 )
 from bugtrace.core.validation_status import ValidationStatus, requires_cdp_validation
 from bugtrace.core.verbose_events import create_emitter
+from bugtrace.agents.rce.detection import check_deser_keywords, create_deserialization_finding
 
 # v3.2.0: Import TechContextMixin for context-aware detection
 from bugtrace.agents.mixins.tech_context import TechContextMixin
@@ -90,7 +91,7 @@ class RCEAgent(BaseAgent, TechContextMixin):
         status = finding.get("status", nested.get("status", ""))
 
         # RCE-specific: Must have evidence
-        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+        if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION", "MANUAL_REVIEW_RECOMMENDED"]:
             has_time = "delay" in str(evidence).lower() or "sleep" in str(evidence).lower()
             has_output = evidence.get("command_output") if isinstance(evidence, dict) else False
             has_callback = evidence.get("interactsh_callback") if isinstance(evidence, dict) else False
@@ -569,15 +570,6 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
     async def _test_deserialization(self, url: str, param: str) -> Optional[Dict]:
         """Test deserialization vulnerability by sending a non-serialized probe via cookie."""
         import base64
-        DESER_KEYWORDS = [
-            "invalid load key", "could not find MARK", "unpickling",
-            "pickle.loads", "_pickle.UnpicklingError", "pickle data", "_pickle.",
-            "java.io.ObjectInputStream", "ClassNotFoundException",
-            "java.io.InvalidClassException", "readObject",
-            "unserialize()", "allowed_classes",
-            "BinaryFormatter", "ObjectStateFormatter",
-            "Marshal.load",
-        ]
         cookie_name = param.replace("Cookie: ", "").strip() if param.startswith("Cookie:") else param
         probe_value = base64.b64encode(b"BTAI_deser_rce_probe").decode()
         try:
@@ -585,28 +577,10 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
                 cookies = {cookie_name: probe_value}
                 async with session.get(url, cookies=cookies, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     body = await resp.text()
-                    matched = [kw for kw in DESER_KEYWORDS if kw.lower() in body.lower()]
+                    matched = check_deser_keywords(body)
                     if matched:
-                        logger.info(f"[{self.name}] Deserialization CONFIRMED on {cookie_name} @ {url}: {matched}")
-                        return {
-                            "type": "Insecure Deserialization",
-                            "url": url,
-                            "parameter": param,
-                            "payload": probe_value,
-                            "severity": "CRITICAL",
-                            "validated": True,
-                            "status": "VALIDATED_CONFIRMED",
-                            "evidence": f"Deserialization error keywords in response: {matched}",
-                            "description": f"Insecure deserialization confirmed in cookie '{cookie_name}' at {url}. "
-                                           f"Non-serialized data triggers deserialization error messages, confirming "
-                                           f"the server deserializes cookie values unsafely.",
-                            "reproduction": f"curl -b '{cookie_name}={probe_value}' '{url}'",
-                            "cwe_id": "CWE-502",
-                            "remediation": get_remediation_for_vuln("RCE"),
-                            "cve_id": "N/A",
-                            "http_request": f"GET {url} (Cookie: {cookie_name}={probe_value})",
-                            "http_response": f"Error keywords: {matched}",
-                        }
+                        logger.info(f"[{self.name}] Deserialization sink detected on {cookie_name} @ {url}: {matched}")
+                        return create_deserialization_finding(url, param, probe_value, matched)
         except Exception as e:
             logger.debug(f"[{self.name}] Deserialization test failed for {cookie_name}: {e}")
         return None
@@ -642,7 +616,10 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
                     result = await self._test_deserialization(url, param)
                 else:
                     result = await self._test_single_param_from_queue(url, param, f.get("finding",{}))
-                if result and result.get("validated"):
+                if result and (
+                    result.get("validated")
+                    or result.get("status") == "MANUAL_REVIEW_RECOMMENDED"
+                ):
                     validated.append(result)
                     fp = self._generate_rce_fingerprint(url, param)
                     if fp not in self._emitted_findings:
@@ -657,7 +634,11 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
                                 "parameter": result.get("parameter"),
                                 "payload": result.get("payload"),
                                 "status": status,
+                                "severity": result.get("severity"),
                                 "evidence": result.get("evidence", ""),
+                                "description": result.get("description", ""),
+                                "reproduction": result.get("reproduction", ""),
+                                "manual_review_reason": result.get("manual_review_reason", ""),
                                 "cwe_id": result.get("cwe_id", get_cwe_for_vuln("RCE")),
                                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
                             }, scan_context=self._scan_context)
@@ -733,9 +714,11 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
 
         results = await self.exploit_dry_list()
 
-        # Count confirmed vulnerabilities
+        # Count confirmed vulnerabilities. `_dry_findings` is the list of CANDIDATES queued
+        # for testing, NOT confirmations — folding it in here reported non-zero "vulns" on
+        # scans that confirmed nothing (same bug as xss_agent.py, same fix).
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
@@ -747,7 +730,7 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
             vulns=vulns_count
         )
 
-        self._v.emit("exploit.specialist.completed", {"agent": "RCE", "dry_count": len(dry_list), "vulns": vulns_count})
+        self._v.emit("exploit.specialist.completed", {"agent": "RCE", "dry_count": len(dry_list), "vulns": vulns_count, "candidates": candidates_count})
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
 

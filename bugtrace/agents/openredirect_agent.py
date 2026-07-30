@@ -1576,9 +1576,11 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
         logger.info(f"[{self.name}] ===== PHASE B: Exploiting DRY list =====")
         results = await self.exploit_dry_list()
 
-        # Count confirmed vulnerabilities
+        # Count confirmed vulnerabilities. `_dry_findings` is the list of CANDIDATES queued
+        # for testing, NOT confirmations — folding it in here reported non-zero "vulns" on
+        # scans that confirmed nothing (same bug as xss_agent.py, same fix).
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         # REPORTING
         if results or self._dry_findings:
@@ -1596,6 +1598,7 @@ class OpenRedirectAgent(BaseAgent, TechContextMixin):
                 "agent": "OpenRedirect",
                 "dry_count": len(dry_list),
                 "vulns": vulns_count,
+                "candidates": candidates_count,
             })
 
         logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")

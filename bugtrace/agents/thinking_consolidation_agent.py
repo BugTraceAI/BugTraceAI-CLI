@@ -156,6 +156,34 @@ VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
 }
 
 
+# PURE
+def classify_vuln_type(vuln_type: str) -> Optional[str]:
+    """Specialist queue for a `type` string, by keyword. None when unrecognised.
+
+    The keyword half of `_classify_finding`, lifted out so it has ONE definition and can
+    be used by callers that only need the question answered — notably team.py's
+    auto-dispatch check, which asked it with exact set membership
+    (`type.upper() in ("XSS", "DOM_XSS", ...)`) while the router two files away already
+    matched substrings. `type` is free text written by an LLM: measured values include
+    "XSS (Reflected)", "DOM-based XSS" and "DOM-based XSS (via searchLogger.js)" — a
+    FILENAME inside the type. None of the three match exactly, so that check answered
+    "no XSS found" on a scan that had found three, and a synthetic candidate for a
+    parameter named `auto_dispatch` was injected on every scan ever run.
+
+    Substring matching is what makes free text usable; keep both callers on this one
+    function so the two can never drift apart again.
+    """
+    normalised = (vuln_type or "").lower().strip()
+    if not normalised:
+        return None
+    if normalised in VULN_TYPE_TO_SPECIALIST:
+        return VULN_TYPE_TO_SPECIALIST[normalised]
+    for pattern, specialist in VULN_TYPE_TO_SPECIALIST.items():
+        if pattern in normalised:
+            return specialist
+    return None
+
+
 # Semantic descriptions for embeddings-based classification (Phase 42: v3.3)
 # Rich descriptions for cosine similarity matching
 SPECIALIST_DESCRIPTIONS: Dict[str, str] = {
@@ -580,7 +608,9 @@ class ThinkingConsolidationAgent(BaseAgent):
 
         logger.info(f"[{self.name}] Processing batch: {len(findings)} findings from {url[:50]}")
 
-        self._stats["total_received"] += len(findings)
+        # NOTE: `total_received` is counted in `_process_batch_items`, the single funnel every
+        # path reaches. Counting here too would double-count in batch mode (this handler buffers
+        # into `_batch_buffer`, which is then flushed through `_process_batch_items`).
 
         if self._mode == "streaming":
             # Process each finding immediately
@@ -629,28 +659,20 @@ class ThinkingConsolidationAgent(BaseAgent):
         """
         vuln_type = finding.get("type", "").lower().strip()
 
-        # PHASE 1: Keyword matching (fast path)
-        # Direct exact match
-        if vuln_type in VULN_TYPE_TO_SPECIALIST:
-            specialist = VULN_TYPE_TO_SPECIALIST[vuln_type]
+        # PHASE 1: Keyword matching (fast path) — exact, then substring.
+        # Shared with team.py's auto-dispatch check via classify_vuln_type() so the two
+        # can never disagree about what counts as an XSS finding again.
+        specialist = classify_vuln_type(vuln_type)
+        if specialist:
+            exact = vuln_type in VULN_TYPE_TO_SPECIALIST
+            method = "keyword_exact" if exact else "keyword_substring"
             if settings.EMBEDDINGS_LOG_CONFIDENCE:
                 logger.debug(
                     f"[{self.name}] Classification: '{vuln_type}' → {specialist} "
-                    f"(method: keyword_exact, confidence: 1.0)"
+                    f"(method: {method}, confidence: {'1.0' if exact else '0.9'})"
                 )
-            self._stats["classification_methods"]["keyword_exact"] += 1
+            self._stats["classification_methods"][method] += 1
             return specialist
-
-        # Substring partial match (for compound types like "Reflected XSS in parameter")
-        for pattern, specialist in VULN_TYPE_TO_SPECIALIST.items():
-            if pattern in vuln_type:
-                if settings.EMBEDDINGS_LOG_CONFIDENCE:
-                    logger.debug(
-                        f"[{self.name}] Classification: '{vuln_type}' → {specialist} "
-                        f"(method: keyword_substring, pattern: '{pattern}', confidence: 0.9)"
-                    )
-                self._stats["classification_methods"]["keyword_substring"] += 1
-                return specialist
 
         # PHASE 2: Embeddings similarity (if enabled)
         if settings.USE_EMBEDDINGS_CLASSIFICATION:
@@ -1236,6 +1258,12 @@ class ThinkingConsolidationAgent(BaseAgent):
         if not batch:
             return
 
+        # Single funnel for every batch path (flush_batch, process_batch_from_list, chunked
+        # flush). The only other writer of `total_received` lives in `_handle_url_analyzed`,
+        # whose subscription is commented out — so this counter read 0 on every scan and made
+        # the batch summary meaningless.
+        self._stats["total_received"] += len(batch)
+
         logger.info(f"[{self.name}] Processing batch of {len(batch)} findings")
 
         # Pre-process all findings to get priority scores
@@ -1549,13 +1577,23 @@ class ThinkingConsolidationAgent(BaseAgent):
     def log_batch_summary(self):
         """Log summary of batch processing."""
         stats = self.get_stats()
+        unclassified = stats.get('unclassified', 0)
         logger.info(
             f"[{self.name}] Batch Summary: "
             f"received={stats['total_received']}, "
             f"deduplicated={stats['duplicates_filtered']}, "
             f"fp_filtered={stats['fp_filtered']}, "
+            f"unclassified={unclassified}, "
             f"distributed={stats['distributed']}"
         )
+        # `unclassified` findings survived FP filtering and then died at the classifier
+        # because their `type` string matched no key in VULN_TYPE_TO_SPECIALIST. They are
+        # never queued, never written to WET, never persisted — a silent drop. Surface it.
+        if unclassified:
+            logger.warning(
+                f"[{self.name}] {unclassified} finding(s) DROPPED as unclassified "
+                f"(passed FP filter, matched no specialist vocabulary) — see 'Unknown vulnerability type' warnings above"
+            )
         for specialist, count in stats.get('by_specialist', {}).items():
             logger.info(f"[{self.name}]   {specialist}: {count} findings queued")
 

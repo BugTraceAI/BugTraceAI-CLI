@@ -988,14 +988,17 @@ Generate a comprehensive IDOR exploitation report in Markdown format covering:
 
         # PHASE B
         results = await self.exploit_dry_list()
+        # Count confirmed vulnerabilities. `_dry_findings` is the list of CANDIDATES queued
+        # for testing, NOT confirmations — folding it in here reported non-zero "vulns" on
+        # scans that confirmed nothing (same bug as xss_agent.py, same fix).
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
 
         report_specialist_done(self.name, processed=len(dry_list), vulns=vulns_count)
-        self._v.emit("exploit.specialist.completed", {"agent": "IDOR", "dry_count": len(dry_list), "vulns": vulns_count})
+        self._v.emit("exploit.specialist.completed", {"agent": "IDOR", "dry_count": len(dry_list), "vulns": vulns_count, "candidates": candidates_count})
 
     async def stop_queue_consumer(self) -> None:
         """Stop queue consumer."""
