@@ -29,13 +29,32 @@ from bugtrace.core.event_bus import EventType, event_bus
 from bugtrace.core.validation_status import ValidationStatus
 from bugtrace.utils.json_parser import safe_json_loads, extract_json_list
 # ScanTable import removed: DB is write-only from CLI
-from bugtrace.reporting.poc_format import md_document_with_values
 from bugtrace.reporting.standards import (
     get_cwe_for_vuln,
     get_remediation_for_vuln,
     get_reference_cve,
     normalize_severity,
     format_cve,
+)
+from bugtrace.agents.lfi.detection import LFI_SIGNATURES
+from bugtrace.reporting.poc_format import (
+    build_query_url,
+    curl_form_field,
+    curl_get,
+    curl_raw_body,
+    curl_header,
+    evidence_pairs,
+    md_code_block,
+    md_evidence_block,
+    md_injection_point,
+    md_labeled_block,
+    md_document_with_values,
+    md_step_with_block,
+    md_step_with_value,
+    plain_evidence_block,
+    shell_word,
+    template_expression_result,
+    truncate_marked,
 )
 import asyncio
 import re
@@ -1061,7 +1080,12 @@ class ReportingAgent(BaseAgent):
             "nginx server - local file inclusion",
             "unknown",
         }
-        return is_lfi and is_scanner_finding and has_traversal_path and not has_real_sink
+        # A missing application-level parameter doesn't mean the probe is unresolved
+        # if the captured response contains actual file content (e.g. /etc/passwd,
+        # win.ini) — that's proof on its own, with or without an identified sink.
+        response = " ".join(str(finding.get(key, "")) for key in ("nuclei_response", "http_response"))
+        has_file_content_proof = any(signature in response for signature in LFI_SIGNATURES)
+        return is_lfi and is_scanner_finding and has_traversal_path and not has_real_sink and not has_file_content_proof
 
     def _apply_deterministic_validation_rules(self, findings: List[Dict]) -> None:
         """Downgrade sink-only deserialization evidence before bucket selection."""
@@ -1410,19 +1434,17 @@ class ReportingAgent(BaseAgent):
                     and evidence["diff_ratio"] > 0.5)
             )
 
-            # Union-based: a unique canary reflected inside a UNION SELECT column (or
-            # explicit data/columns extracted) is one of the STRONGEST SQLi proofs —
-            # it does not depend on DBMS fingerprinting, so dbms_detected may be "unknown".
-            has_union_confirmed = bool(
-                evidence.get("data_extracted") or
-                evidence.get("columns_found") or
-                evidence.get("canary_position") is not None
-            )
-
-            # HTTP Manipulator confirmed (>2000 mutation attempts)
-            has_http_confirmed = (
-                evidence.get("http_confirmed") is True
-            )
+            # Union-based: proof is the canary the DATABASE had to ASSEMBLE via string
+            # concatenation — the request only ever carries the halves, so a reflecting page
+            # can never produce the contiguous value.
+            #
+            # This condition used to accept `data_extracted` / `columns_found` /
+            # `canary_position`, which are NOT evidence: _create_union_finding writes all
+            # three unconditionally on every union candidate it builds. The gate was
+            # therefore asking the producer for permission, and a third-party page that
+            # merely echoed the request URI was published as a CVSS 9.8 union injection.
+            # Only the computed canary distinguishes execution from reflection.
+            has_union_confirmed = bool(evidence.get("computed_canary_confirmed"))
 
             has_solid_evidence = (
                 has_sqlmap_confirmed or
@@ -1432,9 +1454,14 @@ class ReportingAgent(BaseAgent):
                 has_quote_parity or
                 has_verified_time or
                 has_confirmed_boolean or
-                has_union_confirmed or
-                has_http_confirmed
+                has_union_confirmed
             )
+            # NOTE: `http_confirmed` is deliberately NOT sufficient here. It is a flag the
+            # L5 ManipulatorOrchestrator path sets when its own mutation loop reports
+            # success; the finding it builds records nothing the server said (it even reads
+            # the DB type out of our own payload). A heuristic's self-report cannot be the
+            # thing that promotes a finding to CONFIRMED. Such findings go to manual_review
+            # until that path records the response that convinced it.
             
             if not has_solid_evidence:
                 logger.info(
@@ -2352,41 +2379,77 @@ class ReportingAgent(BaseAgent):
             for i, f in enumerate(vulns, 1)
         ]
 
-    def _render_evidence_dict(self, f: Dict, limit: int = 12) -> str:
+    def _render_evidence_dict(self, f: Dict, markdown: bool = True) -> str:
         """Render a specialist's structured ``evidence`` into readable lines.
 
         Many detectors (OpenRedirect, CSTI, CORS, IDOR, Broken Access…) put their proof in
         ``evidence`` as a dict rather than in raw http_request/response, and it was never
         surfaced anywhere in the deliverable → those findings rendered with an empty panel.
+
+        ``markdown`` picks the renderer for the CONSUMER, because the two deliverables
+        parse this text differently and the same bytes cannot serve both:
+
+        * ``True`` — ``final_report.md`` and everything the WEB pushes through
+          marked+DOMPurify. Evidence routinely carries the proof payload, and a payload
+          written bare into prose is markup: ``<svg onload=…>`` is parsed as a tag and then
+          DELETED by the viewer's allowlist, so the panel proved the finding on disk and
+          proved nothing on screen. Values that the grammar can transform get a fenced
+          block; inert ones stay inline so the panel stays compact.
+        * ``False`` — the static HTML viewer (which HTML-escapes this into a ``<code>``
+          block itself) and the LLM prompts. Both read it as plain text, so fences would
+          be rendered/read literally.
         """
         ev = f.get("evidence")
         if isinstance(ev, str):
             return ev.strip()
-        if not isinstance(ev, dict) or not ev:
+        pairs, dropped_keys = evidence_pairs(
+            ev,
+            limit=settings.REPORT_EVIDENCE_MAX_FIELDS,
+            value_budget=settings.REPORT_EVIDENCE_VALUE_CHARS,
+        )
+        if not pairs:
             return ""
-        lines = []
-        for k, v in ev.items():
-            if v in (None, "", [], {}, False):
-                continue
-            vs = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
-            lines.append(f"- **{str(k).replace('_', ' ').strip()}:** {vs[:400]}")
-            if len(lines) >= limit:
-                break
-        return "\n".join(lines)
+        if dropped_keys or any(d for _, _, d in pairs):
+            logger.debug(
+                f"[ReportingAgent] Evidence panel bounded for {f.get('type', '?')} on "
+                f"{f.get('url', '?')}: {dropped_keys} field(s) and "
+                f"{sum(d for _, _, d in pairs)} character(s) not printed "
+                f"(full value in raw_findings.json)"
+            )
+        render = md_evidence_block if markdown else plain_evidence_block
+        return render(pairs, dropped_keys)
+
+    def _md_injection_point(self, f: Dict) -> str:
+        """URL / Parameter / Payload for `f`, rendered byte-exact (fenced blocks).
+
+        Single source of truth for the trio across every markdown deliverable, so a
+        payload cannot round-trip losslessly in one file and be mangled in the next.
+        The detection probe is surfaced whenever the report ships a different (visual)
+        payload than the one the evidence was captured with.
+        """
+        ev = f.get("evidence") if isinstance(f.get("evidence"), dict) else {}
+        return md_injection_point(
+            f.get("url", ""), f.get("parameter", ""), f.get("payload", ""),
+            ev.get("original_payload"),
+        )
 
     def _synthesize_description(self, f: Dict) -> str:
         """A meaningful description when a specialist left ``description`` empty — built from
-        type + parameter + payload, so no finding renders with a blank body."""
+        type + parameter, so no finding renders with a blank body.
+
+        The payload is deliberately NOT inlined here: a description is markdown-active
+        prose, where a code span deletes the payload's backticks and a bare payload loses
+        its backslashes (and, if it looks like a tag, is dropped by the viewer's sanitizer
+        allowlist). Every deliverable prints the payload in its own fenced block instead,
+        in full — the old inline copy was also silently cut at 100 characters.
+        """
         vuln_type = f.get("type", "Unknown")
         url = f.get("url", "")
         param = f.get("parameter", "")
-        payload = f.get("payload", "")
         desc = f"{vuln_type} detected on {url}"
         if param:
             desc += f" via parameter '{param}'"
-        if payload:
-            desc += f" using payload `{str(payload)[:100]}`"
-        return desc + "."
+        return desc + ". See the Payload section for the exact input."
 
     def _build_finding_entry(self, f: Dict, finding_id: str, status: str, confidence: str) -> Dict:
         """Build a single finding entry with all required fields."""
@@ -2490,7 +2553,9 @@ class ReportingAgent(BaseAgent):
         # Also surface the specialist's structured evidence dict (OpenRedirect/CSTI/CORS/
         # Broken Access… keep their proof here, not in raw request/response) — else the
         # evidence panel is empty for those types.
-        _ev_block = self._render_evidence_dict(f)
+        # markdown=False: the static viewer HTML-escapes this into a <code> block and the
+        # WEB shows it verbatim, so fenced blocks would be rendered literally there.
+        _ev_block = self._render_evidence_dict(f, markdown=False)
         if _ev_block:
             _evidence.append({"description": "Detection Evidence", "content": _ev_block})
         if _evidence:
@@ -2907,9 +2972,6 @@ class ReportingAgent(BaseAgent):
         # Extract finding data
         vuln_type = finding.get("type", "Unknown")
         severity = finding.get("severity", "MEDIUM")
-        url = finding.get("url", "")
-        parameter = finding.get("parameter", "")
-        payload = finding.get("payload", "")
         description = finding.get("description") or self._synthesize_description(finding)
         # Surface the specialist's structured evidence (OpenRedirect/CSTI/CORS/Broken Access…
         # keep their proof in `evidence`, not raw request/response) into the markdown body —
@@ -2964,10 +3026,22 @@ class ReportingAgent(BaseAgent):
         status_badge = "✅ CONFIRMED"
 
         # Evidence request/response — prefer the agent's REAL captured request and response
-        # over a synthesized curl / validator notes (only fall back when they're absent).
+        # over a synthesized curl (only fall back for the request, which we can always
+        # reconstruct). The response has no synthetic equivalent: falling back to
+        # validator_notes or description put the CVSS-analysis prose (or the finding's own
+        # description) inside a block labeled "Response (excerpt)" and fenced as ```http```
+        # — text that was never an HTTP response. That prose is already rendered in its own
+        # Description / Exploitation Analysis sections below; an empty fence here (same
+        # empty-block convention already used for Payload on config/observation findings)
+        # is honest about not having captured a real response.
         http_request = (finding.get("http_request") or "").strip() or self._generate_curl(finding)
         validator_notes = finding.get("validator_notes", "")
-        http_response_excerpt = ((finding.get("http_response") or "").strip() or validator_notes or description or "")[:1500]
+        http_response_excerpt = (finding.get("http_response") or "").strip()[:1500]
+        # Fenced in Python, not in the template: a captured request or an LLM-written
+        # reproduction can itself contain a ``` run, which closes a fixed 3-backtick fence
+        # early and spills the rest of the request into the page as prose.
+        http_request_block = md_labeled_block("Request", http_request, "http")
+        http_response_block = md_labeled_block("Response (excerpt)", http_response_excerpt, "http")
 
         # Screenshot section
         screenshot_section = ""
@@ -2990,15 +3064,20 @@ class ReportingAgent(BaseAgent):
         # Validation method label
         validation_method = self._extract_validation_method(finding)
 
-        # Alternative payloads section
+        # Alternative payloads section — one fenced block per payload. A numbered list of
+        # inline code spans looked tidier but deleted every backtick in the payload.
         alt_payloads = finding.get("successful_payloads") or []
         if len(alt_payloads) > 1:
             lines = ["\n**Alternative Payloads:**\n"]
             for i, p in enumerate(alt_payloads, 1):
-                lines.append(f"{i}. `{p}`")
+                lines.append(f"Payload {i}:\n\n{md_code_block(p)}\n")
             alternative_payloads_section = "\n".join(lines) + "\n"
         else:
             alternative_payloads_section = ""
+
+        # URL / Parameter / Payload — byte-exact fenced blocks, plus the detection probe
+        # whenever the report ships a different (visual) payload than the evidence used.
+        injection_point = self._md_injection_point(finding)
 
         # Fill template
         filled = template.format(
@@ -3010,14 +3089,12 @@ class ReportingAgent(BaseAgent):
             status_badge=status_badge,
             cvss_score=cvss_score_str,
             validation_method=validation_method,
-            url=url,
-            parameter=parameter,
-            payload=payload,
+            injection_point=injection_point,
             description=description,
             impact=impact,
             remediation=remediation,
-            http_request=http_request,
-            http_response_excerpt=http_response_excerpt,
+            http_request_block=http_request_block,
+            http_response_block=http_response_block,
             screenshot_section=screenshot_section,
             reproduction_steps=reproduction_steps,
             alternative_payloads_section=alternative_payloads_section
@@ -3040,12 +3117,15 @@ class ReportingAgent(BaseAgent):
         lines.append(f"| **CVSS Score** | {cvss_str} |")
         lines.append(f"| **Status** | ✅ CONFIRMED |")
         lines.append(f"| **Validation Method** | {self._extract_validation_method(finding)} |")
-        lines.append(f"| **URL** | `{finding.get('url', '')}` |")
-        lines.append(f"| **Parameter** | `{finding.get('parameter', '')}` |")
         if finding.get("db_type"):
             lines.append(f"| **DB Type** | {finding.get('db_type')} |")
         if finding.get("tamper_used"):
             lines.append(f"| **Tamper Script** | {finding.get('tamper_used')} |")
+        lines.append("")
+
+        # URL / Parameter / Payload as fenced blocks — a markdown table cell cannot carry
+        # them byte-exact (no newlines, pipes break the row, runs of spaces collapse).
+        lines.append(self._md_injection_point(finding))
         lines.append("")
 
         # Steps to Reproduce (type-specific)
@@ -3057,9 +3137,8 @@ class ReportingAgent(BaseAgent):
         # PoC (Only for SQLi where we have SQLMap command)
         if "SQL" in finding.get("type", "").upper() and not self._generate_curl(finding).startswith("#"):
             lines.append("#### Proof of Concept\n")
-            lines.append("```bash")
-            lines.append(self._generate_curl(finding))
-            lines.append("```\n")
+            lines.append(md_code_block(self._generate_curl(finding), "bash"))
+            lines.append("")
 
         # Validator Notes
         if finding.get("validator_notes"):
@@ -3115,9 +3194,7 @@ class ReportingAgent(BaseAgent):
             lines.append(f"### MR-{i}. {f.get('type', 'Unknown')}\n")
             lines.append(f"- **Severity:** {severity_badge}")
             lines.append(f"- **CVSS Score:** {cvss_str}")
-            lines.append(f"- **URL:** `{f.get('url', '')}`")
-            lines.append(f"- **Parameter:** `{f.get('parameter', '')}`")
-            lines.append(f"- **Payload:** `{f.get('payload', '')}`")
+            lines.append(self._md_injection_point(f))
             lines.append("")
 
             # Full-fidelity body (parity with the HTML/JSON deliverable): description, evidence,
@@ -3151,9 +3228,7 @@ class ReportingAgent(BaseAgent):
                 _repro = self._generate_curl(f)
                 if _repro:
                     lines.append("#### Reproduction\n")
-                    lines.append("```bash")
-                    lines.append(_repro)
-                    lines.append("```")
+                    lines.append(md_code_block(_repro, "bash"))
                     lines.append("")
 
             if f.get("validator_notes"):
@@ -3200,9 +3275,7 @@ class ReportingAgent(BaseAgent):
             lines.append(f"| **CVSS Score** | {cvss_str} |")
             lines.append(f"| **Status** | ⏳ PENDING |")
             lines.append("")
-            lines.append(f"**URL:** `{f.get('url', '')}`")
-            lines.append(f"**Parameter:** `{f.get('parameter', '')}`")
-            lines.append(f"**Payload:** `{f.get('payload', '')}`")
+            lines.append(self._md_injection_point(f))
             lines.append("")
 
             # Description — synthesized from type/param/payload when the specialist (or a raw
@@ -3233,7 +3306,17 @@ class ReportingAgent(BaseAgent):
             lines.append("---\n")
 
     def _copy_html_template(self) -> Path:
-        """Copy the static HTML template that loads engagement_data.json."""
+        """Copy the static HTML template that loads engagement_data.json.
+
+        DEAD (verified 2026-07-28 by import graph): nothing calls this, nor the
+        ``_create_minimal_html`` / ``_build_html_template`` pair below it. The report.html
+        that ships is written by ``reporting/generator.py``, which copies
+        ``templates/report_viewer.html`` — the viewer that HTML-ESCAPES every payload it
+        prints. The two templates this method would use do NOT escape: they concatenate
+        ``reproduction.poc`` / ``exploitation_details`` / ``validation.notes`` straight into
+        ``innerHTML``, so any payload containing a tag would be swallowed by the parser and
+        never shown. Revive either of them and that has to be fixed first.
+        """
         # The HTML template location
         template_src = Path(__file__).parent.parent / "reporting" / "templates" / "report_dynamic.html"
         dest = self.output_dir / "report.html"
@@ -3420,74 +3503,113 @@ class ReportingAgent(BaseAgent):
             return self._curl_build_csti(url, param, payload)
 
         if vuln_type == "XSS":
-            return self._curl_build_xss(url, param, payload)
+            return self._curl_build_xss(url, param, payload, finding.get("http_method") or finding.get("method"))
 
         if vuln_type == "SSRF":
-            return f"# SSRF: Use Burp Collaborator or webhook.site to test OOB callbacks\ncurl '{url}'"
+            return (
+                "# SSRF: Use Burp Collaborator or webhook.site to test OOB callbacks\n"
+                + curl_get(url)
+            )
 
         if vuln_type == "LFI":
-            return self._curl_build_lfi(url, param)
+            return self._curl_build_lfi(url, param, payload)
 
         if vuln_type == "IDOR":
-            return f"# IDOR: Test with different user IDs/values\ncurl '{url}'"
+            return "# IDOR: Test with different user IDs/values\n" + curl_get(url)
 
         return self._curl_build_fallback(url, param, payload)
 
     def _curl_build_sqli(self, url: str, param: str) -> str:
         """Build SQLi reproduction command."""
         if param:
-            return f"sqlmap -u \"{url}\" -p {param} --batch --dbs"
-        return f"sqlmap -u \"{url}\" --batch --dbs"
+            return f"sqlmap -u {shell_word(url)} -p {param} --batch --dbs"
+        return f"sqlmap -u {shell_word(url)} --batch --dbs"
 
     def _curl_build_csti(self, url: str, param: str, payload: str) -> str:
-        """Build CSTI/SSTI reproduction command."""
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        """Build CSTI/SSTI reproduction command.
 
+        Every payload travels through a byte-safe channel — a quoted shell word for the
+        header/body shapes, percent-encoding for the URL shape. The project's own visual
+        CSTI banner contains a single quote, which used to break the command outright.
+
+        The success indicator is DERIVED from the probe that was actually sent
+        (``{{7*7}}`` → 49) instead of being hardcoded: an upgraded, non-arithmetic payload
+        gets no `grep` that could never match.
+        """
         default_payload = "{{7*7}}"
         test_payload = payload if payload else default_payload
+        expected = template_expression_result(test_payload)
+        check = f" | grep {shell_word(expected)}" if expected else ""
 
         # Check if it's a header injection
         if param and param.startswith("HEADER:"):
             header_name = param.replace("HEADER:", "")
-            return f"curl -H '{header_name}: {test_payload}' '{url}' | grep 49"
+            cmd = curl_header(url, header_name, test_payload, extra=check.lstrip())
+            if cmd:
+                return cmd
+            # The payload cannot legally be a header field value (CR/LF); a curl would
+            # silently deliver a truncated header, so point at the injection instead.
+            return (f"# CSTI via header {header_name} on {url}\n"
+                    f"# The payload below spans multiple lines and cannot ride an HTTP\n"
+                    f"# header — replay the captured request in an intercepting proxy.\n"
+                    f"{test_payload}")
         elif param and param.startswith("POST:"):
             param_name = param.replace("POST:", "")
-            return f"curl -X POST '{url}' -d '{param_name}={test_payload}' | grep 49"
+            return curl_form_field(url, param_name, test_payload) + check
         elif param and payload:
-            # URL param injection
-            parsed = urlparse(url)
-            qs = parse_qs(parsed.query)
-            qs[param] = [payload]
-            new_query = urlencode(qs, doseq=True)
-            test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
-            return f"curl '{test_url}' | grep 49"
+            # URL param injection — percent-encoded, so the command has no shell metacharacters
+            test_url = build_query_url(url, param, payload)
+            if test_url:
+                return curl_get(test_url) + check
         return f"# CSTI on {url} - inject {{{{7*7}}}} in parameter {param}"
 
-    def _curl_build_xss(self, url: str, param: str, payload: str) -> str:
-        """Build XSS reproduction command."""
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    def _curl_build_xss(self, url: str, param: str, payload: str, method: str = "") -> str:
+        """Build XSS reproduction command (a browser URL, not a curl — an XSS PoC has to
+        run in a DOM, and the percent-encoded URL carries the payload byte-exact).
 
+        Exception: a POST-only endpoint. Emitting a GET URL for it sends the triager to a
+        page that shows nothing, and the honest conclusion they reach is "false positive".
+        The sibling builders (_build_xxe_steps / _build_ssrf_steps / _build_generic_steps)
+        already branch on http_method; XSS was the only one that never received it.
+        """
+        if param and payload and (method or "").upper() == "POST":
+            return (
+                "# Stored/reflected XSS on a POST endpoint — submit the field, then load the\n"
+                "# page that renders it to observe execution:\n"
+                + curl_form_field(url, param, payload)
+            )
         if param and payload:
-            parsed = urlparse(url)
-            qs = parse_qs(parsed.query)
-            qs[param] = [payload]
-            new_query = urlencode(qs, doseq=True)
-            test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
-            return f"# Open in browser to trigger XSS:\n{test_url}"
-        elif payload:
-            return f"# XSS Payload: {payload}\n# Inject in parameter: {param or 'unknown'}"
-        return f"# XSS on {url} - test with <script>alert(1)</script> in {param or 'input fields'}"
+            test_url = build_query_url(url, param, payload)
+            if test_url:
+                return f"# Open in browser to trigger XSS:\n{test_url}"
+        if payload:
+            # No URL to build. The reproduction is always RENDERED inside a code block
+            # (md_code_block picks a fence long enough for it), so the payload can sit on
+            # its own plain line here and still reach the clipboard byte-exact.
+            return (
+                f"# XSS: inject the payload below into parameter: {param or 'unknown'}\n"
+                f"{payload}"
+            )
+        return f"# XSS on {url} - test the input fields for {param or 'reflected input'}"
 
-    def _curl_build_lfi(self, url: str, param: str) -> str:
-        """Build LFI reproduction command."""
+    def _curl_build_lfi(self, url: str, param: str, payload: str = "") -> str:
+        """Build LFI reproduction command from the finding's OWN traversal payload."""
+        if param and payload:
+            return curl_get(build_query_url(url, param, payload) or url)
         if param:
-            return f"curl '{url}' --data-urlencode '{param}=../../../etc/passwd'"
-        return f"# LFI on {url} - test with ../../etc/passwd"
+            return f"# LFI on {url} - inject a traversal path into parameter {param}"
+        return f"# LFI on {url} - test with a directory-traversal path"
 
     def _curl_build_fallback(self, url: str, param: str, payload: str) -> str:
-        """Build fallback reproduction command."""
+        """Build fallback reproduction command.
+
+        The payload sits on its own line rather than inside a `# Payload: ...` comment:
+        the whole command is rendered inside a code block, so a plain line reaches the
+        clipboard byte-exact while a comment line invites callers to lift it into prose.
+        """
         if url and param:
-            return f"# Vulnerable endpoint: {url}\n# Parameter: {param}\n# Payload: {payload or 'N/A'}"
+            head = f"# Vulnerable endpoint: {url}\n# Parameter: {param}"
+            return f"{head}\n# Payload:\n{payload}" if payload else head
         elif url:
             return f"# Vulnerable endpoint: {url}"
         else:
@@ -3568,39 +3690,47 @@ class ReportingAgent(BaseAgent):
         return self._extract_validation_method(finding)
     
     def _get_validation_notes(self, finding: Dict) -> str:
-        """Generate detailed validation notes based on finding type."""
+        """Generate detailed validation notes based on finding type.
+
+        PLAIN TEXT, deliberately. The one consumer of this string is the finding entry's
+        ``validation.notes``, and every viewer that reads it HTML-escapes the value into a
+        pre-formatted block — so the markdown this used to emit (``**bold**`` labels and a
+        fenced evidence block) reached the reader as literal asterisks and backticks, and
+        the SQLi payload inside the fence was shown with the fence around it. Escaping also
+        means the payload needs no encoding here: it arrives byte-exact as-is.
+        """
         vuln_type = finding.get("type", "").upper()
-        
-        if vuln_type in ["SQLI", "SQLi"]:
-            # Build SQLMap validation details
-            notes = []
-            notes.append("**SQLMap Validation Results:**")
-            
-            if finding.get("db_type"):
-                notes.append(f"- Database Type: {finding.get('db_type')}")
-            
-            if finding.get("payload"):
-                notes.append(f"- Injection Technique: {finding.get('payload')}")
-            
-            if finding.get("tamper_used"):
-                notes.append(f"- WAF Bypass: {finding.get('tamper_used')}")  
-            
-            if finding.get("confidence"):
-                notes.append(f"- Confidence: {finding.get('confidence')*100:.0f}%")
-            
-            if finding.get("evidence"):
-                evidence = finding.get("evidence")
-                # Handle both string and dict evidence formats
-                if isinstance(evidence, dict):
-                    evidence = str(evidence)
-                evidence_preview = evidence[:200] if len(evidence) > 200 else evidence
-                suffix = "..." if len(evidence) > 200 else ""
-                notes.append(f"\n**Evidence:**\n```\n{evidence_preview}{suffix}\n```")
-            
-            return "\n".join(notes)
-        else:
-            # Default notes
+
+        if vuln_type != "SQLI":
             return finding.get("validator_notes", "Confirmed by specialist agent (CDP not required)")
+
+        notes = ["SQLMap Validation Results:"]
+        if finding.get("db_type"):
+            notes.append(f"- Database Type: {finding.get('db_type')}")
+        if finding.get("payload"):
+            notes.append(f"- Injection Technique: {finding.get('payload')}")
+        if finding.get("tamper_used"):
+            notes.append(f"- WAF Bypass: {finding.get('tamper_used')}")
+        if finding.get("confidence"):
+            notes.append(f"- Confidence: {finding.get('confidence')*100:.0f}%")
+
+        evidence = finding.get("evidence")
+        if isinstance(evidence, dict) and evidence:
+            pairs, dropped_keys = evidence_pairs(
+                evidence,
+                limit=settings.REPORT_EVIDENCE_MAX_FIELDS,
+                value_budget=settings.REPORT_EVIDENCE_VALUE_CHARS,
+            )
+            rendered = plain_evidence_block(pairs, dropped_keys)
+        elif evidence:
+            text, dropped = truncate_marked(str(evidence), settings.REPORT_EVIDENCE_VALUE_CHARS)
+            rendered = text + (f"\n  (truncated: {len(text)} of {len(text) + dropped} "
+                               f"characters shown)" if dropped else "")
+        else:
+            rendered = ""
+        if rendered:
+            notes.append("\nEvidence:\n" + rendered)
+        return "\n".join(notes)
 
     def _generate_reproduction_steps(self, finding: Dict) -> List[str]:
         """
@@ -3638,10 +3768,10 @@ class ReportingAgent(BaseAgent):
         method = (finding.get("http_method") or finding.get("method") or "POST").upper()
 
         return [
-            f"1. Identify the endpoint that accepts an XML request body: {url}",
+            md_step_with_value("1. Identify the endpoint that accepts an XML request body:", url),
             "2. Open an intercepting proxy (e.g. Burp) or browser DevTools (F12) → Network tab",
             "3. Trigger the feature that submits XML and capture the normal request",
-            f"4. Intercept the {method} request to: {url}",
+            f"4. Intercept the {method} request to that endpoint",
             "5. Replace the XML body with the malicious payload containing the XXE entity",
             "6. Forward the request and observe the out-of-band callback on your server",
             "7. **Expected Result:** Your OOB server receives a DNS/HTTP callback from the target server"
@@ -3658,9 +3788,9 @@ class ReportingAgent(BaseAgent):
 
         if is_time_based:
             return [
-                f"1. Navigate to: {url}",
-                f"2. Locate the `{param}` parameter in the URL/form",
-                f"3. Inject the time-based payload: `{payload}`",
+                md_step_with_value("1. Navigate to:", url),
+                md_step_with_value("2. Locate this parameter in the URL/form:", param),
+                md_step_with_block("3. Inject the time-based payload:", payload),
                 "4. Submit the request and start a timer",
                 "5. **Expected Result:** Response takes 5+ seconds (indicating SQL SLEEP executed)",
                 "6. Compare with normal request time (should be <1 second)",
@@ -3668,21 +3798,27 @@ class ReportingAgent(BaseAgent):
             ]
         elif is_error_based:
             return [
-                f"1. Navigate to: {url}",
-                f"2. Locate the `{param}` parameter",
-                f"3. Inject the error-based payload: `{payload}`",
+                md_step_with_value("1. Navigate to:", url),
+                md_step_with_value("2. Locate this parameter:", param),
+                md_step_with_block("3. Inject the error-based payload:", payload),
                 "4. Submit the request",
                 "5. **Expected Result:** Response contains database data in error message",
                 "6. Look for extracted values (usernames, passwords, etc.) in the error output"
             ]
         else:
             return [
-                f"1. Navigate to: {url}",
-                f"2. Locate the `{param}` parameter",
-                f"3. Inject the payload: `{payload}`",
+                md_step_with_value("1. Navigate to:", url),
+                md_step_with_value("2. Locate this parameter:", param),
+                md_step_with_block("3. Inject the payload:", payload),
                 "4. Submit the request",
                 "5. **Expected Result:** SQL error message or altered response indicating injection",
-                f"6. For further exploitation, use SQLMap: `sqlmap -u \"{url}\" -p {param} --batch`"
+                # `-p` only when there IS a parameter: with an empty one the option
+                # swallowed the next flag (`-p  --batch`) and sqlmap tested "--batch".
+                md_step_with_block(
+                    "6. For further exploitation, use SQLMap:",
+                    f"sqlmap -u {shell_word(url)}"
+                    + (f" -p {shell_word(param)}" if param else "")
+                    + " --batch", "bash")
             ]
 
     def _build_xss_steps(self, finding: Dict) -> List[str]:
@@ -3691,16 +3827,33 @@ class ReportingAgent(BaseAgent):
         url = finding.get("url", "")
         param = finding.get("parameter", "")
         payload = finding.get("payload", "")
-        loc = f"the `{param}` parameter" if param else "the injection point"
-        return [
-            (f"1. Load this URL in a fresh incognito browser window: {url}" if url
-             else "1. Open the affected page in a fresh incognito browser window"),
-            (f"2. Payload injected into {loc}: `{payload}`" if payload else f"2. Inject the XSS payload into {loc}"),
-            "3. **Expected Result:** a JavaScript alert box appears, or the payload executes in the DOM",
-            "4. Open DevTools Console (F12) to confirm execution",
-            "5. For stored XSS: navigate to where the payload is rendered and confirm it fires",
-            "6. Screenshot the alert/execution as proof",
+        method = (finding.get("http_method") or finding.get("method") or "").upper()
+        loc = "the parameter above" if param else "the injection point"
+        # Step 1 used to tell the triager to load the URL in a browser regardless of method.
+        # On a POST-only endpoint that renders a blank page, and the report reads as a false
+        # positive for a finding that is real.
+        if method == "POST":
+            head = [
+                (md_step_with_value("1. Submit the payload with a POST request to this endpoint (see the reproduction command):", url)
+                 if url else "1. Submit the payload with a POST request to the affected endpoint"),
+            ]
+        else:
+            head = [
+                (md_step_with_value("1. Load this URL in a fresh incognito browser window:", url)
+                 if url else "1. Open the affected page in a fresh incognito browser window"),
+            ]
+        if param:
+            head.append(md_step_with_value("2. Injection parameter:", param))
+        n = len(head) + 1
+        head.append(md_step_with_block(f"{n}. Payload injected into {loc}:", payload) if payload
+                    else f"{n}. Inject the XSS payload into {loc}")
+        tail = [
+            "**Expected Result:** a JavaScript alert box appears, or the payload executes in the DOM",
+            "Open DevTools Console (F12) to confirm execution",
+            "For stored XSS: navigate to where the payload is rendered and confirm it fires",
+            "Screenshot the alert/execution as proof",
         ]
+        return head + [f"{n + 1 + i}. {t}" for i, t in enumerate(tail)]
 
     def _build_ssrf_steps(self, finding: Dict) -> List[str]:
         """Build reproduction steps for SSRF vulnerabilities."""
@@ -3708,10 +3861,11 @@ class ReportingAgent(BaseAgent):
         param = finding.get("parameter", "")
 
         return [
-            f"1. Set up an out-of-band callback server (Burp Collaborator, interactsh, or webhook.site)",
-            f"2. Navigate to: {url}",
-            (f"3. Locate the `{param}` parameter" if param else "3. Locate the request parameter that accepts a URL/host value"),
-            f"4. Inject your callback URL as the payload",
+            "1. Set up an out-of-band callback server (Burp Collaborator, interactsh, or webhook.site)",
+            md_step_with_value("2. Navigate to:", url),
+            (md_step_with_value("3. Locate this parameter:", param) if param
+             else "3. Locate the request parameter that accepts a URL/host value"),
+            "4. Inject your callback URL as the payload",
             "5. Submit the request",
             "6. **Expected Result:** Your callback server receives a request from the target server",
             "7. For internal network access, try: http://169.254.169.254/latest/meta-data/ (AWS metadata)"
@@ -3723,12 +3877,14 @@ class ReportingAgent(BaseAgent):
         and an 'item added to cart' outcome unrelated to the actual target)."""
         url = finding.get("url", "")
         method = (finding.get("http_method") or finding.get("method") or "POST").upper()
-        req = f"{method} {url}" if url else "the state-changing request"
         return [
-            f"1. Log into the target, then confirm the state-changing request carries no anti-CSRF token: {req}",
-            "2. Build an HTML page on an external origin that auto-submits that same request (a cross-site <form> or fetch)",
+            (md_step_with_value(
+                "1. Log into the target, then confirm this state-changing request carries "
+                "no anti-CSRF token:", f"{method} {url}") if url else
+             "1. Log into the target, then confirm the state-changing request carries no anti-CSRF token"),
+            "2. Build an HTML page on an external origin that auto-submits that same request (a cross-site `<form>` or fetch)",
             "3. While still authenticated to the target, open that attacker page in the same browser",
-            f"4. **Expected Result:** the action at {url or 'the endpoint'} executes using the victim's session — no token/Origin check blocks it",
+            "4. **Expected Result:** the action at that endpoint executes using the victim's session — no token/Origin check blocks it",
             "5. Verify in the application that the unauthorized action took effect",
         ]
 
@@ -3738,14 +3894,24 @@ class ReportingAgent(BaseAgent):
         url = finding.get("url", "")
         param = finding.get("parameter", "")
         payload = finding.get("payload", "")
-        return [
-            (f"1. Load this URL in a new browser tab: {url}" if url else "1. Load the affected URL in a new browser tab"),
-            (f"2. The redirect is driven by the `{param}` parameter (value: `{payload}`)." if param
-             else (f"2. Redirect payload: `{payload}`" if payload else "2. Set the redirect parameter to an external attacker domain")),
-            "3. **Expected Result:** the browser redirects to the external attacker domain",
-            "4. Confirm the destination in the address bar",
-            "5. Impact: usable for phishing — redirect users from the trusted domain to a fake login page",
+        steps = [
+            (md_step_with_value("1. Load this URL in a new browser tab:", url) if url
+             else "1. Load the affected URL in a new browser tab"),
         ]
+        if param:
+            steps.append(md_step_with_value(
+                f"{len(steps) + 1}. The redirect is driven by this parameter:", param))
+        if payload:
+            steps.append(md_step_with_block(
+                f"{len(steps) + 1}. Redirect payload:", payload))
+        if not param and not payload:
+            steps.append("2. Set the redirect parameter to an external attacker domain")
+        tail = [
+            "**Expected Result:** the browser redirects to the external attacker domain",
+            "Confirm the destination in the address bar",
+            "Impact: usable for phishing — redirect users from the trusted domain to a fake login page",
+        ]
+        return steps + [f"{len(steps) + 1 + i}. {t}" for i, t in enumerate(tail)]
 
     def _build_generic_steps(self, finding: Dict) -> List[str]:
         """Reproduction steps for types without a dedicated builder.
@@ -3766,24 +3932,28 @@ class ReportingAgent(BaseAgent):
         # A real captured request reproduces it exactly.
         if raw_req and len(raw_req) > 12:
             return [
-                f"1. Target endpoint: {url}",
-                "2. Replay the exact request below (curl, or an intercepting proxy like Burp):",
-                f"   {raw_req}",
+                md_step_with_value("1. Target endpoint:", url),
+                md_step_with_block(
+                    "2. Replay the exact request below (curl, or an intercepting proxy like Burp):",
+                    raw_req, "http",
+                ),
                 "3. Observe the response for the indicator described in the Evidence section.",
             ]
 
         # A genuine injection (a payload goes into the request) — here a curl IS a real PoC.
+        # The payload rides in a percent-encoded URL (GET) or a quoted --data-urlencode
+        # word (POST); interpolated raw it broke the command, or silently sent nothing.
         if url and payload:
             if param:
-                sep = "&" if "?" in url else "?"
-                curl = f"curl -i '{url}{sep}{param}={payload}'"
-                detail = f"This injects `{payload}` into the `{param}` parameter."
+                curl = curl_get(build_query_url(url, param, payload) or url)
+                detail = md_step_with_value(
+                    "2. This injects the payload into this parameter:", param)
             else:
-                curl = f"curl -i -X {method or 'POST'} '{url}' --data '{payload}'"
-                detail = f"This sends the payload `{payload}` to the endpoint."
+                curl = curl_raw_body(url, payload, method=method or "POST")
+                detail = "2. This sends the payload to the endpoint as the request body."
             return [
-                f"1. Reproduce with: {curl}",
-                f"2. {detail}",
+                md_step_with_block("1. Reproduce with:", curl, "bash"),
+                detail,
                 "3. Compare the response against the Evidence to confirm the indicator.",
             ]
 
@@ -3792,7 +3962,8 @@ class ReportingAgent(BaseAgent):
         # / vulnerable components). Point to the Evidence instead.
         return [
             "1. This is an observation / configuration finding, confirmed from the scanner's Evidence below.",
-            (f"2. Affected: {url}" if url else "2. See the Evidence section for the affected component."),
+            (md_step_with_value("2. Affected:", url) if url
+             else "2. See the Evidence section for the affected component."),
             "3. Validate by reviewing the response / configuration in the Evidence — no injection request applies.",
         ]
 
@@ -3982,9 +4153,12 @@ class ReportingAgent(BaseAgent):
 
     def _apply_deterministic_poc_fallback(self, finding: Dict) -> bool:
         """Build a bounded PoC narrative strictly from already-recorded proof."""
-        request = finding.get("http_request") or finding.get("reproduction") or ""
-        response = finding.get("http_response") or finding.get("response_excerpt") or ""
-        evidence = self._render_evidence_dict(finding)
+        request = finding.get("http_request") or finding.get("reproduction") or finding.get("nuclei_request") or ""
+        response = finding.get("http_response") or finding.get("response_excerpt") or finding.get("nuclei_response") or ""
+        # Rendered PLAIN and then wrapped in one fenced block below: `exploitation_details`
+        # is markdown, and slicing a markdown-rendered evidence panel could cut a fence in
+        # half — an unclosed fence swallows the rest of the write-up.
+        evidence = self._render_evidence_dict(finding, markdown=False)
         payload = finding.get("payload") or ""
         proof = request or response or evidence or payload
         if not proof:
@@ -3992,13 +4166,15 @@ class ReportingAgent(BaseAgent):
 
         proof_parts = []
         if request:
-            proof_parts.append(f"Captured request:\n```http\n{str(request)[:2000]}\n```")
+            proof_parts.append("Captured request:\n\n" + md_code_block(str(request)[:2000], "http"))
         if response:
-            proof_parts.append(f"Captured response:\n```http\n{str(response)[:2000]}\n```")
+            proof_parts.append("Captured response:\n\n" + md_code_block(str(response)[:2000], "http"))
         if evidence:
-            proof_parts.append(f"Recorded evidence:\n{evidence[:2000]}")
+            proof_parts.append("Recorded evidence:\n\n" + md_code_block(evidence))
         if payload and not request:
-            proof_parts.append(f"Recorded payload:\n```\n{str(payload)[:1000]}\n```")
+            # No length cap on the payload: it is the one field that has to be lossless
+            # (the request/response above are explicitly labelled excerpts).
+            proof_parts.append("Recorded payload:\n\n" + md_code_block(payload))
 
         finding["exploitation_details"] = (
             "## Reproduction Steps\n"
@@ -4059,9 +4235,14 @@ class ReportingAgent(BaseAgent):
         vuln_type = finding.get("type", "Unknown")
         validator_notes = finding.get("validator_notes", "")
         extra_evidence = f"- Validation Evidence: {validator_notes}" if validator_notes else ""
-        http_request = (finding.get("http_request") or finding.get("reproduction") or "")[:4000]
-        http_response = (finding.get("http_response") or finding.get("response_excerpt") or "")[:4000]
-        structured_evidence = self._render_evidence_dict(finding)[:3000]
+        # nuclei_request/nuclei_response is where nuclei-sourced findings carry their
+        # captured evidence (see _nuclei_parse_findings) — without this fallback the
+        # LLM gets an empty "Captured HTTP Proof" block for a real, evidenced finding
+        # and correctly-but-misleadingly reports the proof as unavailable.
+        http_request = (finding.get("http_request") or finding.get("reproduction") or finding.get("nuclei_request") or "")[:4000]
+        http_response = (finding.get("http_response") or finding.get("response_excerpt") or finding.get("nuclei_response") or "")[:4000]
+        # Prompt context: the LLM reads plain text, so no markdown fences here.
+        structured_evidence = self._render_evidence_dict(finding, markdown=False)[:3000]
 
         return {
             "vuln_type": vuln_type,
@@ -4700,7 +4881,7 @@ Write the entry with EXACTLY these three markdown sections, grounded STRICTLY in
             evidence = f"  Validation Evidence: {validator_notes}" if validator_notes else ""
             request = str(f.get("http_request") or f.get("reproduction") or "")[:1500]
             response = str(f.get("http_response") or f.get("response_excerpt") or "")[:1500]
-            structured = self._render_evidence_dict(f)[:1200]
+            structured = self._render_evidence_dict(f, markdown=False)[:1200]
             finding_blocks.append(
                 f"[Finding {i}]\n"
                 f"  URL: {f.get('url', '')}\n"
@@ -4809,6 +4990,8 @@ Example format:
                 continue
 
             # Reconstruct exploitation_details as markdown (compatible with current format)
+            # The values this prose quotes are fenced later, by _protect_narrative_values,
+            # because the payload is not final until the visual-PoC upgrade has run.
             sections = []
             summary = item.get("summary")
             if summary:
@@ -5406,10 +5589,16 @@ Example format:
         """Score a single chunk of findings via batch LLM call."""
         findings_text = []
         for i, f in enumerate(chunk):
+            # validator_notes carries WHAT the validator actually observed (e.g. an
+            # error-based status differential vs a real UNION/data-dump) — without it
+            # the scorer only sees the vuln TYPE label and defaults to that type's
+            # worst-case example (an error-based SQLi read as "full DB access" CRITICAL).
+            evidence = str(f.get("validator_notes") or "")[:200]
+            evidence_line = f", Validation Evidence: {evidence}" if evidence else ""
             findings_text.append(
                 f"[Finding {i}] Type: {f.get('type')}, URL: {f.get('url')}, "
                 f"Parameter: {f.get('parameter')}, Payload: {str(f.get('payload', ''))[:100]}, "
-                f"Description: {str(f.get('description', ''))[:150]}"
+                f"Description: {str(f.get('description', ''))[:150]}{evidence_line}"
             )
         findings_block = "\n".join(findings_text)
 
@@ -5509,6 +5698,8 @@ Output STRICT JSON array (no markdown):
 
     def _cvss_build_prompt(self, f: Dict) -> str:
         """Build CVSS calculation prompt for LLM."""
+        validator_notes = str(f.get("validator_notes") or "")[:400]
+        evidence_line = f"\n            - Validation Evidence: {validator_notes}" if validator_notes else ""
         return f"""
             You are a Senior Penetration Testing Expert analyzing a confirmed security vulnerability.
 
@@ -5517,7 +5708,7 @@ Output STRICT JSON array (no markdown):
             - Description: {f.get('description')}
             - URL: {f.get('url')}
             - Parameter: {f.get('parameter')}
-            - Payload: {f.get('payload')}
+            - Payload: {f.get('payload')}{evidence_line}
 
             **Your Task:**
             1. Calculate the CVSS v3.1 Vector String (e.g., CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H)
@@ -5532,7 +5723,10 @@ Output STRICT JSON array (no markdown):
             6. If this vulnerability relates to a known CVE (especially for specific technologies/libraries like Apache Velocity, Jinja2, AngularJS, Log4j, etc.), provide the most relevant CVE reference. For generic application-level vulnerabilities (like SQLi in a custom parameter), return null.
 
             **CRITICAL: SEVERITY CALIBRATION GUIDELINES**
-            Be REALISTIC with scoring - not everything is CRITICAL. Use these guidelines:
+            Be REALISTIC with scoring - not everything is CRITICAL. Score what the Validation Evidence
+            above actually shows was demonstrated, NOT the theoretical worst case for this vuln type —
+            e.g. an error-based status differential is not "full DB access" unless the evidence shows
+            actual data was extracted. Use these guidelines:
 
             - **CRITICAL (9.0-10.0)**: Remote Code Execution, SQL Injection with full DB access, Authentication Bypass
             - **HIGH (7.0-8.9)**: Stored XSS, SSRF with internal network access, XXE with file read, CSTI/SSTI
@@ -5696,9 +5890,35 @@ Output STRICT JSON array (no markdown):
         # Append rationale to description or notes
         rationale = data.get('rationale', '')
 
-        enrichment_text = f"\n\n**CVSS Analysis**:\n- **Severity**: {f.get('severity', 'N/A')} ({f.get('cvss_score', 'N/A')})\n- **Vector**: `{f.get('cvss_vector', 'N/A')}`\n- **Rationale**: {rationale}"
+        # Severity and cvss_score are deliberately NOT restated here. This prose is frozen into
+        # validator_notes at enrichment time, but both fields are mutated several more times
+        # afterwards (_apply_deterministic_severity_rules / _apply_severity_floor /
+        # _normalize_cvss_severities, applied both pre- and post-PoC-enrichment) and nothing
+        # rewrites this string. Restating them shipped findings whose header severity
+        # contradicted their own CVSS block — re-injecting exactly the LLM overclaim the
+        # deterministic rules exist to suppress. The finding header is the single source of
+        # truth for severity; this block carries only what enrichment itself owns.
+        enrichment_text = f"\n\n**CVSS Analysis**:\n- **Vector**: `{f.get('cvss_vector', 'N/A')}`\n- **Rationale**: {rationale}"
         if cve:
-            enrichment_text += f"\n- **Reference CVE**: [{cve}](https://nvd.nist.gov/vuln/detail/{cve})"
+            # `cve` is free text from the LLM's enrichment JSON — it has been observed as a
+            # single id ("CVE-2020-11022") AND as a comma-joined list ("CVE-2020-11022,
+            # CVE-2020-11023"). The sibling builder at `_generate_standardized_finding` (~2993)
+            # already guards this with `format_cve()` inside try/except; this site built the
+            # link straight from the raw string, so a multi-CVE value produced one NVD URL with
+            # a literal comma and space in the path — a link that never resolves. Build one
+            # validated link per id instead of one broken link for the whole string.
+            cve_links = []
+            for candidate in cve.split(","):
+                candidate = candidate.strip()
+                if not candidate:
+                    continue
+                try:
+                    formatted = format_cve(candidate)
+                    cve_links.append(f"[{formatted}](https://nvd.nist.gov/vuln/detail/{formatted})")
+                except ValueError:
+                    continue
+            if cve_links:
+                enrichment_text += f"\n- **Reference CVE**: {', '.join(cve_links)}"
 
         # Append to validator_notes instead of overwriting description to keep original clean
         if f.get('validator_notes'):
@@ -5733,9 +5953,8 @@ Output STRICT JSON array (no markdown):
 
         for i, f in enumerate(findings, 1):
             lines.append(f"### {i}. {f.get('type')} on {f.get('parameter', 'unknown')}\n")
-            lines.append(f"- **URL:** `{f.get('url')}`")
-            lines.append(f"- **Payload:** `{f.get('payload')}`")
-            lines.append(f"- **Description:** {f.get('description')}\n")
+            lines.append(self._md_injection_point(f))
+            lines.append(f"\n**Description:** {f.get('description')}\n")
             lines.append("---\n")
 
         with open(path, "w", encoding="utf-8") as file:
@@ -5761,9 +5980,8 @@ Output STRICT JSON array (no markdown):
             for i, f in enumerate(validated, 1):
                 lines.append(f"### C-{i}. {f.get('type')}\n")
                 lines.append(f"**Severity:** {f.get('severity')}\n")
-                lines.append(f"**URL:** `{f.get('url')}`\n")
-                lines.append(f"**Parameter:** `{f.get('parameter')}`\n")
-                lines.append(f"**PoC:**\n```bash\n{self._generate_curl(f)}\n```\n")
+                lines.append(self._md_injection_point(f) + "\n")
+                lines.append("**PoC:**\n\n" + md_code_block(self._generate_curl(f), "bash") + "\n")
                 if f.get("validator_notes"):
                     lines.append(f"**Validation Notes:**\n> {f.get('validator_notes')}\n")
                 lines.append("---\n")
@@ -5773,9 +5991,7 @@ Output STRICT JSON array (no markdown):
             lines.append("## ⚠️ Needs Manual Review\n")
             for i, f in enumerate(manual_review, 1):
                 lines.append(f"### M-{i}. {f.get('type')}\n")
-                lines.append(f"**URL:** `{f.get('url')}`\n")
-                lines.append(f"**Parameter:** `{f.get('parameter')}`\n")
-                lines.append(f"**Payload:** `{f.get('payload')}`\n")
+                lines.append(self._md_injection_point(f) + "\n")
                 lines.append(f"**Why Review:** {f.get('validator_notes')}\n")
                 lines.append("---\n")
 
@@ -5790,8 +6006,7 @@ Output STRICT JSON array (no markdown):
         md = []
         md.append(f"### {index}. {f.get('type')}")
         md.append(f"**Severity:** {f.get('severity')}")
-        md.append(f"**URL:** `{f.get('url')}`")
-        md.append(f"**Parameter:** `{f.get('parameter')}`")
+        md.append(self._md_injection_point(f))
         if f.get("db_type"):
             md.append(f"**DB Type:** {f.get('db_type')}")
         if f.get("tamper_used"):
@@ -5803,7 +6018,8 @@ Output STRICT JSON array (no markdown):
         md.append("")
         if "SQL" in f.get("type", "").upper() and not self._generate_curl(f).startswith("#"):
             md.append("#### Proof of Concept")
-            md.append("```bash")
-            md.append(self._generate_curl(f))
-            md.append("```")
-        return "\\n".join(md)
+            md.append(md_code_block(self._generate_curl(f), "bash"))
+        # Real newlines, not the two-character sequence "\\n": this block is copied to the
+        # clipboard verbatim by the viewer's COPY MD button, and escaped newlines turned the
+        # whole write-up into one unusable line (and would break every fenced block in it).
+        return "\n".join(md)

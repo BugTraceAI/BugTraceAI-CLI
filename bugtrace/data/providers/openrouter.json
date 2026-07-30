@@ -15,16 +15,16 @@
         "DEFAULT_MODEL": "qwen/qwen3-coder",
         "CODE_MODEL": "qwen/qwen3-coder",
         "ANALYSIS_MODEL": "qwen/qwen3-coder",
-        "PRIMARY_MODELS": "qwen/qwen3-coder,x-ai/grok-4-fast",
+        "PRIMARY_MODELS": "qwen/qwen3-coder,x-ai/grok-4.3",
         "VISION_MODEL": "google/gemini-3-flash-preview",
-        "WAF_DETECTION_MODELS": "qwen/qwen3-coder,x-ai/grok-4-fast",
-        "MUTATION_MODEL": "x-ai/grok-4-fast",
+        "WAF_DETECTION_MODELS": "qwen/qwen3-coder,x-ai/grok-4.3",
+        "MUTATION_MODEL": "x-ai/grok-4.3",
         "SKEPTICAL_MODEL": "anthropic/claude-haiku-4.5",
         "REPORTING_MODEL": "anthropic/claude-haiku-4.5"
     },
     "pricing": {
         "qwen/qwen3-coder": { "input": 0.22, "output": 1.00 },
-        "x-ai/grok-4-fast": { "input": 3.00, "output": 15.00 },
+        "x-ai/grok-4.3": { "input": 3.00, "output": 15.00 },
         "google/gemini-3-flash-preview": { "input": 0.10, "output": 0.40 },
         "deepseek/deepseek-chat": { "input": 0.14, "output": 0.28 }
     }

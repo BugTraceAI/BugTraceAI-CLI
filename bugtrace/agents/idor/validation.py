@@ -8,9 +8,33 @@ All functions are PURE: no side effects, no self, data as parameters.
 """
 
 import re
+import json
 from typing import Dict, List, Tuple
 
 from bugtrace.agents.idor.types import SENSITIVE_MARKERS, USER_PATTERNS
+
+
+def _contains_sensitive_fields(body: str) -> bool:
+    """Detect sensitive response fields without matching words in public content."""
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        field_pattern = "|".join(re.escape(marker) for marker in SENSITIVE_MARKERS)
+        return bool(re.search(rf'["\']?(?:{field_pattern})["\']?\s*[:=]', body, re.IGNORECASE))
+
+    def _walk(value) -> bool:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                normalized = str(key).lower().replace("-", "_")
+                if any(marker in normalized for marker in SENSITIVE_MARKERS):
+                    return True
+                if _walk(nested):
+                    return True
+        elif isinstance(value, list):
+            return any(_walk(item) for item in value)
+        return False
+
+    return _walk(payload)
 
 
 def validate_idor_finding(finding: Dict) -> Tuple[bool, str]:
@@ -109,8 +133,10 @@ def analyze_differential(
     if baseline_status >= 400 and test_status == 200:
         indicators.append("status_change")
 
-    # 3. Significant length difference (>30%)
-    if baseline_length > 0:
+    # 3. Significant length difference (>30%) — only meaningful if the test ID
+    # actually resolved (200). An error page naturally differs in length from
+    # real data; that's not IDOR evidence, it's just "the ID doesn't exist."
+    if test_status == 200 and baseline_length > 0:
         diff_ratio = abs(test_length - baseline_length) / baseline_length
         if diff_ratio > 0.3:
             indicators.append("length_change")
@@ -127,17 +153,21 @@ def analyze_differential(
         indicators.append("user_data_leakage")
         return True, "CRITICAL", ",".join(indicators)
 
-    # 5. Sensitive data markers
-    test_has_sensitive = any(marker in test_body.lower() for marker in SENSITIVE_MARKERS)
-    baseline_has_sensitive = any(marker in baseline_body.lower() for marker in SENSITIVE_MARKERS)
+    # 5. Sensitive data markers — must be present in the TEST response itself.
+    # `baseline_has_sensitive` alone used to be enough to trigger this, but the
+    # baseline (the requester's own resource) is almost always sensitive, so
+    # that made this indicator fire on nearly any differing response, including
+    # a plain 404 for a nonexistent ID. Only a successful test response that
+    # itself exposes sensitive data is real IDOR evidence.
+    test_has_sensitive = _contains_sensitive_fields(test_body)
+    baseline_has_sensitive = _contains_sensitive_fields(baseline_body)
 
-    if test_has_sensitive or baseline_has_sensitive:
+    if test_status == 200 and test_has_sensitive:
         indicators.append("sensitive_data_exposure")
 
     # 6. Content divergence: both 200, different resource data with PII
     if baseline_status == 200 and test_status == 200:
         if (test_has_sensitive or baseline_has_sensitive) and baseline_body != test_body:
-            import json
             try:
                 b_json = json.loads(baseline_body)
                 t_json = json.loads(test_body)

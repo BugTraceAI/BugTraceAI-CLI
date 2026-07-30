@@ -452,12 +452,18 @@ class ExternalToolManager:
 
     async def run_nuclei(self, target: str, cookies: List[Dict] = None) -> Dict[str, Any]:
         """
-        Runs two-phase Nuclei scan (native preferred, Docker fallback):
-        1. Tech Detection (-tags tech): Fast detection of technologies/infrastructure
-        2. Automatic Scan (-as): Smart vulnerability scan based on detected tech
+        Runs three-phase Nuclei scan (native preferred, Docker fallback):
+        1. Tech Detection (-tags tech,misconfig,exposure,token): technologies/infrastructure
+        2. Deterministic Scan (fixed -tags): the guaranteed floor — same tags every run,
+           does not depend on Nuclei's own runtime fingerprinting
+        3. Automatic Scan (-as): opportunistic re-fishing on top of the floor — Nuclei
+           fingerprints the target and picks templates dynamically, which is exactly why
+           it cannot be the only source: its picks vary run-to-run against an unchanged
+           target, so it is additive only, never load-bearing for the baseline.
 
         Returns:
-            Dict with 'tech_findings' and 'vuln_findings' lists
+            Dict with 'tech_findings' and 'vuln_findings' lists (vuln_findings deduped
+            across phases 2/3 by template-id + matched-at)
         """
         native = self._native_tools.get("nuclei")
         if not native and not self.docker_cmd:
@@ -465,50 +471,58 @@ class ExternalToolManager:
 
         self._record_tool_run("nuclei")
         mode = "native" if native else "Docker"
-        logger.info(f"Starting Two-Phase Nuclei Scan on {target} ({mode})...")
+        logger.info(f"Starting Three-Phase Nuclei Scan on {target} ({mode})...")
         dashboard.log(f"[External] Launching Nuclei Engine ({mode}) against {target}", "INFO")
 
+        cookie_header = None
+        if cookies:
+            cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+
         # === PHASE 1: Tech Detection ===
-        dashboard.update_task("nuclei", name="Nuclei Tech-Detect", status="Phase 1/2: Tech Detection")
+        dashboard.update_task("nuclei", name="Nuclei Tech-Detect", status="Phase 1/3: Tech Detection")
 
         tech_cmd = ["-u", target, "-tags", "tech,misconfig,exposure,token", "-silent", "-jsonl"]
-        if cookies:
-            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-            tech_cmd.extend(["-H", f"Cookie: {cookie_str}"])
+        if cookie_header:
+            tech_cmd.extend(["-H", f"Cookie: {cookie_header}"])
 
         tech_output = await self._exec_tool("nuclei", "projectdiscovery/nuclei:latest", tech_cmd)
-
-        tech_findings = []
-        for line in tech_output.splitlines():
-            try:
-                if line.strip().startswith("{"):
-                    tech_findings.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+        tech_findings = self._parse_nuclei_jsonl(tech_output)
 
         logger.info(f"[Nuclei] Phase 1: {len(tech_findings)} tech/infrastructure detections")
         dashboard.log(f"[External] Tech-Detect: {len(tech_findings)} technologies identified", "INFO")
 
-        # === PHASE 2: Automatic Scan ===
-        dashboard.update_task("nuclei", name="Nuclei Auto-Scan", status="Phase 2/2: Smart Vulnerability Scan")
+        # === PHASE 2: Deterministic Scan (the floor) ===
+        dashboard.update_task("nuclei", name="Nuclei Deterministic Scan", status="Phase 2/3: Deterministic Vulnerability Scan")
+
+        deterministic_cmd = [
+            "-u", target,
+            "-tags", "cves,vulnerabilities,exposures,misconfig,technologies,default-login",
+            "-silent", "-jsonl",
+        ]
+        if cookie_header:
+            deterministic_cmd.extend(["-H", f"Cookie: {cookie_header}"])
+            deterministic_cmd.extend(["-H", "User-Agent: BugtraceAI/1.0"])
+
+        deterministic_output = await self._exec_tool("nuclei", "projectdiscovery/nuclei:latest", deterministic_cmd)
+        deterministic_findings = self._parse_nuclei_jsonl(deterministic_output)
+
+        logger.info(f"[Nuclei] Phase 2: {len(deterministic_findings)} deterministic vulnerability detections")
+        dashboard.log(f"[External] Deterministic Scan: {len(deterministic_findings)} findings", "INFO")
+
+        # === PHASE 3: Automatic Scan (opportunistic re-fishing) ===
+        dashboard.update_task("nuclei", name="Nuclei Auto-Scan", status="Phase 3/3: Automatic Re-fishing")
 
         auto_cmd = ["-u", target, "-as", "-silent", "-jsonl"]
-        if cookies:
-            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-            auto_cmd.extend(["-H", f"Cookie: {cookie_str}"])
+        if cookie_header:
+            auto_cmd.extend(["-H", f"Cookie: {cookie_header}"])
             auto_cmd.extend(["-H", "User-Agent: BugtraceAI/1.0"])
 
         auto_output = await self._exec_tool("nuclei", "projectdiscovery/nuclei:latest", auto_cmd)
+        auto_findings = self._parse_nuclei_jsonl(auto_output)
 
-        vuln_findings = []
-        for line in auto_output.splitlines():
-            try:
-                if line.strip().startswith("{"):
-                    vuln_findings.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+        logger.info(f"[Nuclei] Phase 3: {len(auto_findings)} auto-scan vulnerability detections")
 
-        logger.info(f"[Nuclei] Phase 2: {len(vuln_findings)} vulnerability detections")
+        vuln_findings = self._dedupe_nuclei_findings(deterministic_findings + auto_findings)
 
         total_findings = len(tech_findings) + len(vuln_findings)
         if total_findings > 0:
@@ -518,6 +532,32 @@ class ExternalToolManager:
             "tech_findings": tech_findings,
             "vuln_findings": vuln_findings
         }
+
+    @staticmethod
+    def _parse_nuclei_jsonl(output: str) -> List[Dict[str, Any]]:
+        """Parses Nuclei -jsonl output into a list of finding dicts, skipping bad lines."""
+        findings = []
+        for line in output.splitlines():
+            try:
+                if line.strip().startswith("{"):
+                    findings.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return findings
+
+    @staticmethod
+    def _dedupe_nuclei_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Dedupes Nuclei findings by (template-id, matched-at) — deterministic and
+        auto-scan phases can both fire the same template on overlapping tag sets."""
+        seen = set()
+        deduped = []
+        for finding in findings:
+            key = (finding.get("template-id"), finding.get("matched-at") or finding.get("host"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(finding)
+        return deduped
 
     def _build_sqlmap_command(
         self,

@@ -73,7 +73,7 @@ class Settings(BaseSettings):
     WAF_DETECTION_MODELS: str = ""
     
     # Model for payload mutation (DeepSeek has fewer safety restrictions)
-    MUTATION_MODEL: str = "x-ai/grok-4-fast"
+    MUTATION_MODEL: str = "x-ai/grok-4.3"
     
     MIN_CREDITS: float = 2.0
     MAX_CONCURRENT_REQUESTS: int = 1
@@ -355,6 +355,20 @@ class Settings(BaseSettings):
     SKIP_VALIDATED_PARAMS: bool = True
     SCAN_DEPTH: str = "standard"  # quick, standard, thorough
 
+    # --- XSS COVERAGE (negative evidence) ---
+    # The escalation pipeline returns None both for "tested hard, found nothing" and for
+    # "never tested". These write one AGGREGATED record per parameter — probes sent, marker
+    # reflected, context set, payloads reflected, exit reason, rung reached — so the two are
+    # distinguishable after the fact. Diagnostics only: never loaded as findings.
+    XSS_COVERAGE_ENABLED: bool = True
+    # Deliberately NOT specialists/{results,dry,wet} (four loaders ingest those as findings)
+    # and not specialists/*_report.json (reporting.py globs that).
+    XSS_COVERAGE_SUBDIR: str = "specialists/xss"
+    XSS_COVERAGE_FILENAME: str = "xss_coverage.json"
+    # Bound the artifact size — the report ZIP ships every byte to the customer. Truncation
+    # is stated in the document itself and logged; it is never silent.
+    XSS_COVERAGE_MAX_PARAMS: int = 500
+
     # --- ANALYSIS Configuration (Multi-Model URL Analysis) ---
     ANALYSIS_ENABLE: bool = True
     ANALYSIS_APPROACH_PENTESTER: bool = True
@@ -412,6 +426,12 @@ class Settings(BaseSettings):
     # --- REPORT Configuration ---
     # Only include validated findings in final report (per report_quality_evaluation.md)
     REPORT_ONLY_VALIDATED: bool = True
+
+    # Detection Evidence panel budgets. Both are BOUNDS ON PRINTING, never on detection:
+    # whatever they cut is still present verbatim in raw_findings.json, and the report
+    # states the loss in-band rather than dropping it silently. 0 = unbounded.
+    REPORT_EVIDENCE_MAX_FIELDS: int = 12    # evidence keys rendered per finding
+    REPORT_EVIDENCE_VALUE_CHARS: int = 400  # characters rendered per evidence value
 
     # --- OPTIMIZATION Configuration ---
     # Early exit after first finding per URL (saves 70%+ scan time)
@@ -506,6 +526,8 @@ class Settings(BaseSettings):
             self.MAX_CONCURRENT_ANALYSIS = section.getint("MAX_CONCURRENT_ANALYSIS")
         if "MAX_CONCURRENT_SPECIALISTS" in section:
             self.MAX_CONCURRENT_SPECIALISTS = section.getint("MAX_CONCURRENT_SPECIALISTS")
+        if "JWT_HEAD_START_TIMEOUT" in section:
+            self.JWT_HEAD_START_TIMEOUT = section.getint("JWT_HEAD_START_TIMEOUT")
         if "LANCEDB_ENABLED" in section:
             self.LANCEDB_ENABLED = section.getboolean("LANCEDB_ENABLED")
         if "DAST_ANALYSIS_TIMEOUT" in section:
@@ -705,6 +727,14 @@ class Settings(BaseSettings):
                 val = section["SCAN_DEPTH"].strip().lower()
                 if val in ("quick", "standard", "thorough"):
                     self.SCAN_DEPTH = val
+            if "XSS_COVERAGE_ENABLED" in section:
+                self.XSS_COVERAGE_ENABLED = section.getboolean("XSS_COVERAGE_ENABLED")
+            if "XSS_COVERAGE_SUBDIR" in section:
+                self.XSS_COVERAGE_SUBDIR = section["XSS_COVERAGE_SUBDIR"].strip()
+            if "XSS_COVERAGE_FILENAME" in section:
+                self.XSS_COVERAGE_FILENAME = section["XSS_COVERAGE_FILENAME"].strip()
+            if "XSS_COVERAGE_MAX_PARAMS" in section:
+                self.XSS_COVERAGE_MAX_PARAMS = section.getint("XSS_COVERAGE_MAX_PARAMS")
 
     def _load_authority_config(self, config):
         """Load AUTHORITY section config."""
@@ -935,6 +965,10 @@ class Settings(BaseSettings):
         if "REPORT" in config:
             if "ONLY_VALIDATED" in config["REPORT"]:
                 self.REPORT_ONLY_VALIDATED = config["REPORT"].getboolean("ONLY_VALIDATED")
+            if "EVIDENCE_MAX_FIELDS" in config["REPORT"]:
+                self.REPORT_EVIDENCE_MAX_FIELDS = config["REPORT"].getint("EVIDENCE_MAX_FIELDS")
+            if "EVIDENCE_VALUE_CHARS" in config["REPORT"]:
+                self.REPORT_EVIDENCE_VALUE_CHARS = config["REPORT"].getint("EVIDENCE_VALUE_CHARS")
 
         if "OPTIMIZATION" in config:
             if "EARLY_EXIT_ON_FINDING" in config["OPTIMIZATION"]:
@@ -1201,6 +1235,7 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_DISCOVERY: int = 1      # GoSpider (single-threaded by design)
     MAX_CONCURRENT_ANALYSIS: int = 5       # DAST/SAST per URL
     MAX_CONCURRENT_SPECIALISTS: int = 10   # SQLi, XSS, CSTI paralelos
+    JWT_HEAD_START_TIMEOUT: int = 300      # Seconds JWTAgent gets to crack/forge before other specialists start (Phase 4)
     # HARDCODED: CDP client only supports 1 concurrent session (crashes with more)
     # Playwright can handle multiple, but AgenticValidator uses CDP exclusively
     MAX_CONCURRENT_VALIDATION: int = 1     # DO NOT CHANGE - CDP limitation

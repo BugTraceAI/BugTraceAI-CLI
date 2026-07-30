@@ -51,21 +51,28 @@ class NucleiAgent(BaseAgent):
         self.report_dir = report_dir
 
     async def run(self) -> Dict:
-        """Runs two-phase Nuclei scan for technology detection and vulnerability discovery.
+        """Runs three-phase Nuclei scan for technology detection and vulnerability discovery.
 
         Returns:
             Comprehensive tech_profile used by specialist agents.
         """
         dashboard.current_agent = self.name
         dashboard.log(
-            f"[{self.name}] Starting 2-phase Nuclei scan (tech-detect + auto-scan)...",
+            f"[{self.name}] Starting 3-phase Nuclei scan (tech-detect + deterministic + auto-scan)...",
             "INFO",
         )
 
         try:
-            # Run two-phase Nuclei scan
             nuclei_results = await external_tools.run_nuclei(self.target)
+        except Exception as e:
+            # A Nuclei subprocess failure (e.g. timeout under concurrent scan load) must
+            # not take down the app-level checks below (headers/cookies/GraphQL/rate-limit/
+            # access-control) — those don't depend on Nuclei and should still run.
+            logger.error(f"Nuclei subprocess failed, continuing with app-level checks only: {e}", exc_info=True)
+            dashboard.log(f"[{self.name}] Nuclei scan failed: {e} (app-level checks still running)", "WARNING")
+            nuclei_results = {"tech_findings": [], "vuln_findings": []}
 
+        try:
             tech_findings = nuclei_results.get("tech_findings", [])
             vuln_findings = nuclei_results.get("vuln_findings", [])
 
@@ -115,7 +122,7 @@ class NucleiAgent(BaseAgent):
                     # Also route into `misconfigurations` — the proven pipeline that reaches
                     # the final report. The standalone js_vulnerabilities emit was lost
                     # downstream (detected in tech_profile but never surfaced as a finding),
-                    # so vulnerable components (e.g. AngularJS 1.7.7) silently dropped. Each
+                    # so vulnerable components silently dropped. Each
                     # entry gets a UNIQUE name -> unique dedup key, so it is not merged away.
                     for jv in js_vulns:
                         tech_profile["misconfigurations"].append({
@@ -125,6 +132,10 @@ class NucleiAgent(BaseAgent):
                             "template_id": jv.get("template_id", "js-vulnerable-library"),
                             "matched_at": jv.get("matched_at", self.target),
                             "tags": jv.get("tags", ["js-dependency", "vulnerable-library"]),
+                            "component_name": jv.get("name"),
+                            "detected_version": jv.get("version"),
+                            "cves": jv.get("cves", []),
+                            "eol": jv.get("eol", False),
                         })
                     dashboard.log(
                         f"[{self.name}] Found {len(js_vulns)} vulnerable JS dependencies",

@@ -15,6 +15,12 @@ from bugtrace.core.verbose_events import create_emitter
 
 from bugtrace.agents.base import BaseAgent
 
+# xss_context values that assert the ABSENCE of a reflection point rather than describing
+# one. They must not become a finding's context: doing so would relabel a candidate with a
+# non-position and lose the neutral default the specialist pipeline expects.
+_NO_REFLECTION_CONTEXTS = frozenset({"none", "unknown", "no_reflection", "n/a"})
+
+
 class DASTySASTAgent(BaseAgent):
     """
     DAST + SAST Analysis Agent.
@@ -660,6 +666,14 @@ class DASTySASTAgent(BaseAgent):
                         ),
                         "exploitation_strategy": "",
                         "url": self.url,
+                        # The MEASURED reflection context, as a field rather than only as
+                        # English inside `reasoning`. Downstream, XSSAgent's LLM dedup is
+                        # asked to emit `context`; reading it back out of prose it answered
+                        # "html" for every record ever written, so the measurement was lost
+                        # one line before it would have been persisted. Kept under its own
+                        # key in THIS agent's vocabulary (script_block / html_attribute /
+                        # ...); XSSAgent owns the canonical names and translates on arrival.
+                        "probe_context": xss_ctx,
                         "_auto_dispatched": True,
                     })
                     existing.add(f"xss:{param_lower}")
@@ -1646,7 +1660,16 @@ class DASTySASTAgent(BaseAgent):
                 if self.url.rstrip("/") != root_url.rstrip("/"):
                     cookie_urls.append(root_url)
                 try:
-                    async with orchestrator.session(DestinationType.TARGET) as cookie_session:
+                    # Jar-less capture: by this point in the scan the pooled session's
+                    # default jar has likely already picked up a valid TrackingId from
+                    # an earlier request (GoSpider, other DAST probes, ...). A request
+                    # through the pooled session would silently resend that stored value,
+                    # and the server won't re-issue Set-Cookie for an already-valid cookie
+                    # — so this capture would find nothing to test. DummyCookieJar forces
+                    # a clean request so any Set-Cookie header actually reaches us.
+                    async with orchestrator.isolated_session(
+                        DestinationType.TARGET, cookie_jar=aiohttp.DummyCookieJar()
+                    ) as cookie_session:
                         for curl in cookie_urls:
                             try:
                                 async with cookie_session.get(
@@ -2471,14 +2494,28 @@ Return ONLY valid XML tags. No markdown. No explanations.
                 ""
             )
 
-            return {
+            # Evidence fields the prompt marks as REQUIRED. They were never read, so every
+            # finding reached _consolidate() with an identical (zero) evidence score and
+            # every XSS candidate reached the specialist labelled with the default "html"
+            # — discarding the one context signal the analysis stage actually produces.
+            xss_context = (parser.extract_tag(vc, "xss_context") or "").strip().lower()
+            vuln = {
                 "type": parser.extract_tag(vc, "type") or "Unknown",
                 "parameter": parser.extract_tag(vc, "parameter") or "unknown",
                 "confidence_score": conf,
                 "reasoning": parser.extract_tag(vc, "reasoning") or "",
                 "severity": parser.extract_tag(vc, "severity") or "Medium",
-                "exploitation_strategy": payload
+                "exploitation_strategy": payload,
+                "xss_context": xss_context,
+                "html_evidence": parser.extract_tag(vc, "html_evidence", unescape_html=True) or "",
+                "chars_survive": parser.extract_tag(vc, "chars_survive", unescape_html=True) or "",
             }
+            # Promote to the finding-wide "context" key, which is what the specialist queue
+            # reads (finding.get("context", "html")). Only a real label: _NO_REFLECTION_CONTEXTS
+            # carry no positional information, so they must leave the default in place.
+            if xss_context and xss_context not in _NO_REFLECTION_CONTEXTS:
+                vuln["context"] = xss_context
+            return vuln
         except Exception as ex:
             logger.warning(f"Failed to parse vulnerability entry: {ex}")
             return None

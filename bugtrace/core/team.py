@@ -8,6 +8,14 @@ from typing import List, Optional, Dict, Any
 from loguru import logger
 from urllib.parse import urlparse, parse_qs
 from bugtrace.core.config import settings
+from bugtrace.core.surface import (
+    ControlModel,
+    ProbeObservation,
+    build_control_model,
+    differs_from_control,
+    drop_insecure_duplicate_origins,
+    names_a_resource,
+)
 from bugtrace.agents.base import BaseAgent
 # Legacy Agents removed
 # from bugtrace.agents.recon import ReconAgent
@@ -19,6 +27,7 @@ from bugtrace.core.conductor import conductor
 from rich.live import Live
 import signal
 import sys
+import uuid
 from pathlib import Path
 from shutil import move, rmtree
 import httpx
@@ -248,15 +257,40 @@ class TeamOrchestrator:
         self.sqli_worker_agent._scan_depth = self._scan_depth
         self.xss_worker_agent._scan_depth = self._scan_depth
 
-        # Dispatch specialists with concurrency control (dispatcher handles queue checks and specialist startup)
+        # JWT head start: let JWTAgent try to crack/forge an admin token BEFORE
+        # the other specialists start, instead of racing them for one of
+        # MAX_CONCURRENT_SPECIALISTS slots (store_auth_token() needs to land
+        # before other specialists check for it, not mid-way through their run).
+        # If it doesn't finish within JWT_HEAD_START_TIMEOUT, the rest start
+        # anyway and JWTAgent keeps running in the background - it still
+        # calls store_auth_token() whenever the crack succeeds.
         max_concurrent = settings.MAX_CONCURRENT_SPECIALISTS  # From bugtraceaicli.conf [PARALLELIZATION]
+        jwt_map = {"jwt": specialist_map.pop("jwt")}
+        jwt_task = asyncio.create_task(dispatch_specialists(jwt_map, scan_ctx, max_concurrent=1))
+        done, _ = await asyncio.wait({jwt_task}, timeout=settings.JWT_HEAD_START_TIMEOUT)
+        if jwt_task in done:
+            logger.info("[PHASE 4] JWT head start finished within window")
+        else:
+            logger.info(
+                f"[PHASE 4] JWT head start still running after {settings.JWT_HEAD_START_TIMEOUT}s, "
+                "starting remaining specialists without waiting further"
+            )
+
+        # Dispatch the rest with concurrency control (dispatcher handles queue checks and specialist startup)
         dispatch_result = await dispatch_specialists(specialist_map, scan_ctx, max_concurrent=max_concurrent)
 
-        if dispatch_result["specialists_dispatched"] > 0:
-            for spec_name in dispatch_result['activated']:
+        # Always collect the JWT task, even if it ran past the head-start window,
+        # so its report/findings aren't lost when this phase returns.
+        jwt_result = await jwt_task
+
+        activated = dispatch_result["activated"] + jwt_result["activated"]
+        specialists_dispatched = dispatch_result["specialists_dispatched"] + jwt_result["specialists_dispatched"]
+
+        if specialists_dispatched > 0:
+            for spec_name in activated:
                 self._v.emit("exploit.specialist.activated", {"specialist": spec_name})
             logger.info(
-                f"[PHASE 4] Specialists completed: {', '.join(dispatch_result['activated'])}"
+                f"[PHASE 4] Specialists completed: {', '.join(activated)}"
             )
         else:
             logger.warning("[PHASE 4] No specialists were dispatched (no work in queues)")
@@ -2338,6 +2372,20 @@ class TeamOrchestrator:
 
         urls_to_scan = deduplicated_list
 
+        # ========== DROP PLAIN-HTTP TWINS ==========
+        # Recon routinely keeps both http://host and https://host. The HTTP one is the
+        # same site, but it is actively harmful: on any target that redirects HTTP to
+        # HTTPS (i.e. almost all of them) every request to that origin is answered by the
+        # redirect rather than by the application, so the whole origin becomes a source of
+        # confident-looking noise — and it makes the scan do everything twice.
+        pre_scheme_count = len(urls_to_scan)
+        urls_to_scan = drop_insecure_duplicate_origins(urls_to_scan)
+        if len(urls_to_scan) < pre_scheme_count:
+            logger.info(
+                f"[Origin Normalization] Dropped {pre_scheme_count - len(urls_to_scan)} "
+                f"plain-HTTP URLs whose host is already reachable over HTTPS"
+            )
+
         # Prioritize URLs (high-value targets first)
         if settings.URL_PRIORITIZATION_ENABLED:
             urls_to_scan = self._prioritize_urls(urls_to_scan)
@@ -2482,12 +2530,47 @@ class TeamOrchestrator:
                     lines.append(stripped)
         return lines
 
+    @staticmethod
+    def _load_endpoint_names(filename: str) -> List[str]:
+        """Load an endpoint wordlist, keeping only entries that NAME A RESOURCE.
+
+        A wordlist may guess *where* something lives; it must never ship the parameters
+        or payloads to send there. An entry like `health?cmd=id` is not discovery — it is
+        one target's attack surface hardcoded into the scanner, and it gets requested
+        verbatim against every unrelated site. Parameters must come from observed forms,
+        links, API schemas, JavaScript call sites or live responses. Enforced here rather
+        than trusted to a comment in the data file, because that comment already existed
+        and the file drifted anyway.
+        """
+        entries = TeamOrchestrator._load_data_lines(filename)
+        kept = [entry for entry in entries if names_a_resource(entry)]
+        dropped = len(entries) - len(kept)
+        if dropped:
+            logger.warning(
+                f"[DataLoader] {filename}: dropped {dropped} entr{'y' if dropped == 1 else 'ies'} "
+                f"carrying a query string — wordlists name resources, not attacks"
+            )
+        return kept
+
     async def _discover_common_vuln_endpoints(self, urls: list) -> list:
         """Probe for common vulnerability endpoints not found by crawling.
 
         Some endpoints (e.g., /api/redirect, /api/admin, /api/debug) are never
         linked from any page but are common attack surfaces. This method probes
-        a short list of well-known patterns and adds any that respond.
+        a short list of well-known RESOURCE NAMES and keeps only the ones whose
+        response DIFFERS from a guaranteed-nonexistent control path on the same prefix.
+
+        Existence is never inferred from a status code. A target that redirects HTTP to
+        HTTPS answers 301 for every path — including paths that do not exist — and a
+        soft-404 target answers 200 for every path, so any status-based rule accepts
+        endpoints that are not there and floods the scan with confident-looking phantoms.
+        Matching words in the body ("not found") is no better: it is a signature list, so
+        it breaks on non-English targets, on SPAs and on CDN interstitials.
+
+        The differential is what generalises — the target itself defines what "nothing
+        here" looks like. When that definition cannot be established (an unstable or
+        rate-limited target), this method FAILS CLOSED and discovers nothing: guessing
+        endpoints is a bonus, never the core of a scan. See bugtrace.core.surface.
         """
         # Extract base origins from existing URLs
         origins = set()
@@ -2507,85 +2590,78 @@ class TeamOrchestrator:
             for origin in origins:
                 api_prefixes.add(f"{origin}/api/")
 
-        # Load endpoints from external data files (not hardcoded)
-        COMMON_ENDPOINTS = self._load_data_lines("common_endpoints.txt")
-        SPA_ROUTES = self._load_data_lines("spa_routes.txt")
+        # Load endpoints from external data files (not hardcoded), keeping only entries
+        # that name a resource — never one target's parameters or payloads.
+        COMMON_ENDPOINTS = self._load_endpoint_names("common_endpoints.txt")
+        SPA_ROUTES = self._load_endpoint_names("spa_routes.txt")
 
         new_urls = []
         existing = set(urls)
 
-        async with httpx.AsyncClient(timeout=5, verify=False, follow_redirects=False) as client:
-            # Probe API-prefix endpoints
-            for prefix in api_prefixes:
-                for endpoint in COMMON_ENDPOINTS:
-                    probe_url = f"{prefix.rstrip('/')}/{endpoint}"
-                    # Strip query string for dedup check
-                    probe_base = probe_url.split("?")[0]
-                    # For parameterized endpoints (e.g., health?cmd=id), only dedup
-                    # against the exact URL — not the base. The base version (health)
-                    # and parameterized version (health?cmd=id) are different attack surfaces.
-                    if "?" in endpoint:
-                        if probe_url in existing:
-                            continue
-                    else:
-                        if probe_base in existing:
-                            continue
-                    try:
-                        resp = await client.get(probe_url)
+        # follow_redirects=True: a redirect is not an answer. Comparing the FINAL response
+        # is what lets the differential see the application instead of the edge.
+        async with httpx.AsyncClient(timeout=5, verify=False, follow_redirects=True) as client:
 
-                        # Trailing-slash retry: some frameworks (FastAPI, Django) only
-                        # respond to /endpoint/ not /endpoint. If the first probe gets
-                        # a catch-all error or empty response, retry with trailing slash.
-                        if "?" in endpoint and resp.status_code == 200:
-                            body = resp.text.strip()
-                            if body in ('{"error":"Not found"}', '{"detail":"Not Found"}', ''):
-                                slash_base = probe_url.split("?")[0]
-                                slash_url = f"{slash_base}/?{'?'.join(probe_url.split('?')[1:])}"
-                                try:
-                                    resp2 = await client.get(slash_url)
-                                    if resp2.status_code == 200 and resp2.text.strip() != body:
-                                        # Trailing-slash version returned different content
-                                        probe_url = slash_url
-                                        probe_base = slash_url.split("?")[0]
-                                        resp = resp2
-                                except Exception:
-                                    pass
+            async def observe(url: str) -> Optional[ProbeObservation]:
+                """# I/O — one request, reduced to the fields the pure predicates need."""
+                try:
+                    resp = await client.get(url)
+                    return ProbeObservation(resp.status_code, resp.text, urlparse(url).path)
+                except Exception:
+                    return None
 
-                        # Accept 2xx (exists), 401/403 (auth-gated), 405 (wrong method but exists)
-                        # Reject 404, 500, 502, 503 (doesn't exist or server error)
-                        if resp.status_code < 404 or resp.status_code in (401, 403, 405):
-                            # Preserve query params for endpoints that need them
-                            # (e.g., redirect?url=... — the param IS the attack surface)
-                            add_url = probe_url if "?" in endpoint else probe_base
-                            if add_url not in existing:
-                                new_urls.append(add_url)
-                                existing.add(add_url)
-                                # Also add base to prevent re-probing
-                                existing.add(probe_base)
-                                logger.info(f"[Endpoint Discovery] Found: {add_url} (status: {resp.status_code})")
-                    except Exception:
-                        continue
+            async def control_for(base: str) -> Optional[ControlModel]:
+                """# I/O — model this origin's "nothing here" response, or None if unknowable.
 
-            # Probe SPA/content routes against origin (not api_prefix)
-            for origin in origins:
-                for route in SPA_ROUTES:
-                    probe_url = f"{origin.rstrip('/')}/{route}"
+                Three nonexistent siblings of deliberately different path lengths. The two
+                extremes measure how much body each path byte adds (targets echo the
+                requested path back, often in a form no literal search would find), and the
+                middle one is held out to check the model actually predicts. When it does
+                not — jitter, A/B tests, rate limiting kicking in — there is no trustworthy
+                verdict and the caller must not guess.
+                """
+                token = uuid.uuid4().hex
+                short = await observe(f"{base.rstrip('/')}/{token[:8]}")
+                middle = await observe(f"{base.rstrip('/')}/{uuid.uuid4().hex}")
+                long = await observe(f"{base.rstrip('/')}/{uuid.uuid4().hex}{uuid.uuid4().hex}")
+                if short is None or middle is None or long is None:
+                    return None
+                return build_control_model(short, middle, long)
+
+            async def probe_all(base: str, entries: List[str], label: str) -> None:
+                """# I/O — probe `entries` under `base`, keeping only what differs."""
+                control = await control_for(base)
+                if control is None:
+                    logger.info(
+                        f"[Endpoint Discovery] Skipping {label} on {base}: this origin's "
+                        f"not-found response could not be modelled (unreachable, rate-limited "
+                        f"or inconsistent) — refusing to guess"
+                    )
+                    return
+                logger.debug(
+                    f"[Endpoint Discovery] {base} not-found model: status={control.status} "
+                    f"base={control.base_length}b path-echo slope={control.slope:.2f}"
+                )
+                for entry in entries:
+                    probe_url = f"{base.rstrip('/')}/{entry}"
                     if probe_url in existing:
                         continue
-                    try:
-                        resp = await client.get(probe_url)
-                        if resp.status_code != 404:
-                            # Only add if response has meaningful content (not just JSON error)
-                            content_type = resp.headers.get("content-type", "")
-                            body_len = len(resp.content)
-                            # Accept HTML pages (SPA) or responses > 100 bytes
-                            if "text/html" in content_type or body_len > 100:
-                                if probe_url not in existing:
-                                    new_urls.append(probe_url)
-                                    existing.add(probe_url)
-                                    logger.info(f"[Endpoint Discovery] Found SPA route: {probe_url} (status: {resp.status_code}, type: {content_type[:30]})")
-                    except Exception:
+                    observation = await observe(probe_url)
+                    if observation is None or not differs_from_control(observation, control):
                         continue
+                    new_urls.append(probe_url)
+                    existing.add(probe_url)
+                    logger.info(
+                        f"[Endpoint Discovery] Found {label}: {probe_url} "
+                        f"(status: {observation.status}, differs from this origin's catch-all)"
+                    )
+
+            for prefix in api_prefixes:
+                await probe_all(prefix, COMMON_ENDPOINTS, "endpoint")
+
+            # SPA/content routes are probed against the origin, not the API prefix
+            for origin in origins:
+                await probe_all(origin, SPA_ROUTES, "SPA route")
 
         if new_urls:
             logger.info(f"[Endpoint Discovery] Discovered {len(new_urls)} common endpoints: {new_urls}")
@@ -3698,11 +3774,15 @@ class TeamOrchestrator:
                 try:
                     queue = queue_manager.get_queue(specialist)
                     depth = queue.depth() if hasattr(queue, 'depth') else 0
-                    total_enqueued = queue.total_enqueued if hasattr(queue, 'total_enqueued') else 0
-                    total_dequeued = queue.total_dequeued if hasattr(queue, 'total_dequeued') else 0
+                    # SpecialistQueue keeps its counters inside a QueueStats dataclass and
+                    # exposes them ONLY through get_stats(). The old `hasattr(queue, 'total_dequeued')`
+                    # probes were always False, so `processed` was hardcoded 0 for every specialist
+                    # and the "complete" status below was unreachable.
+                    qstats = queue.get_stats() if hasattr(queue, 'get_stats') else {}
                     queue_stats[specialist] = {
                         'depth': depth,
-                        'processed': total_dequeued
+                        'processed': qstats.get('total_dequeued', 0),
+                        'enqueued': qstats.get('total_enqueued', 0),
                     }
                     total_pending += depth
                 except Exception:
@@ -4667,8 +4747,15 @@ class TeamOrchestrator:
         # Auto-dispatch XSSAgent when no XSS finding from DASTySAST.
         # XSSAgent handles DOM XSS (Phase B.2) which requires Playwright.
         # DOM XSS can exist even without reflected params (e.g., jQuery href sinks).
+        # Exact set membership answered "no XSS found" on every scan ever run: `type` is
+        # free text from an LLM and the measured values are "XSS (Reflected)",
+        # "DOM-based XSS" and "DOM-based XSS (via searchLogger.js)". So the synthetic
+        # candidate below was injected ALWAYS, giving the escalation ladder a parameter
+        # literally named `auto_dispatch` to burn L0.5→L4 on — and it reached a report as
+        # a "vulnerable parameter". Use the same classifier the router uses.
+        from bugtrace.agents.thinking_consolidation_agent import classify_vuln_type
         has_xss = any(
-            f.get("type", "").upper() in ("XSS", "DOM_XSS", "CROSS-SITE SCRIPTING")
+            classify_vuln_type(f.get("type", "")) == "xss"
             for f in all_findings
         )
         if not has_xss:
@@ -5364,12 +5451,18 @@ class TeamOrchestrator:
 
         # Update dashboard with deduplication metrics
         if self.thinking_agent and hasattr(self.thinking_agent, 'get_stats'):
+            # ThinkingConsolidationAgent.get_stats() has never produced 'total_findings',
+            # 'unique_findings' or 'dedup_rate' — the dashboard showed a hardcoded 0.0%
+            # effectiveness next to non-zero before/after counts. Derive it from the keys
+            # that actually exist.
             stats = self.thinking_agent.get_stats()
+            received = stats.get('total_received', 0) or len(all_findings)
+            duplicates = stats.get('duplicates_filtered', 0)
             dashboard.set_progress_metrics(
-                findings_before_dedup=stats.get('total_findings', len(all_findings)),
-                findings_after_dedup=stats.get('unique_findings', processed_count),
+                findings_before_dedup=received,
+                findings_after_dedup=max(received - duplicates, 0),
                 findings_distributed=stats.get('distributed', processed_count),
-                dedup_effectiveness=stats.get('dedup_rate', 0.0) * 100,  # Convert to percentage
+                dedup_effectiveness=(duplicates / received * 100) if received else 0.0,
                 scan_id=self.scan_id
             )
 
