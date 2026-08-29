@@ -24,6 +24,7 @@
 - [🔬 Core Methodology](#-core-methodology)
 - [🏗️ Architecture](#️-architecture)
 - [🛠️ Technology Stack](#️-technology-stack)
+- [CI/CD Integration](#cicd-integration)
 - [🚀 Getting Started](#-getting-started)
 - [🤖 AI Assistant Setup (MCP)](#-ai-assistant-setup-mcp)
 - [⚙️ Configuration](#️-configuration)
@@ -37,6 +38,14 @@
 BugTraceAI-CLI is an autonomous offensive security framework that combines LLM-driven analysis with deterministic exploitation tools. Unlike passive analysis tools, BugTraceAI-CLI actively exploits vulnerabilities using real payloads, SQLMap integration, and browser-based validation to deliver confirmed, actionable findings.
 
 The core philosophy is **"Think like a pentester, execute like a machine, validate like an auditor"** - using AI for intelligent hypothesis generation, but relying on real tools for exploitation and validation.
+
+## CI/CD Integration
+
+Use BugTraceAI-CLI as the autonomous security testing layer in an authorized CI/CD workflow: receive jobs through its API or MCP layer, scan approved targets, generate evidence-rich reports, and hand validated findings to analysis and ticketing systems.
+
+<p align="center">
+  <img src="BUGTRACEAI-CI-CD_Proposal.png" alt="BugTraceAI CI/CD integration proposal" width="720"/>
+</p>
 
 ## What's New in v3.7.12-beta
 
