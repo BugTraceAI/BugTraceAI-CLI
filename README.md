@@ -7,6 +7,7 @@
 [![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white)](https://bugtraceai.com)
 [![Wiki Documentation](https://img.shields.io/badge/Wiki%20Documentation-000?logo=wikipedia&logoColor=white)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
+[![Discord](https://img.shields.io/discord/5HjujkScC?label=Discord&logo=discord&logoColor=white&color=5865F2)](https://discord.gg/5HjujkScC)
 ![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)
 ![Version](https://img.shields.io/badge/Version-3.7.12--beta-orange)
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
