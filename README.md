@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="BTAI_Logo_GitHub.png" alt="BugTraceAI" width="180"/>
+</p>
+
 # BugTraceAI-CLI
 
 [![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white)](https://bugtraceai.com)
