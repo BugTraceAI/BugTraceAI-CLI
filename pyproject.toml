@@ -1,6 +1,6 @@
 [project]
 name = "bugtraceai-cli"
-dynamic = ["version"]
+# version is now static
 description = "AI-Driven Professional Penetration Testing Framework - Autonomous offensive security scanner with LLM-powered analysis"
 authors = [
     { name = "BugTraceAI Team", email = "hello@bugtraceai.com" }
