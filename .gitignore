@@ -72,8 +72,22 @@ bugtrace/data/xss_proven_payloads.lock
 .claude/
 CLAUDE.md
 
-# Tests (internal only)
-tests/
+# Tests (internal only — but TRACKED in the private DEV remote).
+# Rationale: tests/ is the offline verification harness (smoke_*.py, the
+# Chromium-judged multiscope corpus, parity snapshots). While untracked it was
+# destroyed by a single `git clean -fdx`. Public exclusion is NOT enforced by
+# this file: it is enforced by (a) the curated file-level release process — the
+# public repo has an unrelated single-commit history, never a push of this tree
+# — and (b) .git/hooks/pre-push, which blocks any ref whose tree contains
+# tests/ from reaching a non-DEV BugTraceAI remote. tests/ is also excluded
+# from Docker images by .dockerignore.
+# Only harness SOURCE is tracked; generated artifacts stay ignored. To track a
+# new non-source fixture type, add an explicit `!tests/**/*.<ext>` line.
+tests/**
+!tests/**/
+!tests/**/*.py
+!tests/**/*.md
+tests/**/__pycache__/
 
 # Dev scripts and archives (local-only)
 scripts/

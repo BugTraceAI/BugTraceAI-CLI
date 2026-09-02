@@ -64,6 +64,8 @@ class XSSFinding:
     bypass_explanation: str = ""
     exploit_url: str = ""
     exploit_url_encoded: str = ""
+    # Parity with monolith XSSFinding (http_method required by finding_builder).
+    http_method: str = "GET"
     verification_methods: List[Dict] = field(default_factory=list)
     verification_warnings: List[str] = field(default_factory=list)
     reproduction_steps: List[str] = field(default_factory=list)
@@ -93,6 +95,7 @@ class XSSFinding:
             "bypass_explanation": self.bypass_explanation,
             "exploit_url": self.exploit_url,
             "exploit_url_encoded": self.exploit_url_encoded,
+            "http_method": self.http_method,
             "verification_methods": self.verification_methods,
             "verification_warnings": self.verification_warnings,
             "reproduction_steps": self.reproduction_steps,

@@ -18,13 +18,13 @@ info:
     - POST /api/auth/validate (YAML auth configuration validation)
     - PATCH /api/scans/{scan_id}/auth-config (Update scan authentication)
     - POST /api/tools/totp-verify (TOTP/2FA verification)
-  version: 3.6.93-beta
+  version: 4.0.0-rc1
   contact:
     name: BugTraceAI
     url: https://bugtraceai.com
   license:
-    name: AGPL-3.0
-    url: https://www.gnu.org/licenses/agpl-3.0.html
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
 
 servers:
   - url: http://localhost:8000

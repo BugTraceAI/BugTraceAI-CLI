@@ -27,6 +27,8 @@ from bugtrace.api.schemas import (
     ScanSummary,
     StopScanResponse,
     DeleteScanResponse,
+    RepeaterFindingCreate,
+    RepeaterFindingResponse,
 )
 from bugtrace.core.ui import dashboard
 from bugtrace.core.batch_metrics import batch_metrics
@@ -89,28 +91,18 @@ async def create_scan(
 
 
 def _build_scan_options(request: CreateScanRequest) -> ScanOptions:
-    """Convert API request to ScanOptions."""
-    # Extract scope_path from auth config if present
-    scope_path = None
-    if request.auth and isinstance(request.auth, dict):
-        scope_path = request.auth.get("scope_path")
-
-    return ScanOptions(
-        target_url=request.target_url,
-        scan_type=request.scan_type,
-        safe_mode=request.safe_mode,
-        max_depth=request.max_depth,
-        max_urls=request.max_urls,
-        resume=request.resume,
-        use_vertical=request.use_vertical,
-        focused_agents=request.focused_agents,
-        param=request.param,
-        scan_depth=request.scan_depth,
-        auth_token=request.auth_token,
-        auth=request.auth,
-        url_list=request.url_list,
-        scope_path=scope_path,
+    """Convert API request to ScanOptions. Pure map: scan_options_policy."""
+    from bugtrace.services.scan_options_policy import (
+        drop_none_kwargs,
+        scan_options_kwargs_from_request,
     )
+
+    raw = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+    kwargs = drop_none_kwargs(scan_options_kwargs_from_request(raw))
+    # target_url required by ScanOptions — keep even if others default
+    if "target_url" not in kwargs and getattr(request, "target_url", None):
+        kwargs["target_url"] = request.target_url
+    return ScanOptions(**kwargs)
 
 
 @router.get("/scans/{scan_id}/status", response_model=ScanStatusResponse)
@@ -193,6 +185,58 @@ async def get_scan_findings(
     except ValueError as e:
         logger.error(f"Error getting findings for scan {scan_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@router.post("/scans/{scan_id}/findings", status_code=status.HTTP_201_CREATED, response_model=RepeaterFindingResponse)
+async def create_repeater_finding(
+    scan_id: int,
+    request: RepeaterFindingCreate,
+    scan_service: ScanServiceDep,
+):
+    """
+    Persist a confirmed finding from the AI Repeater.
+
+    Creates or updates a VALIDATED_CONFIRMED finding in SQLite and canonical
+    report artifacts (raw_findings.json, validated_findings.json). The server
+    enforces scan-target origin matching, deduplication, and atomic file writes.
+
+    Args:
+        scan_id: Scan ID to attach the finding to
+        request: Finding data from the Repeater (type, severity, url, summary, etc.)
+
+    Returns:
+        RepeaterFindingResponse with finding_id, created flag, and message
+
+    Raises:
+        404: Scan not found
+        400: Cross-origin URL or invalid data
+    """
+    try:
+        result = await scan_service.persist_repeater_finding(scan_id, {
+            "type": request.type,
+            "severity": request.severity,
+            "url": request.url,
+            "parameter": request.parameter,
+            "summary": request.summary,
+            "request": request.request,
+            "response_status": request.response_status,
+            "response_excerpt": request.response_excerpt,
+            "source_finding_id": request.source_finding_id,
+            "confidence": request.confidence,
+            "request_ok": request.request_ok,
+        })
+        return RepeaterFindingResponse(**result)
+    except ValueError as e:
+        error_msg = str(e)
+        if "not found" in error_msg.lower():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=error_msg)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error_msg)
+    except RuntimeError as e:
+        logger.error(f"Repeater persistence failed for scan {scan_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Finding persistence failed; transaction compensation was attempted",
+        )
 
 
 def _validate_findings_pagination(page: int, per_page: int):

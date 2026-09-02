@@ -10,6 +10,7 @@ Date: 2026-01-08
 """
 
 import os
+import re
 import asyncio
 from typing import Tuple, List, Optional, Dict, Any
 from pathlib import Path
@@ -21,19 +22,44 @@ from bugtrace.core.config import settings
 logger = get_logger("tools.browser_verifier")
 
 
-@dataclass
-class VerificationResult:
-    """Result of XSS verification."""
-    success: bool
-    method: str  # "cdp", "playwright", or "none"
-    screenshot_path: Optional[str] = None
-    console_logs: List[Dict] = None
-    details: Dict[str, Any] = None
-    alert_message: Optional[str] = None
-    error: Optional[str] = None
+from bugtrace.tools.visual.verifier_evidence import (
+    _MARKER_EVIDENCE_NODE_LIMIT,
+    _MARKER_EVIDENCE_JS,
+    _POC_ELEMENT_ID_HINTS,
+    _DEFACEMENT_TEXT_MARKERS,
+    _BANNER_STYLE_TOKENS,
+    _MIN_BANNER_STYLE_TOKENS,
+    _SOURCE_SYNTAX_CHARS,
+    _JS_STRING_DELIMITERS,
+    _ECHO_DATA_BOUNDARY,
+    _ECHO_LITERAL_SCAN_WINDOW,
+    _JS_ESCAPE_RE,
+    _OVERLAY_MIN_VIEWPORT_COVERAGE,
+    _OVERLAY_MAX_TEXT_SHARE,
+    _OCCLUSION_MAX_ROUNDS,
+    _OCCLUSION_SAMPLE_COLS,
+    _OCCLUSION_SAMPLE_ROWS,
+    _OCCLUSION_TIMEOUT_S,
+    _STACKING_RESET_DECLARATIONS,
+    _BANNER_LOCK_DECLARATIONS,
+    _NEUTRALIZE_OCCLUDERS_JS,
+    decode_js_escapes,
+    decoded_payload_sources,
+    normalize_style,
+    _node_attrs,
+    has_poc_element_id,
+    has_banner_style,
+    marker_sent_as_string_literal,
+    is_execution_evidence,
+    node_execution_evidence,
+    evaluate_marker_evidence,
+    payload_carries_marker,
+    VerificationResult,
+)
+from bugtrace.tools.visual.verifier_checks import VerifierChecksMixin
 
 
-class XSSVerifier:
+class XSSVerifier(VerifierChecksMixin):
     """
     Hybrid XSS Verifier using CDP (primary) and Playwright (fallback).
     
@@ -301,310 +327,16 @@ class XSSVerifier:
             except Exception as fallback_e:
                 logger.error(f"Navigation failed completely: {fallback_e}")
 
-    async def _simulate_user_interactions(self, page, url: str, console_logs: List, dialog_detected: List):
-        """Simulate user interactions to trigger XSS."""
-        try:
-            logger.info(f"[{url}] 🖱️ Simulating User Interactions...")
-
-            # Try focus events
-            if await self._simulate_focus_events(page, dialog_detected):
-                return self._make_early_result(console_logs)
-
-            # Try hover events
-            if await self._simulate_hover_events(page, dialog_detected):
-                return self._make_early_result(console_logs)
-
-            # Try click events
-            if await self._simulate_click_events(page, url, dialog_detected):
-                return self._make_early_result(console_logs)
-        except Exception as e:
-            logger.warning(f"Interaction simulation error: {e}")
-
-        return None
-
-    async def _simulate_focus_events(self, page, dialog_detected: List) -> bool:
-        """Simulate focus events on inputs."""
-        inputs = await page.query_selector_all("input, textarea, select")
-        for i, inp in enumerate(inputs[:5]):
-            if dialog_detected[0]:
-                return True
-            if not await inp.is_visible():
-                continue
-
-            await self._trigger_focus_event(page, inp, i)
-
-        return dialog_detected[0]
-
-    async def _trigger_focus_event(self, page, element, index: int):
-        """Trigger focus event on a single element."""
-        try:
-            logger.debug(f"Forcing focus on input {index}")
-            await page.evaluate('''(el) => {
-                el.focus();
-                el.dispatchEvent(new FocusEvent('focus', { bubbles: true }));
-                el.dispatchEvent(new FocusEvent('focusin', { bubbles: true }));
-            }''', element)
-            await asyncio.sleep(0.8)
-        except Exception as e:
-            logger.debug(f"Focus event failed: {e}")
-
-    async def _simulate_hover_events(self, page, dialog_detected: List) -> bool:
-        """Simulate hover events on elements."""
-        candidates = await page.query_selector_all("img, div, span, a, label")
-        for i, cand in enumerate(candidates[:10]):
-            if dialog_detected[0]:
-                return True
-            try:
-                if await cand.is_visible():
-                    await cand.hover(timeout=500)
-            except Exception as e:
-                logger.debug(f"Hover action failed: {e}")
-        return dialog_detected[0]
-
-    async def _simulate_click_events(self, page, url: str, dialog_detected: List) -> bool:
-        """Simulate click events on clickable elements."""
-        clickable_selectors = [
-            "a[href^='javascript:']", "button[onclick]", "div[onclick]",
-            "input[type='submit']", "a:has-text('Back')",
-            "button:has-text('Back')", ".back-button"
-        ]
-
-        for selector in clickable_selectors:
-            if dialog_detected[0]:
-                return True
-            elements = await page.query_selector_all(selector)
-            if await self._click_elements(elements, url, selector, dialog_detected):
-                return True
-        return dialog_detected[0]
-
-    async def _click_elements(self, elements, url: str, selector: str, dialog_detected: List) -> bool:
-        """Click elements and check for dialog detection."""
-        for i, elem in enumerate(elements[:3]):
-            if dialog_detected[0]:
-                return True
-            try:
-                if await elem.is_visible():
-                    logger.info(f"[{url}] Clicking: {selector} [{i}]")
-                    await elem.click(timeout=1000)
-                    await asyncio.sleep(1.0)
-            except Exception as e:
-                logger.debug(f"Element click failed: {e}")
-        return dialog_detected[0]
-
-    def _make_early_result(self, console_logs: List) -> VerificationResult:
-        """Create early success result for user interaction."""
-        return VerificationResult(
-            success=True,
-            method="playwright",
-            screenshot_path=None,
-            console_logs=console_logs,
-            details={"dialog_detected": True, "trigger": "user_interaction"}
-        )
-
-    async def _evaluate_xss_indicators(self, page, url: str, dialog_detected: bool,
-                                      console_logs: List, expected_marker: Optional[str]) -> Tuple[bool, Dict]:
-        """Evaluate all XSS indicators in the page."""
-        if dialog_detected:
-            return True, {}
-
-        try:
-            marker_found = await self._check_expected_marker(page, expected_marker)
-            xss_in_dom = await self._check_xss_in_dom(page)
-            xss_var_confirmed = await self._check_window_variable(page, url)
-            csti_confirmed = await self._check_csti(page, url)
-            visual_confirmed = await self._check_visual_defacement(page, url)
-            xss_in_console = self._check_console_logs(console_logs)
-
-            xss_confirmed = (marker_found or xss_in_dom or xss_in_console or
-                           csti_confirmed or visual_confirmed or xss_var_confirmed)
-
-            return xss_confirmed, {"marker_found": marker_found}
-        except Exception as e:
-            logger.debug(f"DOM evaluation failed: {e}")
-            return False, {}
-
-    async def _check_expected_marker(self, page, expected_marker: Optional[str]) -> bool:
-        """Check if expected marker exists."""
-        if expected_marker:
-            return await page.evaluate(f'document.getElementById("{expected_marker}") !== null')
-        return False
-
-    async def _check_xss_in_dom(self, page) -> bool:
-        """Check for XSS markers in DOM."""
-        if await page.evaluate(f'document.body.innerHTML.includes("{self.XSS_MARKER}")'):
-            return True
-        return await page.evaluate('document.body.innerHTML.includes("XSS-HACKED")')
-
-    async def _check_window_variable(self, page, url: str) -> bool:
-        """Check for XSS_CONFIRMED window variable."""
-        xss_var = await page.evaluate('window.XSS_CONFIRMED === true')
-        if xss_var:
-            logger.info(f"[{url}] Window variable XSS_CONFIRMED found!")
-        return xss_var
-
-    async def _check_csti(self, page, url: str) -> bool:
-        """Check for CSTI arithmetic expression evaluation in rendered DOM.
-
-        Uses page.content() (rendered DOM) instead of innerText because Angular/Vue
-        may evaluate {{7*7}} in attributes (e.g., hidden input value="49") that
-        aren't visible in innerText. Strips <script> tags since template markers
-        in JS variables are NOT evaluated by client-side engines.
-        """
-        import re
-        from urllib.parse import unquote
-        decoded_url = unquote(url)
-
-        # Arithmetic markers: (payload_expression, evaluated_result).
-        # The distinctive 1000003*1000003 → 1000006000009 marker is the CURRENT CSTI
-        # probe (commit bf8ba65) — chosen so a stray short "49" can't false-confirm.
-        # The 7*7 → 49 forms are kept for backward compatibility with legacy payloads.
-        # NOTE: this browser-side detector previously only knew 7*7/49 and silently
-        # failed to confirm every 1000003*1000003 payload the CSTI agent actually sends.
-        arithmetic_markers = [
-            ("1000003*1000003", "1000006000009"),
-            ("7*7", "49"),
-            ("7*'7'", "49"),
-            ("'7'*7", "49"),
-        ]
-        present = [(m, r) for (m, r) in arithmetic_markers if m in decoded_url]
-        has_arithmetic = bool(present)
-        has_constructor = "constructor" in decoded_url
-
-        if not has_arithmetic and not has_constructor:
-            return False
-
-        # Get rendered DOM and strip <script> tags (JS vars aren't template-evaluated)
-        page_content = await page.content()
-        page_content_no_scripts = re.sub(
-            r'<script[^>]*>.*?</script>', '', page_content,
-            flags=re.DOTALL | re.IGNORECASE
-        )
-
-        # Also get visible text for string multiply / constructor checks
-        page_text = await page.evaluate("document.body.innerText")
-
-        # Literal template markers (payload reflected but NOT evaluated). If any is
-        # present, the engine echoed the source verbatim — that is NOT evaluation.
-        template_markers = [
-            "{{7*7}}", "${7*7}", "<%= 7*7 %>", "#{7*7}", "{{7*'7'}}", "{{'7'*7}}",
-            "{{1000003*1000003}}", "${1000003*1000003}", "<%= 1000003*1000003 %>",
-            "#{1000003*1000003}", "[[1000003*1000003]]", "{1000003*1000003}",
-        ]
-
-        # Check 1: arithmetic eval → evaluated result present in DOM, literal NOT present.
-        # Use DOM content (not just innerText) because Angular evaluates {{expr}} in
-        # attributes like value="1000006000009" which innerText doesn't include.
-        for marker, result in present:
-            if result in page_content_no_scripts:
-                if not any(m in page_content_no_scripts for m in template_markers):
-                    logger.info(f"[{url}] CSTI Confirmed: arithmetic eval {marker} → {result}")
-                    return True
-
-        # Check 2: '7'*7 → 7777777 (string multiply)
-        if "7777777" in page_text or "7777777" in page_content_no_scripts:
-            logger.info(f"[{url}] CSTI Confirmed: string multiply → 7777777")
-            return True
-
-        # Check 3: constructor eval — the literal constructor payload carries only the
-        # SOURCE expression (e.g. 'return 1000003*1000003'), never the RESULT, so a
-        # result match means it executed. Gate on markers actually in the payload.
-        if has_constructor and present:
-            for _marker, result in present:
-                if result in page_text or result in page_content_no_scripts:
-                    if not any(m in page_content_no_scripts for m in template_markers):
-                        logger.info(f"[{url}] CSTI Confirmed: constructor eval → {result}")
-                        return True
-
-        return False
-
-    async def _check_visual_defacement(self, page, url: str) -> bool:
-        """Check for visual defacement markers."""
-        try:
-            pwn_elements = await page.evaluate('''() => {
-                const allElements = document.querySelectorAll('[id*="bt-pwn"]');
-                return allElements.length;
-            }''')
-            if pwn_elements > 0:
-                logger.info(f"[{url}] Visual Defacement Confirmed (count: {pwn_elements})!")
-                return True
-        except Exception as e:
-            logger.debug(f"Visual defacement check failed: {e}")
-            if await self._check_specific_pwn_ids(page, url):
-                return True
-
-        return await self._check_text_based_markers(page, url)
-
-    async def _check_specific_pwn_ids(self, page, url: str) -> bool:
-        """Check for specific bt-pwn ID variants."""
-        for pwn_id in ["#bt-pwn", "#bt-pwn-l8", "#bt-pwn-l7"]:
-            if await page.locator(pwn_id).count() > 0:
-                logger.info(f"[{url}] Visual Defacement Confirmed: '{pwn_id}' element found!")
-                return True
-        return False
-
-    async def _check_text_based_markers(self, page, url: str) -> bool:
-        """Check for text-based defacement markers."""
-        markers = ["HACKED BY BUGTRACEAI", "FRAGMENT XSS", "MXSS DETECTED",
-                  "XSS DETECTED", "PWNED BY BUGTRACE"]
-
-        for marker in markers:
-            if await page.locator(f"div:has-text('{marker}')").count() > 0:
-                if await self._check_marker_divs(page, url, marker):
-                    return True
-        return False
-
-    async def _check_marker_divs(self, page, url: str, marker: str) -> bool:
-        """Check divs containing marker for XSS confirmation."""
-        pwn_divs = await page.locator(f"div:has-text('{marker}')").all()
-        for div in pwn_divs:
-            style = await div.get_attribute("style")
-            div_id = await div.get_attribute("id")
-            if (style and "background:red" in style) or (div_id and "bt-pwn" in div_id):
-                logger.info(f"[{url}] Visual Defacement Confirmed: '{marker}' banner!")
-                return True
-        return False
-
-    def _check_console_logs(self, console_logs: List) -> bool:
-        """Check console logs for XSS markers."""
-        return any((self.XSS_MARKER in log.get("text", "") or
-                   "XSS-VERIFIED" in log.get("text", "")) for log in console_logs)
-
-    async def _extract_impact_data(self, page, url: str, xss_confirmed: bool) -> Dict:
-        """Extract impact data if XSS is confirmed."""
-        if not xss_confirmed:
-            return {}
-
-        try:
-            impact_data = await page.evaluate('''() => {
-                return {
-                    cookie_count: document.cookie ? document.cookie.split(';').length : 0,
-                    cookies: document.cookie,
-                    origin: window.origin,
-                    localStorageKeys: Object.keys(localStorage),
-                    sessionStorageKeys: Object.keys(sessionStorage),
-                    has_sensitive_tokens: (document.cookie + JSON.stringify(localStorage)).match(/token|jwt|session|auth|key/i) !== null
-                }
-            }''')
-
-            has_storage_access = (impact_data.get('cookies') or impact_data.get('localStorageKeys'))
-            is_sandboxed = impact_data.get('origin') == "null" or not has_storage_access
-
-            if is_sandboxed:
-                logger.warning(f"[{url}] ⚠️ XSS confirmed but SANDBOXED. Impact is LOW.")
-
-            if impact_data.get('has_sensitive_tokens'):
-                logger.info(f"[{url}] 💰 CRITICAL IMPACT: Sensitive tokens found!")
-
-            impact_data['is_sandboxed'] = is_sandboxed
-            return impact_data
-        except Exception as e:
-            logger.warning(f"Impact extraction failed: {e}")
-            return {}
-
     async def _capture_screenshot(self, page, screenshot_dir: Optional[str], xss_confirmed: bool) -> Optional[str]:
         """Capture screenshot as evidence."""
         if not screenshot_dir:
             return None
+
+        # Every detection probe has already read the DOM by now, so clearing site
+        # chrome here can only change the IMAGE, never the verdict. Run it for the
+        # failed attempts too: a `repro_attempt` shot of a consent modal tells the
+        # triager nothing either.
+        await self._neutralize_occluders(page)
 
         import time
         prefix = "playwright_xss" if xss_confirmed else "repro_attempt"
@@ -652,6 +384,7 @@ class XSSVerifier:
 
 
 # Convenience function
+
 async def verify_xss(
     url: str,
     screenshot_dir: Optional[str] = None,

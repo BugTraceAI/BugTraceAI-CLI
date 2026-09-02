@@ -158,21 +158,19 @@ class ServiceEventBus:
 
     async def _store_event_in_history(self, scan_id: int, event: str, data: Dict[str, Any]):
         """Store event in scan-scoped history and push to streams."""
+        from bugtrace.api.ws_envelope_policy import build_history_entry, map_event_type
+
         # Assign sequence number
         current_seq = self._seq_counters.get(scan_id, 0) + 1
         self._seq_counters[scan_id] = current_seq
 
-        # Map event to type
-        event_type = self._map_event_type(event)
-
-        # Create history entry
-        history_entry = {
-            "event": event,
-            "data": data,
-            "timestamp": datetime.utcnow().isoformat(),
-            "seq": current_seq,
-            "event_type": event_type,
-        }
+        history_entry = build_history_entry(
+            event,
+            data,
+            seq=current_seq,
+            timestamp_iso=datetime.utcnow().isoformat(),
+            event_type=map_event_type(event),
+        )
 
         # Store and cap history
         self._append_to_history(scan_id, history_entry)
@@ -181,56 +179,10 @@ class ServiceEventBus:
         self._push_to_queues(scan_id, event, history_entry)
 
     def _map_event_type(self, event: str) -> str:
-        """Map internal event names to WS-02 types."""
-        event_type_mapping = {
-            "scan.created": "scan_created",
-            "scan.started": "scan_started",
-            "scan.completed": "scan_complete",
-            "scan.stopped": "scan_complete",
-            "scan.failed": "error",
-            "scan.error": "error",
-            "scan.paused": "scan_paused",
-            "scan.resumed": "scan_resumed",
-            "vulnerability_detected": "finding_discovered",
-            "pipeline_started": "log",
-            "pipeline_complete": "log",
-            "pipeline_error": "error",
-            "url_analyzed": "log",
-            # Dashboard events (pass through as-is for WEB widgets)
-            "pipeline_progress": "pipeline_progress",
-            "agent_update": "agent_update",
-            "metrics_update": "metrics_update",
-            "scan_complete_summary": "scan_complete_summary",
-            "scan_log": "log",
-        }
+        """Map internal event names to WS types. Pure owner: ws_envelope_policy."""
+        from bugtrace.api.ws_envelope_policy import map_event_type
 
-        if event in event_type_mapping:
-            return event_type_mapping[event]
-
-        # Verbose events (dotted names) pass through as their own type.
-        # "auth" is bridged via the auth.* wildcard (see _VERBOSE_PREFIXES) and MUST be
-        # in this allowlist too — otherwise auth.phase.started falls through to the
-        # "phase" substring rule below and mis-renders as "[PHASE] … complete" at phase START.
-        if "." in event:
-            prefix = event.split(".")[0]
-            if prefix in ("pipeline", "recon", "discovery", "strategy",
-                          "exploit", "auth", "validation", "reporting"):
-                return event
-
-        if "agent" in event:
-            return "agent_active"
-        # Only a genuine new-vuln announcement becomes a finding card. finding_verified /
-        # finding_rejected / finding_validated are validation-lifecycle events — mapping any
-        # name merely CONTAINING "finding" to finding_discovered would render a rejected or
-        # already-validated finding as a fresh CONFIRMED CRITICAL. Route those to a log line.
-        # (vulnerability_detected is mapped explicitly above.)
-        if event == "finding_discovered":
-            return "finding_discovered"
-        if "finding" in event:
-            return "log"
-        if "phase" in event:
-            return "phase_complete"
-        return event
+        return map_event_type(event)
 
     def _append_to_history(self, scan_id: int, history_entry: Dict[str, Any]):
         """Append entry to history with cap."""
@@ -301,14 +253,10 @@ class ServiceEventBus:
             - WebSocket reconnection (Phase 2): Client sends last_seq, gets missed events
             - MCP polling (Phase 3): Poll for new events since last check
         """
+        from bugtrace.api.ws_envelope_policy import events_after_seq
+
         history = self._event_history.get(scan_id, [])
-
-        # Backward compatible: if since_seq is 0, return all events
-        if since_seq == 0:
-            return history
-
-        # Filter events by sequence number
-        return [event for event in history if event.get("seq", 0) > since_seq]
+        return events_after_seq(history, since_seq)
 
     async def stream(self, scan_id: int) -> AsyncIterator[Dict[str, Any]]:
         """

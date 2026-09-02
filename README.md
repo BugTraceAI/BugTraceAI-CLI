@@ -1,15 +1,10 @@
-<p align="center">
-  <img src="BTAI_Logo_GitHub.png" alt="BugTraceAI" width="180"/>
-</p>
-
 # BugTraceAI-CLI
 
 [![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white)](https://bugtraceai.com)
 [![Wiki Documentation](https://img.shields.io/badge/Wiki%20Documentation-000?logo=wikipedia&logoColor=white)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
-[![Join the Community on Discord](https://img.shields.io/badge/Join_the_Community-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/5HjujkScC)
-![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)
-![Version](https://img.shields.io/badge/Version-3.7.12--beta-orange)
+![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)
+![Version](https://img.shields.io/badge/Version-4.0.0--rc1-orange)
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Required-blue?logo=docker)
@@ -25,7 +20,6 @@
 - [🔬 Core Methodology](#-core-methodology)
 - [🏗️ Architecture](#️-architecture)
 - [🛠️ Technology Stack](#️-technology-stack)
-- [CI/CD Integration](#cicd-integration)
 - [🚀 Getting Started](#-getting-started)
 - [🤖 AI Assistant Setup (MCP)](#-ai-assistant-setup-mcp)
 - [⚙️ Configuration](#️-configuration)
@@ -40,15 +34,14 @@ BugTraceAI-CLI is an autonomous offensive security framework that combines LLM-d
 
 The core philosophy is **"Think like a pentester, execute like a machine, validate like an auditor"** - using AI for intelligent hypothesis generation, but relying on real tools for exploitation and validation.
 
-## CI/CD Integration
+## What's New in v4.0.0-rc1
 
-Use BugTraceAI-CLI as the autonomous security testing layer in an authorized CI/CD workflow: receive jobs through its API or MCP layer, scan approved targets, generate evidence-rich reports, and hand validated findings to analysis and ticketing systems.
-
-<p align="center">
-  <img src="BUGTRACEAI-CI-CD_Proposal.png" alt="BugTraceAI CI/CD integration proposal" width="720"/>
-</p>
-
-## What's New in v3.7.12-beta
+- **Refactor standard release candidate** — the modular CLI refactor is the
+  release baseline for the 4.0 line, with compatibility shims retained for
+  supported import paths.
+- **License transition** — BugTraceAI-owned portions of this snapshot are
+  released under Apache-2.0. Earlier AGPL-3.0 releases retain their original
+  terms; see `LICENSE-HISTORY.md` and `THIRD_PARTY_NOTICES.md`.
 
 - **Anthropic direct-API provider**: Anthropic is now a first-class LLM provider using an API key (`x-api-key`, Messages API), selectable via the `anthropic` preset. A new `api_format` preset field decouples the wire format from the OAuth path, so `generate`, threaded generation, vision, and connectivity all route to the Anthropic Messages API when active. Existing OpenRouter/Z.ai behaviour is unchanged.
 - **Integrated Model Lab (model-eval)**: benchmark and compare OpenRouter models from BugTraceAI-WEB through the CLI API (`/api/model-eval`, `/api/model-eval/models`, `/api/model-eval/test-key`) with a per-request OpenRouter key, live WebSocket progress, cost visibility, and a key-validation check before a run. The recalibration adds a quality-dominant composite (median latency as a side axis), per-slot leaderboards (MUTATION / SKEPTICAL / ANALYSIS / REPORTING), the `quick-v3` / `advanced-v2` suites, and an opt-in MUTATION payload-diversity probe.
@@ -516,9 +509,9 @@ CANDIDATE → PENDING_VALIDATION → CONFIRMED / FALSE_POSITIVE → PROBE_VALIDA
 
 ## 📜 License
 
-AGPL-3.0 License
+Apache-2.0 License
 
-Copyright (c) 2026 BugTraceAI
+Copyright (c) 2026 Albert Corzo; portions Copyright (c) 2026 Ricardo Sánchez
 
 See [LICENSE](LICENSE) for details.
 

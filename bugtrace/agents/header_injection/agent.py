@@ -225,6 +225,10 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
         """Get agent statistics."""
         return self._stats
 
+    async def _discover_header_params(self, url: str) -> Dict[str, str]:
+        """Legacy class adapter for the package-owned discovery function."""
+        return await discover_header_params(url)
+
     # =========================================================================
     # WET -> DRY Two-Phase Processing
     # =========================================================================
@@ -269,7 +273,7 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
             seen_urls.add(url)
 
             try:
-                all_params = await discover_header_params(url)
+                all_params = await self._discover_header_params(url)
                 if not all_params:
                     continue
 
@@ -512,7 +516,8 @@ class HeaderInjectionAgent(BaseAgent, TechContextMixin):
         results = await self.exploit_dry_list()
 
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        # dry_findings are CANDIDATES, not confirmations (stable 4074425)
+        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         if results or self._dry_findings:
             await self._generate_specialist_report(results)

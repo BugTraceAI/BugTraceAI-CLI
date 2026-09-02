@@ -1,10 +1,19 @@
+"""AssetDiscoveryAgent shell — package owner (dual collapse).
+
+Historical path asset_discovery_agent is a thin re-export.
 """
-Asset Discovery Agent
 
-Thin orchestrator for comprehensive subdomain and endpoint enumeration.
-Delegates pure data/logic to core.py, performs I/O (HTTP, DNS) directly.
+"""
+Asset Discovery Agent - Comprehensive Subdomain and Endpoint Enumeration
 
-Extracted from asset_discovery_agent.py for modularity.
+This agent discovers the complete attack surface:
+- Subdomains (DNS bruteforce, CT logs)
+- Hidden endpoints (Wayback, common paths)
+- Cloud storage (S3, Azure, GCP buckets)
+- GitHub code search
+- Related domains
+
+Advanced reconnaissance and comprehensive asset mapping.
 """
 
 import asyncio
@@ -15,19 +24,9 @@ from loguru import logger
 from datetime import datetime
 
 from bugtrace.agents.base import BaseAgent
+from bugtrace.core.llm_client import llm_client
+from bugtrace.core.ui import dashboard
 from bugtrace.core.config import settings
-
-from bugtrace.agents.asset_discovery.core import (
-    load_subdomain_wordlist,
-    get_common_paths,
-    generate_bucket_patterns,
-    extract_company_name,
-    process_ct_certificates,
-    process_wayback_results,
-    aggregate_results,
-    is_sensitive_endpoint,
-    is_s3_bucket_public,
-)
 
 
 class AssetDiscoveryAgent(BaseAgent):
@@ -48,17 +47,13 @@ class AssetDiscoveryAgent(BaseAgent):
             "AssetDiscoveryAgent",
             "Attack Surface Mapper",
             event_bus,
-            agent_id="asset_discovery",
+            agent_id="asset_discovery"
         )
         self.discovered_subdomains: Set[str] = set()
         self.discovered_endpoints: Set[str] = set()
         self.discovered_cloud_buckets: Set[str] = set()
         self.target_domain = ""
-        self.wordlist_subdomains = load_subdomain_wordlist()
-
-    # =====================================================================
-    # EVENT SUBSCRIPTIONS
-    # =====================================================================
+        self.wordlist_subdomains = self._load_subdomain_wordlist()
 
     def _setup_event_subscriptions(self):
         """Subscribe to target discovery events."""
@@ -66,99 +61,53 @@ class AssetDiscoveryAgent(BaseAgent):
             self.event_bus.subscribe("new_target_added", self.handle_new_target)
             logger.info(f"[{self.name}] Subscribed to 'new_target_added' events")
 
-    async def handle_new_target(self, data: Dict[str, Any]):  # I/O
+    async def handle_new_target(self, data: Dict[str, Any]):
         """Triggered when a new target is added to scope."""
         target_url = data.get("url")
         self.think(f"New target in scope: {target_url}")
         await self.discover_assets(target_url)
 
-    # =====================================================================
-    # RUN LOOP
-    # =====================================================================
+    def _load_subdomain_wordlist(self) -> List[str]:
+        """Load common subdomain wordlist (top 1000)."""
+        # Top 100 most common subdomains for bug bounty
+        common = [
+            "www", "mail", "ftp", "localhost", "webmail", "smtp", "pop", "ns1", "webdisk",
+            "ns2", "cpanel", "whm", "autodiscover", "autoconfig", "m", "imap", "test",
+            "ns", "blog", "pop3", "dev", "www2", "admin", "forum", "news", "vpn", "ns3",
+            "mail2", "new", "mysql", "old", "lists", "support", "mobile", "mx", "static",
+            "docs", "beta", "shop", "sql", "secure", "demo", "cp", "calendar", "wiki",
+            "web", "media", "email", "images", "img", "www1", "intranet", "portal", "video",
+            "sip", "dns2", "api", "cdn", "stats", "dns1", "ns4", "www3", "dns", "search",
+            "staging", "server", "mx1", "chat", "wap", "my", "svn", "mail1", "sites",
+            "proxy", "ads", "host", "crm", "cms", "backup", "mx2", "lyncdiscover", "info",
+            "apps", "download", "remote", "db", "forums", "store", "relay", "files", "newsletter",
+            "app", "live", "owa", "en", "start", "sms", "office", "exchange", "ipv4",
+        ]
 
-    async def run_loop(self):  # I/O
+        # Add staging/dev variations
+        prefixes = ["dev", "staging", "test", "qa", "uat", "pre", "prod"]
+        variations = common + [f"{p}-{sub}" for p in prefixes for sub in common[:20]]
+
+        return list(set(variations))[:500]  # Limit to 500 for performance
+
+    async def run_loop(self):
         """Main agent loop."""
-        from bugtrace.core.ui import dashboard
-
         dashboard.current_agent = self.name
         self.think("Asset Discovery Agent initialized and waiting for targets...")
 
         while self.running:
             await asyncio.sleep(1)
 
-    # =====================================================================
-    # MAIN DISCOVERY ORCHESTRATION
-    # =====================================================================
-
-    async def discover_assets(self, target_url: str) -> Dict[str, Any]:  # I/O
-        """Main discovery orchestration method."""
-        from bugtrace.core.ui import dashboard
-
-        parsed = urlparse(target_url)
-        self.target_domain = parsed.netloc or parsed.path
-
-        # Check if asset discovery is enabled in config
-        enable_asset_discovery = settings.get("ASSET_DISCOVERY", "ENABLE_ASSET_DISCOVERY", "False").lower() == "true"
-
-        if not enable_asset_discovery:
-            dashboard.log(f"Asset discovery disabled - scanning target URL only: {self.target_domain}", "INFO")
-            return {
-                "subdomains": [],
-                "endpoints": [],
-                "cloud_buckets": [],
-                "total_assets": 0,
-                "discovery_disabled": True,
-            }
-
-        dashboard.log(f"Starting comprehensive asset discovery for: {self.target_domain}", "INFO")
-
-        tasks = self._build_discovery_tasks(target_url)
-        if not tasks:
-            dashboard.log("All asset discovery methods disabled", "WARNING")
-            return {"subdomains": [], "endpoints": [], "cloud_buckets": [], "total_assets": 0}
-
-        # Run enabled discovery methods in parallel
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Aggregate and limit results (PURE)
-        max_subdomains = int(settings.get("ASSET_DISCOVERY", "MAX_SUBDOMAINS", "50"))
-        assets = aggregate_results(
-            self.discovered_subdomains,
-            self.discovered_endpoints,
-            self.discovered_cloud_buckets,
-            max_subdomains=max_subdomains,
-        )
-
-        if assets["was_limited"]:
-            dashboard.log(
-                f"Limited to {max_subdomains} subdomains (found {assets['total_subdomains_found']})",
-                "WARNING",
-            )
-
-        # Emit discovery event
-        if self.event_bus:
-            await self.event_bus.emit("assets_discovered", {
-                "target": self.target_domain,
-                "assets": assets,
-                "timestamp": datetime.now().isoformat(),
-            })
-
-        dashboard.log(
-            f"Discovery complete: {len(assets['subdomains'])} subdomains, "
-            f"{len(self.discovered_endpoints)} endpoints, "
-            f"{len(self.discovered_cloud_buckets)} cloud buckets",
-            "SUCCESS",
-        )
-
-        return assets
-
     def _build_discovery_tasks(self, target_url: str) -> List:
         """Build list of discovery tasks based on enabled methods."""
-        enable_dns = settings.get("ASSET_DISCOVERY", "ENABLE_DNS_ENUMERATION", "True").lower() == "true"
-        enable_ct = settings.get("ASSET_DISCOVERY", "ENABLE_CERTIFICATE_TRANSPARENCY", "True").lower() == "true"
-        enable_wayback = settings.get("ASSET_DISCOVERY", "ENABLE_WAYBACK_DISCOVERY", "True").lower() == "true"
-        enable_cloud = settings.get("ASSET_DISCOVERY", "ENABLE_CLOUD_STORAGE_ENUM", "True").lower() == "true"
-        enable_common = settings.get("ASSET_DISCOVERY", "ENABLE_COMMON_PATHS", "True").lower() == "true"
+        # Settings already parsed these from [ASSET_DISCOVERY] via getboolean, so they
+        # arrive as real bools -- no string comparison needed. (They used to be read
+        # with settings.get(SECTION, KEY, default), which Settings has never had.)
+        enable_dns = settings.ENABLE_DNS_ENUMERATION
+        enable_ct = settings.ENABLE_CERTIFICATE_TRANSPARENCY
+        enable_wayback = settings.ENABLE_WAYBACK_DISCOVERY
+        enable_cloud = settings.ENABLE_CLOUD_STORAGE_ENUM
+        enable_common = settings.ENABLE_COMMON_PATHS
 
         tasks = []
         if enable_dns:
@@ -173,11 +122,73 @@ class AssetDiscoveryAgent(BaseAgent):
             tasks.append(self._common_paths_discovery(target_url))
         return tasks
 
-    # =====================================================================
-    # DNS ENUMERATION (I/O)
-    # =====================================================================
+    def _aggregate_results(self) -> Dict[str, Any]:
+        """Aggregate and limit discovered assets."""
+        max_subdomains = settings.MAX_SUBDOMAINS  # already an int via getint
+        limited_subdomains = sorted(self.discovered_subdomains)[:max_subdomains]
 
-    async def _dns_enumeration(self):  # I/O
+        if len(self.discovered_subdomains) > max_subdomains:
+            dashboard.log(
+                f"⚠️  Limited to {max_subdomains} subdomains (found {len(self.discovered_subdomains)})",
+                "WARNING"
+            )
+
+        return {
+            "subdomains": limited_subdomains,
+            "endpoints": sorted(self.discovered_endpoints),
+            "cloud_buckets": sorted(self.discovered_cloud_buckets),
+            "total_assets": len(limited_subdomains) + len(self.discovered_endpoints)
+        }
+
+    async def discover_assets(self, target_url: str) -> Dict[str, Any]:
+        """Main discovery orchestration method."""
+        parsed = urlparse(target_url)
+        self.target_domain = parsed.netloc or parsed.path
+
+        # Check if asset discovery is enabled in config
+        enable_asset_discovery = settings.ENABLE_ASSET_DISCOVERY
+
+        if not enable_asset_discovery:
+            dashboard.log(f"ℹ️  Asset discovery disabled - scanning target URL only: {self.target_domain}", "INFO")
+            return {
+                "subdomains": [],
+                "endpoints": [],
+                "cloud_buckets": [],
+                "total_assets": 0,
+                "discovery_disabled": True
+            }
+
+        dashboard.log(f"🔍 Starting comprehensive asset discovery for: {self.target_domain}", "INFO")
+
+        tasks = self._build_discovery_tasks(target_url)
+        if not tasks:
+            dashboard.log("⚠️  All asset discovery methods disabled", "WARNING")
+            return {"subdomains": [], "endpoints": [], "cloud_buckets": [], "total_assets": 0}
+
+        # Run enabled discovery methods in parallel
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Aggregate and limit results
+        assets = self._aggregate_results()
+
+        # Emit discovery event
+        if self.event_bus:
+            await self.event_bus.emit("assets_discovered", {
+                "target": self.target_domain,
+                "assets": assets,
+                "timestamp": datetime.now().isoformat()
+            })
+
+        dashboard.log(
+            f"✅ Discovery complete: {len(assets['subdomains'])} subdomains, "
+            f"{len(self.discovered_endpoints)} endpoints, "
+            f"{len(self.discovered_cloud_buckets)} cloud buckets",
+            "SUCCESS"
+        )
+
+        return assets
+
+    async def _dns_enumeration(self):
         """DNS bruteforce using common subdomain wordlist."""
         self.think("Starting DNS enumeration...")
 
@@ -193,34 +204,37 @@ class AssetDiscoveryAgent(BaseAgent):
             await asyncio.gather(*batch, return_exceptions=True)
             await asyncio.sleep(0.5)  # Rate limiting
 
-    async def _check_dns_record(self, hostname: str):  # I/O
+    async def _check_dns_record(self, hostname: str):
         """Check if hostname resolves (simple HTTP check)."""
         try:
             async with httpx.AsyncClient(timeout=3, follow_redirects=False) as client:
-                for scheme in ["https", "http"]:
-                    try:
-                        url = f"{scheme}://{hostname}"
-                        response = await client.get(url, timeout=3)
-                        if response.status_code >= 500:
-                            continue
-                        # Any response = exists
-                        self.discovered_subdomains.add(hostname)
-                        from bugtrace.core.ui import dashboard
-                        dashboard.log(f"  Found: {hostname}", "INFO")
-                        return
-                    except Exception:
-                        continue
-        except Exception:
+                await self._check_schemes(client, hostname)
+        except Exception as e:
             pass  # DNS resolution failed
 
-    # =====================================================================
-    # CERTIFICATE TRANSPARENCY (I/O)
-    # =====================================================================
+    async def _check_schemes(self, client, hostname: str):
+        """Try both HTTP and HTTPS schemes for hostname."""
+        for scheme in ["https", "http"]:
+            if await self._try_scheme_check(client, hostname, scheme):
+                return
 
-    async def _certificate_transparency(self):  # I/O
+    async def _try_scheme_check(self, client, hostname: str, scheme: str) -> bool:
+        """Try to check hostname with a specific scheme. Returns True if found."""
+        try:
+            url = f"{scheme}://{hostname}"
+            response = await client.get(url, timeout=3)
+            # Guard: Skip if server error
+            if response.status_code >= 500:
+                return False
+            # Any response = exists
+            self.discovered_subdomains.add(hostname)
+            dashboard.log(f"  ✅ Found: {hostname}", "INFO")
+            return True
+        except Exception:
+            return False
+
+    async def _certificate_transparency(self):
         """Query Certificate Transparency logs via crt.sh."""
-        from bugtrace.core.ui import dashboard
-
         self.think("Querying Certificate Transparency logs...")
 
         try:
@@ -228,25 +242,38 @@ class AssetDiscoveryAgent(BaseAgent):
                 url = f"https://crt.sh/?q=%.{self.target_domain}&output=json"
                 response = await client.get(url)
 
+                # Guard: Skip if request failed
                 if response.status_code != 200:
                     return
 
                 certs = response.json()
-                # Process certificates (PURE)
-                new_subdomains = process_ct_certificates(certs, self.target_domain)
-                self.discovered_subdomains.update(new_subdomains)
-                dashboard.log(f"  CT Logs: Found {len(certs)} certificates", "INFO")
+                self._process_ct_certificates(certs)
+                dashboard.log(f"  📜 CT Logs: Found {len(certs)} certificates", "INFO")
         except Exception as e:
             logger.warning(f"Certificate Transparency query failed: {e}")
 
-    # =====================================================================
-    # WAYBACK MACHINE (I/O)
-    # =====================================================================
+    def _process_ct_certificates(self, certs: list):
+        """Process certificate transparency results and extract subdomains."""
+        for cert in certs:
+            name_value = cert.get("name_value", "")
+            # CT logs can have multiple domains per cert
+            domains = name_value.split("\n")
+            self._extract_valid_subdomains(domains)
 
-    async def _wayback_discovery(self):  # I/O
+    def _extract_valid_subdomains(self, domains: list):
+        """Extract valid subdomains from domain list."""
+        for domain in domains:
+            domain = domain.strip()
+            # Guard: Skip wildcards
+            if "*" in domain:
+                continue
+            # Guard: Skip if not our target domain
+            if self.target_domain not in domain:
+                continue
+            self.discovered_subdomains.add(domain)
+
+    async def _wayback_discovery(self):
         """Query Wayback Machine for historical URLs."""
-        from bugtrace.core.ui import dashboard
-
         self.think("Querying Wayback Machine for historical endpoints...")
 
         try:
@@ -254,64 +281,87 @@ class AssetDiscoveryAgent(BaseAgent):
                 url = f"http://web.archive.org/cdx/search/cdx?url={self.target_domain}/*&output=json&collapse=urlkey&fl=original"
                 response = await client.get(url)
 
+                # Guard: Skip if request failed
                 if response.status_code != 200:
                     return
 
                 data = response.json()
-                # Process results (PURE)
-                new_endpoints = process_wayback_results(data)
-                self.discovered_endpoints.update(new_endpoints)
-                dashboard.log(f"  Wayback: Found {len(data)-1} historical URLs", "INFO")
+                self._process_wayback_results(data)
+                dashboard.log(f"  🕰️  Wayback: Found {len(data)-1} historical URLs", "INFO")
         except Exception as e:
             logger.warning(f"Wayback Machine query failed: {e}")
 
-    # =====================================================================
-    # CLOUD STORAGE ENUMERATION (I/O)
-    # =====================================================================
+    def _process_wayback_results(self, data: list):
+        """Process Wayback Machine results and extract historical URLs."""
+        # Skip header row
+        for row in data[1:]:
+            # Guard: Skip empty rows
+            if not row:
+                continue
+            historical_url = row[0] if isinstance(row, list) else row
+            self.discovered_endpoints.add(historical_url)
 
-    async def _cloud_storage_enum(self):  # I/O
+    async def _cloud_storage_enum(self):
         """Enumerate cloud storage buckets (S3, Azure, GCP)."""
         self.think("Enumerating cloud storage buckets...")
 
-        company_name = extract_company_name(self.target_domain)
-        patterns = generate_bucket_patterns(company_name)
+        # Extract company name from domain
+        company_name = self.target_domain.split('.')[0]
+
+        # Common bucket name patterns
+        patterns = [
+            company_name,
+            f"{company_name}-backup",
+            f"{company_name}-backups",
+            f"{company_name}-data",
+            f"{company_name}-files",
+            f"{company_name}-uploads",
+            f"{company_name}-assets",
+            f"{company_name}-images",
+            f"{company_name}-static",
+            f"{company_name}-prod",
+            f"{company_name}-production",
+            f"{company_name}-dev",
+            f"{company_name}-staging",
+        ]
 
         tasks = []
         # S3 buckets
         for pattern in patterns:
             tasks.append(self._check_s3_bucket(pattern))
+
         # Azure blobs
         for pattern in patterns:
             tasks.append(self._check_azure_blob(pattern))
 
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _check_s3_bucket(self, bucket_name: str):  # I/O
+    async def _check_s3_bucket(self, bucket_name: str):
         """Check if S3 bucket exists and is accessible."""
-        from bugtrace.core.ui import dashboard
-
         try:
             async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
                 url = f"https://{bucket_name}.s3.amazonaws.com"
                 response = await client.get(url, timeout=5)
 
+                # Guard: Skip if bucket doesn't exist
                 if response.status_code not in [200, 403] and "<?xml" not in response.text:
                     return
 
                 self.discovered_cloud_buckets.add(f"s3://{bucket_name}")
-
-                # Check if publicly accessible (PURE)
-                if is_s3_bucket_public(response.status_code, response.text):
-                    dashboard.log(f"  PUBLIC S3 bucket: {bucket_name}", "CRITICAL")
-                else:
-                    dashboard.log(f"  Found S3 bucket: {bucket_name} (access denied)", "INFO")
+                self._log_s3_bucket_access(bucket_name, response)
         except Exception as e:
             logger.debug(f"operation failed: {e}")
 
-    async def _check_azure_blob(self, container_name: str):  # I/O
-        """Check if Azure blob storage exists."""
-        from bugtrace.core.ui import dashboard
+    def _log_s3_bucket_access(self, bucket_name: str, response):
+        """Log S3 bucket access level."""
+        # Check if publicly accessible
+        if response.status_code == 200 and "<Contents>" in response.text:
+            dashboard.log(f"  ⚠️  PUBLIC S3 bucket: {bucket_name}", "CRITICAL")
+        else:
+            dashboard.log(f"  🪣 Found S3 bucket: {bucket_name} (access denied)", "INFO")
 
+    async def _check_azure_blob(self, container_name: str):
+        """Check if Azure blob storage exists."""
         try:
             async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
                 url = f"https://{container_name}.blob.core.windows.net"
@@ -319,19 +369,26 @@ class AssetDiscoveryAgent(BaseAgent):
 
                 if response.status_code in [200, 400, 403]:
                     self.discovered_cloud_buckets.add(f"azure://{container_name}")
-                    dashboard.log(f"  Found Azure blob: {container_name}", "INFO")
+                    dashboard.log(f"  🪣 Found Azure blob: {container_name}", "INFO")
         except Exception as e:
             logger.debug(f"_check_azure_blob failed: {e}")
 
-    # =====================================================================
-    # COMMON PATHS DISCOVERY (I/O)
-    # =====================================================================
-
-    async def _common_paths_discovery(self, base_url: str):  # I/O
+    async def _common_paths_discovery(self, base_url: str):
         """Discover common paths and hidden endpoints."""
         self.think("Probing for common endpoints...")
 
-        common_paths = get_common_paths()
+        # Top 50 common paths for bug bounty
+        common_paths = [
+            "/admin", "/administrator", "/login", "/signin", "/api", "/v1", "/v2",
+            "/swagger", "/swagger-ui", "/swagger.json", "/openapi.json", "/docs",
+            "/graphql", "/graphiql", "/api/graphql", "/.git", "/.git/config",
+            "/.env", "/.env.local", "/.env.production", "/backup", "/backups",
+            "/wp-admin", "/wp-login.php", "/phpmyadmin", "/pma", "/admin.php",
+            "/config", "/config.php", "/config.json", "/settings", "/debug",
+            "/.aws/credentials", "/.docker", "/api/v1", "/api/v2", "/api/docs",
+            "/rest/api", "/api-docs", "/actuator", "/health", "/metrics",
+            "/status", "/server-status", "/trace", "/dump", "/env",
+        ]
 
         tasks = []
         for path in common_paths:
@@ -345,23 +402,33 @@ class AssetDiscoveryAgent(BaseAgent):
             await asyncio.gather(*batch, return_exceptions=True)
             await asyncio.sleep(0.5)
 
-    async def _probe_endpoint(self, url: str):  # I/O
+    async def _probe_endpoint(self, url: str):
         """Probe single endpoint to check if it exists."""
-        from bugtrace.core.ui import dashboard
-
         try:
             async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
                 response = await client.get(url, timeout=5)
 
+                # Guard: Skip 404 responses
                 if response.status_code == 404:
                     return
 
                 self.discovered_endpoints.add(url)
-
-                # Only check sensitive keywords for 200 responses
-                if response.status_code == 200 and is_sensitive_endpoint(url):
-                    dashboard.log(f"  Sensitive endpoint exposed: {url}", "CRITICAL")
-                elif response.status_code == 200:
-                    dashboard.log(f"  Found: {url}", "INFO")
+                self._log_endpoint_discovery(url, response.status_code)
         except Exception as e:
             logger.debug(f"operation failed: {e}")
+
+    def _log_endpoint_discovery(self, url: str, status_code: int):
+        """Log discovered endpoint with appropriate severity."""
+        # Guard: Only check sensitive keywords for 200 responses
+        if status_code != 200:
+            return
+
+        sensitive_keywords = [".git", ".env", "swagger", "graphql", "admin", "config", "backup"]
+        if any(kw in url.lower() for kw in sensitive_keywords):
+            dashboard.log(f"  ⚠️  Sensitive endpoint exposed: {url}", "CRITICAL")
+        else:
+            dashboard.log(f"  📍 Found: {url}", "INFO")
+
+
+# Export for team orchestrator
+__all__ = ["AssetDiscoveryAgent"]

@@ -7,10 +7,10 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - cli-scans:/app/scans
-      - cli-reports:/app/reports
-      - cli-db:/app/data
-      - cli-logs:/app/logs   # persist scanner logs (execution.log / bugtrace.jsonl / errors.log) across rebuilds — enables saturation/timeout forensics
+      - bugtraceai-cli_cli-scans:/app/scans
+      - bugtraceai-cli_cli-reports:/app/reports
+      - bugtraceai-cli_cli-db:/app/data
+      - bugtraceai-cli_cli-logs:/app/logs   # persist scanner logs (execution.log / bugtrace.jsonl / errors.log) across rebuilds — enables saturation/timeout forensics
       - /var/run/docker.sock:/var/run/docker.sock
       - ./.env:/app/.env   # bind the host .env so Provider-tab key changes (update_env_var writes /app/.env) persist across restarts
     env_file:
@@ -32,9 +32,9 @@ services:
     ports:
       - "8001:8001"
     volumes:
-      - cli-reports:/app/reports
-      - cli-logs:/app/logs
-      - cli-db:/app/data
+      - bugtraceai-cli_cli-reports:/app/reports
+      - bugtraceai-cli_cli-logs:/app/logs
+      - bugtraceai-cli_cli-db:/app/data
     env_file:
       - .env
     depends_on:
@@ -49,7 +49,7 @@ services:
     restart: unless-stopped
 
 volumes:
-  cli-scans:
-  cli-reports:
-  cli-logs:
-  cli-db:
+  bugtraceai-cli_cli-scans:
+  bugtraceai-cli_cli-reports:
+  bugtraceai-cli_cli-logs:
+  bugtraceai-cli_cli-db:

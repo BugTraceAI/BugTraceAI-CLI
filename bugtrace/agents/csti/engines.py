@@ -21,8 +21,8 @@ ENGINE_SIGNATURES: Dict[str, Dict] = {
     },
     "vue": {
         "patterns": ["v-if", "v-for", "v-model", "vue.js", "vue.min.js"],
-        "probe": "{{7*7}}",
-        "success_indicator": "49",
+        "probe": "{{1000003*1000003}}",
+        "success_indicator": "1000006000009",
     },
     "jinja2": {
         "patterns": ["jinja", "flask", "werkzeug"],
@@ -31,28 +31,28 @@ ENGINE_SIGNATURES: Dict[str, Dict] = {
     },
     "twig": {
         "patterns": ["twig", "symfony"],
-        "probe": "{{7*7}}",
-        "success_indicator": "49",
+        "probe": "{{1000003*1000003}}",
+        "success_indicator": "1000006000009",
     },
     "freemarker": {
         "patterns": ["freemarker", ".ftl"],
-        "probe": "${7*7}",
-        "success_indicator": "49",
+        "probe": "${1000003*1000003}",
+        "success_indicator": "1000006000009",
     },
     "velocity": {
         "patterns": ["velocity", ".vm"],
-        "probe": "#set($x=7*7)$x",
-        "success_indicator": "49",
+        "probe": "#set($x=1000003*1000003)$x",
+        "success_indicator": "1000006000009",
     },
     "mako": {
         "patterns": ["mako"],
-        "probe": "${7*7}",
-        "success_indicator": "49",
+        "probe": "${1000003*1000003}",
+        "success_indicator": "1000006000009",
     },
     "pebble": {
         "patterns": ["pebble"],
-        "probe": "{{ 7*7 }}",
-        "success_indicator": "49",
+        "probe": "{{ 1000003*1000003 }}",
+        "success_indicator": "1000006000009",
     },
     "smarty": {
         "patterns": ["smarty"],
@@ -61,8 +61,8 @@ ENGINE_SIGNATURES: Dict[str, Dict] = {
     },
     "erb": {
         "patterns": ["erb", "ruby", "rails"],
-        "probe": "<%= 7*7 %>",
-        "success_indicator": "49",
+        "probe": "<%= 1000003*1000003 %>",
+        "success_indicator": "1000006000009",
     },
 }
 
@@ -195,19 +195,19 @@ def try_alternative_engine(current_engine: str) -> str:  # PURE
         A payload string for an alternative engine
     """
     payloads = {
-        "jinja2": "{{7*7}}",
-        "twig": "{{7*7}}",
-        "freemarker": "${7*7}",
-        "velocity": "#set($x=7*7)$x",
-        "pebble": "{{7*7}}",
-        "thymeleaf": "[[${7*7}]]",
+        "jinja2": "{{1000003*1000003}}",
+        "twig": "{{1000003*1000003}}",
+        "freemarker": "${1000003*1000003}",
+        "velocity": "#set($x=1000003*1000003)$x",
+        "pebble": "{{1000003*1000003}}",
+        "thymeleaf": "[[${1000003*1000003}]]",
     }
 
     for engine, payload in payloads.items():
         if engine != current_engine:
             return payload
 
-    return "{{7*7}}"
+    return "{{1000003*1000003}}"
 
 
 def encode_template_chars(payload: str, stripped: List[str]) -> str:  # PURE

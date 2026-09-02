@@ -1,22 +1,18 @@
 # Common API endpoints for vulnerability discovery
 # Lines starting with # are comments
 # One endpoint per line (appended to API prefix, e.g. /api/)
-# Query params are preserved as-is
+# Entries identify generic resources only. Parameters must come from observed
+# forms, links, API schemas, JavaScript call sites, or live responses.
 
-# Redirect (SSRF, Open Redirect)
-redirect?url=https://example.com
-redirect?to=https://example.com
+# Redirect
+redirect
 
 # Debug/Admin
 debug
-debug/vulns
 admin
-admin/email-preview
-admin/email-templates
 admin/stats
 admin/products
 admin/users
-admin/vulnerable-debug-stats
 config
 
 # Auth
@@ -27,45 +23,30 @@ auth/register
 users/me
 profile
 user/profile
-user/profile/1
-user/profile/2
-user/preferences
 users
-users/1
 
 # File operations
 upload
 
-# Search (SQLi, XSS targets)
-products?search=test
-products?q=test
-search?q=test
-search?query=test
+# Search
+products
+search
 
 # GraphQL
 graphql
 
-# Health/System (RCE targets)
+# Health/System
 health
-health?cmd=id
+status
 
 # Checkout/Payments (price manipulation)
 checkout
 checkout/process
 
-# Content (Stored XSS, IDOR)
+# Content
 reviews
-reviews/1
 blog
-blog/1
-blog/3
 forum/threads
-forum/threads/1
 
-# Import (SSRF, XXE)
-products/import?url=https://example.com
-admin/import/xml
-admin/import/url
-
-# Template injection (SSTI)
-admin/email-preview?template={{7*7}}
+# Import
+import

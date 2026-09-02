@@ -3,6 +3,18 @@ Finding formatting, severity display, markdown generation, reproduction steps,
 curl commands, validation methods.
 
 All functions are PURE (no self, no I/O, data in -> data out).
+
+LIVE SURFACE — READ BEFORE PATCHING (verified 2026-07-28 by import graph):
+``normalize_severity`` is the ONLY name any caller imports from this module
+(``reporting_mod.finding_processor``); nothing else here is reachable from a scan, and
+nothing here is covered by ``tests/smoke_report.py``, which drives the monolith.
+
+The reproduction/curl/markdown builders below started as copies of the live methods on
+``bugtrace/agents/reporting.py``'s ReportingAgent and have since DRIFTED from them (the
+monolith's payload/URL rendering was hardened on 2026-07-28; these were not). They are
+kept only so the subpackage still imports cleanly. Fixing a report defect HERE changes
+no deliverable — fix it in the monolith, and treat any difference as the copy being
+stale, never as two supported variants.
 """
 
 from typing import Dict, List
@@ -23,6 +35,15 @@ from bugtrace.reporting.standards import (
     get_remediation_for_vuln,
     get_reference_cve,
     format_cve,
+)
+from bugtrace.reporting.poc_format import (
+    build_query_url,
+    curl_form_field,
+    curl_get,
+    curl_header,
+    md_step_with_block,
+    shell_word,
+    template_expression_result,
 )
 from bugtrace.utils.logger import get_logger
 
@@ -193,11 +214,12 @@ def generate_curl(finding: Dict) -> str:
     if vuln_type == "XSS":
         return _curl_build_xss(url, param, payload)
     if vuln_type == "SSRF":
-        return f"# SSRF: Use Burp Collaborator or webhook.site to test OOB callbacks\ncurl '{url}'"
+        return ("# SSRF: Use Burp Collaborator or webhook.site to test OOB callbacks\n"
+                + curl_get(url))
     if vuln_type == "LFI":
-        return _curl_build_lfi(url, param)
+        return _curl_build_lfi(url, param, payload)
     if vuln_type == "IDOR":
-        return f"# IDOR: Test with different user IDs/values\ncurl '{url}'"
+        return "# IDOR: Test with different user IDs/values\n" + curl_get(url)
 
     return _curl_build_fallback(url, param, payload)
 
@@ -206,8 +228,8 @@ def generate_curl(finding: Dict) -> str:
 def _curl_build_sqli(url: str, param: str) -> str:
     """Build SQLi reproduction command."""
     if param:
-        return f"sqlmap -u \"{url}\" -p {param} --batch --dbs"
-    return f"sqlmap -u \"{url}\" --batch --dbs"
+        return f"sqlmap -u {shell_word(url)} -p {param} --batch --dbs"
+    return f"sqlmap -u {shell_word(url)} --batch --dbs"
 
 
 # PURE
@@ -215,20 +237,27 @@ def _curl_build_csti(url: str, param: str, payload: str) -> str:
     """Build CSTI/SSTI reproduction command."""
     default_payload = "{{7*7}}"
     test_payload = payload if payload else default_payload
+    expected = template_expression_result(test_payload)
+    check = f" | grep {shell_word(expected)}" if expected else ""
 
     if param and param.startswith("HEADER:"):
         header_name = param.replace("HEADER:", "")
-        return f"curl -H '{header_name}: {test_payload}' '{url}' | grep 49"
+        cmd = curl_header(url, header_name, test_payload, extra=check.lstrip())
+        if cmd:
+            return cmd
+        # The payload cannot legally be a header field value (CR/LF); a curl would
+        # silently deliver a truncated header, so point at the injection instead.
+        return (f"# CSTI via header {header_name} on {url}\n"
+                f"# The payload below spans multiple lines and cannot ride an HTTP\n"
+                f"# header — replay the captured request in an intercepting proxy.\n"
+                f"{test_payload}")
     elif param and param.startswith("POST:"):
         param_name = param.replace("POST:", "")
-        return f"curl -X POST '{url}' -d '{param_name}={test_payload}' | grep 49"
+        return curl_form_field(url, param_name, test_payload) + check
     elif param and payload:
-        parsed = urlparse(url)
-        qs = parse_qs(parsed.query)
-        qs[param] = [payload]
-        new_query = urlencode(qs, doseq=True)
-        test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
-        return f"curl '{test_url}' | grep 49"
+        test_url = build_query_url(url, param, payload)
+        if test_url:
+            return curl_get(test_url) + check
     return f"# CSTI on {url} - inject {{{{7*7}}}} in parameter {param}"
 
 
@@ -236,30 +265,32 @@ def _curl_build_csti(url: str, param: str, payload: str) -> str:
 def _curl_build_xss(url: str, param: str, payload: str) -> str:
     """Build XSS reproduction command."""
     if param and payload:
-        parsed = urlparse(url)
-        qs = parse_qs(parsed.query)
-        qs[param] = [payload]
-        new_query = urlencode(qs, doseq=True)
-        test_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', new_query, ''))
-        return f"# Open in browser to trigger XSS:\n{test_url}"
-    elif payload:
-        return f"# XSS Payload: {payload}\n# Inject in parameter: {param or 'unknown'}"
-    return f"# XSS on {url} - test with <script>alert(1)</script> in {param or 'input fields'}"
+        test_url = build_query_url(url, param, payload)
+        if test_url:
+            return f"# Open in browser to trigger XSS:\n{test_url}"
+    if payload:
+        # The reproduction is always RENDERED inside a code block, so a plain payload
+        # line reaches the clipboard byte-exact where a `#`-comment line would not.
+        return f"# XSS: inject the payload below into parameter: {param or 'unknown'}\n{payload}"
+    return f"# XSS on {url} - test the input fields for {param or 'reflected input'}"
 
 
 # PURE
-def _curl_build_lfi(url: str, param: str) -> str:
-    """Build LFI reproduction command."""
+def _curl_build_lfi(url: str, param: str, payload: str = "") -> str:
+    """Build LFI reproduction command from the finding's OWN traversal payload."""
+    if param and payload:
+        return curl_get(build_query_url(url, param, payload) or url)
     if param:
-        return f"curl '{url}' --data-urlencode '{param}=../../../etc/passwd'"
-    return f"# LFI on {url} - test with ../../etc/passwd"
+        return f"# LFI on {url} - inject a traversal path into parameter {param}"
+    return f"# LFI on {url} - test with a directory-traversal path"
 
 
 # PURE
 def _curl_build_fallback(url: str, param: str, payload: str) -> str:
     """Build fallback reproduction command."""
     if url and param:
-        return f"# Vulnerable endpoint: {url}\n# Parameter: {param}\n# Payload: {payload or 'N/A'}"
+        head = f"# Vulnerable endpoint: {url}\n# Parameter: {param}"
+        return f"{head}\n# Payload:\n{payload}" if payload else head
     elif url:
         return f"# Vulnerable endpoint: {url}"
     else:
@@ -323,7 +354,7 @@ def _build_sqli_steps(finding: Dict) -> List[str]:
         return [
             f"1. Navigate to: {url}",
             f"2. Locate the `{param}` parameter in the URL/form",
-            f"3. Inject the time-based payload: `{payload}`",
+            md_step_with_block("3. Inject the time-based payload:", payload),
             "4. Submit the request and start a timer",
             "5. **Expected Result:** Response takes 5+ seconds (indicating SQL SLEEP executed)",
             "6. Compare with normal request time (should be <1 second)",
@@ -333,7 +364,7 @@ def _build_sqli_steps(finding: Dict) -> List[str]:
         return [
             f"1. Navigate to: {url}",
             f"2. Locate the `{param}` parameter",
-            f"3. Inject the error-based payload: `{payload}`",
+            md_step_with_block("3. Inject the error-based payload:", payload),
             "4. Submit the request",
             "5. **Expected Result:** Response contains database data in error message",
             "6. Look for extracted values (usernames, passwords, etc.) in the error output"
@@ -342,10 +373,11 @@ def _build_sqli_steps(finding: Dict) -> List[str]:
         return [
             f"1. Navigate to: {url}",
             f"2. Locate the `{param}` parameter",
-            f"3. Inject the payload: `{payload}`",
+            md_step_with_block("3. Inject the payload:", payload),
             "4. Submit the request",
             "5. **Expected Result:** SQL error message or altered response indicating injection",
-            f"6. For further exploitation, use SQLMap: `sqlmap -u \"{url}\" -p {param} --batch`"
+            md_step_with_block("6. For further exploitation, use SQLMap:",
+                               f"sqlmap -u {shell_word(url)} -p {param} --batch", "bash")
         ]
 
 
@@ -416,7 +448,7 @@ def _build_generic_steps(finding: Dict) -> List[str]:
     return [
         f"1. Navigate to: {url}",
         f"2. Locate the vulnerable parameter: `{param}`",
-        f"3. Inject the payload: `{payload}`",
+        md_step_with_block("3. Inject the payload:", payload),
         "4. Submit the request",
         "5. Observe the application response for vulnerability indicators",
         "6. Document any security-relevant behavior"

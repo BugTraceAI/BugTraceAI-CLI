@@ -336,8 +336,6 @@ REFERENCE_CVES = {
     "CSTI:freemarker": "CVE-2022-24816",  # Apache Freemarker template injection
     "CSTI:jinja2": "CVE-2019-10906",      # Jinja2 sandbox escape
     "CSTI:twig": "CVE-2022-39261",        # Twig path traversal / code execution
-    "CSTI:angular": "CVE-2022-25869",     # AngularJS XSS via sandbox escape
-    "CSTI:angularjs": "CVE-2022-25869",
     "CSTI:pebble": "CVE-2022-37767",      # Pebble template injection
     "SSTI:velocity": "CVE-2020-13936",
     "SSTI:freemarker": "CVE-2022-24816",

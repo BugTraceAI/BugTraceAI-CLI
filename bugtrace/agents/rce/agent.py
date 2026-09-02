@@ -50,6 +50,13 @@ from bugtrace.agents.rce.detection import (
 logger = logging.getLogger(__name__)
 
 
+def _legacy_orchestrator():
+    """Resolve the legacy facade's patched orchestrator at call time."""
+    from bugtrace.agents.rce_agent import orchestrator as legacy_orchestrator
+
+    return legacy_orchestrator
+
+
 class RCEAgent(BaseAgent, TechContextMixin):
     """
     Specialist Agent for Remote Code Execution (RCE) and Command Injection.
@@ -110,7 +117,7 @@ class RCEAgent(BaseAgent, TechContextMixin):
         all_findings = []
         time_payloads = get_time_payloads()
 
-        async with orchestrator.session(DestinationType.TARGET) as session:
+        async with _legacy_orchestrator().session(DestinationType.TARGET) as session:
             for param in self.params:
                 logger.info(f"[{self.name}] Testing RCE on {self.url} (Param: {param})")
                 finding = await self._test_parameter(session, param, time_payloads)
@@ -222,13 +229,13 @@ class RCEAgent(BaseAgent, TechContextMixin):
         cookie_name = param.replace("Cookie: ", "").strip() if param.startswith("Cookie:") else param
         probe_value = base64.b64encode(b"BTAI_deser_rce_probe").decode()
         try:
-            async with orchestrator.session(DestinationType.TARGET) as session:
+            async with _legacy_orchestrator().session(DestinationType.TARGET) as session:
                 cookies = {cookie_name: probe_value}
                 async with session.get(url, cookies=cookies, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     body = await resp.text()
                     matched = check_deser_keywords(body)
                     if matched:
-                        logger.info(f"[{self.name}] Deserialization CONFIRMED on {cookie_name} @ {url}: {matched}")
+                        logger.info(f"[{self.name}] Deserialization sink detected on {cookie_name} @ {url}: {matched}")
                         return create_deserialization_finding(url, param, probe_value, matched)
         except Exception as e:
             logger.debug(f"[{self.name}] Deserialization test failed for {cookie_name}: {e}")
@@ -485,7 +492,13 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
             temperature=0.2,
         )
         try:
-            return json.loads(response).get("findings", wet_findings)
+            from bugtrace.utils.json_parser import extract_json_list, safe_json_loads
+            result = safe_json_loads(response)
+            findings = extract_json_list(result, "findings")
+            if findings is None:
+                logger.warning(f"[{self.name}] LLM dedup returned invalid JSON, using fallback")
+                return fallback_fingerprint_dedup(wet_findings)
+            return findings
         except Exception:
             return fallback_fingerprint_dedup(wet_findings)
 
@@ -517,7 +530,10 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
                     result = await self._test_deserialization(url, param)
                 else:
                     result = await self._test_single_param_from_queue(url, param, f.get("finding", {}))
-                if result and result.get("validated"):
+                if result and (
+                    result.get("validated")
+                    or result.get("status") == "MANUAL_REVIEW_RECOMMENDED"
+                ):
                     validated.append(result)
                     fp = generate_rce_fingerprint(url, param)
                     if fp not in self._emitted_findings:
@@ -532,7 +548,11 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
                                 "parameter": result.get("parameter"),
                                 "payload": result.get("payload"),
                                 "status": status,
+                                "severity": result.get("severity"),
                                 "evidence": result.get("evidence", ""),
+                                "description": result.get("description", ""),
+                                "reproduction": result.get("reproduction", ""),
+                                "manual_review_reason": result.get("manual_review_reason", ""),
                                 "cwe_id": result.get("cwe_id", get_cwe_for_vuln("RCE")),
                                 "validation_requires_cdp": status == ValidationStatus.PENDING_VALIDATION.value,
                             }, scan_context=self._scan_context)
@@ -624,7 +644,8 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
         results = await self.exploit_dry_list()
 
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        # dry_findings are CANDIDATES, not confirmations (stable 4074425)
+        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
@@ -659,7 +680,7 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
         try:
             # Phase 1: Try without auth
             got_auth_error = False
-            async with orchestrator.session(DestinationType.TARGET) as session:
+            async with _legacy_orchestrator().session(DestinationType.TARGET) as session:
                 time_payloads = get_time_payloads()
                 # Quick probe: send first payload and check for 403/401
                 probe_url = inject_payload(url, param, time_payloads[0])

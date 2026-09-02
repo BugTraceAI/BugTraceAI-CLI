@@ -68,6 +68,7 @@ class IDORFinding:
             "remediation": self.remediation,
             "http_request": self.http_request,
             "http_response": self.http_response,
+            "original_value": self.original_value,
         }
         if self.exploitation:
             result["exploitation"] = self.exploitation

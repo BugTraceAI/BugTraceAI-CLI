@@ -9,13 +9,7 @@
 | **CVSS Score** | {cvss_score} |
 | **Validation Method** | {validation_method} |
 
-**URL:** `{url}`
-**Parameter:** `{parameter}`
-
-**Payload:**
-```text
-{payload}
-```
+{injection_point}
 {alternative_payloads_section}
 #### Description
 
@@ -31,15 +25,9 @@
 
 #### Evidence
 
-**Request:**
-```http
-{http_request}
-```
+{http_request_block}
 
-**Response (excerpt):**
-```http
-{http_response_excerpt}
-```
+{http_response_block}
 
 {screenshot_section}
 

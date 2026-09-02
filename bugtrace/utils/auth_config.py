@@ -21,8 +21,11 @@ logger = get_logger("utils.auth_config")
 AUTH_CONFIG_SCHEMA = {
     "required_fields": ["login_url", "credentials"],
     "credentials_fields": ["username", "password"],  # At least one identifier + password
-    "optional_fields": ["login_flow", "success_condition", "login_type", "scope_path"],
+    "optional_fields": [
+        "login_flow", "success_condition", "login_type", "request_format", "scope_path"
+    ],
     "login_types": ["form", "sso", "api", "basic"],
+    "request_formats": ["form", "json"],
     "success_condition_types": ["url_contains", "url_equals_exactly", "element_present", "text_contains"],
 }
 
@@ -170,12 +173,25 @@ def validate_auth_config(config: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
     if login_type not in AUTH_CONFIG_SCHEMA["login_types"]:
         return None, f"Invalid login_type: {login_type}"
 
+    request_format = config.get("request_format")
+    if request_format and request_format not in AUTH_CONFIG_SCHEMA["request_formats"]:
+        return None, f"Invalid request_format: {request_format}"
+
     # Build sanitized config
+    identifier_field = (
+        "email"
+        if "email" in credentials and "username" not in credentials
+        else "username"
+    )
+    identifier_value = credentials.get(
+        identifier_field,
+        credentials.get("user", ""),
+    )
     sanitized = {
         "login_url": login_url.strip(),
         "login_type": login_type,
         "credentials": {
-            "username": credentials.get("username", credentials.get("email", "")).strip(),
+            identifier_field: identifier_value.strip(),
             "password": credentials.get("password", ""),
         },
     }
@@ -203,6 +219,9 @@ def validate_auth_config(config: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any
             scope_path = "/" + scope_path
         sanitized["scope_path"] = scope_path.strip()
         logger.info(f"Crawling scope restricted to: {scope_path}")
+
+    if request_format:
+        sanitized["request_format"] = request_format
 
     return sanitized, None
 
@@ -235,10 +254,14 @@ def convert_to_scan_auth(config: Dict[str, Any]) -> Dict[str, Any]:
     """
     result = {
         "login_url": config.get("login_url", ""),
+        "login_type": config.get("login_type", "form"),
         "credentials": config.get("credentials", {}),
         "login_flow": config.get("login_flow", []),
         "success_condition": config.get("success_condition", {}),
     }
+
+    if config.get("request_format"):
+        result["request_format"] = config["request_format"]
 
     # Include scope_path if set (restrict crawling to this path)
     if config.get("scope_path"):

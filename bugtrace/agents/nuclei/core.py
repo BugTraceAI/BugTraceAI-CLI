@@ -294,7 +294,7 @@ def detect_js_versions(
                 "eol": lib_info.get("eol", False),
                 "severity": lib_info["severity"],
                 "description": f"{lib_info['name']} {v_str} is below {threshold_str}. Known CVEs: {cve_str}",
-                "tags": ["js-dependency", "vulnerable-library"],
+                "tags": ["js-dependency", "vulnerable-library", "misconfiguration"],
                 "template_id": f"js-vulnerable-{lib_key}",
                 "matched_at": target,
                 "script_src": source if source != "inline" else "",

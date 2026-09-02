@@ -16,7 +16,7 @@ Contents:
     - detect_frameworks_from_recon_urls: Detect frameworks from recon-discovered URLs
 """
 
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Mapping, Optional, Set
 from pathlib import Path
 from urllib.parse import urlparse
 from loguru import logger
@@ -30,6 +30,94 @@ from bugtrace.agents.nuclei.core import (
     detect_frameworks_from_html,
     filter_fp_waf_matchers,
 )
+
+
+_SOFT_404_MARKERS = (
+    "404 not found",
+    "404 page not found",
+    "page not found",
+    "this website does not exist",
+    "this website doesn't exist",
+    "website does not exist",
+    "website doesn't exist",
+    "nothing here",
+    "there is nothing here",
+    "route not found",
+    "endpoint not found",
+    "resource not found",
+    "cannot post ",
+    "cannot get ",
+)
+_AUTH_RESPONSE_STATUSES = frozenset({400, 401, 403, 422})
+_WAF_BLOCK_MARKERS = (
+    "errors.edgesuite.net",
+    "request has been blocked",
+    "the requested url was rejected",
+    "cf-mitigated",
+    "attention required",
+)
+_GENERIC_BLOCK_MARKERS = (
+    "access denied",
+    "you don't have permission to access",
+)
+_WAF_SERVER_MARKERS = (
+    "akamai",
+    "cloudflare",
+    "imperva",
+    "incapsula",
+    "sucuri",
+    "modsecurity",
+    "fortinet",
+)
+
+
+def _normalise_response_text(value: str) -> str:
+    """Make response text comparable across HTML, JSON, and headers."""
+    return " ".join(value.casefold().split())
+
+
+def _is_missing_endpoint_response(
+    status: int,
+    headers: Mapping[str, str],
+    body: str,
+) -> bool:
+    """Return whether an HTTP response represents a real or soft 404 page."""
+    if status in {404, 405, 410}:
+        return True
+
+    header_text = _normalise_response_text(
+        " ".join(f"{key}: {value}" for key, value in headers.items())
+    )
+    body_text = _normalise_response_text(body)
+    if any(marker in header_text or marker in body_text for marker in _SOFT_404_MARKERS):
+        return True
+
+    # Some soft-404 handlers only return a terse JSON/plain-text "Not Found".
+    return body_text in {"404", "404 not found", "not found", "notfound"}
+
+
+def _is_waf_block_response(
+    status: int,
+    headers: Mapping[str, str],
+    body: str,
+) -> bool:
+    """Return whether a response is a WAF denial page rather than app content."""
+    header_text = _normalise_response_text(
+        " ".join(f"{key}: {value}" for key, value in headers.items())
+    )
+    body_text = _normalise_response_text(body)
+    response_text = f"{header_text} {body_text}"
+    if any(marker in response_text for marker in _WAF_BLOCK_MARKERS):
+        return True
+
+    has_generic_block = any(marker in body_text for marker in _GENERIC_BLOCK_MARKERS)
+    has_waf_server = any(marker in header_text for marker in _WAF_SERVER_MARKERS)
+    return status in {403, 406, 429, 503} and has_generic_block and has_waf_server
+
+
+def _is_usable_auth_response(status: int) -> bool:
+    """Whether a status proves the candidate accepted an auth-style request."""
+    return 200 <= status < 400 or status in _AUTH_RESPONSE_STATUSES
 
 
 async def fetch_html(url: str) -> Optional[str]:  # I/O
@@ -61,7 +149,7 @@ async def check_security_headers(
     target: str,
     existing_template_ids: Set[str],
 ) -> List[Dict]:  # I/O
-    """Check for missing security headers via a single HEAD request.
+    """Check for missing security headers via a single GET request.
 
     Runs AFTER Nuclei to catch headers that Nuclei templates missed.
     Skips headers already detected by Nuclei (via template_id dedup).
@@ -78,8 +166,14 @@ async def check_security_headers(
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.head(target, ssl=False, allow_redirects=True) as response:
+            async with session.get(target, ssl=False, allow_redirects=True) as response:
                 response_headers = {k.lower(): v for k, v in response.headers.items()}
+                response_body = await response.text(errors="ignore")
+                if _is_missing_endpoint_response(
+                    response.status, response.headers, response_body
+                ) or _is_waf_block_response(response.status, response.headers, response_body):
+                    logger.info("Skipping security header checks on an error or WAF block page")
+                    return findings
     except Exception as e:
         logger.warning(f"Security headers check failed: {e}")
         return findings
@@ -147,6 +241,11 @@ async def check_insecure_cookies(
         for url in urls_to_check:
             try:
                 async with session.get(url, ssl=False, allow_redirects=True) as response:
+                    body = await response.text(errors="ignore")
+                    if _is_missing_endpoint_response(
+                        response.status, response.headers, body
+                    ) or _is_waf_block_response(response.status, response.headers, body):
+                        continue
                     set_cookies = response.headers.getall("Set-Cookie", [])
                     for cookie_header in set_cookies:
                         cookie_name = (
@@ -319,15 +418,18 @@ async def test_graphql_unauth_access(
                         if sensitive_mutations:
                             findings.append({
                                 "name": (
-                                    f"GraphQL Mutations Accessible Without Auth "
-                                    f"({len(sensitive_mutations)} sensitive)"
+                                    f"GraphQL Sensitive Mutations Exposed in Schema "
+                                    f"({len(sensitive_mutations)} mutations)"
                                 ),
-                                "severity": "high",
+                                "severity": "medium",
                                 "description": (
-                                    f"GraphQL endpoint exposes {len(mutation_fields)} mutations "
-                                    f"without authentication, including sensitive operations: "
+                                    f"Schema introspection reveals {len(mutation_fields)} mutations, "
+                                    f"including potentially sensitive operations: "
                                     f"{', '.join(sensitive_mutations[:5])}. "
-                                    f"Attackers can modify data without credentials."
+                                    f"This is information disclosure via schema enumeration — "
+                                    f"the mutations were NOT tested for execution. "
+                                    f"Manual review recommended to verify whether these mutations "
+                                    f"are actually reachable without authentication."
                                 ),
                                 "tags": ["misconfig", "graphql", "access-control", "api"],
                                 "template_id": "graphql-unauth-mutations",
@@ -345,8 +447,10 @@ async def check_rate_limiting(
 ) -> List[Dict]:  # I/O
     """Check for missing rate limiting on authentication endpoints.
 
-    Sends 25 rapid requests to common auth endpoints. If no 429 response
-    is received, reports missing rate limiting.
+    Sends 25 rapid requests to common auth endpoints. A candidate must first
+    prove that it exists (including rejecting soft-404 pages), and all requests
+    must receive an auth-compatible response without a 429 before a finding is
+    emitted.
 
     Args:
         target: The target URL.
@@ -384,40 +488,62 @@ async def check_rate_limiting(
         endpoint = f"{base}{path}"
         got_429 = False
         successful_requests = 0
+        candidate_is_usable = True
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                # First check if endpoint exists
+                # Reject real and soft 404s before sending a burst of requests.
                 try:
                     async with session.post(endpoint, json=test_body, ssl=False) as resp:
-                        if resp.status in (404, 405):
+                        body = await resp.text(errors="ignore")
+                        if _is_missing_endpoint_response(resp.status, resp.headers, body):
+                            logger.debug(f"Skipping missing auth endpoint: {endpoint}")
+                            continue
+                        if _is_waf_block_response(resp.status, resp.headers, body):
+                            logger.debug(f"Skipping WAF-blocked auth endpoint: {endpoint}")
                             continue
                         if resp.status == 429:
                             got_429 = True
+                        elif not _is_usable_auth_response(resp.status):
+                            candidate_is_usable = False
+                        else:
+                            successful_requests = 1
                 except Exception:
                     continue
 
-                if got_429:
+                if got_429 or not candidate_is_usable:
                     continue
 
                 # Send rapid requests
                 for _ in range(request_count - 1):
                     try:
                         async with session.post(endpoint, json=test_body, ssl=False) as resp:
+                            body = await resp.text(errors="ignore")
+                            if _is_waf_block_response(resp.status, resp.headers, body):
+                                candidate_is_usable = False
+                                break
                             if resp.status == 429:
                                 got_429 = True
                                 break
+                            if not _is_usable_auth_response(resp.status):
+                                candidate_is_usable = False
+                                break
                             successful_requests += 1
                     except Exception:
+                        candidate_is_usable = False
                         break
 
-            if not got_429 and successful_requests >= 15:
+            if (
+                not got_429
+                and candidate_is_usable
+                and successful_requests == request_count
+            ):
                 findings.append({
                     "name": f"No Rate Limiting on {path}",
                     "severity": "medium",
                     "description": (
                         f"Authentication endpoint {endpoint} accepted "
-                        f"{successful_requests + 1} rapid requests without returning 429. "
+                        f"{successful_requests} rapid requests without returning 429. "
                         f"Missing rate limiting enables credential brute-force and stuffing attacks."
                     ),
                     "tags": ["misconfig", "rate-limiting", "authentication", "security"],
@@ -426,7 +552,7 @@ async def check_rate_limiting(
                 })
                 logger.info(
                     f"No rate limiting on {endpoint} "
-                    f"({successful_requests + 1} requests accepted)"
+                    f"({successful_requests} requests accepted)"
                 )
                 break
         except Exception as e:

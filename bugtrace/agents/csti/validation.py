@@ -44,8 +44,8 @@ def check_csti_confirmed(
     Check if CSTI is confirmed in HTTP response.
 
     Performs all validation checks:
-    1. Arithmetic evaluation (7*7=49)
-    2. Constructor evaluation (return 7*7 -> 49)
+    1. Arithmetic evaluation (1000003*1000003=1000006000009)
+    2. Constructor evaluation of the distinctive arithmetic marker
     3. String multiplication ('7'*7 -> 7777777)
     4. Config reflection (Jinja2)
     5. Engine signatures (Twig, Smarty, Freemarker)
@@ -66,20 +66,36 @@ def check_csti_confirmed(
 
     evidence: Dict[str, Any] = {"payload": payload}
 
-    # 1. Arithmetic evaluation (7*7=49)
-    if "49" in response_html and "7*7" in payload:
+    # Small arithmetic probes remain useful for deterministic smoke and live
+    # checks, provided the evaluated value is absent from the baseline.
+    arithmetic = re.search(r"(?<!\d)(\d{1,3})\s*\*\s*(\d{1,3})(?!\d)", payload or "")
+    if arithmetic:
+        left, right = (int(value) for value in arithmetic.groups())
+        expected = str(left * right)
+        if (
+            expected in response_html
+            and payload not in response_html
+            and expected not in baseline_html
+        ):
+            evidence["method"] = "arithmetic_eval"
+            evidence["proof"] = f"{left}*{right} evaluated to {expected}"
+            evidence["status"] = "VALIDATED_CONFIRMED"
+            return True, evidence
+
+    # 1. Arithmetic evaluation with a distinctive result
+    if "1000006000009" in response_html and "1000003*1000003" in payload:
         if payload not in response_html:
-            if "49" not in baseline_html:
+            if "1000006000009" not in baseline_html:
                 evidence["method"] = "arithmetic_eval"
-                evidence["proof"] = "7*7 evaluated to 49"
+                evidence["proof"] = "1000003*1000003 evaluated to 1000006000009"
                 evidence["status"] = "VALIDATED_CONFIRMED"
                 return True, evidence
 
-    # 2. Constructor evaluation (return 7*7 -> 49)
-    if "constructor" in payload and "49" in response_html:
-        if payload not in response_html and "49" not in baseline_html:
+    # 2. Constructor evaluation
+    if "constructor" in payload and "1000006000009" in response_html:
+        if payload not in response_html and "1000006000009" not in baseline_html:
             evidence["method"] = "constructor_eval"
-            evidence["proof"] = "Constructor payload evaluated to 49"
+            evidence["proof"] = "Constructor payload evaluated to 1000006000009"
             evidence["status"] = "VALIDATED_CONFIRMED"
             return True, evidence
 
@@ -121,8 +137,8 @@ def check_csti_confirmed(
             return True, evidence
 
     # 7. Conditional evaluation ({% if %})
-    if "{% if" in payload and "49" in payload:
-        if "{%" not in response_html and "%}" not in response_html and "49" in response_html:
+    if "{% if" in payload and "1000006000009" in payload:
+        if "{%" not in response_html and "%}" not in response_html and "1000006000009" in response_html:
             evidence["method"] = "conditional_eval"
             evidence["status"] = "VALIDATED_CONFIRMED"
             return True, evidence
@@ -149,7 +165,7 @@ def check_arithmetic_evaluation(
     content: str, payload: str, baseline: str
 ) -> bool:  # PURE
     """
-    Check for arithmetic evaluation (7*7=49).
+    Check for arithmetic evaluation using the distinctive long marker.
 
     Args:
         content: Response HTML
@@ -159,15 +175,15 @@ def check_arithmetic_evaluation(
     Returns:
         True if arithmetic evaluation confirmed
     """
-    if "49" not in content:
+    if "1000006000009" not in content:
         return False
 
-    if "7*7" in payload:
+    if "1000003*1000003" in payload:
         if payload in content:
             return False
-        return "49" not in baseline
+        return "1000006000009" not in baseline
 
-    if "{% if" in payload and "49" in payload:
+    if "{% if" in payload and "1000006000009" in payload:
         return "{%" not in content and "%}" not in content
 
     if "print" in payload:

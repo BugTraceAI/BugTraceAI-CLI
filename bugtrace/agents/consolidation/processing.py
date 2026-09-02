@@ -502,6 +502,29 @@ async def process_batch_items(  # I/O
             stats.setdefault("unclassified", 0)
             stats["unclassified"] += 1
 
+    # Optional second-pass semantic near-dup collapse (PURE merge + injected embeddings)
+    from bugtrace.core.config import settings as _settings
+    from bugtrace.agents.consolidation.semantic_dedup import apply_semantic_dedup_batch
+
+    if getattr(_settings, "SEMANTIC_DEDUP_ENABLED", False) and len(prioritized_batch) > 1:
+        try:
+            from bugtrace.core.embeddings import EmbeddingManager
+            from bugtrace.core.semantic import build_finding_semantic_text
+
+            manager = EmbeddingManager.get_instance()
+            prioritized_batch = apply_semantic_dedup_batch(
+                prioritized_batch,
+                enabled=True,
+                threshold=float(getattr(_settings, "SEMANTIC_DEDUP_THRESHOLD", 0.92)),
+                is_real_model=bool(getattr(manager, "is_real_model", False)),
+                encode_query=manager.encode_query,
+                build_text=build_finding_semantic_text,
+                stats=stats,
+                log=lambda msg: logger.info(f"[{agent_name}] {msg}"),
+            )
+        except Exception as e:
+            logger.warning(f"[{agent_name}] Semantic dedup skipped: {e}")
+
     # Sort by priority (highest first)
     prioritized_batch.sort(key=lambda p: p.priority, reverse=True)
 

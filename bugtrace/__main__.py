@@ -94,18 +94,35 @@ def scan(
     lfi: bool = typer.Option(False, "--lfi", help="LFI-only mode: Run only LFI detection"),
     idor: bool = typer.Option(False, "--idor", help="IDOR-only mode: Run only IDORAgent"),
     ssrf: bool = typer.Option(False, "--ssrf", help="SSRF-only mode: Run only SSRFAgent"),
-    param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
+    param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)"),
+    header: Optional[list[str]] = typer.Option(
+        None, "--header", "-H",
+        help=(
+            "Custom HTTP header to send with every scan request. "
+            "Format: 'Name: value'. Repeatable; later values override earlier ones. "
+            "Precedence: --conf < DEFAULT_HEADERS_JSON < auth discovery < --header. "
+            "Authorization and Cookie may be set here (override auto-discovered values). "
+            "Reserved names (Host, Content-Length, Transfer-Encoding, Connection, Upgrade) "
+            "are rejected. Values must not contain CR/LF."
+        ),
+    ),
 ):
     """Run the Discovery (Hunter) phase only."""
-    _run_pipeline(target, phase="hunter", url_list_file=url_list_file, swagger_file=swagger_file, auth_config=auth_config, safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    custom_headers = _parse_cli_headers(header)
+    _run_pipeline(target, phase="hunter", url_list_file=url_list_file, swagger_file=swagger_file, auth_config=auth_config, safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param, custom_headers=custom_headers)
 
 @app.command(name="audit")
 def audit(
     target: str = typer.Argument(..., help="The target URL to audit (Auditor phase)"),
     scan_id: Optional[int] = typer.Option(None, "--scan-id", help="Specific Scan ID to audit"),
+    header: Optional[list[str]] = typer.Option(
+        None, "--header", "-H",
+        help="Custom HTTP header 'Name: value'. Repeatable. See `bugtrace scan --help` for full rules.",
+    ),
 ):
     """Run the Audit (Auditor) phase only."""
-    _run_pipeline(target, phase="manager", scan_id=scan_id)
+    custom_headers = _parse_cli_headers(header)
+    _run_pipeline(target, phase="manager", scan_id=scan_id, custom_headers=custom_headers)
 
 @app.command(name="full")
 def full_scan(
@@ -123,10 +140,15 @@ def full_scan(
     lfi: bool = typer.Option(False, "--lfi", help="LFI-only mode"),
     idor: bool = typer.Option(False, "--idor", help="IDOR-only mode"),
     ssrf: bool = typer.Option(False, "--ssrf", help="SSRF-only mode"),
-    param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
+    param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)"),
+    header: Optional[list[str]] = typer.Option(
+        None, "--header", "-H",
+        help="Custom HTTP header 'Name: value'. Repeatable. See `bugtrace scan --help` for full rules.",
+    ),
 ):
     """Run Hunter followed by Auditor (The complete professional workflow)."""
-    _run_pipeline(target, phase="all", url_list_file=url_list_file, swagger_file=swagger_file, auth_config=auth_config, safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    custom_headers = _parse_cli_headers(header)
+    _run_pipeline(target, phase="all", url_list_file=url_list_file, swagger_file=swagger_file, auth_config=auth_config, safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param, custom_headers=custom_headers)
 
 @app.command(name="serve")
 def serve(
@@ -475,7 +497,31 @@ def _load_url_list(file_path: str, target: str) -> list:
 
     return urls
 
-def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, auth_config=None, safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
+def _parse_cli_headers(raw_list: Optional[list]) -> Optional[dict]:
+    """Parse repeated --header 'Name: value' arguments into a validated dict.
+
+    Returns None when no headers were supplied. On a malformed header, exits
+    the process with a clear message — failing fast is the design rule
+    (refusing to start a scan with a misconfigured header is safer than
+    silently dropping it).
+    """
+    if not raw_list:
+        return None
+    from bugtrace.utils.headers import parse_header_kv, merge_headers
+    parsed: dict = {}
+    for raw in raw_list:
+        try:
+            name, value = parse_header_kv(raw)
+        except Exception as e:
+            console.print(f"[bold red]Invalid --header {raw!r}:[/bold red] {e}")
+            raise typer.Exit(code=2)
+        # merge_headers applies the reserved-name filter as defence-in-depth.
+        merged = merge_headers(parsed, {name: value})
+        parsed.update(merged)
+    return parsed or None
+
+
+def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, auth_config=None, safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False, custom_headers=None):
     """Internal helper to run the pipeline phases."""
     if safe_mode is not None:
         settings.SAFE_MODE = safe_mode
@@ -525,7 +571,7 @@ def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, au
 
     # Execute phases
     try:
-        asyncio.run(_execute_phases(target, phase, resume, clean, scan_id, continuous, url_list, auth_data))
+        asyncio.run(_execute_phases(target, phase, resume, clean, scan_id, continuous, url_list, auth_data, custom_headers))
     except KeyboardInterrupt:
         console.print("\n[yellow]Engagement aborted by user.[/yellow]")
     except Exception as e:
@@ -567,7 +613,7 @@ def _display_framework_info(target: str):
     console.print(f"[bold cyan]Architecture:[/bold cyan] Sequential Pipeline (V2 Architecture)")
 
 
-async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, scan_id: int, continuous: bool, url_list: Optional[list] = None, auth_data: Optional[dict] = None):
+async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, scan_id: int, continuous: bool, url_list: Optional[list] = None, auth_data: Optional[dict] = None, custom_headers: Optional[dict] = None):
     """Execute scan phases with dashboard UI."""
     from bugtrace.core.database import get_db_manager
     from bugtrace.core.ui import dashboard
@@ -600,11 +646,11 @@ async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, sc
             # Execute Hunter phase
             orchestrator = None
             if phase in ["hunter", "all"]:
-                orchestrator = await _run_hunter_phase(target, db, resume, common_output_dir, url_list, auth_data)
+                orchestrator = await _run_hunter_phase(target, db, resume, common_output_dir, url_list, auth_data, custom_headers)
 
             # Execute Auditor phase
             if phase in ["manager", "all"]:
-                await _run_auditor_phase(target, db, scan_id, orchestrator, common_output_dir, continuous)
+                await _run_auditor_phase(target, db, scan_id, orchestrator, common_output_dir, continuous, custom_headers)
 
             dashboard.active = False
     finally:
@@ -656,7 +702,7 @@ def _perform_emergency_shutdown():
         os._exit(1)
 
 
-async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Path, url_list: Optional[list] = None, auth_data: Optional[dict] = None):
+async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Path, url_list: Optional[list] = None, auth_data: Optional[dict] = None, custom_headers: Optional[dict] = None):
     """Run Hunter (Discovery) phase."""
     # Check for active scan and auto-resume
     resume = await _check_and_resume_scan(target, db, resume)
@@ -671,7 +717,8 @@ async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Pa
         use_vertical_agents=True,
         output_dir=common_output_dir,
         url_list=url_list,
-        auth=auth_data
+        auth=auth_data,
+        custom_headers=custom_headers,
     )
 
     # Display mode info
@@ -712,9 +759,55 @@ async def _check_and_resume_scan(target: str, db, resume: bool) -> bool:
     return resume
 
 
-async def _run_auditor_phase(target: str, db, scan_id: int, orchestrator, common_output_dir: Path, continuous: bool):
-    """Run Auditor (Validator) phase."""
+async def _run_auditor_phase(target: str, db, scan_id: int, orchestrator, common_output_dir: Path, continuous: bool, custom_headers: Optional[dict] = None):
+    """Run Auditor (Validator) phase.
+
+    `custom_headers` is the per-scan header set from CLI / API. The auditor
+    reuses the browser_manager (Playwright) for XSS / CSTI / SSRF validation;
+    the browser was already primed with these headers in the Hunter phase
+    via recon_ops_flow.set_default_headers(). When the auditor runs STANDALONE
+    (`bugtrace audit --scan-id N`), the Hunter may not have run in this
+    process — so we re-prime the browser here to keep the contract.
+
+    The HTTP orchestrator's TARGET / PROBE clients were also primed during
+    the Hunter phase. The auditor uses ValidationEngine → AgenticValidator
+    which goes through the browser (Playwright), so a single browser-level
+    re-prime is sufficient for the validator surface.
+    """
     from bugtrace.core.validator_engine import ValidationEngine
+    from bugtrace.tools.visual.browser import browser_manager
+
+    # Re-prime the browser with the effective headers (per-scan + auth + global
+    # + captured). Without this, `bugtrace audit --scan-id N` would launch
+    # without the user's --header values and silently lose the override.
+    if orchestrator is not None and hasattr(orchestrator, "get_effective_headers"):
+        try:
+            browser_manager.set_default_headers(orchestrator.get_effective_headers())
+        except Exception:
+            # Best-effort: a stale browser manager in shutdown must not break
+            # the auditor.
+            pass
+    elif custom_headers:
+        # Standalone audit: no orchestrator, but the user passed --header.
+        # Build the minimal effective-headers set: per-scan custom only.
+        # Auth-discovery and captured are unavailable (no browser ran in this
+        # process). Global defaults are loaded by Settings at startup.
+        try:
+            from bugtrace.core.config import settings
+            from bugtrace.utils.headers import merge_headers, parse_default_headers_json
+            # Layer 1: global defaults from bugtraceaicli.conf [SCAN]
+            default_layer = {}
+            try:
+                default_layer = parse_default_headers_json(
+                    getattr(settings, "DEFAULT_HEADERS_JSON", "") or ""
+                )
+            except Exception:
+                pass  # malformed .conf already raised at Settings init
+            # Layer 2: per-scan headers (this is all we have in standalone mode)
+            merged = merge_headers(default_layer, custom_headers)
+            browser_manager.set_default_headers(merged)
+        except Exception:
+            pass  # best-effort — stale browser manager or env error
 
     sid = scan_id or (orchestrator.scan_id if orchestrator else None)
 

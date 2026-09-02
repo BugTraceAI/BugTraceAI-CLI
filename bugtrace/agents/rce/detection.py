@@ -65,14 +65,20 @@ def validate_before_emit(
     nested = finding.get("finding", {})
     evidence = finding.get("evidence", nested.get("evidence", ""))
     status = finding.get("status", nested.get("status", ""))
+    finding_type = finding.get("type", nested.get("type", "")).lower()
 
     # RCE-specific: Must have evidence
-    if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION"]:
+    if status not in ["VALIDATED_CONFIRMED", "PENDING_VALIDATION", "MANUAL_REVIEW_RECOMMENDED"]:
         has_time = "delay" in str(evidence).lower() or "sleep" in str(evidence).lower()
         has_output = evidence.get("command_output") if isinstance(evidence, dict) else False
         has_callback = evidence.get("interactsh_callback") if isinstance(evidence, dict) else False
         if not (has_time or has_output or has_callback):
             return False, "RCE requires proof: time delay, command output, or callback"
+
+    # A malformed-input response can establish a deserialization sink, but its
+    # probe is intentionally not an execution payload.
+    if "deserialization" in finding_type:
+        return True, ""
 
     # RCE-specific: Payload should contain command patterns
     payload = finding.get("payload", nested.get("payload", ""))
@@ -101,6 +107,15 @@ def get_time_payloads() -> List[str]:
 # Finding creation (PURE)
 # =========================================================================
 
+def is_time_based_confirmed(
+    baseline_s: float,
+    payload_s: float,
+    delay_s: float = 5.0,
+    margin: float = 0.6,
+) -> bool:
+    """Return true only when the payload is slower than its target baseline."""
+    return (payload_s - baseline_s) >= delay_s * margin
+
 def create_time_based_finding(
     url: str, param: str, payload: str, elapsed: float,
 ) -> Dict:
@@ -123,7 +138,7 @@ def create_time_based_finding(
         "parameter": param,
         "payload": payload,
         "severity": "CRITICAL",
-        "validated": True,
+        "validated": False,
         "status": "VALIDATED_CONFIRMED",
         "evidence": f"Delay of {elapsed:.2f}s detected with payload: {payload}",
         "description": (
@@ -236,15 +251,18 @@ def create_deserialization_finding(
         "url": url,
         "parameter": param,
         "payload": probe_value,
-        "severity": "CRITICAL",
+        "severity": "HIGH",
+        # The malformed-input probe deterministically found a sink. It did not
+        # establish a gadget chain or code execution, so surface it for review.
         "validated": True,
-        "status": "VALIDATED_CONFIRMED",
+        "status": "MANUAL_REVIEW_RECOMMENDED",
         "evidence": f"Deserialization error keywords in response: {matched}",
         "description": (
-            f"Insecure deserialization confirmed in cookie '{cookie_name}' at {url}. "
-            f"Non-serialized data triggers deserialization error messages, confirming "
-            f"the server deserializes cookie values unsafely."
+            f"Deserialization sink detected in cookie '{cookie_name}' at {url}. "
+            f"Non-serialized data triggers deserialization error messages. This confirms "
+            f"the sink is reachable, but does not confirm an exploitable gadget chain or RCE."
         ),
+        "manual_review_reason": "Confirm accepted types and gadget availability with a safe, authorized proof.",
         "reproduction": f"curl -b '{cookie_name}={probe_value}' '{url}'",
         "cwe_id": "CWE-502",
         "remediation": get_remediation_for_vuln("RCE"),

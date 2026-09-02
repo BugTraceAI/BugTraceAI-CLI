@@ -109,6 +109,39 @@ def split_canary_confirms_execution(content: str, canary: str) -> bool:
     return bool(content) and bool(canary) and canary in content
 
 
+def make_delimiter_control_value(canary: str) -> str:
+    """
+    # PURE
+    Build a plain parameter VALUE that is not an injection, but which a server that
+    DELETES quote and pipe characters would collapse into the assembled canary.
+
+    The split-canary proof rests on one assumption: the contiguous canary cannot appear
+    unless the database concatenated it, because the request only ever carries the halves
+    separated by `'||'`. A sanitising WAF that strips those exact characters before
+    echoing the input breaks that assumption — it manufactures the assembled canary out of
+    pure reflection.
+
+    So we send the same delimiters as data, with no leading quote and no UNION: any
+    ordinary server reflects `BtAc'|'I15` verbatim, and any database treats it as a value
+    (`'BtAc'|'I15'` is a bitwise OR or a syntax error, never string concatenation). Only a
+    stripper turns it into `BtAcI15`. Companion to `delimiter_stripping_detected`.
+    """
+    left, right = make_split_canary(canary)
+    return f"{left}'|'{right}"
+
+
+def delimiter_stripping_detected(content: str, canary: str) -> bool:
+    """
+    # PURE
+    True when the response to `make_delimiter_control_value` contains the ASSEMBLED
+    canary, meaning this host strips the delimiters the split-canary proof depends on.
+
+    When this fires, no canary-based confirmation from this host can be trusted and the
+    caller must withhold the proof rather than report an unprovable CRITICAL.
+    """
+    return bool(content) and bool(canary) and canary in content
+
+
 def quote_parity_confirms_sqli(
     baseline_status, unbalanced_status, balanced_status
 ) -> bool:
@@ -183,6 +216,19 @@ def extract_info_from_error(error_response: str) -> Dict:
     # PURE
     Extract useful information from SQL error messages.
 
+    ONLY mines a response that actually contains a SQL error. The extractors below match SQL
+    keywords case-insensitively, so `FROM ['"`]?(\\w+)` also matches the ordinary English
+    preposition: on any prose page, "farmers from agricultural communities" yields the "table"
+    `agricultural`. That is not hypothetical — a live scan reported a HIGH header-injection
+    SQLi on a news site whose evidence read
+    `tables_leaked: ['agricultural', 'colonized', 'the', 'two', 'this', 'Africa', '3']`,
+    every one of them a word from the article. Because the baseline had no "tables", the
+    header check saw them as newly leaked and fired.
+
+    Gating on `has_sql_error_signature` is the whole fix: a function named "extract info from
+    ERROR" has nothing to extract when there is no error, and every caller already treats an
+    empty result as "no evidence".
+
     Args:
         error_response: Error response text
 
@@ -197,7 +243,7 @@ def extract_info_from_error(error_response: str) -> Dict:
         "db_type": None,
     }
 
-    if not error_response:
+    if not error_response or not has_sql_error_signature(error_response):
         return info
 
     info["tables_leaked"] = extract_tables_from_error(error_response)

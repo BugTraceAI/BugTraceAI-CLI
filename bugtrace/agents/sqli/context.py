@@ -8,13 +8,20 @@ Pure functions for SQL injection context analysis:
 - Technique name mapping
 - Infrastructure cookie filtering
 
-All functions are PURE: no self, no I/O, no mutation.
+Most functions are PURE: no self, no I/O, no mutation.
+
+Exception (effect shell, injectable):
+- ``load_infrastructure_cookies`` may read a static config file unless the
+  caller injects ``data`` / ``text`` / an explicit ``path``. Parsing itself is
+  pure via ``parse_infrastructure_cookie_catalog``.
 """
+
+from __future__ import annotations
 
 import json
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from loguru import logger
 
@@ -30,27 +37,106 @@ from bugtrace.agents.sqli.types import (
 # INFRASTRUCTURE COOKIE FILTER
 # =============================================================================
 
-def load_infrastructure_cookies() -> Tuple[set, tuple]:
-    """Load infrastructure cookie list and prefixes from JSON data file.
+def parse_infrastructure_cookie_catalog(
+    data: Mapping[str, Any] | None,
+) -> Tuple[set, tuple]:
+    """PURE: map a catalog dict to (cookies_set, prefixes_tuple).
 
-    Returns:
-        Tuple of (cookies_set, prefixes_tuple)
+    Accepts the shape of ``infrastructure_cookies.json`` (``cookies`` list +
+    ``prefixes`` list). Unknown/empty input fails open to empty catalogs.
+    Cookie names and prefixes are lowercased for case-insensitive matching.
     """
-    # PURE: reads a static config file at module load time
-    data_path = Path(__file__).parent.parent.parent / "config" / "infrastructure_cookies.json"
+    if not data or not isinstance(data, Mapping):
+        return set(), ()
+
+    cookies_raw = data.get("cookies") or []
+    prefixes_raw = data.get("prefixes") or []
+    if not isinstance(cookies_raw, (list, tuple, set)):
+        cookies_raw = []
+    if not isinstance(prefixes_raw, (list, tuple)):
+        prefixes_raw = []
+
+    cookies = {
+        str(name).lower().strip()
+        for name in cookies_raw
+        if str(name).strip()
+    }
+    prefixes = tuple(
+        str(prefix).lower().strip()
+        for prefix in prefixes_raw
+        if str(prefix).strip()
+    )
+    return cookies, prefixes
+
+
+def default_infrastructure_cookies_path(
+    *,
+    base_dir: Path | str | None = None,
+    anchor_file: Path | str | None = None,
+) -> Path:
+    """PURE: resolve packaged ``config/infrastructure_cookies.json``.
+
+    ``base_dir`` is the ``bugtrace`` package root (contains ``config/``).
+    When omitted, three parents of ``anchor_file`` (default: this module) are
+    used — same layout as the historical hard-coded path.
+    """
+    if base_dir is not None:
+        root = Path(base_dir)
+    else:
+        anchor = Path(anchor_file) if anchor_file is not None else Path(__file__)
+        # bugtrace/agents/sqli/context.py → agents → bugtrace
+        root = anchor.resolve().parent.parent.parent
+    return root / "config" / "infrastructure_cookies.json"
+
+
+def load_infrastructure_cookies(
+    path: Path | str | None = None,
+    *,
+    data: Mapping[str, Any] | None = None,
+    text: str | None = None,
+) -> Tuple[set, tuple]:
+    """Load infrastructure cookie catalog (thin I/O adapter).
+
+    Preference order (first wins):
+      1. ``data`` mapping — pure, no I/O
+      2. ``text`` JSON string — pure parse after decode, no filesystem
+      3. ``path`` or packaged default path — filesystem read
+
+    Fail-open: missing/invalid input returns empty catalogs (same as baseline).
+    """
+    if data is not None:
+        return parse_infrastructure_cookie_catalog(data)
+
+    if text is not None:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as e:
+            logger.warning(
+                f"Failed to parse infrastructure cookie text: {e}. Using empty defaults."
+            )
+            return set(), ()
+        return parse_infrastructure_cookie_catalog(parsed)
+
+    data_path = (
+        Path(path) if path is not None else default_infrastructure_cookies_path()
+    )
     try:
-        with open(data_path, "r") as f:
-            data = json.load(f)
-        cookies = set(data.get("cookies", []))
-        prefixes = tuple(data.get("prefixes", []))
-        logger.debug(f"Loaded {len(cookies)} infrastructure cookies, {len(prefixes)} prefixes from {data_path.name}")
+        with open(data_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        cookies, prefixes = parse_infrastructure_cookie_catalog(loaded)
+        logger.debug(
+            f"Loaded {len(cookies)} infrastructure cookies, "
+            f"{len(prefixes)} prefixes from {data_path.name}"
+        )
         return cookies, prefixes
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        logger.warning(f"Failed to load infrastructure_cookies.json: {e}. Using empty defaults.")
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+        logger.warning(
+            f"Failed to load infrastructure_cookies.json: {e}. Using empty defaults."
+        )
         return set(), ()
 
 
-# Module-level constants loaded once
+# Module-level constants loaded once (production bootstrap; tests inject via kwargs)
 INFRASTRUCTURE_COOKIES, _INFRASTRUCTURE_COOKIE_PREFIXES = load_infrastructure_cookies()
 
 
@@ -288,7 +374,12 @@ def get_technique_name(technique: str) -> str:
 # COOKIE FILTERING
 # =============================================================================
 
-def should_test_cookie(cookie_name: str) -> bool:
+def should_test_cookie(
+    cookie_name: str,
+    *,
+    cookies: Set[str] | None = None,
+    prefixes: Tuple[str, ...] | None = None,
+) -> bool:
     """
     # PURE
     Check if a cookie should be tested for SQLi.
@@ -299,18 +390,24 @@ def should_test_cookie(cookie_name: str) -> bool:
 
     Args:
         cookie_name: The cookie name to evaluate.
+        cookies: Optional infrastructure cookie set (defaults to module catalog).
+        prefixes: Optional prefix tuple (defaults to module catalog).
 
     Returns:
         True if the cookie should be tested, False if it's infrastructure.
     """
     normalized = cookie_name.lower().strip()
+    catalog = INFRASTRUCTURE_COOKIES if cookies is None else cookies
+    prefix_list = (
+        _INFRASTRUCTURE_COOKIE_PREFIXES if prefixes is None else prefixes
+    )
 
     # Exact match against known infrastructure cookies
-    if normalized in INFRASTRUCTURE_COOKIES:
+    if normalized in catalog:
         return False
 
     # Prefix match for cookie families (e.g. awsalb-*, __cf_*)
-    for prefix in _INFRASTRUCTURE_COOKIE_PREFIXES:
+    for prefix in prefix_list:
         if normalized.startswith(prefix):
             return False
 
@@ -395,6 +492,8 @@ def detect_dbms_from_output(output: str) -> str:
 
 __all__ = [
     "INFRASTRUCTURE_COOKIES",
+    "parse_infrastructure_cookie_catalog",
+    "default_infrastructure_cookies_path",
     "load_infrastructure_cookies",
     "get_confidence_tier",
     "determine_validation_status",

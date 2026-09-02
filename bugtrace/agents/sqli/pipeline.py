@@ -310,7 +310,28 @@ async def _escalation_l0_wet_payload(
                     f"[{agent_name}] L0: WET payload caused status change "
                     f"{baseline_status_code}->{status_code}"
                 )
-                return _create_error_based_finding(url, param, wet_payload, error_info)
+                finding = _create_error_based_finding(url, param, wet_payload, error_info)
+                # A status change is a SIGNAL, never proof. Anything can turn a 200 into a
+                # 4xx/5xx: a WAF blocking the payload (Cloudflare answers 403 to any
+                # injection-shaped input), rate limiting, a generic crash on a quote. None of
+                # those is a SQL injection, and confirming here would publish one HIGH finding
+                # per parameter the WAF happens to block.
+                #
+                # _create_error_based_finding hardcodes sql_error_visible=True, which is what
+                # promotes it to VALIDATED_CONFIRMED — but no SQL error was seen on this path,
+                # so record what actually happened and leave the verdict to the L1-L4
+                # escalation (quote parity, UNION canary, OOB, timing, sqlmap), exactly as
+                # test_error_based already does when its own quote-parity check fails.
+                finding.status = "PENDING_VALIDATION"
+                finding.severity = "MEDIUM"
+                finding.validated = False
+                finding.evidence["sql_error_visible"] = False
+                finding.evidence["unproven_reason"] = (
+                    f"Only a status differential was observed ({baseline_status_code} -> "
+                    f"{status_code}); no SQL error signature and no injection proof. A WAF "
+                    f"block or a generic application error produces the same signal."
+                )
+                return finding
             # No usable baseline differential (baseline itself errored / was unknown) → do
             # NOT confirm SQLi from a bare 4xx/5xx plus generic error words — that flagged
             # every "Internal Server Error" page. A genuinely injectable parameter is
@@ -593,10 +614,16 @@ async def _llm_analyze_and_dedup(
             system_prompt=system_prompt,
         )
 
-        dry_data = json.loads(response)
-        dry_list = dry_data.get("dry_findings", [])
+        from bugtrace.utils.json_parser import extract_json_list, safe_json_loads
 
-        logger.info(f"[{agent_name}] LLM deduplication: {dry_data.get('reasoning', 'No reasoning provided')}")
+        dry_data = safe_json_loads(response)
+        dry_list = extract_json_list(dry_data, "dry_findings")
+        if dry_list is None:
+            logger.warning(f"[{agent_name}] LLM deduplication returned invalid JSON. Falling back to fingerprint dedup.")
+            return fallback_fingerprint_dedup(wet_findings)
+
+        reasoning = dry_data.get("reasoning", "No reasoning provided") if isinstance(dry_data, dict) else "Direct JSON array"
+        logger.info(f"[{agent_name}] LLM deduplication: {reasoning}")
 
         return dry_list
 

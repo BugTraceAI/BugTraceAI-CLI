@@ -1,3 +1,8 @@
+"""External security tools facade (Docker / native binaries).
+
+Split: external_util, external_gospider, external_fuzzers, external_sqlmap.
+"""
+
 import shutil
 import asyncio
 import json
@@ -38,101 +43,22 @@ TRUSTED_DOCKER_IMAGES = frozenset({
 })
 
 
-def _validate_docker_image(image: str) -> bool:
-    """
-    Validate Docker image against whitelist.
 
-    Args:
-        image: Docker image name with optional tag
+from bugtrace.tools.external_util import *  # re-export helpers/constants
+# import * skips leading-underscore names — pull the private helpers explicitly
+from bugtrace.tools.external_util import (
+    _sanitize_output,
+    _validate_docker_image,
+    ANSI_ESCAPE_PATTERN,
+    TRUSTED_DOCKER_IMAGES,
+    MAX_JSON_SIZE,
+    MAX_JSON_DEPTH,
+)
+from bugtrace.tools.external_gospider import ExternalGospiderMixin
+from bugtrace.tools.external_fuzzers import ExternalFuzzersMixin
+from bugtrace.tools.external_sqlmap import ExternalSqlmapMixin
 
-    Returns:
-        True if image is trusted, False otherwise
-    """
-    # Normalize image name (remove tag for comparison)
-    base_image = image.split(':')[0] if ':' in image else image
-
-    # Check exact match first
-    if image in TRUSTED_DOCKER_IMAGES:
-        return True
-
-    # Check base image (without tag)
-    if base_image in TRUSTED_DOCKER_IMAGES:
-        return True
-
-    # Check with :latest suffix
-    if f"{base_image}:latest" in TRUSTED_DOCKER_IMAGES:
-        return True
-
-    logger.warning(f"Untrusted Docker image blocked: {image}")
-    return False
-
-
-# ANSI escape sequence pattern (TASK-113)
-ANSI_ESCAPE_PATTERN = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-
-
-def _sanitize_output(output: str) -> str:
-    """
-    Sanitize tool output by removing ANSI escape codes and control characters.
-
-    Args:
-        output: Raw tool output
-
-    Returns:
-        Sanitized output string
-    """
-    # Remove ANSI escape sequences
-    sanitized = ANSI_ESCAPE_PATTERN.sub('', output)
-
-    # Remove other control characters except newlines and tabs
-    sanitized = ''.join(
-        char for char in sanitized
-        if char == '\n' or char == '\t' or (ord(char) >= 32 and ord(char) != 127)
-    )
-
-    return sanitized
-
-
-def _check_json_depth(obj: Any, current_depth: int = 0) -> None:
-    """Check JSON nesting depth to prevent DoS attacks."""
-    if current_depth > MAX_JSON_DEPTH:
-        raise ValueError(f"JSON depth exceeds maximum allowed ({MAX_JSON_DEPTH})")
-
-    if isinstance(obj, dict):
-        for value in obj.values():
-            _check_json_depth(value, current_depth + 1)
-    elif isinstance(obj, list):
-        for item in obj:
-            _check_json_depth(item, current_depth + 1)
-
-
-def _parse_tool_output(output: str, max_size: int = MAX_JSON_SIZE) -> Dict:
-    """
-    Parse and validate tool output JSON securely.
-
-    Args:
-        output: Raw JSON string from tool
-        max_size: Maximum allowed output size in bytes
-
-    Returns:
-        Parsed and validated dict
-
-    Raises:
-        ValueError: If output exceeds size limit or depth limit
-        json.JSONDecodeError: If invalid JSON
-    """
-    if len(output) > max_size:
-        raise ValueError(f"Tool output too large: {len(output)} bytes (max: {max_size})")
-
-    try:
-        data = json.loads(output)
-        _check_json_depth(data)
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON from tool: {e}", exc_info=True)
-        raise
-
-class ExternalToolManager:
+class ExternalToolManager(ExternalGospiderMixin, ExternalFuzzersMixin, ExternalSqlmapMixin):
     """
     Manages execution of external security tools.
     Prefers native binaries (fastest), falls back to Docker execution.
@@ -450,20 +376,20 @@ class ExternalToolManager:
             return await self._run_native(tool_name, [native] + cmd, **kwargs)
         return await self._run_container(docker_image, cmd, **kwargs)
 
-    async def run_nuclei(self, target: str, cookies: List[Dict] = None) -> Dict[str, Any]:
+    async def run_nuclei(
+        self,
+        target: str,
+        cookies: List[Dict] = None,
+        headers: Dict[str, str] = None,
+    ) -> Dict[str, Any]:
         """
         Runs three-phase Nuclei scan (native preferred, Docker fallback):
-        1. Tech Detection (-tags tech,misconfig,exposure,token): technologies/infrastructure
-        2. Deterministic Scan (fixed -tags): the guaranteed floor — same tags every run,
-           does not depend on Nuclei's own runtime fingerprinting
-        3. Automatic Scan (-as): opportunistic re-fishing on top of the floor — Nuclei
-           fingerprints the target and picks templates dynamically, which is exactly why
-           it cannot be the only source: its picks vary run-to-run against an unchanged
-           target, so it is additive only, never load-bearing for the baseline.
+        1. Tech Detection (-tags tech,misconfig,exposure,token)
+        2. Deterministic Scan (fixed -tags) — guaranteed floor, same tags every run
+        3. Automatic Scan (-as) — opportunistic re-fishing on top of the floor
 
         Returns:
-            Dict with 'tech_findings' and 'vuln_findings' lists (vuln_findings deduped
-            across phases 2/3 by template-id + matched-at)
+            Dict with 'tech_findings' and 'vuln_findings' (vulns deduped across 2/3)
         """
         native = self._native_tools.get("nuclei")
         if not native and not self.docker_cmd:
@@ -478,12 +404,19 @@ class ExternalToolManager:
         if cookies:
             cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
 
+        request_headers = dict(headers or {})
+        if cookie_header:
+            request_headers["Cookie"] = cookie_header
+
+        def add_request_headers(command: List[str]) -> None:
+            for name, value in request_headers.items():
+                command.extend(["-H", f"{name}: {value}"])
+
         # === PHASE 1: Tech Detection ===
         dashboard.update_task("nuclei", name="Nuclei Tech-Detect", status="Phase 1/3: Tech Detection")
 
         tech_cmd = ["-u", target, "-tags", "tech,misconfig,exposure,token", "-silent", "-jsonl"]
-        if cookie_header:
-            tech_cmd.extend(["-H", f"Cookie: {cookie_header}"])
+        add_request_headers(tech_cmd)
 
         tech_output = await self._exec_tool("nuclei", "projectdiscovery/nuclei:latest", tech_cmd)
         tech_findings = self._parse_nuclei_jsonl(tech_output)
@@ -492,29 +425,39 @@ class ExternalToolManager:
         dashboard.log(f"[External] Tech-Detect: {len(tech_findings)} technologies identified", "INFO")
 
         # === PHASE 2: Deterministic Scan (the floor) ===
-        dashboard.update_task("nuclei", name="Nuclei Deterministic Scan", status="Phase 2/3: Deterministic Vulnerability Scan")
+        dashboard.update_task(
+            "nuclei", name="Nuclei Deterministic Scan", status="Phase 2/3: Deterministic Vulnerability Scan"
+        )
 
         deterministic_cmd = [
             "-u", target,
             "-tags", "cves,vulnerabilities,exposures,misconfig,technologies,default-login",
             "-silent", "-jsonl",
         ]
-        if cookie_header:
-            deterministic_cmd.extend(["-H", f"Cookie: {cookie_header}"])
+        add_request_headers(deterministic_cmd)
+        if request_headers:
             deterministic_cmd.extend(["-H", "User-Agent: BugtraceAI/1.0"])
 
-        deterministic_output = await self._exec_tool("nuclei", "projectdiscovery/nuclei:latest", deterministic_cmd)
+        deterministic_output = await self._exec_tool(
+            "nuclei", "projectdiscovery/nuclei:latest", deterministic_cmd
+        )
         deterministic_findings = self._parse_nuclei_jsonl(deterministic_output)
 
-        logger.info(f"[Nuclei] Phase 2: {len(deterministic_findings)} deterministic vulnerability detections")
-        dashboard.log(f"[External] Deterministic Scan: {len(deterministic_findings)} findings", "INFO")
+        logger.info(
+            f"[Nuclei] Phase 2: {len(deterministic_findings)} deterministic vulnerability detections"
+        )
+        dashboard.log(
+            f"[External] Deterministic Scan: {len(deterministic_findings)} findings", "INFO"
+        )
 
         # === PHASE 3: Automatic Scan (opportunistic re-fishing) ===
-        dashboard.update_task("nuclei", name="Nuclei Auto-Scan", status="Phase 3/3: Automatic Re-fishing")
+        dashboard.update_task(
+            "nuclei", name="Nuclei Auto-Scan", status="Phase 3/3: Automatic Re-fishing"
+        )
 
         auto_cmd = ["-u", target, "-as", "-silent", "-jsonl"]
-        if cookie_header:
-            auto_cmd.extend(["-H", f"Cookie: {cookie_header}"])
+        add_request_headers(auto_cmd)
+        if request_headers:
             auto_cmd.extend(["-H", "User-Agent: BugtraceAI/1.0"])
 
         auto_output = await self._exec_tool("nuclei", "projectdiscovery/nuclei:latest", auto_cmd)
@@ -522,22 +465,35 @@ class ExternalToolManager:
 
         logger.info(f"[Nuclei] Phase 3: {len(auto_findings)} auto-scan vulnerability detections")
 
-        vuln_findings = self._dedupe_nuclei_findings(deterministic_findings + auto_findings)
+        from bugtrace.tools.nuclei_results import is_nuclei_infrastructure_finding
+
+        # Technology/WAF templates can also appear in automatic scans. They are
+        # useful recon context, but never vulnerability findings.
+        vuln_findings = [
+            finding
+            for finding in self._dedupe_nuclei_findings(
+                deterministic_findings + auto_findings
+            )
+            if not is_nuclei_infrastructure_finding(finding)
+        ]
 
         total_findings = len(tech_findings) + len(vuln_findings)
         if total_findings > 0:
-            dashboard.log(f"[External] Nuclei Complete: {len(tech_findings)} tech + {len(vuln_findings)} vulns", "SUCCESS")
+            dashboard.log(
+                f"[External] Nuclei Complete: {len(tech_findings)} tech + {len(vuln_findings)} vulns",
+                "SUCCESS",
+            )
 
         return {
             "tech_findings": tech_findings,
-            "vuln_findings": vuln_findings
+            "vuln_findings": vuln_findings,
         }
 
     @staticmethod
     def _parse_nuclei_jsonl(output: str) -> List[Dict[str, Any]]:
-        """Parses Nuclei -jsonl output into a list of finding dicts, skipping bad lines."""
+        """Parse Nuclei -jsonl output into finding dicts, skipping bad lines."""
         findings = []
-        for line in output.splitlines():
+        for line in (output or "").splitlines():
             try:
                 if line.strip().startswith("{"):
                     findings.append(json.loads(line))
@@ -547,379 +503,16 @@ class ExternalToolManager:
 
     @staticmethod
     def _dedupe_nuclei_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Dedupes Nuclei findings by (template-id, matched-at) — deterministic and
-        auto-scan phases can both fire the same template on overlapping tag sets."""
+        """Dedup by (template-id, matched-at) across deterministic + auto phases."""
         seen = set()
         deduped = []
-        for finding in findings:
+        for finding in findings or []:
             key = (finding.get("template-id"), finding.get("matched-at") or finding.get("host"))
             if key in seen:
                 continue
             seen.add(key)
             deduped.append(finding)
         return deduped
-
-    def _build_sqlmap_command(
-        self,
-        url: str,
-        target_param: Optional[str],
-        cookies: Optional[List[Dict]],
-        technique: Optional[str] = None,
-        exploit_mode: bool = False
-    ) -> tuple[List[str], str]:
-        """Build SQLMap command and reproduction command.
-
-        Args:
-            technique: SQLMap technique hint from internal checks.
-                       E=Error, B=Boolean, U=Union, S=Stacked, T=Time, Q=Inline
-                       If None, uses all techniques (BEUSTQ).
-        """
-        tech = technique if technique else "BEUSTQ"
-        reproduction_cmd = f"sqlmap -u '{url}' --batch --random-agent --technique={tech} --level 2 --risk 2"
-
-        cmd = [
-            "-u", url,
-            "--batch",
-            "--random-agent",
-            f"--technique={tech}",
-            "--level", "2",
-            "--risk", "2",
-            "--parse-errors",
-            "--flush-session",
-            "--output-dir=/tmp"
-        ]
-
-        if target_param:
-            cmd.extend(["-p", target_param])
-            reproduction_cmd += f" -p {target_param}"
-            cmd.append("--skip-urlencoding")
-        else:
-            cmd.append("--forms")
-            reproduction_cmd += " --forms"
-
-        if exploit_mode:
-            # Aggressive extraction for confirmed flaws
-            cmd.extend(["--dbs", "--users", "--passwords"])
-            reproduction_cmd += " --dbs --users --passwords"
-
-        if cookies:
-            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-            cmd.append(f"--cookie={cookie_str}")
-            reproduction_cmd += f" --cookie='{cookie_str}'"
-
-        return cmd, reproduction_cmd
-
-    def _parse_sqlmap_output(self, output: str) -> Optional[tuple[str, str]]:
-        """Parse SQLMap output for vulnerability detection."""
-        param_match = re.search(r"Parameter:\s+(.+?)\s+\(", output)
-        type_match = re.search(r"Type:\s+(.+?)\s", output)
-
-        if param_match and type_match:
-            return param_match.group(1), type_match.group(1)
-        return None
-
-    async def run_sqlmap(
-        self,
-        url: str,
-        cookies: List[Dict] = None,
-        target_param: str = None,
-        technique: str = None,
-        exploit_mode: bool = False
-    ) -> Optional[Dict]:
-        """
-        Runs SQLMap active scan (native preferred, Docker fallback).
-        Targets specific parameters found by GoSpider.
-
-        Args:
-            technique: Technique hint from internal checks (E/B/U/S/T/Q or combination).
-                       If provided, SQLMap will try this technique first for faster detection.
-        """
-        native = self._native_tools.get("sqlmap")
-        if not native and not self.docker_cmd:
-            return None
-
-        self._record_tool_run("sqlmap")
-        mode = "native" if native else "Docker"
-        target_info = f"param '{target_param}' on {url}" if target_param else url
-        tech_info = f" (technique: {technique})" if technique else ""
-        logger.info(f"Starting SQLMap ({mode}) on {target_info}{tech_info}...")
-        dashboard.log(f"[External] Launching SQLMap ({mode}) against {target_info}{tech_info}", "INFO")
-
-        cmd, reproduction_cmd = self._build_sqlmap_command(url, target_param, cookies, technique, exploit_mode=exploit_mode)
-
-        if native:
-            output = await self._run_native("sqlmap", [native] + cmd, tolerate_nonzero=True)
-        else:
-            output = await self._run_container("googlesky/sqlmap:latest", cmd)
-
-        result = self._parse_sqlmap_output(output)
-        if result:
-            param, vuln_type = result
-            return {
-                "vulnerable": True,
-                "parameter": param,
-                "type": vuln_type,
-                "reproduction_command": reproduction_cmd,
-                "output_snippet": extract_sqlmap_verdict(output)
-            }
-        return None
-
-    def _parse_gospider_urls(self, output: str, target_domain: str) -> Tuple[List[str], List[str]]:
-        """
-        Parse URLs from GoSpider output, filtering to target domain.
-
-        Returns:
-            Tuple of (all_urls, form_urls) - form_urls need parameter extraction
-        """
-        urls = []
-        form_urls = []
-
-        for line in output.splitlines():
-            line = line.strip()
-
-            # Detect line type BEFORE stripping brackets
-            is_form = line.startswith("[form]")
-
-            # Extract URL from line
-            parts = line.replace("[", "").replace("]", "").split(" - ")
-            extracted = self._extract_urls_from_parts(parts, target_domain)
-
-            urls.extend(extracted)
-
-            # Track form URLs separately for parameter extraction
-            if is_form:
-                form_urls.extend(extracted)
-
-        return list(set(urls)), list(set(form_urls))
-
-    # Path segments that indicate a content-type or metadata, not a real endpoint
-    _INVALID_PATH_SEGMENTS = frozenset({
-        "application/json", "application/xml", "application/javascript",
-        "text/html", "text/plain", "text/css", "text/javascript",
-        "image/png", "image/jpeg", "image/gif", "image/svg+xml",
-        "multipart/form-data", "application/x-www-form-urlencoded",
-        "charset=utf-8", "charset=iso-8859-1",
-    })
-
-    def _extract_urls_from_parts(self, parts: list, target_domain: str) -> list:
-        """Extract in-scope URLs from line parts."""
-        urls = []
-        for p in parts:
-            p = p.strip()
-            if not p.startswith("http"):
-                continue
-
-            url = self._parse_url_if_in_scope(p, target_domain)
-            if url:
-                # Reject URLs where path contains MIME types (e.g. /application/json)
-                path = urlparse(url).path.lower()
-                if any(seg in path for seg in self._INVALID_PATH_SEGMENTS):
-                    continue
-                urls.append(url)
-        return urls
-
-    def _parse_url_if_in_scope(self, url: str, target_domain: str) -> str:
-        """Parse URL and return it if in scope, otherwise None."""
-        try:
-            parsed = urlparse(url)
-            url_host = (parsed.hostname or "").lower()
-            if url_host == target_domain or url_host.endswith("." + target_domain):
-                return url
-        except Exception as e:
-            logger.debug(f"URL parsing error in GoSpider output: {e}")
-        return None
-
-    async def run_gospider(self, url: str, cookies: List[Dict] = None, depth: int = 3, max_urls: int = None) -> List[str]:
-        """
-        Runs GoSpider crawler (native preferred, Docker fallback).
-        Respects max_urls by counting unique in-scope URLs in real-time.
-
-        FIX 2026-03-02: Replaced line-based kill limit with URL-counted streaming.
-        Previously, GoSpider was killed after N raw output lines, which produced
-        wildly inconsistent URL counts (14, 20, 50 for the same site) because
-        the raw line count includes duplicates, out-of-scope URLs, and status lines.
-        Now we parse each line in real-time and kill only when we have enough
-        unique in-scope URLs.
-
-        Args:
-            url: Target URL to crawl
-            cookies: Optional session cookies
-            depth: Crawl depth
-            max_urls: Stop after finding this many unique in-scope URLs
-        """
-        native = self._native_tools.get("gospider")
-        if not native and not self.docker_cmd:
-            return []
-
-        self._record_tool_run("gospider")
-        mode = "native" if native else "Docker"
-        logger.info(f"Starting GoSpider ({mode}) on {url} (depth={depth}, limit={max_urls})...")
-        dashboard.log(f"[External] Launching GoSpider ({mode}, depth={depth}) against {url}", "INFO")
-        dashboard.update_task("gospider", name="GoSpider", status=f"Crawling: {url}")
-
-        from bugtrace.core.config import settings
-        concurrency = str(settings.GOSPIDER_CONCURRENCY)
-        cmd = ["-s", url, "-d", str(depth), "-c", concurrency, "--sitemap"]
-
-        # External archive queries (-a) are a major source of variability;
-        # Wayback/CommonCrawl/VirusTotal return different results per run.
-        if settings.GOSPIDER_USE_ARCHIVES:
-            cmd.append("-a")
-
-        if cookies:
-            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-            cmd.extend(["--cookie", cookie_str])
-
-        if settings.GOSPIDER_NO_REDIRECT:
-            cmd.append("--no-redirect")
-
-        _hostname = urlparse(url).hostname
-        if not _hostname:
-            logger.warning(f"GoSpider: could not extract hostname from URL: {url}")
-            return []
-        target_domain = _hostname.lower()
-
-        # Use URL-counted streaming when limit is set (consistent results)
-        if max_urls and max_urls > 0:
-            if native:
-                output = await self._run_gospider_streaming(
-                    [native] + cmd, target_domain, max_urls
-                )
-            else:
-                full_cmd = self._build_docker_command(
-                    "trickest/gospider", cmd, "512m", "1.0", "bridge"
-                )
-                output = await self._run_gospider_streaming(
-                    full_cmd, target_domain, max_urls
-                )
-        else:
-            if native:
-                output = await self._run_native("gospider", [native] + cmd)
-            else:
-                output = await self._run_container("trickest/gospider", cmd)
-
-        if output:
-            lines = output.splitlines()
-            logger.info(f"GoSpider raw output examples:\n{chr(10).join(lines[:5])}")
-
-        unique_urls, form_urls = self._parse_gospider_urls(output, target_domain)
-        logger.info(f"GoSpider found {len(unique_urls)} in-scope URLs, {len(form_urls)} forms.")
-
-        # Extract parameters from forms - ALWAYS do this, params are critical for vuln discovery
-        # FIX 2026-02-04: Previously skipped when max_urls reached, missing vulns like searchTerm XSS
-        if form_urls:
-            logger.info(f"[GoSpider] Extracting parameters from {len(form_urls)} forms...")
-            param_urls = await self._extract_form_params(form_urls, cookies)
-            if param_urls:
-                # Add form param URLs with HIGH priority (insert at front)
-                unique_urls = list(set(param_urls + unique_urls))
-
-        dashboard.log(f"[External] GoSpider discovered {len(unique_urls)} endpoints.", "INFO")
-        return unique_urls
-
-    async def _run_gospider_streaming(
-        self,
-        full_cmd: List[str],
-        target_domain: str,
-        max_urls: int,
-        timeout: int = 600,
-    ) -> str:
-        """
-        Run GoSpider with URL-counted streaming: parse output in real-time,
-        count unique in-scope URLs, and kill when we have enough.
-
-        This replaces the old line-based kill limit which produced inconsistent
-        results because raw line count != unique URL count.
-
-        Args:
-            full_cmd: Complete command to execute (native binary or docker)
-            target_domain: Target domain for scope filtering
-            max_urls: Kill process after finding this many unique in-scope URLs
-            timeout: Maximum execution time in seconds
-
-        Returns:
-            Raw GoSpider output (all lines read before kill)
-        """
-        logger.debug(f"GoSpider URL-counted streaming: target={max_urls} unique URLs")
-
-        process = await asyncio.create_subprocess_exec(
-            *full_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
-        output_lines = []
-        seen_urls: set = set()
-        # Safety: absolute max lines to prevent infinite reads on pathological output
-        absolute_line_cap = max(max_urls * 20, 2000)
-
-        try:
-            while len(output_lines) < absolute_line_cap:
-                try:
-                    line_bytes = await asyncio.wait_for(
-                        process.stdout.readline(), timeout=30
-                    )
-                    if not line_bytes:
-                        break  # EOF — GoSpider finished naturally
-                    line = line_bytes.decode("utf-8", errors="replace")
-                    output_lines.append(line)
-
-                    # Parse this line for in-scope URLs (same logic as _parse_gospider_urls)
-                    stripped = line.strip()
-                    is_form = stripped.startswith("[form]")
-                    parts = stripped.replace("[", "").replace("]", "").split(" - ")
-                    for p in parts:
-                        p = p.strip()
-                        if not p.startswith("http"):
-                            continue
-                        parsed_url = self._parse_url_if_in_scope(p, target_domain)
-                        if parsed_url:
-                            # Reject MIME-type paths
-                            path = urlparse(parsed_url).path.lower()
-                            if any(seg in path for seg in self._INVALID_PATH_SEGMENTS):
-                                continue
-                            seen_urls.add(parsed_url)
-
-                    # Check if we've found enough unique in-scope URLs
-                    if len(seen_urls) >= max_urls:
-                        logger.info(
-                            f"GoSpider URL limit reached: {len(seen_urls)} unique "
-                            f"in-scope URLs found (from {len(output_lines)} output lines). "
-                            f"Terminating crawler."
-                        )
-                        break
-
-                except asyncio.TimeoutError:
-                    if output_lines:
-                        logger.info(
-                            f"GoSpider read timeout after 30s with {len(seen_urls)} "
-                            f"unique URLs from {len(output_lines)} lines. Stopping."
-                        )
-                        break
-                    raise  # Real timeout — no data at all
-
-            if len(output_lines) >= absolute_line_cap:
-                logger.warning(
-                    f"GoSpider hit absolute line cap ({absolute_line_cap}) with "
-                    f"{len(seen_urls)} unique URLs. Force stopping."
-                )
-
-        except Exception as e:
-            logger.error(f"GoSpider streaming error: {e}")
-        finally:
-            # Kill the process if still running
-            try:
-                if process.returncode is None:
-                    process.kill()
-                    await process.wait()
-            except (ProcessLookupError, OSError):
-                pass
-
-        logger.info(
-            f"GoSpider streaming complete: {len(seen_urls)} unique in-scope URLs "
-            f"from {len(output_lines)} raw output lines"
-        )
-        return "".join(output_lines)
 
     async def _run_container_with_limit(
         self,
@@ -983,413 +576,5 @@ class ExternalToolManager:
         await self._cleanup_docker_process(process)
         
         return "".join(output_lines)
-
-    async def _extract_form_params(self, form_urls: List[str], cookies: List[Dict] = None) -> List[str]:
-        """
-        Fetch form URLs and extract input names to build parameterized URLs.
-
-        This is CRITICAL for discovering vulnerabilities like:
-        - /blog?search=X (CSTI)
-        - /catalog?category=X (SQLi, CSTI)
-        - /login?username=X (SQLi)
-
-        Extracts from:
-        1. HTML forms (<input name="...">)
-        2. Inline JavaScript (URLs with query params in JS objects/strings)
-
-        Args:
-            form_urls: List of URLs where GoSpider detected forms
-            cookies: Optional session cookies
-
-        Returns:
-            List of URLs with discovered parameters (e.g., /blog?search=FUZZ)
-        """
-        from bs4 import BeautifulSoup
-
-        param_urls = []
-        headers = {"User-Agent": settings.USER_AGENT}
-
-        # Build cookie header if provided
-        cookie_header = None
-        if cookies:
-            cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-
-        async with orchestrator.session(DestinationType.TARGET) as session:
-            for form_url in form_urls:
-                try:
-                    req_headers = headers.copy()
-                    if cookie_header:
-                        req_headers["Cookie"] = cookie_header
-
-                    async with session.get(form_url, headers=req_headers, ssl=False) as resp:
-                        if resp.status != 200:
-                            continue
-
-                        html = await resp.text()
-                        soup = BeautifulSoup(html, 'html.parser')
-                        base_domain = urlparse(form_url).hostname
-
-                        # 1. Extract from HTML forms
-                        for form in soup.find_all('form'):
-                            action = form.get('action', '')
-                            method = form.get('method', 'GET').upper()
-
-                            # Build form action URL
-                            if action:
-                                action_url = urljoin(form_url, action)
-                            else:
-                                action_url = form_url
-
-                            # Ensure action URL is in scope
-                            action_domain = urlparse(action_url).hostname
-                            if action_domain and action_domain != base_domain:
-                                continue
-
-                            # Extract all input elements
-                            inputs = form.find_all(['input', 'textarea', 'select'])
-                            for inp in inputs:
-                                name = inp.get('name')
-                                inp_type = inp.get('type', 'text').lower()
-
-                                # Skip hidden tokens, CSRF, submit buttons
-                                if not name:
-                                    continue
-                                if inp_type in ('hidden', 'submit', 'button', 'image', 'reset'):
-                                    continue
-                                if name.lower() in ('csrf', 'token', '_token', 'csrfmiddlewaretoken'):
-                                    continue
-
-                                # Build URL with parameter
-                                separator = "&" if "?" in action_url else "?"
-                                param_url = f"{action_url}{separator}{name}=FUZZ"
-                                param_urls.append(param_url)
-                                logger.debug(f"[GoSpider] Found form param: {name} at {action_url}")
-
-                        # 2. Extract URLs with params from inline JavaScript
-                        # This catches dynamic navigation like: {"/catalog?category=Gin"}
-                        js_param_urls = self._extract_js_urls(html, form_url, base_domain)
-                        param_urls.extend(js_param_urls)
-
-                except Exception as e:
-                    logger.debug(f"[GoSpider] Failed to extract form params from {form_url}: {e}")
-
-        return list(set(param_urls))
-
-    def _extract_js_urls(self, html: str, base_url: str, base_domain: str) -> List[str]:
-        """
-        Extract URLs with query parameters from inline JavaScript.
-
-        Catches patterns like:
-        - "/catalog?category=Accessories"
-        - '/blog?search=' + query
-        - href="/page?param=value"
-
-        Args:
-            html: Page HTML content
-            base_url: Base URL for resolving relative paths
-            base_domain: Domain for scope checking
-
-        Returns:
-            List of discovered parameterized URLs
-        """
-        urls = []
-
-        # Pattern to find URLs with query params in JS strings
-        # Matches: "/path?param=value" or '/path?param=value'
-        js_url_pattern = re.compile(r'["\'](/[^"\']*\?[^"\']+)["\']')
-
-        for match in js_url_pattern.finditer(html):
-            relative_url = match.group(1)
-            try:
-                full_url = urljoin(base_url, relative_url)
-                url_domain = urlparse(full_url).hostname
-
-                # Check scope
-                if url_domain == base_domain:
-                    urls.append(full_url)
-                    logger.debug(f"[GoSpider] Found JS URL with params: {full_url}")
-            except Exception:
-                pass
-
-        return urls
-
-    def _build_fuzz_url(self, url: str, param: str) -> str:
-        """Build URL with FUZZ marker replacing parameter value.
-
-        Handles three cases:
-        1. Query parameter exists in URL → replace its value with FUZZ
-        2. Path-based parameter (URL Path, :param, {param}) → replace path segment
-        3. Fallback → append as new query parameter
-        """
-        # Case 1: query param exists in URL
-        if f"{param}=" in url:
-            return re.sub(rf"([?&]{re.escape(param)})=([^&]*)", r"\1=FUZZ", url)
-
-        # Case 2: path-based parameter — replace last numeric/template segment
-        path_indicators = {"URL Path", "url_path", "path", "path_id"}
-        is_path_param = (
-            param in path_indicators
-            or param.startswith(":")
-            or (param.startswith("{") and param.endswith("}"))
-        )
-        if is_path_param:
-            parsed = urlparse(url)
-            segments = parsed.path.rstrip("/").split("/")
-            # Replace last numeric/UUID segment, or append FUZZ if URL ends with /
-            replaced = False
-            for i in range(len(segments) - 1, -1, -1):
-                seg = segments[i]
-                if not seg:
-                    continue
-                # Template vars: :id, {id}
-                if seg.startswith(":") or (seg.startswith("{") and seg.endswith("}")):
-                    segments[i] = "FUZZ"
-                    replaced = True
-                    break
-                # Numeric IDs
-                if seg.isdigit():
-                    segments[i] = "FUZZ"
-                    replaced = True
-                    break
-            if not replaced:
-                # URL like /api/orders/ → append FUZZ as path segment
-                segments.append("FUZZ")
-            new_path = "/".join(segments)
-            base = f"{parsed.scheme}://{parsed.netloc}{new_path}"
-            if parsed.query:
-                return f"{base}?{parsed.query}"
-            return base
-
-        # Case 3: fallback — add as new query parameter
-        separator = "&" if "?" in url else "?"
-        return f"{url}{separator}{param}=FUZZ"
-
-    async def _write_payloads_file(self, payloads: List[str]) -> str:
-        """Write payloads to temporary file and return path."""
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            f.write("\n".join(payloads))
-            return f.name
-
-    async def _cleanup_temp_file(self, filepath: str) -> None:
-        """Clean up temporary file safely."""
-        if filepath and os.path.exists(filepath):
-            try:
-                os.unlink(filepath)
-            except OSError:
-                logger.warning(f"Failed to cleanup temp file: {filepath}")
-
-    async def run_go_xss_fuzzer(self, url: str, param: str, payloads: List[str] = None) -> Optional[Dict]:
-        """
-        Run the Go XSS fuzzer for high-performance payload testing.
-
-        Returns:
-            {
-                "reflections": [...],
-                "metadata": {...}
-            }
-        """
-        binary_path = settings.BASE_DIR / "bin" / "go-xss-fuzzer"
-
-        if not binary_path.exists():
-            logger.warning(f"Go XSS fuzzer not found at {binary_path}, falling back to Python")
-            return None
-
-        fuzz_url = self._build_fuzz_url(url, param)
-        cmd = [str(binary_path), "-u", fuzz_url, "-c", "100", "-t", "5", "--json"]
-
-        payloads_file = None
-        try:
-            if payloads:
-                payloads_file = await self._write_payloads_file(payloads)
-                cmd.extend(["-p", payloads_file])
-                logger.debug(f"Go XSS Fuzzer using custom payloads file: {payloads_file}")
-
-            logger.info(f"Launching Go XSS Fuzzer against {param} on {url}")
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
-
-            if process.returncode == 0:
-                result = _parse_tool_output(stdout.decode())
-                logger.debug(f"Go XSS Fuzzer finished successfully. Metadata: {result.get('metadata')}")
-                return result
-            else:
-                logger.error(f"Go XSS fuzzer failed (Exit Code {process.returncode}): {stderr.decode()}")
-                return None
-        except Exception as e:
-            logger.error(f"Go XSS fuzzer error: {e}", exc_info=True)
-            return None
-        finally:
-            await self._cleanup_temp_file(payloads_file)
-
-    def _build_ssrf_command(
-        self,
-        binary_path: str,
-        fuzz_url: str,
-        oob_url: Optional[str]
-    ) -> List[str]:
-        """Build command for SSRF fuzzer execution."""
-        cmd = [
-            str(binary_path),
-            "-u", fuzz_url,
-            "-c", "100",
-            "-t", "5",
-            "--json"
-        ]
-
-        if oob_url:
-            cmd.extend(["--oob", oob_url])
-
-        return cmd
-
-    async def run_go_ssrf_fuzzer(self, url: str, param: str, oob_url: str = None) -> Optional[Dict]:
-        """
-        Run the Go SSRF fuzzer for high-performance bypass testing.
-
-        Returns:
-            {
-                "hits": [...],
-                "metadata": {...}
-            }
-        """
-        binary_path = settings.BASE_DIR / "bin" / "go-ssrf-fuzzer"
-
-        if not binary_path.exists():
-            logger.warning(f"Go SSRF fuzzer not found at {binary_path}")
-            return None
-
-        fuzz_url = self._build_fuzz_url(url, param)
-        cmd = self._build_ssrf_command(binary_path, fuzz_url, oob_url)
-
-        try:
-            logger.info(f"Launching Go SSRF Fuzzer against {param} on {url}")
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
-
-            if process.returncode == 0:
-                return _parse_tool_output(stdout.decode())
-            else:
-                logger.error(f"Go SSRF fuzzer failed: {stderr.decode()}")
-                return None
-        except Exception as e:
-            logger.error(f"Go SSRF fuzzer error: {e}", exc_info=True)
-            return None
-
-    async def run_go_lfi_fuzzer(self, url: str, param: str, os_hint: str = "both") -> Optional[Dict]:
-        """
-        Run the Go LFI fuzzer for high-performance path traversal testing.
-        
-        Returns:
-            {
-                "hits": [...],
-                "metadata": {...}
-            }
-        """
-        binary_path = settings.BASE_DIR / "bin" / "go-lfi-fuzzer"
-        
-        if not binary_path.exists():
-            logger.warning(f"Go LFI fuzzer not found at {binary_path}")
-            return None
-        
-        fuzz_url = url
-        if f"{param}=" in url:
-            fuzz_url = re.sub(rf"([?&]{re.escape(param)})=([^&]*)", r"\1=FUZZ", url)
-        else:
-            separator = "&" if "?" in url else "?"
-            fuzz_url = f"{url}{separator}{param}=FUZZ"
-            
-        cmd = [
-            str(binary_path),
-            "-u", fuzz_url,
-            "-c", "100",
-            "-t", "5",
-            "--os", os_hint,
-            "--json"
-        ]
-        
-        try:
-            logger.info(f"Launching Go LFI Fuzzer against {param} on {url}")
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
-            
-            if process.returncode == 0:
-                return _parse_tool_output(stdout.decode())
-            else:
-                logger.error(f"Go LFI fuzzer failed: {stderr.decode()}")
-                return None
-        except Exception as e:
-            logger.error(f"Go LFI fuzzer error: {e}", exc_info=True)
-            return None
-
-    async def _run_go_fuzzer(
-        self,
-        binary_name: str,
-        url: str,
-        param: str,
-        extra_args: List[str],
-        timeout: int = 120
-    ) -> Optional[Dict]:
-        """Generic Go fuzzer execution helper."""
-        binary_path = settings.BASE_DIR / "bin" / binary_name
-
-        if not binary_path.exists():
-            logger.warning(f"{binary_name} not found at {binary_path}")
-            return None
-
-        fuzz_url = self._build_fuzz_url(url, param)
-        cmd = [str(binary_path), "-u", fuzz_url] + extra_args + ["--json"]
-
-        try:
-            logger.info(f"Launching {binary_name} against {param} on {url}")
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-
-            if process.returncode == 0:
-                return _parse_tool_output(stdout.decode())
-            else:
-                logger.error(f"{binary_name} failed: {stderr.decode()}")
-                return None
-        except Exception as e:
-            logger.error(f"{binary_name} error: {e}", exc_info=True)
-            return None
-
-    async def run_go_idor_fuzzer(
-        self,
-        url: str,
-        param: str,
-        id_range: str = "1-100",
-        baseline_id: str = "1",
-        auth_header: str = None
-    ) -> Optional[Dict]:
-        """
-        Run the Go IDOR fuzzer for high-performance ID enumeration.
-
-        Returns:
-            {
-                "hits": [...],
-                "metadata": {...}
-            }
-        """
-        extra_args = ["-range", id_range, "-baseline", baseline_id, "-c", "200", "-t", "5"]
-        if auth_header:
-            extra_args.extend(["-H", auth_header])
-
-        return await self._run_go_fuzzer("go-idor-fuzzer", url, param, extra_args, timeout=300)
 
 external_tools = ExternalToolManager()

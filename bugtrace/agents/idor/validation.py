@@ -133,9 +133,8 @@ def analyze_differential(
     if baseline_status >= 400 and test_status == 200:
         indicators.append("status_change")
 
-    # 3. Significant length difference (>30%) — only meaningful if the test ID
-    # actually resolved (200). An error page naturally differs in length from
-    # real data; that's not IDOR evidence, it's just "the ID doesn't exist."
+    # 3. Significant length difference (>30%) — only if test ID resolved (200).
+    # Error pages differ in length from real data; that is not IDOR evidence.
     if test_status == 200 and baseline_length > 0:
         diff_ratio = abs(test_length - baseline_length) / baseline_length
         if diff_ratio > 0.3:
@@ -153,12 +152,8 @@ def analyze_differential(
         indicators.append("user_data_leakage")
         return True, "CRITICAL", ",".join(indicators)
 
-    # 5. Sensitive data markers — must be present in the TEST response itself.
-    # `baseline_has_sensitive` alone used to be enough to trigger this, but the
-    # baseline (the requester's own resource) is almost always sensitive, so
-    # that made this indicator fire on nearly any differing response, including
-    # a plain 404 for a nonexistent ID. Only a successful test response that
-    # itself exposes sensitive data is real IDOR evidence.
+    # 5. Sensitive data markers — only in a successful TEST response.
+    # baseline_has_sensitive alone used to fire on 404s (own resource is sensitive).
     test_has_sensitive = _contains_sensitive_fields(test_body)
     baseline_has_sensitive = _contains_sensitive_fields(baseline_body)
 

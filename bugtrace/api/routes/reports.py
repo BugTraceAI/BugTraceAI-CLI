@@ -101,16 +101,22 @@ async def get_report(
     _validate_report_format(format)
 
     try:
-        report_bytes = report_service.get_report(scan_id, format)
-
-        if report_bytes is None:
+        report_dir = _find_report_dir(scan_id)
+        filename_by_format = {
+            "html": "report.html",
+            "json": "engagement_data.json",
+            "markdown": "final_report.md",
+        }
+        report_path = report_dir / filename_by_format[format] if report_dir else None
+        if not report_path or not report_path.is_file():
             raise HTTPException(
                 status_code=404,
                 detail=f"Report not found for scan {scan_id}"
             )
+        return _build_report_response(report_path.read_bytes(), format, scan_id)
 
-        return _build_report_response(report_bytes, format, scan_id)
-
+    except HTTPException:
+        raise
     except ValueError as e:
         logger.error(f"Report not found: {e}", exc_info=True)
         raise HTTPException(status_code=404, detail=str(e))
@@ -250,6 +256,27 @@ async def get_report_file(
 MAX_ZIP_SIZE_BYTES = 500 * 1024 * 1024
 
 
+def _report_export_files(report_dir: FilePath) -> list[FilePath]:
+    """Return client artifacts without transient locks or pending markers."""
+    excluded = {".report-artifacts.lock", ".repeater-refresh-pending.json"}
+    root = report_dir.resolve()
+    files = []
+    for path in report_dir.rglob("*"):
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or path.name in excluded
+            or path.name.endswith((".lock", ".tmp"))
+        ):
+            continue
+        try:
+            path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        files.append(path)
+    return files
+
+
 @router.get("/scans/{scan_id}/report-zip")
 async def get_report_zip(scan_id: int):
     """
@@ -276,32 +303,31 @@ async def get_report_zip(scan_id: int):
             detail=f"No report directory found for scan {scan_id}"
         )
 
-    # Calculate total size first to prevent memory issues
-    total_size = sum(f.stat().st_size for f in report_dir.rglob("*") if f.is_file())
-    if total_size > MAX_ZIP_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Report too large to zip ({total_size // (1024*1024)} MB). Max: {MAX_ZIP_SIZE_BYTES // (1024*1024)} MB"
-        )
+    from bugtrace.services.scan_service import ScanService
 
-    # Build ZIP in memory
-    zip_buffer = io.BytesIO()
-    report_dirname = report_dir.name  # e.g. "bugstore.bugtraceai.com_20260221_113155"
+    async with ScanService._async_repeater_artifact_lock(report_dir):
+        # Calculate and archive one coherent snapshot under the report lock.
+        export_files = _report_export_files(report_dir)
+        total_size = sum(file_path.stat().st_size for file_path in export_files)
+        if total_size > MAX_ZIP_SIZE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Report too large to zip ({total_size // (1024*1024)} MB). Max: {MAX_ZIP_SIZE_BYTES // (1024*1024)} MB"
+            )
 
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file_path in sorted(report_dir.rglob("*")):
-            if not file_path.is_file():
-                continue
-            # Relative path inside ZIP preserves directory structure
-            arcname = f"{report_dirname}/{file_path.relative_to(report_dir)}"
-            zf.write(file_path, arcname)
+        zip_buffer = io.BytesIO()
+        report_dirname = report_dir.name
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in sorted(export_files):
+                arcname = f"{report_dirname}/{file_path.relative_to(report_dir)}"
+                zf.write(file_path, arcname)
 
     zip_buffer.seek(0)
     zip_filename = f"{report_dirname}.zip"
 
     logger.info(
         f"Serving report ZIP: scan={scan_id} "
-        f"files={sum(1 for _ in report_dir.rglob('*') if _.is_file())} "
+        f"files={len(export_files)} "
         f"size={zip_buffer.getbuffer().nbytes // 1024}KB"
     )
 

@@ -6,16 +6,12 @@
 
 # Blog/Content
 blog
-blog/1
-blog?legacy_q=test
 
 # Search
 search
-search?q=test
 
 # Products
 products
-products?filter=test
 
 # Community
 forum

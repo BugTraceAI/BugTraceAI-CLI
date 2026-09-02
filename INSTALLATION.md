@@ -340,7 +340,7 @@ docker compose ps
 curl http://localhost:8000/health
 
 # Expected response:
-# {"status": "healthy", "version": "3.7.12-beta"}
+# {"status": "healthy", "version": "4.0.0-rc1"}
 
 # Check logs
 docker compose logs --tail=50

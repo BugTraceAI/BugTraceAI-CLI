@@ -22,6 +22,7 @@ from bugtrace.reporting.standards import (
     get_remediation_for_vuln,
     normalize_severity,
 )
+from bugtrace.reporting.poc_format import curl_form_field, md_code_block
 
 logger = get_logger("agents.xss.finding_builder")
 
@@ -89,6 +90,197 @@ def validate_before_emit(
 # FINDING SERIALIZATION (PURE)
 # =========================================================================
 
+def build_raw_http(req: Dict[str, Any]) -> str:
+    """Render a captured request dict as a raw HTTP request string (for the report)."""
+    method = req.get("method", "GET")
+    p = urlparse(req.get("url", "") or "")
+    path = (p.path or "/") + (("?" + p.query) if p.query else "")
+    lines = [f"{method} {path} HTTP/1.1"]
+    headers = dict(req.get("headers") or {})
+    if p.netloc and not any(isinstance(h, str) and h.lower() == "host" for h in headers):
+        lines.append(f"Host: {p.netloc}")
+    for k, v in headers.items():
+        lines.append(f"{k}: {v}")
+    body = req.get("body") or ""
+    return "\n".join(lines) + "\n\n" + body
+
+
+# =========================================================================
+# SEED / REPRO ENRICHMENT (PURE) — WEB AI Repeater + report file safety
+# =========================================================================
+
+SENSITIVE_HEADERS = (
+    "authorization",
+    "cookie",
+    "x-csrf-token",
+    "x-api-key",
+    "x-auth-token",
+    "x-session-token",
+)
+
+
+def mask_auth_headers(headers: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Redact sensitive auth header VALUES (short prefix kept). Pure."""
+    masked: Dict[str, Any] = {}
+    for k, v in (headers or {}).items():
+        if (
+            isinstance(k, str)
+            and k.lower() in SENSITIVE_HEADERS
+            and isinstance(v, str)
+            and v
+        ):
+            masked[k] = f"{v[:6]}…<redacted>"
+        else:
+            masked[k] = v
+    return masked
+
+
+def auth_meta(auth_headers: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Record that auth was used (scheme + masked token) without leaking secrets."""
+    if not auth_headers:
+        return {
+            "auth_used": False,
+            "auth_role": None,
+            "auth_scheme": "none",
+            "auth_token_masked": None,
+        }
+    scheme, token = "header", None
+    for k, v in auth_headers.items():
+        if not isinstance(v, str) or not v:
+            continue
+        kl = k.lower()
+        if kl == "authorization":
+            scheme = v.split(" ", 1)[0] if " " in v else "Bearer"
+            token = f"{v[:8]}…<redacted>"
+            break
+        if kl == "cookie":
+            scheme = "Cookie"
+            token = f"{v[:8]}…<redacted>"
+            break
+    return {
+        "auth_used": True,
+        "auth_role": "user",
+        "auth_scheme": scheme,
+        "auth_token_masked": token,
+    }
+
+
+def excerpt_around(text: str, marker: str, radius: int = 2000) -> str:
+    """Return ~radius chars centered on the payload reflection (not from byte 0)."""
+    if not text:
+        return ""
+    idx = text.find(marker) if marker else -1
+    if idx < 0 and marker:
+        for token in (marker[:24], "BTXSS", "BUGTRACE"):
+            if token:
+                j = text.find(token)
+                if j >= 0:
+                    idx = j
+                    break
+    if idx < 0:
+        return text[: radius * 2]
+    start = max(0, idx - radius)
+    end = min(len(text), idx + len(marker or "") + radius)
+    return text[start:end]
+
+
+def promote_repro(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure an XSS finding dict exposes top-level ``repro`` + ``http_request``.
+
+    Idempotent: findings that already carry ``repro`` are returned untouched.
+    Mutates and returns the same dict for pipeline compatibility.
+    """
+    if not isinstance(d, dict) or d.get("repro"):
+        return d
+    ev = d.get("evidence") or {}
+    cr = ev.get("confirming_request") if isinstance(ev, dict) else None
+    capture = ev.get("capture_method") if isinstance(ev, dict) else None
+    if not cr:
+        method = str(d.get("http_method") or d.get("method") or "GET").upper()
+        url = d.get("url") or ""
+        param = d.get("parameter") or ""
+        payload = d.get("payload") or ""
+        if method == "POST":
+            cr = {
+                "method": "POST",
+                "url": url,
+                "headers": {},
+                "body": f"{param}={payload}",
+                "body_content_type": "application/x-www-form-urlencoded",
+            }
+        else:
+            try:
+                p = urlparse(url)
+                qs = parse_qs(p.query)
+                if param:
+                    qs[param] = [payload]
+                url = urlunparse(
+                    (p.scheme, p.netloc, p.path, "", urlencode(qs, doseq=True), "")
+                )
+            except Exception:
+                pass
+            cr = {
+                "method": "GET",
+                "url": url,
+                "headers": {},
+                "body": None,
+                "body_content_type": None,
+            }
+        capture = "reconstructed_from_finding"
+    d["repro"] = {
+        "confirming_request": cr,
+        "confirming_response": ev.get("confirming_response") if isinstance(ev, dict) else None,
+        "readback_request": ev.get("readback_request") if isinstance(ev, dict) else None,
+        "auth": ev.get("repro_auth") if isinstance(ev, dict) else None,
+        "capture_method": capture,
+    }
+    if not d.get("http_request"):
+        try:
+            d["http_request"] = build_raw_http(cr)
+        except Exception:
+            pass
+    return d
+
+
+def _build_repro_seed(finding, *, test_url: str) -> Dict[str, Any]:
+    """Build the nested ``repro`` object used by the WEB AI Repeater.
+
+    Prefer live-captured confirming_request on evidence; otherwise reconstruct
+    from finding fields so repro is never null for confirmed XSS paths.
+    """
+    evidence = getattr(finding, "evidence", None) or {}
+    if not isinstance(evidence, dict):
+        evidence = {}
+    method = (getattr(finding, "http_method", None) or "GET").upper()
+    confirming = evidence.get("confirming_request")
+    capture = evidence.get("capture_method")
+    if not confirming:
+        if method == "POST":
+            confirming = {
+                "method": "POST",
+                "url": finding.url,
+                "headers": {},
+                "body": f"{finding.parameter}={finding.payload}",
+                "body_content_type": "application/x-www-form-urlencoded",
+            }
+        else:
+            confirming = {
+                "method": "GET",
+                "url": test_url,
+                "headers": {},
+                "body": None,
+                "body_content_type": None,
+            }
+        capture = "reconstructed_from_finding"
+    return {
+        "confirming_request": confirming,
+        "confirming_response": evidence.get("confirming_response"),
+        "readback_request": evidence.get("readback_request"),
+        "auth": evidence.get("repro_auth"),
+        "capture_method": capture,
+    }
+
+
 def finding_to_dict(finding) -> Dict:
     """
     Convert an XSSFinding dataclass to dictionary for JSON output.
@@ -110,12 +302,17 @@ def finding_to_dict(finding) -> Dict:
     Returns:
         Dict suitable for JSON serialization.
     """
-    # Generate reproduction URL/command
+    # Generate reproduction URL/command.
+    # Both shapes carry the payload through a BYTE-SAFE channel: percent-encoding for the
+    # GET URL, a quoted shell word + --data-urlencode for the POST command. Interpolating
+    # the payload raw into `-d '...'` used to break the command outright on a payload
+    # containing a quote, and — worse — silently deliver an EMPTY parameter on payloads
+    # whose quotes happened to balance.
     try:
         if finding.http_method == "POST":
             reproduction = (
-                f"# POST request to trigger XSS:\n"
-                f"curl -X POST -d '{finding.parameter}={finding.payload}' '{finding.url}'"
+                "# POST request to trigger XSS:\n"
+                + curl_form_field(finding.url, finding.parameter, finding.payload)
             )
             test_url = finding.url
         else:
@@ -128,9 +325,11 @@ def finding_to_dict(finding) -> Dict:
             ))
             reproduction = f"# Open in browser to trigger XSS:\n{test_url}"
     except Exception:
+        # No usable URL: point at the injection point and ship the payload in a fenced
+        # block, never bare in a comment line where markdown would eat its backticks.
         reproduction = (
-            f"# XSS: Inject payload '{finding.payload}' "
-            f"in parameter '{finding.parameter}'"
+            f"# XSS: inject the payload below into parameter '{finding.parameter}'\n"
+            + md_code_block(finding.payload)
         )
         test_url = finding.url
 
@@ -158,9 +357,12 @@ def finding_to_dict(finding) -> Dict:
             f"Payload executed successfully via {finding.validation_method}."
         ),
         "reproduction": reproduction,
-        # HTTP evidence fields
-        "http_request": finding.evidence.get(
-            "http_request", f"{finding.http_method} {test_url}"
+        # Seed enrichment for WEB AI Repeater (parity with monolith _finding_to_dict).
+        "repro": (repro := _build_repro_seed(finding, test_url=test_url)),
+        # HTTP evidence fields — raw HTTP block from confirming request when possible.
+        "http_request": (
+            finding.evidence.get("http_request")
+            or build_raw_http(repro.get("confirming_request") or {"method": finding.http_method, "url": test_url})
         ),
         "http_response": finding.evidence.get(
             "http_response",
@@ -305,6 +507,116 @@ def add_safety_net_payloads(
     return result
 
 
+def create_reflected_xss_finding(
+    *,
+    url: str,
+    parameter: str,
+    payload: str,
+    context: str,
+    validation_method: str,
+    evidence: Dict,
+    confidence: float,
+    status: str,
+    validated: bool,
+    reflection_context: str,
+    surviving_chars: str,
+    successful_payloads: List[str],
+    injection_context_type: str,
+    vulnerable_code_snippet: str,
+    server_escaping: Dict,
+    escape_bypass_technique: str,
+    bypass_explanation: str,
+    exploit_url: str,
+    exploit_url_encoded: str,
+    verification_methods: List,
+    verification_warnings: List,
+    reproduction_steps: List,
+    screenshot_path: Optional[str] = None,
+    finding_cls: Any = None,
+):
+    """PURE: assemble a reflected XSSFinding from precomputed fields."""
+    if finding_cls is None:
+        from bugtrace.agents.xss.types import XSSFinding as finding_cls
+    return finding_cls(
+        url=url,
+        parameter=parameter,
+        payload=payload,
+        context=context,
+        validation_method=validation_method,
+        evidence=evidence,
+        confidence=confidence,
+        status=status,
+        validated=validated,
+        screenshot_path=screenshot_path,
+        reflection_context=reflection_context,
+        surviving_chars=surviving_chars,
+        successful_payloads=successful_payloads,
+        xss_type="reflected",
+        injection_context_type=injection_context_type,
+        vulnerable_code_snippet=vulnerable_code_snippet,
+        server_escaping=server_escaping,
+        escape_bypass_technique=escape_bypass_technique,
+        bypass_explanation=bypass_explanation,
+        exploit_url=exploit_url,
+        exploit_url_encoded=exploit_url_encoded,
+        verification_methods=verification_methods,
+        verification_warnings=verification_warnings,
+        reproduction_steps=reproduction_steps,
+    )
+
+
+def create_authority_xss_finding(
+    *,
+    url: str,
+    parameter: str,
+    payload: str,
+    ref_context: str,
+    injection_context_type: str,
+    vulnerable_code_snippet: str,
+    server_escaping: Dict,
+    exploit_url: str,
+    exploit_url_encoded: str,
+    verification_methods: List,
+    verification_warnings: List,
+    reproduction_steps: List,
+    finding_cls: Any = None,
+):
+    """PURE: authority-confirmed unencoded reflection finding."""
+    if finding_cls is None:
+        from bugtrace.agents.xss.types import XSSFinding as finding_cls
+    evidence = {
+        "payload": payload,
+        "unencoded_reflection": True,
+        "reflection_context": ref_context,
+        "description": (
+            f"Reflected without encoding in {ref_context} context "
+            "(Go Fuzzer Authority)."
+        ),
+    }
+    return finding_cls(
+        url=url,
+        parameter=parameter,
+        payload=payload,
+        context="reflected_unencoded",
+        validation_method="go_fuzzer_authority",
+        evidence=evidence,
+        confidence=1.0,
+        status="VALIDATED_CONFIRMED",
+        reflection_context=ref_context,
+        xss_type="reflected",
+        injection_context_type=injection_context_type,
+        vulnerable_code_snippet=vulnerable_code_snippet,
+        server_escaping=server_escaping,
+        escape_bypass_technique="none_needed",
+        bypass_explanation="Payload was reflected without encoding.",
+        exploit_url=exploit_url,
+        exploit_url_encoded=exploit_url_encoded,
+        verification_methods=verification_methods,
+        verification_warnings=verification_warnings,
+        reproduction_steps=reproduction_steps,
+    )
+
+
 __all__ = [
     # Validation
     "validate_before_emit",
@@ -312,6 +624,8 @@ __all__ = [
     "finding_to_dict",
     # Building
     "build_fragment_finding",
+    "create_reflected_xss_finding",
+    "create_authority_xss_finding",
     # Learned breakouts
     "update_learned_breakouts",
     # Safety net

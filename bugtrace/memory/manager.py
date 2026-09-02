@@ -17,13 +17,12 @@ from bugtrace.utils.logger import get_logger
 
 logger = get_logger("core.memory")
 
-# Lazy import to avoid startup delays if not used immediately
-try:
-    from sentence_transformers import SentenceTransformer
-    EMBEDDINGS_AVAILABLE = True
-except ImportError:
-    EMBEDDINGS_AVAILABLE = False
-    logger.warning("sentence-transformers not installed. Semantic search will be disabled.")
+# Vector search is optional. It is disabled by default so a missing/slow native
+# LanceDB runtime cannot block API startup. Embedding dependencies are imported
+# only when vector search is explicitly enabled and first used.
+LANCEDB_ENABLED = os.getenv("BUGTRACE_LANCEDB_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 class MemoryManager:
     """
@@ -43,28 +42,19 @@ class MemoryManager:
 
         # 2. Initialize Vector DB (LanceDB) — optional
         self.vector_db_path = settings.LOG_DIR / "lancedb"
-        if LANCEDB_AVAILABLE:
+        self.obs_table = None
+        if LANCEDB_AVAILABLE and LANCEDB_ENABLED:
             self.vector_db_path.mkdir(parents=True, exist_ok=True)
             self.vector_db = lancedb.connect(str(self.vector_db_path))
         else:
             self.vector_db = None
-            logger.warning("LanceDB unavailable. MemoryManager running without vector search.")
+            if LANCEDB_AVAILABLE and not LANCEDB_ENABLED:
+                logger.info("LanceDB disabled by default; set BUGTRACE_LANCEDB_ENABLED=1 to opt in.")
+            else:
+                logger.warning("LanceDB unavailable. MemoryManager running without vector search.")
         
-        # 3. Initialize Embedding Model (Lazy Load)
+        # 3. Initialize Embedding Model lazily on first vector operation.
         self.model = None
-        if EMBEDDINGS_AVAILABLE:
-            try:
-                # Lightweight model for local use
-                # Set a timeout for the download if possible or handle the error
-                import os
-                os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1' # Optional speedup
-                self.model = SentenceTransformer('BAAI/bge-small-en-v1.5') 
-                logger.info("Memory: Embedding model loaded (BAAI/bge-small-en-v1.5)")
-            except Exception as e:
-                logger.warning(f"Failed to load embedding model (likely network timeout): {e}. Running in semantic-blind mode.")
-                self.model = None
-                # Don't crash, just proceed without embeddings
-
         # 4. Initialize Tables
         if self.vector_db:
             self._init_vector_table()
@@ -115,6 +105,17 @@ class MemoryManager:
 
     def _get_embedding(self, text: str) -> List[float]:
         """Generates embedding for text."""
+        if self.model is None and self.vector_db is not None:
+            try:
+                import os
+                os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+                from sentence_transformers import SentenceTransformer
+
+                self.model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+                logger.info("Memory: Embedding model loaded (BAAI/bge-small-en-v1.5)")
+            except Exception as e:
+                logger.warning("Failed to load embedding model: {}. Running in semantic-blind mode.", e)
+                self.model = False
         if not self.model:
             return [0.0] * 384 # Fallback dummy vector
         return self.model.encode(text).tolist()

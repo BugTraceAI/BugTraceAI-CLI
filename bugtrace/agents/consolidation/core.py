@@ -16,121 +16,12 @@ from loguru import logger
 
 
 # =========================================================================
-# VULNERABILITY TYPE TO SPECIALIST QUEUE MAPPING
+# VULNERABILITY TYPE TO SPECIALIST QUEUE MAPPING (pure owner: core)
 # =========================================================================
 
-VULN_TYPE_TO_SPECIALIST: Dict[str, str] = {
-    # XSS variants
-    "xss": "xss",
-    "cross-site scripting": "xss",
-    "reflected xss": "xss",
-    "stored xss": "xss",
-    "dom xss": "xss",
-    "dom-based xss": "xss",
-
-    # SQL Injection variants
-    "sql injection": "sqli",
-    "sqli": "sqli",
-    "sql": "sqli",
-    "blind sql injection": "sqli",
-    "boolean-based sqli": "sqli",
-    "time-based sqli": "sqli",
-    "error-based sqli": "sqli",
-
-    # Template injection
-    "ssti": "csti",
-    "csti": "csti",
-    "server-side template injection": "csti",
-    "client-side template injection": "csti",
-    "template injection": "csti",
-
-    # File inclusion
-    "lfi": "lfi",
-    "local file inclusion": "lfi",
-    "path traversal": "lfi",
-    "directory traversal": "lfi",
-    "file read": "lfi",
-
-    # Access control
-    "idor": "idor",
-    "insecure direct object reference": "idor",
-    "broken access control": "idor",
-    "authorization bypass": "idor",
-    "privilege escalation": "idor",
-
-    # Remote code execution
-    "rce": "rce",
-    "remote code execution": "rce",
-    "command injection": "rce",
-    "os command injection": "rce",
-    "code injection": "rce",
-    "deserialization": "rce",
-
-    # Open redirect (BEFORE ssrf -- compound types like "Open Redirect / SSRF"
-    # must match "redirect" first, since SSRF substring would match too)
-    "open redirect": "openredirect",
-    "openredirect": "openredirect",
-    "url redirect": "openredirect",
-    "redirect": "openredirect",
-
-    # Server-side request forgery
-    "ssrf": "ssrf",
-    "server-side request forgery": "ssrf",
-    "url injection": "ssrf",
-
-    # XML vulnerabilities
-    "xxe": "xxe",
-    "xml external entity": "xxe",
-    "xml injection": "xxe",
-
-    # JWT vulnerabilities
-    "jwt": "jwt",
-    "jwt vulnerability": "jwt",
-    "jwt bypass": "jwt",
-    "jwt manipulation": "jwt",
-    "authentication bypass": "jwt",
-    "jwt_discovered": "jwt",
-
-    # GraphQL vulnerabilities (route to API Security specialist)
-    "graphql": "api_security",
-    "graphql introspection": "api_security",
-    "graphql information disclosure": "api_security",
-    "information exposure": "api_security",
-
-    # Prototype pollution
-    "prototype pollution": "prototype_pollution",
-    "prototype_pollution": "prototype_pollution",
-    "__proto__ pollution": "prototype_pollution",
-
-    # Header injection / CRLF
-    "header injection": "header_injection",
-    "crlf": "header_injection",
-    "crlf injection": "header_injection",
-    "http response header injection": "header_injection",
-    "response splitting": "header_injection",
-    "http header injection": "header_injection",
-    "http response splitting": "xss",
-
-    # Mass assignment
-    "mass assignment": "mass_assignment",
-    "overposting": "mass_assignment",
-
-    # Broken authentication / access control variants
-    "bola": "idor",
-    "broken object level authorization": "idor",
-
-    # Insecure deserialization
-    "insecure deserialization": "rce",
-
-    # Misconfiguration types
-    "broken access control (admin)": "idor",
-    "no rate limiting": "idor",
-    "rate limiting": "idor",
-
-    # Input validation
-    "input validation": "sqli",
-    "type confusion": "sqli",
-}
+from bugtrace.core.specialist_route_policy import (  # noqa: E402
+    VULN_TYPE_TO_SPECIALIST,
+)
 
 
 # =========================================================================
@@ -452,7 +343,31 @@ def classify_finding(
     Returns:
         Specialist queue name (e.g., "xss") or None if unclassifiable
     """
-    vuln_type = finding.get("type", "").lower().strip()
+    # Resolve Unknown / aliases before keyword match (pure finding_type_policy)
+    from bugtrace.core.finding_type_policy import apply_type_policy
+    from bugtrace.core.specialist_route_policy import specialist_queue_for_type
+
+    resolved = apply_type_policy(finding)
+    finding["type"] = resolved.get("type", finding.get("type"))
+    vuln_type = (finding.get("type") or "").lower().strip()
+
+    # Legacy reporting treats response splitting/CRLF as XSS-family work;
+    # preserve that public classification while plain header injection keeps
+    # its dedicated specialist queue.
+    if vuln_type in {"crlf", "crlf injection", "http response splitting"}:
+        stats["classification_methods"]["keyword_exact"] += 1
+        return "xss"
+
+    # Pure specialist map (includes alias routes like "broken access control" → idor)
+    pure_q = specialist_queue_for_type(finding.get("type"))
+    if pure_q:
+        if log_confidence:
+            logger.debug(
+                f"[{agent_name}] Classification: '{vuln_type}' -> {pure_q} "
+                f"(method: type_policy, confidence: 1.0)"
+            )
+        stats["classification_methods"]["keyword_exact"] += 1
+        return pure_q
 
     # PHASE 1: Keyword matching (fast path)
     # Direct exact match

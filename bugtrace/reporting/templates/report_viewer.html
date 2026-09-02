@@ -861,7 +861,7 @@
                         <!-- Left Column: Description & Steps -->
                         <div class="md:col-span-12 lg:col-span-7 space-y-8">
                             
-                            ${f.cvss_score ? `
+                            ${f.cvss_score !== null && f.cvss_score !== undefined ? `
                             <div class="bg-indigo-50/50 p-6 rounded-lg border border-indigo-100">
                                 <h4 class="text-xs font-black text-indigo-600 uppercase mb-4 tracking-widest flex items-center gap-2">
                                     <i class="fas fa-brain"></i> AI Security Intelligence
@@ -1026,8 +1026,10 @@
                                                 // For SQLi, suggest sqlmap command
                                                 return param ? 'sqlmap -u "' + url + '" -p ' + param + ' --batch --dbs' : 'sqlmap -u "' + url + '" --batch --dbs';
                                             }
-                                            // Default: Show URL and manual testing note
-                                            return '# Vulnerable endpoint: ' + url + (param ? '\\n# Parameter: ' + param : '') + '\\n# Payload: ' + payload;
+                                            // Default: show the endpoint and the payload on its
+                                            // OWN line (same shape the CLI emits) — a payload on a
+                                            // `#`-comment line invites callers to lift it into prose.
+                                            return '# Vulnerable endpoint: ' + url + (param ? '\\n# Parameter: ' + param : '') + '\\n# Payload:\\n' + payload;
                                         })())}</code>
                                         <button class="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity text-slate-400 hover:text-white" onclick="copyToClipboard(this.previousElementSibling.innerText)">
                                             <i class="fas fa-copy"></i>
@@ -1056,7 +1058,10 @@
                                         ${f.successful_payloads.map((p, idx) => `
                                         <div class="bg-slate-900 rounded p-3 group relative flex items-center gap-2">
                                             <span class="text-[10px] text-slate-500 font-mono shrink-0">#${idx + 1}</span>
-                                            <code class="text-green-400 text-xs break-all leading-relaxed flex-1">${escapeHtml(p)}</code>
+                                            <!-- whitespace-pre-wrap is load-bearing: without it the browser collapses
+                                                 runs of spaces inside the payload, and the copy button (innerText) puts
+                                                 the COLLAPSED text on the clipboard. Every other <code> here has it. -->
+                                            <code class="text-green-400 text-xs break-all leading-relaxed whitespace-pre-wrap font-mono flex-1">${escapeHtml(p)}</code>
                                             <button class="opacity-0 group-hover:opacity-100 transition-opacity text-slate-400 hover:text-white shrink-0" onclick="copyToClipboard(this.closest('.group').querySelector('code').innerText)">
                                                 <i class="fas fa-copy"></i>
                                             </button>
@@ -1340,6 +1345,18 @@
             });
         }
 
+        // Mirror of bugtrace/reporting/poc_format.md_code_block: a fenced block whose fence
+        // is one backtick longer than the longest backtick run in the payload (CommonMark 4.5).
+        // An inline `code span` deletes every backtick in the payload, which turned the
+        // visual-PoC banner into createElement(div) — a ReferenceError, not an exploit.
+        function mdCodeBlock(text, lang) {
+            const body = text === null || text === undefined ? '' : String(text);
+            const runs = body.match(/`+/g) || [];
+            const longest = runs.reduce((m, r) => Math.max(m, r.length), 0);
+            const fence = '`'.repeat(Math.max(3, longest + 1));
+            return fence + (lang || 'text') + '\n' + body + '\n' + fence;
+        }
+
         function copyFindingMarkdown(index) {
             const finding = window.reportData.findings[index];
             const markdown = finding.markdown_block || (finding.metadata && finding.metadata.markdown_block);
@@ -1348,7 +1365,7 @@
                 // Fallback generation if missing in JSON
                 const url = finding.url || (finding.metadata && finding.metadata.url) || "Unknown URL";
                 const payload = finding.payload || (finding.metadata && finding.metadata.payload) || "PAYLOAD";
-                const md = `### ${finding.type}\n**URL:** ${url}\n**Payload:** \`${payload}\`\n\n### Steps\n1. Go to ${url}\n2. Inject payload`;
+                const md = `### ${finding.type}\n\n**URL:**\n\n${mdCodeBlock(url)}\n\n**Payload:**\n\n${mdCodeBlock(payload)}\n\n### Steps\n1. Go to the URL above\n2. Inject the payload above`;
                 copyToClipboard(md);
                 return;
             }

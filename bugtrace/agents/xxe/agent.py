@@ -110,6 +110,10 @@ class XXEAgent(BaseAgent, TechContextMixin):
         finding_dict["agent"] = self.name
         return self.emit_finding(finding_dict)
 
+    async def _discover_xxe_params(self, url: str) -> List[Dict[str, str]]:
+        """Legacy class adapter for the package-owned endpoint discovery."""
+        return await discover_xxe_params(url)
+
     # =========================================================================
     # DIRECT MODE (run_loop)
     # =========================================================================
@@ -185,7 +189,7 @@ class XXEAgent(BaseAgent, TechContextMixin):
             seen_urls.add(url)
 
             try:
-                xxe_endpoints = await discover_xxe_params(url)
+                xxe_endpoints = await self._discover_xxe_params(url)
                 if not xxe_endpoints:
                     continue
 
@@ -386,7 +390,8 @@ class XXEAgent(BaseAgent, TechContextMixin):
         results = await self.exploit_dry_list()
 
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        # dry_findings are CANDIDATES, not confirmations (stable 4074425)
+        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         if results or self._dry_findings:
             await self._generate_specialist_report_file(results)

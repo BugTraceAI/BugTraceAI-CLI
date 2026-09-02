@@ -33,7 +33,9 @@ Usage:
     agent = XSSAgent(url="http://example.com", params=["q", "search"])
     findings = await agent.run()
 
-For backward compatibility, XSSAgent can also be imported from:
+Canonical shell: ``bugtrace.agents.xss.agent.XSSAgent``.
+
+Backward-compatible re-export:
     from bugtrace.agents.xss_agent import XSSAgent
 """
 
@@ -236,6 +238,22 @@ from bugtrace.agents.xss.reflection import (
     requires_browser_validation,
 )
 
+# Re-export pure agent policy (victory hierarchy, fingerprint, gates)
+from bugtrace.agents.xss.policy import (
+    get_payload_impact_tier,
+    should_stop_testing,
+    detect_xss_root_cause,
+    generate_xss_fingerprint,
+    determine_validation_status,
+    should_create_finding,
+    clean_payload,
+    build_exploit_url,
+    generate_repro_steps,
+    generate_verification_methods,
+    calculate_confidence,
+    browser_only_candidate,
+)
+
 # Re-export dedup functions (pure + I/O)
 from bugtrace.agents.xss.dedup import (
     fallback_fingerprint_dedup,
@@ -251,8 +269,16 @@ from bugtrace.agents.xss.finding_builder import (
     validate_before_emit,
     finding_to_dict,
     build_fragment_finding as fb_build_fragment_finding,
+    create_reflected_xss_finding,
+    create_authority_xss_finding,
     update_learned_breakouts,
     add_safety_net_payloads,
+    build_raw_http,
+    mask_auth_headers,
+    auth_meta,
+    excerpt_around,
+    promote_repro,
+    SENSITIVE_HEADERS,
 )
 
 # Re-export param discovery functions (pure + I/O)
@@ -264,9 +290,50 @@ from bugtrace.agents.xss.param_discovery import (
     discover_xss_params_full,
 )
 
-# Import XSSAgent from the original file (will be migrated later)
-# This maintains backward compatibility during the modularization process
-from bugtrace.agents.xss_agent import XSSAgent
+# XSSAgent lives in xss.agent (P4-XSS-15). Eager import of the shell here can
+# re-enter package init while submodules load; lazy __getattr__ keeps either
+# import order working (package-first or legacy xss_agent-first).
+def __getattr__(name: str):
+    if name == "XSSAgent":
+        from bugtrace.agents.xss.agent import XSSAgent
+
+        return XSSAgent
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(__all__)
+
+
+def _sync_legacy_facade() -> None:
+    """Refresh an already-imported facade after module reloads."""
+    import sys
+
+    legacy = sys.modules.get("bugtrace.agents.xss_agent")
+    if legacy is None:
+        return
+
+    aliases = {
+        "_mask_auth_headers": "mask_auth_headers",
+        "_auth_meta": "auth_meta",
+        "_excerpt_around": "excerpt_around",
+        "_build_raw_http": "build_raw_http",
+        "_promote_repro": "promote_repro",
+        "XSSFinding": "XSSFinding",
+        "InjectionContext": "InjectionContext",
+        "ValidationMethod": "ValidationMethod",
+    }
+    for legacy_name, package_name in aliases.items():
+        if legacy_name in legacy.__dict__ and package_name in globals():
+            legacy.__dict__[legacy_name] = globals()[package_name]
+
+    if "XSSAgent" in legacy.__dict__:
+        try:
+            from bugtrace.agents.xss.agent import XSSAgent as current_agent
+            legacy.XSSAgent = current_agent
+        except Exception:
+            pass
+
 
 __all__ = [
     # Main class
@@ -417,6 +484,19 @@ __all__ = [
     "payload_reflects",
     "detect_execution_context",
     "requires_browser_validation",
+    # Policy (pure)
+    "get_payload_impact_tier",
+    "should_stop_testing",
+    "detect_xss_root_cause",
+    "generate_xss_fingerprint",
+    "determine_validation_status",
+    "should_create_finding",
+    "clean_payload",
+    "build_exploit_url",
+    "generate_repro_steps",
+    "generate_verification_methods",
+    "calculate_confidence",
+    "browser_only_candidate",
     # Dedup (pure + I/O)
     "fallback_fingerprint_dedup",
     "expand_wet_findings",
@@ -428,8 +508,16 @@ __all__ = [
     "validate_before_emit",
     "finding_to_dict",
     "fb_build_fragment_finding",
+    "create_reflected_xss_finding",
+    "create_authority_xss_finding",
     "update_learned_breakouts",
     "add_safety_net_payloads",
+    "build_raw_http",
+    "mask_auth_headers",
+    "auth_meta",
+    "excerpt_around",
+    "promote_repro",
+    "SENSITIVE_HEADERS",
     # Param Discovery (pure + I/O)
     "PARAM_HIGH_PRIORITY",
     "COMMON_VULN_PARAMS",
@@ -437,3 +525,5 @@ __all__ = [
     "discover_params",
     "discover_xss_params_full",
 ]
+
+_sync_legacy_facade()

