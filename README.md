@@ -4,7 +4,7 @@
 [![Wiki Documentation](https://img.shields.io/badge/Wiki%20Documentation-000?logo=wikipedia&logoColor=white)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 ![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)
-![Version](https://img.shields.io/badge/Version-4.0.0--rc1-orange)
+![Version](https://img.shields.io/badge/Version-4.0.0-orange)
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Required-blue?logo=docker)
@@ -34,7 +34,7 @@ BugTraceAI-CLI is an autonomous offensive security framework that combines LLM-d
 
 The core philosophy is **"Think like a pentester, execute like a machine, validate like an auditor"** - using AI for intelligent hypothesis generation, but relying on real tools for exploitation and validation.
 
-## What's New in v4.0.0-rc1
+## What's New in v4.0.0
 
 - **Refactor standard release candidate** — the modular CLI refactor is the
   release baseline for the 4.0 line, with compatibility shims retained for
