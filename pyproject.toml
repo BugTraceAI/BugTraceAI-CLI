@@ -126,7 +126,7 @@ bugtrace = [
 ]
 
 [tool.setuptools.dynamic]
-version = { attr = "bugtrace.__version__" }
+version = "4.0.0"
 
 # Tooling configuration for development
 [tool.black]
