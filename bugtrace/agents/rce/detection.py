@@ -107,15 +107,6 @@ def get_time_payloads() -> List[str]:
 # Finding creation (PURE)
 # =========================================================================
 
-def is_time_based_confirmed(
-    baseline_s: float,
-    payload_s: float,
-    delay_s: float = 5.0,
-    margin: float = 0.6,
-) -> bool:
-    """Return true only when the payload is slower than its target baseline."""
-    return (payload_s - baseline_s) >= delay_s * margin
-
 def create_time_based_finding(
     url: str, param: str, payload: str, elapsed: float,
 ) -> Dict:

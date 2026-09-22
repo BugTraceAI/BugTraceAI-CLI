@@ -10,11 +10,10 @@ from rich.table import Table
 from rich import box
 from dotenv import load_dotenv
 
-from bugtrace.core.config import settings, test_mode_enabled
+# Load env immediately
+load_dotenv()
 
-# Load env immediately — never in hermetic test mode (credentials / live keys).
-if not test_mode_enabled():
-    load_dotenv()
+from bugtrace.core.config import settings
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 # Lazy import for llm_client to avoid circular or early init issues if possible,
 # but verifying connectivity requires it.

@@ -66,22 +66,6 @@ def check_csti_confirmed(
 
     evidence: Dict[str, Any] = {"payload": payload}
 
-    # Small arithmetic probes remain useful for deterministic smoke and live
-    # checks, provided the evaluated value is absent from the baseline.
-    arithmetic = re.search(r"(?<!\d)(\d{1,3})\s*\*\s*(\d{1,3})(?!\d)", payload or "")
-    if arithmetic:
-        left, right = (int(value) for value in arithmetic.groups())
-        expected = str(left * right)
-        if (
-            expected in response_html
-            and payload not in response_html
-            and expected not in baseline_html
-        ):
-            evidence["method"] = "arithmetic_eval"
-            evidence["proof"] = f"{left}*{right} evaluated to {expected}"
-            evidence["status"] = "VALIDATED_CONFIRMED"
-            return True, evidence
-
     # 1. Arithmetic evaluation with a distinctive result
     if "1000006000009" in response_html and "1000003*1000003" in payload:
         if payload not in response_html:

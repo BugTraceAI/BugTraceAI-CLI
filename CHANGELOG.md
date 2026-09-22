@@ -7,14 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [4.0.0-rc1] - 2026-09-02
+## [3.7.28-beta] - 2026-09-22
 
 ### Changed
-- The refactored CLI tree is the release baseline for the 4.0 line.
-- BugTraceAI-owned portions of this snapshot are licensed under Apache-2.0.
-  Earlier AGPL-3.0 releases remain governed by their original terms.
-- Added release notices, contributor attribution, license history and a
-  preliminary third-party register for final artifact verification.
+
+- Launcher-selected CLI and MCP ports now drive container listeners, Compose
+  bindings, health checks and the WEB proxy path.
+- Added shared-network integration for standalone BugTraceAI-API and WEB
+  deployments.
+
+### Added
+
+- Public release documentation for the integrated ModelLab and API handoff.
 
 ## [3.7.12-beta] - 2026-07-24
 

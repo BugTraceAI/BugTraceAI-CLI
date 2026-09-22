@@ -31,7 +31,6 @@ Answer with ONLY one word: SI or NO"""
 
 # Positive vision responses
 VISION_POSITIVE_RESPONSES = ["SI", "SÍ", "YES", "S", "Y"]
-VISION_NEGATIVE_RESPONSES = ["NO", "N"]
 
 
 def build_attack_url(base_url: str, param: str, payload: str) -> str:
@@ -387,18 +386,17 @@ def process_vision_result(
     vision_response: str,
     evidence: Dict[str, Any],
     agent_name: str = "XSSAgent",
-) -> Optional[bool]:
-    """Process vision AI SI/NO response (pure evidence mutation + log).
+) -> bool:
+    """
+    Process vision AI response - simple SI/NO parsing.
 
     Returns:
-        True: banner confirmed
-        None: empty, NO, or inconclusive — never hard-reject (Playwright may
-            already have confirmed execution)
+        True if Vision confirmed banner visible
     """
     if not vision_response:
         evidence["vision_confirmed"] = False
         evidence["vision_reason"] = "Empty response"
-        return None
+        return False
 
     response_upper = vision_response.strip().upper()
 
@@ -406,30 +404,20 @@ def process_vision_result(
         evidence["vision_confirmed"] = True
         evidence["vision_response"] = vision_response
         evidence["validation_method"] = "playwright+vision"
+
         dashboard.log(
-            f"[{agent_name}] VISION CONFIRMED: Banner 'HACKED BY BUGTRACEAI' visible",
-            "SUCCESS",
+            f"[{agent_name}] VISION CONFIRMED: Banner visible",
+            "SUCCESS"
         )
         return True
 
-    if response_upper in VISION_NEGATIVE_RESPONSES:
-        evidence["vision_confirmed"] = False
-        evidence["vision_response"] = vision_response
-        evidence["vision_reason"] = "Banner not visible in screenshot"
-        dashboard.log(
-            f"[{agent_name}] Vision: Banner NOT visible (Playwright still confirmed)",
-            "WARNING",
-        )
-        return None
-
     evidence["vision_confirmed"] = False
     evidence["vision_response"] = vision_response
-    evidence["vision_reason"] = f"Unexpected response: {vision_response[:50]}"
     dashboard.log(
-        f"[{agent_name}] Vision inconclusive: {vision_response[:30]}...",
-        "WARNING",
+        f"[{agent_name}] Vision says NO banner: {vision_response}",
+        "WARN"
     )
-    return None
+    return False
 
 
 def _requires_browser_validation(payload: str, response_html: str) -> bool:
