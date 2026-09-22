@@ -65,55 +65,8 @@ class CreateScanRequest(BaseModel):
     focused_agents: List[str] = Field(default_factory=list, description="List of focused agent names")
     param: Optional[str] = Field(default=None, description="Specific parameter to target")
     auth_token: Optional[str] = Field(default=None, description="Pre-authenticated Bearer token (Level 1)")
-    auth: Optional[Dict[str, Any]] = Field(default=None, description="Auto-login credentials: {login_url, login_type?: form|api, request_format?: form|json, credentials: {email, password, totp_secret?}, login_flow?: [...]} (Level 2/3)")
+    auth: Optional[Dict[str, Any]] = Field(default=None, description="Auto-login credentials: {login_url, credentials: {email, password, totp_secret?}, login_flow?: [...]} (Level 2/3)")
     url_list: Optional[List[str]] = Field(default=None, description="Pre-defined URL list (from URL list file or Swagger import)")
-    custom_headers: Optional[Dict[str, str]] = Field(
-        default=None,
-        description=(
-            "Per-scan HTTP headers. Precedence (low -> high): DEFAULT_HEADERS_JSON "
-            "< auth discovery < these. Authorization/Cookie may be set here to "
-            "override auto-discovered values. Reserved names (Host, Content-Length, "
-            "Transfer-Encoding, Connection, Upgrade) are rejected."
-        ),
-    )
-
-    @field_validator("custom_headers")
-    @classmethod
-    def _validate_custom_headers(cls, v):
-        if v is None:
-            return v
-        if not isinstance(v, dict):
-            raise ValueError("custom_headers must be a JSON object (dict)")
-        from bugtrace.utils.headers import (
-            merge_headers,
-            validate_header_name,
-            validate_header_value,
-        )
-        # validate every name + value BEFORE merge_headers (which only strips
-        # reserved names as a safety net). This closes the API-side header
-        # injection path where {"X-Test": "v\r\nX-Injected: evil"} would
-        # otherwise be accepted and reach Nuclei -H / aiohttp verbatim.
-        validated: dict = {}
-        for raw_name, raw_value in v.items():
-            name = validate_header_name(raw_name)
-            value = validate_header_value(name, raw_value)
-            if not value:
-                # Treat empty values at the API boundary the same as a
-                # malformed header: refuse the request rather than silently
-                # dropping the user's intent.
-                raise ValueError(
-                    f"value for header {name!r} is empty; omit the key or "
-                    f"send a non-empty string"
-                )
-            validated[name] = value
-        merged = merge_headers(validated)
-        if not merged:
-            raise ValueError(
-                "custom_headers contains only reserved/empty entries and cannot "
-                "be used; reserved names (Host, Content-Length, Transfer-Encoding, "
-                "Connection, Upgrade) are not permitted"
-            )
-        return merged
 
     @field_validator("target_url")
     @classmethod

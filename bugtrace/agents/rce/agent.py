@@ -50,13 +50,6 @@ from bugtrace.agents.rce.detection import (
 logger = logging.getLogger(__name__)
 
 
-def _legacy_orchestrator():
-    """Resolve the legacy facade's patched orchestrator at call time."""
-    from bugtrace.agents.rce_agent import orchestrator as legacy_orchestrator
-
-    return legacy_orchestrator
-
-
 class RCEAgent(BaseAgent, TechContextMixin):
     """
     Specialist Agent for Remote Code Execution (RCE) and Command Injection.
@@ -117,7 +110,7 @@ class RCEAgent(BaseAgent, TechContextMixin):
         all_findings = []
         time_payloads = get_time_payloads()
 
-        async with _legacy_orchestrator().session(DestinationType.TARGET) as session:
+        async with orchestrator.session(DestinationType.TARGET) as session:
             for param in self.params:
                 logger.info(f"[{self.name}] Testing RCE on {self.url} (Param: {param})")
                 finding = await self._test_parameter(session, param, time_payloads)
@@ -229,7 +222,7 @@ class RCEAgent(BaseAgent, TechContextMixin):
         cookie_name = param.replace("Cookie: ", "").strip() if param.startswith("Cookie:") else param
         probe_value = base64.b64encode(b"BTAI_deser_rce_probe").decode()
         try:
-            async with _legacy_orchestrator().session(DestinationType.TARGET) as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 cookies = {cookie_name: probe_value}
                 async with session.get(url, cookies=cookies, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     body = await resp.text()
@@ -644,8 +637,7 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
         results = await self.exploit_dry_list()
 
         vulns_count = len([r for r in results if r]) if results else 0
-        # dry_findings are CANDIDATES, not confirmations (stable 4074425)
-        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         if results or self._dry_findings:
             await self._generate_specialist_report(results)
@@ -680,7 +672,7 @@ Treat each parameter as a SEPARATE potential injection point - do not merge them
         try:
             # Phase 1: Try without auth
             got_auth_error = False
-            async with _legacy_orchestrator().session(DestinationType.TARGET) as session:
+            async with orchestrator.session(DestinationType.TARGET) as session:
                 time_payloads = get_time_payloads()
                 # Quick probe: send first payload and check for 403/401
                 probe_url = inject_payload(url, param, time_payloads[0])

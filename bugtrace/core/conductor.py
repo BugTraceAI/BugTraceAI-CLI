@@ -480,11 +480,6 @@ class ConductorV2:
             progress: Progress percentage (0.0 to 1.0).
             status: Optional status message.
         """
-        try:
-            progress = max(0.0, min(1.0, float(progress)))
-        except (TypeError, ValueError):
-            progress = 0.0
-
         if self.ui_callback:
             self.ui_callback.on_phase_change(phase, progress, status)
         else:

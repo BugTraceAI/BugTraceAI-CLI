@@ -10,7 +10,7 @@ Solves:
 
 Author: BugtraceAI Team
 Date: 2026-01-27
-Version: 4.0.0-rc1
+Version: 3.4.9-beta
 """
 
 import asyncio
@@ -115,7 +115,7 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     contact={"name": "BugTraceAI", "url": "https://github.com/BugTraceAI"},
-    license_info={"name": "Apache-2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0.html"},
+    license_info={"name": "AGPL-3.0", "url": "https://www.gnu.org/licenses/agpl-3.0.html"},
 )
 
 
@@ -355,6 +355,7 @@ from bugtrace.api.routes.metrics import router as metrics_router
 from bugtrace.api.routes.websocket import router as websocket_router
 from bugtrace.api.routes.providers import router as providers_router
 from bugtrace.api.routes.oob import router as oob_router
+from bugtrace.api.routes.model_eval import router as model_eval_router
 
 app.include_router(scans_router, prefix="/api", tags=["scans"])
 app.include_router(reports_router, prefix="/api", tags=["reports"])
@@ -362,6 +363,7 @@ app.include_router(config_router, prefix="/api", tags=["config"])
 app.include_router(providers_router, prefix="/api", tags=["providers"])
 app.include_router(metrics_router, prefix="/api", tags=["metrics"])
 app.include_router(websocket_router, prefix="/api", tags=["websocket"])
+app.include_router(model_eval_router, prefix="/api", tags=["model-eval"])
 app.include_router(oob_router, prefix="/api", tags=["oob"])
 
 
@@ -472,27 +474,19 @@ async def _ws_stream_live_events(websocket: WebSocket, scan_id: int, highest_sen
 
 
 async def _ws_drain_event_stream(websocket: WebSocket, scan_id: int, highest_sent: int):
-    """Drain service event bus events into the websocket.
-
-    Skip/terminal rules: pure owner ``ws_envelope_policy`` (P5-WS-1).
-    """
-    from bugtrace.api.ws_envelope_policy import (
-        is_terminal_event_type,
-        should_skip_stream_event,
-    )
-
+    """Drain service event bus events into the websocket."""
     async for event in service_event_bus.stream(scan_id):
-        if should_skip_stream_event(event, highest_sent):
+        if event.get("event_type") == "heartbeat":
+            continue
+
+        if event.get("seq", 0) <= highest_sent:
             continue
 
         await websocket.send_json(event)
         highest_sent = event.get("seq", highest_sent)
 
-        if is_terminal_event_type(event.get("event_type")):
-            logger.info(
-                f"Scan {scan_id} completed with event_type={event.get('event_type')}, "
-                "closing WebSocket"
-            )
+        if event.get("event_type") in ("scan_complete", "error"):
+            logger.info(f"Scan {scan_id} completed with event_type={event.get('event_type')}, closing WebSocket")
             break
 
 

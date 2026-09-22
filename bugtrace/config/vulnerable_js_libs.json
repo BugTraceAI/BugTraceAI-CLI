@@ -4,7 +4,7 @@
     "angularjs": {
       "below": [1, 8, 0],
       "name": "AngularJS",
-      "cves": ["CVE-2020-7676", "CVE-2022-25869"],
+      "cves": ["CVE-2020-7676"],
       "eol": true,
       "severity": "medium"
     },

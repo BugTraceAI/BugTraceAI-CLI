@@ -28,8 +28,6 @@ from bugtrace.schemas.db_models import FindingTable
 
 logger = get_logger("services.report_service")
 
-from bugtrace.services.report_policy import REPORTABLE_STATUSES  # noqa: E402
-
 
 class ReportService:
     """
@@ -46,9 +44,6 @@ class ReportService:
     - get_report_path(scan_id, format): Find existing report file path
     """
 
-    # Pure owner: report_policy.REPORTABLE_STATUSES (P5-REPORT-1).
-    REPORTABLE_STATUSES = REPORTABLE_STATUSES
-
     def __init__(self):
         """Initialize ReportService with database connection."""
         self.db = get_db_manager()
@@ -56,6 +51,14 @@ class ReportService:
         self.markdown_generator = MarkdownGenerator(output_base_dir=str(settings.REPORT_DIR))
 
         logger.info("ReportService initialized")
+
+    REPORTABLE_STATUSES = {
+        "VALIDATED_CONFIRMED",
+        "MANUAL_REVIEW_RECOMMENDED",
+        "PENDING_VALIDATION",
+        "PENDING_CDP_VALIDATION",
+        "PENDING",
+    }
 
     def generate_report(self, scan_id: int, format: str = "html") -> str:
         """
@@ -71,9 +74,10 @@ class ReportService:
         Raises:
             ValueError: If scan not found or format invalid
         """
-        from bugtrace.services.report_policy import normalize_report_format
+        format = format.lower()
 
-        format = normalize_report_format(format)
+        if format not in ["html", "markdown", "json"]:
+            raise ValueError(f"Invalid report format: {format}. Must be html, markdown, or json")
 
         # Get scan info
         with self.db.get_session() as session:
@@ -177,28 +181,44 @@ class ReportService:
 
     @staticmethod
     def _extract_rich_findings(data: Any) -> List[Dict[str, Any]]:
-        """Extract findings from report JSON shapes. Pure: report_policy."""
-        from bugtrace.services.report_policy import extract_rich_findings
+        """Extract findings from common report JSON shapes."""
+        if isinstance(data, list):
+            return [f for f in data if isinstance(f, dict)]
+        if not isinstance(data, dict):
+            return []
 
-        return extract_rich_findings(data)
+        findings = data.get("validated_findings")
+        if findings is None:
+            findings = data.get("findings", [])
+        manual_review = data.get("manual_review", [])
+        # PENDING/POTENTIAL findings are a REPORTABLE_STATUS and already appear in the
+        # Markdown + engagement deliverables; read them here too so the rich-report path
+        # stays in parity (the reportable-status filter still gates what's shown).
+        pending = data.get("pending", [])
+
+        rich = []
+        if isinstance(findings, list):
+            rich.extend(f for f in findings if isinstance(f, dict))
+        if isinstance(manual_review, list):
+            rich.extend(f for f in manual_review if isinstance(f, dict))
+        if isinstance(pending, list):
+            rich.extend(f for f in pending if isinstance(f, dict))
+        return rich
 
     @classmethod
     def _is_reportable_finding_dict(cls, finding: Dict[str, Any]) -> bool:
-        from bugtrace.services.report_policy import is_reportable_finding_dict
-
-        return is_reportable_finding_dict(finding)
+        status = finding.get("status")
+        if status in (None, ""):
+            return True
+        return cls._is_reportable_status(status)
 
     @classmethod
     def _is_reportable_status(cls, status: Any) -> bool:
-        from bugtrace.services.report_policy import is_reportable_status
-
-        return is_reportable_status(status)
+        return cls._enum_value(status) in cls.REPORTABLE_STATUSES
 
     @staticmethod
     def _enum_value(value: Any) -> str:
-        from bugtrace.services.report_policy import enum_value
-
-        return enum_value(value)
+        return value.value if hasattr(value, "value") else str(value)
 
     def _finding_table_to_dict(self, finding: FindingTable) -> Dict[str, Any]:
         """
