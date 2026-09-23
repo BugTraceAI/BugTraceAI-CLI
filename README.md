@@ -3,7 +3,7 @@
 [![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white)](https://bugtraceai.com)
 [![Wiki Documentation](https://img.shields.io/badge/Wiki%20Documentation-000?logo=wikipedia&logoColor=white)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
-![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)
+![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)
 ![Version](https://img.shields.io/badge/Version-3.7.28--beta-orange)
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
@@ -502,7 +502,7 @@ CANDIDATE → PENDING_VALIDATION → CONFIRMED / FALSE_POSITIVE → PROBE_VALIDA
 
 ## 📜 License
 
-AGPL-3.0 License
+Apache License 2.0
 
 Copyright (c) 2026 BugTraceAI
 
