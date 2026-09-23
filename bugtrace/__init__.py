@@ -19,4 +19,4 @@ def _read_version() -> str:
 
 __version__ = _read_version()
 __author__ = "BugTraceAI Team"
-__license__ = "AGPL-3.0"
+__license__ = "Apache-2.0"

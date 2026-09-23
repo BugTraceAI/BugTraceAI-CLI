@@ -115,7 +115,7 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     contact={"name": "BugTraceAI", "url": "https://github.com/BugTraceAI"},
-    license_info={"name": "AGPL-3.0", "url": "https://www.gnu.org/licenses/agpl-3.0.html"},
+    license_info={"name": "Apache-2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0"},
 )
 
 
