@@ -1,6 +1,6 @@
 from typing import Any, Optional, List, Dict
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from sqlmodel import SQLModel, create_engine, Session, select
 from sqlalchemy import Engine, text, event, func
@@ -747,7 +747,7 @@ class DatabaseManager:
             
             if checkpoint:
                 checkpoint.state_json = state_data
-                checkpoint.updated_at = datetime.utcnow()
+                checkpoint.updated_at = datetime.now(timezone.utc)
             else:
                 checkpoint = ScanStateTable(scan_id=scan_id, state_json=state_data)
             
