@@ -1,8 +1,42 @@
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from sqlmodel import SQLModel, Field, Relationship
+from sqlalchemy import Text, Column, DateTime, Index
+from sqlalchemy.types import TypeDecorator
 from bugtrace.schemas.models import VulnType, ReflectionContext
+
+
+def utcnow() -> datetime:
+    """Return the current time as a timezone-aware UTC datetime."""
+    return datetime.now(timezone.utc)
+
+
+class UTCDateTime(TypeDecorator):
+    """Store UTC consistently and return timezone-aware datetimes.
+
+    SQLite strips timezone metadata from SQLAlchemy ``DateTime`` values. This
+    normalizes values on write and restores the UTC marker on read, keeping
+    existing SQLite databases compatible while satisfying SQLModel's timezone
+    requirement in application code.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        if value is None or not isinstance(value, datetime):
+            return value
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def process_result_value(self, value, dialect):
+        if value is None or not isinstance(value, datetime):
+            return value
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
 
 class ScanStatus(str, Enum):
@@ -30,7 +64,7 @@ class TargetTable(SQLModel, table=True):
     __tablename__ = "target"
     id: Optional[int] = Field(default=None, primary_key=True)
     url: str = Field(index=True, unique=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(sa_column=Column(UTCDateTime(), default=utcnow))
     
     # Relationships
     scans: List["ScanTable"] = Relationship(back_populates="target")
@@ -39,7 +73,7 @@ class ScanTable(SQLModel, table=True):
     __tablename__ = "scan"
     id: Optional[int] = Field(default=None, primary_key=True)
     target_id: int = Field(foreign_key="target.id")
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(sa_column=Column(UTCDateTime(), default=utcnow))
     status: ScanStatus = Field(default=ScanStatus.PENDING)
     progress_percent: int = 0
     origin: str = Field(default="unknown")  # "cli", "web", or "unknown" — tracks where scan was launched
@@ -56,9 +90,6 @@ class ScanTable(SQLModel, table=True):
 
     target: Optional[TargetTable] = Relationship(back_populates="scans")
     findings: List["FindingTable"] = Relationship(back_populates="scan")
-
-from sqlalchemy import Text, Column, Index
-
 
 class FindingTable(SQLModel, table=True):
     __tablename__ = "finding"
@@ -94,7 +125,7 @@ class ScanStateTable(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     scan_id: int = Field(foreign_key="scan.id", unique=True)
     state_json: str = Field(sa_column=Column(Text)) # Safe large text blob
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(sa_column=Column(UTCDateTime(), default=utcnow))
 
 # Vector Store Logic (LanceDB)
 # We don't define LanceDB tables here as they are defined dynamically or via PyArrow, 

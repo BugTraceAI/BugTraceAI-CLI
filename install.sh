@@ -26,6 +26,7 @@ ROCKET="🚀"
 GEAR="⚙️"
 DOCKER="🐳"
 PYTHON="🐍"
+ENV_FILE_CREATED=false
 
 # ============================================================
 # Helper Functions
@@ -86,18 +87,57 @@ find_free_port() {
     local max_attempts=100
     local port=$start_port
     
-    print_step "Searching for available port starting from $start_port..."
+    # This function is used in command substitution; progress must not be
+    # captured together with the numeric port.
+    print_step "Searching for available port starting from $start_port..." >&2
     
     for ((i=0; i<max_attempts; i++)); do
         if ! is_port_in_use "$port"; then
             echo "$port"
             return 0
         fi
-        ((port++))
+        port=$((port + 1))
     done
     
-    print_error "Could not find a free port after $max_attempts attempts"
+    print_error "Could not find a free port after $max_attempts attempts" >&2
     return 1
+}
+
+find_free_port_avoiding() {
+    local start_port=${1:-8000}
+    local avoid_port=${2:-}
+    local max_attempts=100
+    local port=$start_port
+
+    for ((i=0; i<max_attempts; i++)); do
+        if [ "$port" != "$avoid_port" ] && ! is_port_in_use "$port"; then
+            echo "$port"
+            return 0
+        fi
+        port=$((port + 1))
+    done
+
+    print_error "Could not find a free port after $max_attempts attempts" >&2
+    return 1
+}
+
+is_valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+read_env_value() {
+    local key=$1
+    [ -f .env ] || return 0
+    grep -E "^${key}=" .env 2>/dev/null | tail -n 1 | cut -d= -f2-
+}
+
+set_env_value() {
+    local key=$1 value=$2
+    if grep -qE "^${key}=" .env 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" .env
+    else
+        printf '\n%s=%s\n' "$key" "$value" >> .env
+    fi
 }
 
 # ============================================================
@@ -201,6 +241,7 @@ setup_env_file() {
     if [ ! -f .env ]; then
         if [ -f .env.example ]; then
             cp .env.example .env
+            ENV_FILE_CREATED=true
             print_success "Created .env file from .env.example"
         else
             print_warning ".env.example not found, creating basic .env"
@@ -209,6 +250,7 @@ setup_env_file() {
 OPENROUTER_API_KEY=your-openrouter-api-key-here
 BUGTRACE_CORS_ORIGINS=http://localhost:3000,http://localhost:5173,http://localhost:6869
 EOF
+            ENV_FILE_CREATED=true
         fi
         
         echo ""
@@ -331,55 +373,51 @@ install_docker() {
     echo ""
     print_step "Configuring network ports..."
     
-    local default_port=8000
-    local selected_port=$default_port
-    
-    if is_port_in_use "$default_port"; then
-        print_warning "Default port $default_port is already in use"
-        
-        local free_port
-        free_port=$(find_free_port $default_port)
-        
-        if [ -n "$free_port" ]; then
-            print_info "Found available port: $free_port"
-            echo ""
-            read -p "$(echo -e ${YELLOW}Use port $free_port? [Y/n]: ${NC})" use_free_port
-            
-            if [[ ! "$use_free_port" =~ ^[Nn]$ ]]; then
-                selected_port=$free_port
-            else
-                read -p "$(echo -e ${YELLOW}Enter custom port: ${NC})" custom_port
-                selected_port=${custom_port:-$default_port}
-            fi
-        else
-            read -p "$(echo -e ${YELLOW}Enter custom port: ${NC})" custom_port
-            selected_port=${custom_port:-$default_port}
-        fi
-    else
-        print_success "Port $default_port is available"
+    local default_cli_port=8000
+    local default_mcp_port=8001
+    local selected_cli_port=$default_cli_port
+    local selected_mcp_port=$default_mcp_port
+    local existing_cli_port existing_mcp_port
+
+    existing_cli_port=$(read_env_value CLI_PORT || true)
+    existing_mcp_port=$(read_env_value MCP_PORT || true)
+
+    # An existing .env may be owned by a Launcher deployment. Preserve its
+    # explicit ports; a newly-created .env can safely choose free defaults.
+    if is_valid_port "$existing_cli_port" && [ "$ENV_FILE_CREATED" = false ]; then
+        selected_cli_port=$existing_cli_port
+        print_info "Preserving configured CLI port: $selected_cli_port"
+    elif is_port_in_use "$default_cli_port"; then
+        print_warning "Default CLI port $default_cli_port is already in use"
+        selected_cli_port=$(find_free_port "$default_cli_port")
     fi
-    
-    echo ""
-    print_info "Using port: $selected_port"
-    
-    # Update docker-compose.yml with selected port
-    if [ "$selected_port" != "$default_port" ]; then
-        print_step "Updating docker-compose.yml with port $selected_port..."
-        
-        if [ -f docker-compose.yml ]; then
-            # Create backup
-            cp docker-compose.yml docker-compose.yml.bak
-            
-            # Update port mapping
-            sed -i "s/- \"[0-9]*:8000\"/- \"$selected_port:8000\"/" docker-compose.yml
-            print_success "Port configuration updated"
-        fi
+
+    if is_valid_port "$existing_mcp_port" && [ "$ENV_FILE_CREATED" = false ]; then
+        selected_mcp_port=$existing_mcp_port
+        print_info "Preserving configured MCP port: $selected_mcp_port"
+    elif is_port_in_use "$default_mcp_port"; then
+        print_warning "Default MCP port $default_mcp_port is already in use"
+        selected_mcp_port=$(find_free_port "$default_mcp_port")
     fi
-    
+
+    if [ "$selected_cli_port" = "$selected_mcp_port" ]; then
+        print_warning "CLI and MCP ports collide; selecting another MCP port"
+        selected_mcp_port=$(find_free_port_avoiding "$((selected_mcp_port + 1))" "$selected_cli_port")
+    fi
+
+    if ! is_valid_port "$selected_cli_port" || ! is_valid_port "$selected_mcp_port"; then
+        print_error "Could not determine valid CLI and MCP ports"
+        exit 1
+    fi
+
     echo ""
-    print_step "Building Docker image..."
-    print_info "This may take 5-10 minutes on first build..."
-    
+    print_info "Using CLI port: $selected_cli_port, MCP port: $selected_mcp_port"
+    print_step "Writing port configuration to .env..."
+    set_env_value CLI_PORT "$selected_cli_port"
+    set_env_value MCP_PORT "$selected_mcp_port"
+    print_success "Port configuration written to .env"
+
+    echo ""
     # Prefer docker compose (V2) over docker-compose (V1) - V1 has Python 3.12 issues
     if docker compose version &> /dev/null; then
         COMPOSE_CMD="docker compose"
@@ -389,7 +427,18 @@ install_docker() {
         print_error "Docker Compose not available"
         exit 1
     fi
-    
+
+    print_step "Validating Docker Compose configuration..."
+    if ! $COMPOSE_CMD config -q &> /dev/null; then
+        print_error "Docker Compose configuration is invalid"
+        $COMPOSE_CMD config
+        exit 1
+    fi
+    print_success "Docker Compose configuration is valid"
+
+    echo ""
+    print_step "Building Docker image..."
+    print_info "This may take 5-10 minutes on first build..."
     $COMPOSE_CMD build
     print_success "Docker image built successfully"
     
@@ -404,7 +453,7 @@ install_docker() {
     local waited=0
     
     while [ $waited -lt $max_wait ]; do
-        if curl -sf "http://localhost:$selected_port/health" > /dev/null 2>&1; then
+        if curl -sf "http://localhost:$selected_cli_port/health" > /dev/null 2>&1; then
             print_success "API is ready!"
             break
         fi
@@ -428,13 +477,16 @@ install_docker() {
     echo ""
     
     print_info "BugTraceAI is now running at:"
-    echo -e "  ${CYAN}http://localhost:$selected_port${NC}"
+    echo -e "  ${CYAN}http://localhost:$selected_cli_port${NC}"
+    echo ""
+    print_info "MCP SSE endpoint:"
+    echo -e "  ${CYAN}http://localhost:$selected_mcp_port/sse${NC}"
     echo ""
     print_info "API Health Check:"
-    echo -e "  ${CYAN}http://localhost:$selected_port/health${NC}"
+    echo -e "  ${CYAN}http://localhost:$selected_cli_port/health${NC}"
     echo ""
     print_info "API Documentation:"
-    echo -e "  ${CYAN}http://localhost:$selected_port/docs${NC}"
+    echo -e "  ${CYAN}http://localhost:$selected_cli_port/docs${NC}"
     echo ""
     print_info "Useful commands:"
     echo -e "  ${CYAN}$COMPOSE_CMD logs -f${NC}         # View logs"

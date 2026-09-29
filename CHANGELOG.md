@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.7.30-beta] - 2026-09-29
+
+### Fixed
+
+- Docker installs now keep `CLI_PORT` and `MCP_PORT` consistent between
+  `.env`, Compose, health checks, and the MCP service, including fresh installs
+  and existing Launcher-managed deployments.
+- Database timestamps are stored and returned as timezone-aware UTC values,
+  allowing the first target insert and subsequent scan state updates to work
+  with SQLModel's timezone validation.
+
+### Documentation
+
+- Clarified the Launcher versus standalone CLI installation paths and MCP
+  assistant setup.
+
 ## [3.7.28-beta] - 2026-09-22
 
 ### Changed

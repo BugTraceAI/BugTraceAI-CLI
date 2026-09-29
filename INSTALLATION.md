@@ -8,9 +8,13 @@ The easiest way to get BugTraceAI-CLI up and running is using the interactive in
 ./install.sh
 ```
 
+This guide covers the standalone CLI. For the WEB dashboard and guided service
+wiring, use [BugTraceAI-Launcher](https://github.com/BugTraceAI/BugTraceAI-Launcher).
+Keep Launcher and standalone CLI installations in separate directories.
+
 The wizard provides two installation modes:
 - **Local Installation**: Python virtual environment setup (best for development)
-- **Docker Installation**: Containerized deployment with automatic port detection (best for production)
+- **Docker Installation**: Containerized API + MCP deployment with automatic port handling (best for production)
 
 ## 📋 Prerequisites
 
@@ -91,7 +95,7 @@ When you choose **Option 2: Docker Installation**, the wizard will:
 3. 📄 Create `.env` file from `.env.example` (if not exists)
 4. 🔍 **Automatically detect if port 8000 is in use**
 5. 🎯 **Find the next available port** if 8000 is occupied
-6. ⚙️ Update `docker-compose.yml` with the selected port
+6. ⚙️ Write `CLI_PORT` and `MCP_PORT` to `.env` without overwriting an existing deployment's ports
 7. 🏗️ Build the Docker image (includes Go fuzzers, Playwright, PyTorch)
 8. 🚀 Start the container in detached mode
 9. ⏳ Wait for the API to be ready (health check)
@@ -104,12 +108,9 @@ $ ./install.sh
 ⚙️ Configuring network ports...
 ⚠ Default port 8000 is already in use
 ⚙️ Searching for available port starting from 8000...
-→ Found available port: 8003
-Use port 8003? [Y/n]: y
-
-→ Using port: 8003
-⚙️ Updating docker-compose.yml with port 8003...
-✓ Port configuration updated
+→ Using CLI port: 8003, MCP port: 8004
+⚙️ Writing port configuration to .env...
+✓ Port configuration written to .env
 ```
 
 ### After Installation
@@ -123,6 +124,9 @@ curl http://localhost:8000/health
 
 # View API documentation
 open http://localhost:8000/docs
+
+# MCP endpoint (MCP_PORT, 8001 by default)
+curl -sf http://localhost:8001/sse
 
 # View container logs
 docker compose logs -f
@@ -146,10 +150,10 @@ docker compose down
 # Trigger a scan via API
 curl -X POST http://localhost:8000/api/scans \
   -H "Content-Type: application/json" \
-  -d '{"target": "https://example.com"}'
+  -d '{"target_url": "https://example.com"}'
 
 # Get scan status
-curl http://localhost:8000/api/scans/{scan_id}
+curl http://localhost:8000/api/scans/{scan_id}/status
 
 # List all scans
 curl http://localhost:8000/api/scans
@@ -157,7 +161,7 @@ curl http://localhost:8000/api/scans
 # Trigger an authenticated scan via API
 curl -X POST http://localhost:8000/api/scans \
   -H "Content-Type: application/json" \
-  -d '{"target": "https://example.com", "auth_config_path": "/app/auth_config.yaml"}'
+  -d '{"target_url": "https://example.com"}'
 ```
 
 ### Pros & Cons
@@ -224,14 +228,15 @@ The scanner will automatically:
 
 ### Port Configuration (Docker Only)
 
-The wizard automatically handles port conflicts, but you can manually edit `docker-compose.yml`:
+The wizard writes selected Docker ports to `.env`:
 
-```yaml
-services:
-  api:
-    ports:
-      - "8000:8000"  # Change left number to use different host port
+```dotenv
+CLI_PORT=8000
+MCP_PORT=8001
 ```
+
+When using the Launcher, use the ports and MCP endpoint it reports instead of
+editing its CLI `.env` through this guide.
 
 ## 🐛 Troubleshooting
 
@@ -338,6 +343,9 @@ docker compose ps
 
 # Check API health
 curl http://localhost:8000/health
+
+# Check MCP health
+curl -sf http://localhost:8001/sse
 
 # Expected response:
 # {"status": "healthy", "version": "3.7.12-beta"}
