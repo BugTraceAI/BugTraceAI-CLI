@@ -31,7 +31,7 @@ The wizard provides two installation modes:
 - ✅ Git (for cloning the repository)
 
 ### Both Modes Require
-- 🔑 OpenRouter API key ([get one here](https://openrouter.ai/keys))
+- 🔑 An LLM provider API key (OpenRouter is the default; compatible APIs and local models can use a [custom provider preset](docs/CUSTOM_PROVIDERS.md))
 
 ## 🐍 Local Installation (Development Mode)
 
@@ -54,7 +54,7 @@ When you choose **Option 1: Local Installation**, the wizard will:
 source .venv/bin/activate
 
 # Configure your API key in .env
-nano .env  # Add your OPENROUTER_API_KEY
+nano .env  # Add the key for your active provider (OPENROUTER_API_KEY by default)
 
 # Run a scan
 ./bugtraceai-cli scan https://example.com
@@ -196,6 +196,14 @@ BUGTRACE_CORS_ORIGINS=http://localhost:3000,http://localhost:5173
 # SKEPTICAL_MODEL=anthropic/claude-haiku-4.5
 # VISION_MODEL=google/gemini-3-flash-preview
 ```
+
+### Custom and Local LLM Providers
+
+The default provider is OpenRouter. You can configure an OpenAI-compatible API
+or a local model server by adding a JSON preset, selecting it in
+`bugtraceaicli.conf`, and providing its key in `.env`. Follow the
+[custom provider preset guide](docs/CUSTOM_PROVIDERS.md) before rebuilding a
+Docker deployment. This configures the scanner's LLM, not an MCP client.
 
 ### Authenticated Scanning (YAML + TOTP/2FA)
 

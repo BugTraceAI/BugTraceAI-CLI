@@ -244,7 +244,7 @@ Each phase runs with independent concurrency:
 
 - **For Docker**: Docker & Docker Compose
 - **For Local**: Python 3.10+, Docker (for some agents), nmap (optional)
-- OpenRouter API key ([get one here](https://openrouter.ai/keys))
+- An LLM provider API key (OpenRouter is the default; see [custom provider presets](docs/CUSTOM_PROVIDERS.md) for compatible APIs and local models)
 
 ### 🧭 Choose an installation path
 
@@ -283,6 +283,14 @@ The wizard will:
 1. **Local Installation** - Python virtual environment (best for development)
 2. **Docker Installation** - Containerized deployment (best for production)
 
+### Custom and local LLM providers
+
+OpenRouter is the default provider. To use an OpenAI-compatible API or a local
+model server instead, add a provider preset and select it in the CLI
+configuration. See [Custom and Local LLM Provider Presets](docs/CUSTOM_PROVIDERS.md).
+This configures the scanner's LLM; it is separate from connecting Codex, Claude
+Code, Cursor, or another assistant to the MCP endpoint.
+
 ### 📖 Manual Installation
 
 <details>
@@ -303,7 +311,7 @@ playwright install chromium
 
 # Configure environment
 cp .env.example .env
-# Edit .env and add your OPENROUTER_API_KEY
+# Edit .env and add the API key for your active provider (OPENROUTER_API_KEY by default)
 ```
 
 #### Docker Installation
@@ -311,7 +319,7 @@ cp .env.example .env
 ```bash
 # Configure environment
 cp .env.example .env
-# Edit .env and add your OPENROUTER_API_KEY
+# Edit .env and add the API key for your active provider (OPENROUTER_API_KEY by default)
 
 # Build and start
 docker compose up -d
@@ -369,7 +377,7 @@ BugTraceAI exposes its scanning engine as **MCP tools** via the [Model Context P
 
 > **Using an AI assistant? Tell it which deployment path you want:**
 >
-> _For the full platform, clone https://github.com/BugTraceAI/BugTraceAI-Launcher and run `./launcher.sh`. For scanner-only use, clone this repository, run `./install.sh`, choose Docker, configure the OpenRouter key, and report the `MCP_PORT` written to `.env`._
+> _For the full platform, clone https://github.com/BugTraceAI/BugTraceAI-Launcher and run `./launcher.sh`. For scanner-only use, clone this repository, run `./install.sh`, choose Docker, configure the active provider key (OpenRouter by default), and report the `MCP_PORT` written to `.env`._
 
 ### Manual MCP Setup
 
@@ -378,7 +386,7 @@ BugTraceAI exposes its scanning engine as **MCP tools** via the [Model Context P
 git clone https://github.com/BugTraceAI/BugTraceAI-CLI
 cd BugTraceAI-CLI
 cp .env.example .env
-# Edit .env → add your OPENROUTER_API_KEY
+# Edit .env → add the API key for your active provider (OpenRouter by default)
 
 # 2. Start services (API + MCP)
 docker compose up -d
