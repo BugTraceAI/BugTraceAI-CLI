@@ -33,6 +33,7 @@ INSTALL_GLOBAL=""
 INSTALLER_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$INSTALLER_DIR" || exit 1
 source "$INSTALLER_DIR/scripts/install_global_command.sh"
+source "$INSTALLER_DIR/scripts/install_docker_runtime.sh"
 
 # Persist only installation choices, never API keys. Read values without sourcing shell code.
 load_install_choices() {
@@ -211,6 +212,131 @@ check_command() {
     fi
 }
 
+check_optional_command() {
+    local cmd=$1
+    local name=$2
+    if command -v "$cmd" >/dev/null 2>&1; then
+        print_success "$name is installed"
+        return 0
+    fi
+    print_warning "$name not found (optional for the local TUI)"
+    return 1
+}
+
+run_privileged() {
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        print_error "Administrator privileges are required to install: $*"
+        return 1
+    fi
+}
+
+install_linux_packages() {
+    local packages=("$@")
+    [[ ${#packages[@]} -gt 0 ]] || return 0
+
+    print_info "Installing system packages: ${packages[*]}"
+    if command -v apt-get >/dev/null 2>&1; then
+        run_privileged apt-get update -qq && \
+            run_privileged apt-get install -y --no-install-recommends "${packages[@]}"
+    elif command -v dnf >/dev/null 2>&1; then
+        run_privileged dnf install -y "${packages[@]}"
+    elif command -v yum >/dev/null 2>&1; then
+        run_privileged yum install -y "${packages[@]}"
+    elif command -v pacman >/dev/null 2>&1; then
+        run_privileged pacman -S --needed --noconfirm "${packages[@]}"
+    elif command -v zypper >/dev/null 2>&1; then
+        run_privileged zypper install -y "${packages[@]}"
+    else
+        print_error "No supported system package manager was found."
+        return 1
+    fi
+}
+
+probe_python_venv() {
+    local probe
+    probe=$(mktemp -d "${TMPDIR:-/tmp}/bugtraceai-venv.XXXXXX")
+    if python3 -m venv --without-pip "$probe" >/dev/null 2>&1; then
+        rm -rf "$probe"
+        return 0
+    fi
+    rm -rf "$probe"
+    return 1
+}
+
+prepare_local_requirements() {
+    command -v python3 >/dev/null 2>&1 || {
+        print_error "Python 3.10 or newer is required. Install Python and run the installer again."
+        return 1
+    }
+
+    local need_python_packages=()
+    local need_nmap=false
+
+    if ! python3 -m pip --version >/dev/null 2>&1; then
+        if python3 -m ensurepip --upgrade >/dev/null 2>&1 && python3 -m pip --version >/dev/null 2>&1; then
+            print_success "Bootstrapped pip with Python ensurepip"
+        else
+            need_python_packages+=(python3-pip)
+        fi
+    fi
+    if ! probe_python_venv; then
+        need_python_packages+=(python3-venv)
+    fi
+    command -v nmap >/dev/null 2>&1 || need_nmap=true
+
+    if [[ ${#need_python_packages[@]} -eq 0 && "$need_nmap" == false ]]; then
+        return 0
+    fi
+
+    print_info "Missing local tools detected; installing them now."
+
+    if [[ "$need_nmap" == true ]]; then
+        if [[ "$(uname -s)" == Darwin ]]; then
+            local brew_bin=""
+            if command -v brew >/dev/null 2>&1; then
+                brew_bin="$(command -v brew)"
+            elif [[ -x /opt/homebrew/bin/brew ]]; then
+                brew_bin=/opt/homebrew/bin/brew
+            elif [[ -x /usr/local/bin/brew ]]; then
+                brew_bin=/usr/local/bin/brew
+            fi
+            if [[ -n "$brew_bin" ]]; then
+                "$brew_bin" install nmap || print_warning "Could not install nmap; continuing without it."
+            else
+                print_warning "Homebrew is not installed; install nmap separately if you need it."
+            fi
+        else
+            need_python_packages+=(nmap)
+        fi
+    fi
+
+    if [[ ${#need_python_packages[@]} -gt 0 ]]; then
+        if [[ "$(uname -s)" == Darwin ]]; then
+            if command -v brew >/dev/null 2>&1; then
+                brew install python || return 1
+            else
+                print_error "Python packaging tools are missing and Homebrew is not installed."
+                return 1
+            fi
+        else
+            install_linux_packages "${need_python_packages[@]}" || {
+                print_error "Could not install the required Python tools automatically."
+                return 1
+            }
+        fi
+    fi
+
+    if ! python3 -m pip --version >/dev/null 2>&1 || ! probe_python_venv; then
+        print_error "Python pip/venv is still unavailable after installation."
+        return 1
+    fi
+    return 0
+}
+
 check_local_requirements() {
     print_step "Checking local installation requirements..."
     echo ""
@@ -224,9 +350,18 @@ check_local_requirements() {
         print_info "Python version: $python_version"
     fi
     
-    check_command pip3 "pip3" || all_ok=false
-    check_command nmap "nmap" || print_warning "nmap not found (optional, but recommended)"
-    check_command docker "Docker" || print_warning "Docker not found (needed for some agents)"
+    if python3 -m pip --version >/dev/null 2>&1; then
+        print_success "pip (Python module) is installed"
+    else
+        print_error "pip is not installed"
+        all_ok=false
+    fi
+    check_optional_command nmap "nmap" || true
+    if command -v docker >/dev/null 2>&1; then
+        print_success "Docker is installed"
+    else
+        print_info "Docker is optional for local TUI; choose the Docker runtime for container setup"
+    fi
     
     echo ""
     
@@ -239,12 +374,8 @@ check_local_requirements() {
 }
 
 check_docker_compose_works() {
-    # Try docker compose (V2) first, then docker-compose (V1)
-    if docker compose version &> /dev/null; then
-        print_success "Docker Compose V2 is installed"
-        return 0
-    elif docker-compose version &> /dev/null; then
-        print_success "Docker Compose V1 is installed"
+    if docker_select_compose; then
+        print_success "Docker Compose is ready ($COMPOSE_CMD)"
         return 0
     else
         print_error "Docker Compose is not installed or not working"
@@ -262,7 +393,7 @@ check_docker_requirements() {
     check_docker_compose_works || all_ok=false
     
     # Check if Docker daemon is running
-    if docker info &> /dev/null; then
+    if "${DOCKER_RUN[@]}" info &> /dev/null; then
         print_success "Docker daemon is running"
     else
         print_error "Docker daemon is not running"
@@ -270,10 +401,11 @@ check_docker_requirements() {
     fi
     
     # Check Docker permissions
-    if docker ps &> /dev/null; then
+    if "${DOCKER_RUN[@]}" ps &> /dev/null; then
         print_success "Docker permissions OK"
     else
-        print_warning "Docker requires sudo (you may need to add your user to docker group)"
+        print_error "Docker container access failed using ${DOCKER_RUN[*]}"
+        all_ok=false
     fi
     
     echo ""
@@ -284,6 +416,18 @@ check_docker_requirements() {
     fi
     
     return 0
+}
+
+api_health_ready() {
+    local port=$1
+    if command -v curl >/dev/null 2>&1; then
+        curl -sf --max-time 2 "http://localhost:$port/health" >/dev/null 2>&1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO /dev/null --timeout=2 --tries=1 "http://localhost:$port/health" >/dev/null 2>&1
+    else
+        print_error "curl or wget is required for the API health check."
+        return 1
+    fi
 }
 
 # ============================================================
@@ -327,13 +471,9 @@ install_local() {
     echo -e "${PYTHON} ${GREEN}Local Installation Mode${NC}"
     echo ""
     
-    if ! check_local_requirements; then
-        echo ""
-        read -p "$(echo -e ${YELLOW}Continue anyway? [y/N]: ${NC})" continue_install
-        if [[ ! "$continue_install" =~ ^[Yy]$ ]]; then
-            print_error "Installation cancelled"
-            exit 1
-        fi
+    if ! prepare_local_requirements || ! check_local_requirements; then
+        print_error "Local prerequisites could not be prepared. Installation cancelled."
+        exit 1
     fi
     
     echo ""
@@ -418,10 +558,10 @@ install_docker() {
     echo -e "${DOCKER} ${GREEN}Docker Installation Mode${NC}"
     echo ""
     
-    if ! check_docker_requirements; then
+    if ! prepare_docker_requirements || ! check_docker_requirements; then
         echo ""
         print_error "Cannot proceed with Docker installation"
-        print_info "Please install Docker and Docker Compose first:"
+        print_info "Docker setup failed. Resolve the error above or see:"
         print_info "  https://docs.docker.com/get-docker/"
         exit 1
     fi
@@ -431,9 +571,8 @@ install_docker() {
     
     # A terminal-only image is built on demand and has no listening services.
     if [[ "$INSTALL_INTERFACE" == tui ]]; then
-        if docker compose version &>/dev/null; then COMPOSE_CMD="docker compose"; else COMPOSE_CMD="docker-compose"; fi
-        $COMPOSE_CMD -f docker-compose.tui.yml config -q
-        $COMPOSE_CMD -f docker-compose.tui.yml build
+        "${COMPOSE_ARGS[@]}" -f docker-compose.tui.yml config -q
+        "${COMPOSE_ARGS[@]}" -f docker-compose.tui.yml build
         show_launch_commands
         return
     fi
@@ -451,7 +590,7 @@ install_docker() {
 
     existing_cli_port=$(read_env_value CLI_PORT || true)
     existing_mcp_port=$(read_env_value MCP_PORT || true)
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^(bugtrace_api|bugtrace_mcp)$'; then
+    if "${DOCKER_RUN[@]}" ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^(bugtrace_api|bugtrace_mcp)$'; then
         preserve_existing_ports=true
     fi
 
@@ -484,27 +623,22 @@ install_docker() {
     print_step "Building Docker image..."
     print_info "This may take 5-10 minutes on first build..."
     
-    # Prefer docker compose (V2) over docker-compose (V1) - V1 has Python 3.12 issues
-    if docker compose version &> /dev/null; then
-        COMPOSE_CMD="docker compose"
-    elif docker-compose version &> /dev/null; then
-        COMPOSE_CMD="docker-compose"
-    else
+    if ! docker_select_compose; then
         print_error "Docker Compose not available"
         exit 1
     fi
     
-    if ! $COMPOSE_CMD config -q &>/dev/null; then
+    if ! "${COMPOSE_ARGS[@]}" config -q &>/dev/null; then
         print_error "Docker compose configuration is invalid"
-        $COMPOSE_CMD config
+        "${COMPOSE_ARGS[@]}" config
         exit 1
     fi
-    $COMPOSE_CMD build
+    "${COMPOSE_ARGS[@]}" build
     print_success "Docker image built successfully"
     
     echo ""
     print_step "Starting BugTraceAI container..."
-    $COMPOSE_CMD up -d
+    "${COMPOSE_ARGS[@]}" up -d
     print_success "Container started"
     
     echo ""
@@ -513,7 +647,7 @@ install_docker() {
     local waited=0
     
     while [ $waited -lt $max_wait ]; do
-        if curl -sf --max-time 2 "http://localhost:$selected_cli_port/health" > /dev/null 2>&1; then
+        if api_health_ready "$selected_cli_port"; then
             print_success "API is ready!"
             break
         fi
@@ -560,24 +694,6 @@ install_docker() {
 # Main Menu
 # ============================================================
 
-show_menu() {
-    print_header
-    
-    echo -e "Choose your installation method:"
-    echo ""
-    echo -e "  ${PYTHON} ${CYAN}1)${NC} Local Installation (Python Virtual Environment)"
-    echo -e "     ${ARROW} Best for development and customization"
-    echo -e "     ${ARROW} Requires Python 3.10+, pip, and system dependencies"
-    echo ""
-    echo -e "  ${DOCKER} ${CYAN}2)${NC} Docker Installation (Containerized)"
-    echo -e "     ${ARROW} Best for production and isolated environments"
-    echo -e "     ${ARROW} Requires Docker and Docker Compose"
-    echo -e "     ${ARROW} Automatic port detection and configuration"
-    echo ""
-    echo -e "  ${CYAN}3)${NC} Exit"
-    echo ""
-}
-
 main() {
     local reuse=false global_only=false requested_interface="" requested_runtime="" requested_global="" choice
     while [[ $# -gt 0 ]]; do
@@ -599,17 +715,32 @@ main() {
     [[ -z "$requested_runtime" ]] || INSTALL_RUNTIME="$requested_runtime"
     if [[ -z "$INSTALL_INTERFACE" ]]; then
         print_header
-        echo "How will you use BugTraceAI?"
+        echo "Which BugTraceAI CLI interfaces do you want?"
         echo "  1) Interactive terminal (TUI)"
         echo "  2) API server + MCP (WEB / integrations)"
-        echo "  3) Both TUI and API"
+        echo "  3) Both TUI and API/MCP"
         echo "  4) Cancel"
         read -r -p "Select interface [1-4]: " choice
         case "$choice" in 1) INSTALL_INTERFACE=tui ;; 2) INSTALL_INTERFACE=api ;; 3) INSTALL_INTERFACE=both ;; 4) return ;; *) print_error "Invalid interface"; return 1 ;; esac
     fi
     case "$INSTALL_INTERFACE" in tui|api|both) ;; *) print_error "Interface must be tui, api or both"; return 1 ;; esac
     if [[ -z "$INSTALL_RUNTIME" ]]; then
-        show_menu
+        echo ""
+        echo "Where should the selected CLI interfaces run?"
+        echo ""
+        echo "  1) Local Python virtual environment"
+        echo "     -> The selected interfaces run in a local .venv"
+        echo ""
+        echo "  2) Docker containers"
+        case "$INSTALL_INTERFACE" in
+            tui) echo "     -> TUI runs in an interactive container; no API server is started" ;;
+            api) echo "     -> API/MCP run as Compose services" ;;
+            both) echo "     -> API/MCP run in Compose; the TUI opens inside the API container" ;;
+        esac
+        echo "     -> Missing Docker/Compose will be installed; sudo may be requested"
+        echo ""
+        echo "  3) Cancel"
+        echo ""
         read -r -p "Select runtime [1-3]: " choice
         case "$choice" in 1) INSTALL_RUNTIME=local ;; 2) INSTALL_RUNTIME=docker ;; 3) return ;; *) print_error "Invalid runtime"; return 1 ;; esac
     fi

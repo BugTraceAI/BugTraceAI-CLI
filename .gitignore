@@ -93,6 +93,7 @@ tests/**/__pycache__/
 scripts/*
 !scripts/interface_requirements.py
 !scripts/install_global_command.sh
+!scripts/install_docker_runtime.sh
 archive/
 analyze_*.py
 check_*.py

@@ -17,6 +17,20 @@ local scans. The scanning engine and browser dependencies are shared.
 TUI adds Textual. API adds FastAPI, Uvicorn, WebSockets and MCP. Local packages
 are installed from the selected extras in `pyproject.toml`. The installer
 prepares the environment, Chromium and scanner tools for the selected runtime.
+On Linux it automatically installs missing `pip`/`venv` packages and `nmap`
+through the system package manager, asking for `sudo` only when needed. On
+macOS it uses Homebrew when available. Docker is reported as optional for a
+local TUI profile; choose the Docker runtime when Docker should be required.
+
+The Docker profile prepares the runtime before building the selected CLI
+interfaces. On Linux it installs missing Docker Engine using the official
+Docker installer, starts the daemon and installs Compose if needed. On macOS
+it starts an existing Docker Desktop installation or uses Homebrew to install
+Docker, Compose and Colima. Homebrew must already be available for that setup.
+Administrator/password prompts remain in your terminal. Existing working
+Docker installations are reused. If a Linux socket needs administrator access,
+the installer and `btai` use `sudo` for Docker commands without changing groups.
+Unavailable custom Docker contexts are reported rather than switched.
 
 For scripted installations:
 
