@@ -3,13 +3,13 @@
 import bugtrace.utils.aiohttp_patch  # noqa: F401, E402
 
 import asyncio
+from importlib.util import find_spec
 import sys
 import typer
 import warnings
 from typing import Optional
 from datetime import datetime
 from rich.console import Console
-from bugtrace.core.config import settings
 from bugtrace.core.instance_lock import acquire_instance_lock
 from pathlib import Path
 
@@ -20,13 +20,17 @@ warnings.filterwarnings("ignore", category=RuntimeWarning,
                        module="asyncio.base_subprocess")
 warnings.filterwarnings("ignore", message=".*Event loop is closed.*")
 
-# Q-Learning WAF Strategy Router (for graceful shutdown persistence)
-from bugtrace.tools.waf import strategy_router
+
+
+def _settings():
+    from bugtrace.core.config import settings
+    return settings
 
 
 def _save_qlearning_data():
     """Persist Q-Learning WAF bypass data on shutdown."""
     try:
+        from bugtrace.tools.waf import strategy_router
         strategy_router.force_save()
     except Exception as e:
         # Silent fail on shutdown - Q-Learning data is non-critical
@@ -54,17 +58,25 @@ def main_callback(ctx: typer.Context):
     if command_name in SKIP_LOCK_COMMANDS:
         return
 
+    # The TUI acquires its scan lock when Start is pressed, without terminal prompts.
+    if command_name in {"scan", "full", "audit"} and sys.stdin.isatty() and sys.stdout.isatty():
+        return
+
     # Skip if no command was invoked (just `bugtrace` with no args)
     if command_name is None:
+        if sys.stdin.isatty() and sys.stdout.isatty() and find_spec("textual") is not None:
+            tui(target=None, demo=False, resume=False)
+        else:
+            console.print(ctx.get_help())
         return
 
     # Check for updates (silent, cached — hits GitHub at most once per 24h)
     try:
         from bugtrace.utils.version_check import check_for_update_sync
-        update = check_for_update_sync(settings.VERSION)
+        update = check_for_update_sync(_settings().VERSION)
         if update and update.get("update_available"):
             console.print(
-                f"[yellow]Update available: {settings.VERSION} → {update['latest_version']}[/yellow]  "
+                f"[yellow]Update available: {_settings().VERSION} → {update['latest_version']}[/yellow]  "
                 f"[dim]Run: ./launcher.sh update[/dim]"
             )
     except Exception:
@@ -76,14 +88,17 @@ def main_callback(ctx: typer.Context):
         command_str = f"bugtrace {' '.join(sys.argv[1:])}"
 
     # Check for existing instance and acquire lock
+    from bugtrace.core.instance_lock import acquire_instance_lock
     if not acquire_instance_lock(command_str):
         raise typer.Exit(code=1)
 
+
 @app.command(name="scan")
 def scan(
-    target: str = typer.Argument(..., help="The target URL to scan (Hunter phase)"),
+    target: Optional[str] = typer.Argument(None, help="The target URL to scan (may come from --handoff)"),
     url_list_file: Optional[str] = typer.Option(None, "--url-list-file", "-ul", help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
     swagger_file: Optional[str] = typer.Option(None, "--swagger", "-sw", help="Swagger/OpenAPI JSON file to import endpoints"),
+    handoff_file: Optional[str] = typer.Option(None, "--handoff", help="BugTraceAI API handoff JSON (v1)"),
     auth_config: Optional[str] = typer.Option(None, "--auth-config", "-ac", help="YAML file with authentication config (supports TOTP)"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
@@ -94,24 +109,42 @@ def scan(
     lfi: bool = typer.Option(False, "--lfi", help="LFI-only mode: Run only LFI detection"),
     idor: bool = typer.Option(False, "--idor", help="IDOR-only mode: Run only IDORAgent"),
     ssrf: bool = typer.Option(False, "--ssrf", help="SSRF-only mode: Run only SSRFAgent"),
-    param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
+    param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)"),
+    header: Optional[list[str]] = typer.Option(
+        None, "--header", "-H",
+        help=(
+            "Custom HTTP header to send with every scan request. "
+            "Format: 'Name: value'. Repeatable; later values override earlier ones. "
+            "Precedence: --conf < DEFAULT_HEADERS_JSON < auth discovery < --header. "
+            "Authorization and Cookie may be set here (override auto-discovered values). "
+            "Reserved names (Host, Content-Length, Transfer-Encoding, Connection, Upgrade) "
+            "are rejected. Values must not contain CR/LF."
+        ),
+    ),
 ):
     """Run the Discovery (Hunter) phase only."""
-    _run_pipeline(target, phase="hunter", url_list_file=url_list_file, swagger_file=swagger_file, auth_config=auth_config, safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    custom_headers = _parse_cli_headers(header)
+    _run_pipeline(target, phase="hunter", url_list_file=url_list_file, swagger_file=swagger_file, handoff_file=handoff_file, auth_config=auth_config, safe_mode=safe_mode, resume=resume, clean=clean, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param, custom_headers=custom_headers)
 
 @app.command(name="audit")
 def audit(
     target: str = typer.Argument(..., help="The target URL to audit (Auditor phase)"),
     scan_id: Optional[int] = typer.Option(None, "--scan-id", help="Specific Scan ID to audit"),
+    header: Optional[list[str]] = typer.Option(
+        None, "--header", "-H",
+        help="Custom HTTP header 'Name: value'. Repeatable. See `bugtrace scan --help` for full rules.",
+    ),
 ):
     """Run the Audit (Auditor) phase only."""
-    _run_pipeline(target, phase="manager", scan_id=scan_id)
+    custom_headers = _parse_cli_headers(header)
+    _run_pipeline(target, phase="manager", scan_id=scan_id, custom_headers=custom_headers)
 
 @app.command(name="full")
 def full_scan(
-    target: str = typer.Argument(..., help="The target URL for full engagement"),
+    target: Optional[str] = typer.Argument(None, help="The target URL for full engagement (may come from --handoff)"),
     url_list_file: Optional[str] = typer.Option(None, "--url-list-file", "-ul", help="File with URLs to scan (bypasses GoSpider, one URL per line)"),
     swagger_file: Optional[str] = typer.Option(None, "--swagger", "-sw", help="Swagger/OpenAPI JSON file to import endpoints"),
+    handoff_file: Optional[str] = typer.Option(None, "--handoff", help="BugTraceAI API handoff JSON (v1)"),
     auth_config: Optional[str] = typer.Option(None, "--auth-config", "-ac", help="YAML file with authentication config (supports TOTP)"),
     safe_mode: Optional[bool] = typer.Option(None, "--safe-mode", help="Override SAFE_MODE setting"),
     resume: bool = typer.Option(False, "--resume", help="Resume from previous state file"),
@@ -123,10 +156,15 @@ def full_scan(
     lfi: bool = typer.Option(False, "--lfi", help="LFI-only mode"),
     idor: bool = typer.Option(False, "--idor", help="IDOR-only mode"),
     ssrf: bool = typer.Option(False, "--ssrf", help="SSRF-only mode"),
-    param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)")
+    param: Optional[str] = typer.Option(None, "--param", "-p", help="Parameter to test (for focused modes)"),
+    header: Optional[list[str]] = typer.Option(
+        None, "--header", "-H",
+        help="Custom HTTP header 'Name: value'. Repeatable. See `bugtrace scan --help` for full rules.",
+    ),
 ):
     """Run Hunter followed by Auditor (The complete professional workflow)."""
-    _run_pipeline(target, phase="all", url_list_file=url_list_file, swagger_file=swagger_file, auth_config=auth_config, safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param)
+    custom_headers = _parse_cli_headers(header)
+    _run_pipeline(target, phase="all", url_list_file=url_list_file, swagger_file=swagger_file, handoff_file=handoff_file, auth_config=auth_config, safe_mode=safe_mode, resume=resume, clean=clean, continuous=continuous, xss=xss, sqli=sqli, jwt=jwt, lfi=lfi, idor=idor, ssrf=ssrf, param=param, custom_headers=custom_headers)
 
 @app.command(name="serve")
 def serve(
@@ -135,7 +173,11 @@ def serve(
     reload: bool = typer.Option(False, "--reload", help="Enable auto-reload on code changes")
 ):
     """Start the FastAPI server for REST API access."""
-    from bugtrace.api.server import start_api_server
+    try:
+        from bugtrace.api.server import start_api_server
+    except ImportError:
+        console.print('[red]API dependencies missing. Install with: pip install -e \".[api]\"[/red]')
+        raise typer.Exit(code=1)
 
     console.print(f"\n[bold green]Starting BugTraceAI API Server[/bold green]")
     console.print(f"[bold green]Host:[/bold green] {host}")
@@ -164,7 +206,11 @@ def mcp(
     Default: STDIO transport for local AI assistants (Claude Code, Cursor).
     With --sse: HTTP/SSE transport for remote clients (OpenClaw, network MCP clients).
     """
-    from bugtrace.mcp.server import run_mcp_server
+    try:
+        from bugtrace.mcp.server import run_mcp_server
+    except ImportError:
+        console.print('[red]API/MCP dependencies missing. Install with: pip install -e ".[api]"[/red]')
+        raise typer.Exit(code=1)
     run_mcp_server(transport="sse" if sse else "stdio", host=host, port=port)
 
 @app.command(name="summary")
@@ -228,6 +274,7 @@ def tui(
     demo: bool = typer.Option(
         False, "--demo", help="Run in demo mode with animated mock data"
     ),
+    resume: bool = typer.Option(False, "--resume", help="Resume the previous scan state"),
 ):
     """Launch the Textual-based Terminal User Interface.
 
@@ -247,14 +294,14 @@ def tui(
     try:
         from bugtrace.core.ui.tui import BugTraceApp
 
-        app_instance = BugTraceApp(target=target, demo_mode=demo)
+        app_instance = BugTraceApp(target=target, demo_mode=demo, scan_options={"resume": resume})
         app_instance.run()
     except KeyboardInterrupt:
         # Clean exit on CTRL+C
         pass
     except ImportError as e:
         console.print(f"[bold red]Error:[/bold red] Textual TUI dependencies not installed.")
-        console.print(f"[dim]Install with: pip install textual[/dim]")
+        console.print('[dim]Install the TUI dependencies with: pip install -e ".[tui]"[/dim]')
         console.print(f"[dim]Details: {e}[/dim]")
         raise typer.Exit(code=1)
     except Exception as e:
@@ -475,12 +522,52 @@ def _load_url_list(file_path: str, target: str) -> list:
 
     return urls
 
-def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, auth_config=None, safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False):
+def _parse_cli_headers(raw_list: Optional[list]) -> Optional[dict]:
+    """Parse repeated --header 'Name: value' arguments into a validated dict.
+
+    Returns None when no headers were supplied. On a malformed header, exits
+    the process with a clear message — failing fast is the design rule
+    (refusing to start a scan with a misconfigured header is safer than
+    silently dropping it).
+    """
+    if not raw_list:
+        return None
+    from bugtrace.utils.headers import parse_header_kv, merge_headers
+    parsed: dict = {}
+    for raw in raw_list:
+        try:
+            name, value = parse_header_kv(raw)
+        except Exception as e:
+            console.print(f"[bold red]Invalid --header {raw!r}:[/bold red] {e}")
+            raise typer.Exit(code=2)
+        # merge_headers applies the reserved-name filter as defence-in-depth.
+        merged = merge_headers(parsed, {name: value})
+        parsed.update(merged)
+    return parsed or None
+
+
+def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, handoff_file=None, auth_config=None, safe_mode=None, resume=False, clean=False, xss=False, sqli=False, jwt=False, lfi=False, idor=False, ssrf=False, param=None, scan_id=None, continuous=False, custom_headers=None):
     """Internal helper to run the pipeline phases."""
     if safe_mode is not None:
-        settings.SAFE_MODE = safe_mode
+        _settings().SAFE_MODE = safe_mode
 
-    # Load URL list from file or Swagger
+    # Load API handoff before resolving the target or inventory.
+    handoff = None
+    if handoff_file:
+        import json
+        from bugtrace.services.handoff_policy import validate_handoff
+        try:
+            with open(handoff_file, encoding="utf-8") as handle:
+                handoff = validate_handoff(json.load(handle))
+        except Exception as exc:
+            console.print(f"[bold red]Error loading handoff:[/bold red] {exc}")
+            raise typer.Exit(code=1)
+        target = target or handoff.get("target")
+    if not target:
+        console.print("[bold red]A target URL or handoff.target is required.[/bold red]")
+        raise typer.Exit(code=2)
+
+    # Load URL list from file, Swagger, or the richer handoff inventory.
     url_list = None
     if swagger_file:
         try:
@@ -494,6 +581,9 @@ def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, au
         except Exception as e:
             console.print(f"[bold red]Error loading URL list:[/bold red] {e}")
             raise typer.Exit(code=1)
+    elif handoff:
+        from bugtrace.services.handoff_policy import urls_from_handoff
+        url_list = urls_from_handoff(handoff)
 
     # Load authentication config from YAML
     auth_data = None
@@ -511,6 +601,24 @@ def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, au
             console.print(f"[bold red]Error loading auth config:[/bold red] {e}")
             raise typer.Exit(code=1)
 
+    # The workspace always runs Full. Explicit partial/focused CLI commands use text.
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if interactive and find_spec("textual") is not None and phase == "all" and not any((xss, sqli, jwt, lfi, idor, ssrf)):
+        from bugtrace.core.ui.tui import BugTraceApp
+        BugTraceApp(target=target, scan_options={
+            "phase": phase, "url_list": url_list, "auth_data": auth_data,
+            "safe_mode": safe_mode, "resume": resume, "clean": clean,
+            "scan_id": scan_id, "continuous": continuous, "param": param,
+            "custom_headers": custom_headers, "handoff": handoff,
+            "focused": {"xss": xss, "sqli": sqli, "jwt": jwt, "lfi": lfi, "idor": idor, "ssrf": ssrf},
+        }).run()
+        _save_qlearning_data()
+        return
+
+    # Interactive commands deferred their lock in main_callback for TUI routing.
+    if interactive and not acquire_instance_lock(f"bugtrace {phase} {target}"):
+        raise typer.Exit(code=1)
+
     # Check for focused mode
     if xss or sqli or lfi or jwt or idor or ssrf:
         _run_focused_mode(target, xss=xss, sqli=sqli, lfi=lfi, jwt=jwt, idor=idor, ssrf=ssrf, param=param)
@@ -525,7 +633,7 @@ def _run_pipeline(target, phase="all", url_list_file=None, swagger_file=None, au
 
     # Execute phases
     try:
-        asyncio.run(_execute_phases(target, phase, resume, clean, scan_id, continuous, url_list, auth_data))
+        asyncio.run(_execute_phases(target, phase, resume, clean, scan_id, continuous, url_list, auth_data, custom_headers, handoff))
     except KeyboardInterrupt:
         console.print("\n[yellow]Engagement aborted by user.[/yellow]")
     except Exception as e:
@@ -562,17 +670,15 @@ def _run_boot_sequence() -> bool:
 def _display_framework_info(target: str):
     """Display framework deployment information."""
     console.print(f"\n[bold green]Deploying Framework against:[/bold green] [cyan]{target}[/cyan]")
-    console.print(f"[bold green]Security Level:[/bold green] [{'green' if settings.SAFE_MODE else 'red'}]{'SAFE' if settings.SAFE_MODE else 'ASSAULT'}[/]")
-    console.print(f"[bold green]Framework Capacity:[/bold green] Depth={settings.MAX_DEPTH}, Concurrency={settings.MAX_CONCURRENT_URL_AGENTS}")
+    console.print(f"[bold green]Security Level:[/bold green] [{'green' if _settings().SAFE_MODE else 'red'}]{'SAFE' if _settings().SAFE_MODE else 'ASSAULT'}[/]")
+    console.print(f"[bold green]Framework Capacity:[/bold green] Depth={_settings().MAX_DEPTH}, Concurrency={_settings().MAX_CONCURRENT_URL_AGENTS}")
     console.print(f"[bold cyan]Architecture:[/bold cyan] Sequential Pipeline (V2 Architecture)")
 
 
-async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, scan_id: int, continuous: bool, url_list: Optional[list] = None, auth_data: Optional[dict] = None):
-    """Execute scan phases with dashboard UI."""
+async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, scan_id: int, continuous: bool, url_list: Optional[list] = None, auth_data: Optional[dict] = None, custom_headers: Optional[dict] = None, handoff: Optional[dict] = None):
+    """Execute scan phases with passive telemetry and ordinary text output."""
     from bugtrace.core.database import get_db_manager
     from bugtrace.core.ui import dashboard
-    from rich.live import Live
-    from urllib.parse import urlparse
 
     db = get_db_manager()
 
@@ -585,32 +691,15 @@ async def _execute_phases(target: str, phase: str, resume: bool, clean: bool, sc
         clean_environment()
         console.print("[yellow]🧹 Previous scan data cleaned.[/yellow]")
 
-    # Initialize dashboard
     dashboard.reset()
-    dashboard.start_keyboard_listener()
+    dashboard.set_target(target)
+    dashboard.set_status("Running", "Initializing pipeline...")
 
-    # Start stop monitor thread
-    stop_thread = _start_stop_monitor_thread(dashboard)
-
-    try:
-        with Live(dashboard, refresh_per_second=4, screen=True):
-            dashboard.active = True
-            dashboard.set_status("Running", "Initializing pipeline...")
-
-            # Execute Hunter phase
-            orchestrator = None
-            if phase in ["hunter", "all"]:
-                orchestrator = await _run_hunter_phase(target, db, resume, common_output_dir, url_list, auth_data)
-
-            # Execute Auditor phase
-            if phase in ["manager", "all"]:
-                await _run_auditor_phase(target, db, scan_id, orchestrator, common_output_dir, continuous)
-
-            dashboard.active = False
-    finally:
-        # ALWAYS ensure keyboard listener restores terminal settings
-        dashboard.active = False
-        dashboard.stop_keyboard_listener()
+    orchestrator = None
+    if phase in ["hunter", "all"]:
+        orchestrator = await _run_hunter_phase(target, db, resume, common_output_dir, url_list, auth_data, custom_headers, handoff)
+    if phase in ["manager", "all"]:
+        await _run_auditor_phase(target, db, scan_id, orchestrator, common_output_dir, continuous, custom_headers)
 
 
 def _setup_output_directory(target: str) -> Path:
@@ -621,42 +710,11 @@ def _setup_output_directory(target: str) -> Path:
     if ":" in domain:
         domain = domain.split(":")[0]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    common_output_dir = Path(settings.REPORT_DIR) / f"{domain}_{timestamp}"
+    common_output_dir = Path(_settings().REPORT_DIR) / f"{domain}_{timestamp}"
     return common_output_dir
 
 
-def _start_stop_monitor_thread(dashboard):
-    """Start daemon thread to monitor stop requests."""
-    import threading
-
-    def _stop_monitor_thread():
-        import time as _time
-        while dashboard.active:
-            _time.sleep(0.5)
-            if not dashboard.stop_requested:
-                continue
-
-            _time.sleep(3)  # Grace period
-            if not dashboard.active:
-                continue
-
-            _perform_emergency_shutdown()
-
-    stop_thread = threading.Thread(target=_stop_monitor_thread, daemon=True)
-    stop_thread.start()
-    return stop_thread
-
-
-def _perform_emergency_shutdown():
-    """Perform emergency shutdown via SIGKILL."""
-    import os, signal as sig_mod
-    try:
-        os.killpg(os.getpgrp(), sig_mod.SIGKILL)
-    except Exception:
-        os._exit(1)
-
-
-async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Path, url_list: Optional[list] = None, auth_data: Optional[dict] = None):
+async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Path, url_list: Optional[list] = None, auth_data: Optional[dict] = None, custom_headers: Optional[dict] = None, handoff: Optional[dict] = None):
     """Run Hunter (Discovery) phase."""
     # Check for active scan and auto-resume
     resume = await _check_and_resume_scan(target, db, resume)
@@ -666,12 +724,15 @@ async def _run_hunter_phase(target: str, db, resume: bool, common_output_dir: Pa
     orchestrator = TeamOrchestrator(
         target,
         resume=resume,
-        max_depth=settings.MAX_DEPTH,
-        max_urls=settings.MAX_URLS,
+        max_depth=_settings().MAX_DEPTH,
+        max_urls=_settings().MAX_URLS,
         use_vertical_agents=True,
         output_dir=common_output_dir,
         url_list=url_list,
-        auth=auth_data
+        auth=auth_data,
+        custom_headers=custom_headers,
+        api_handoff=handoff,
+        api_inventory=(__import__("bugtrace.services.handoff_policy", fromlist=["inventory_from_handoff"]).inventory_from_handoff(handoff) if handoff else None),
     )
 
     # Display mode info
@@ -712,9 +773,54 @@ async def _check_and_resume_scan(target: str, db, resume: bool) -> bool:
     return resume
 
 
-async def _run_auditor_phase(target: str, db, scan_id: int, orchestrator, common_output_dir: Path, continuous: bool):
-    """Run Auditor (Validator) phase."""
+async def _run_auditor_phase(target: str, db, scan_id: int, orchestrator, common_output_dir: Path, continuous: bool, custom_headers: Optional[dict] = None):
+    """Run Auditor (Validator) phase.
+
+    `custom_headers` is the per-scan header set from CLI / API. The auditor
+    reuses the browser_manager (Playwright) for XSS / CSTI / SSRF validation;
+    the browser was already primed with these headers in the Hunter phase
+    via recon_ops_flow.set_default_headers(). When the auditor runs STANDALONE
+    (`bugtrace audit --scan-id N`), the Hunter may not have run in this
+    process — so we re-prime the browser here to keep the contract.
+
+    The HTTP orchestrator's TARGET / PROBE clients were also primed during
+    the Hunter phase. The auditor uses ValidationEngine → AgenticValidator
+    which goes through the browser (Playwright), so a single browser-level
+    re-prime is sufficient for the validator surface.
+    """
     from bugtrace.core.validator_engine import ValidationEngine
+    from bugtrace.tools.visual.browser import browser_manager
+
+    # Re-prime the browser with the effective headers (per-scan + auth + global
+    # + captured). Without this, `bugtrace audit --scan-id N` would launch
+    # without the user's --header values and silently lose the override.
+    if orchestrator is not None and hasattr(orchestrator, "get_effective_headers"):
+        try:
+            browser_manager.set_default_headers(orchestrator.get_effective_headers())
+        except Exception:
+            # Best-effort: a stale browser manager in shutdown must not break
+            # the auditor.
+            pass
+    elif custom_headers:
+        # Standalone audit: no orchestrator, but the user passed --header.
+        # Build the minimal effective-headers set: per-scan custom only.
+        # Auth-discovery and captured are unavailable (no browser ran in this
+        # process). Global defaults are loaded by Settings at startup.
+        try:
+            from bugtrace.utils.headers import merge_headers, parse_default_headers_json
+            # Layer 1: global defaults from bugtraceaicli.conf [SCAN]
+            default_layer = {}
+            try:
+                default_layer = parse_default_headers_json(
+                    getattr(_settings(), "DEFAULT_HEADERS_JSON", "") or ""
+                )
+            except Exception:
+                pass  # malformed .conf already raised at Settings init
+            # Layer 2: per-scan headers (this is all we have in standalone mode)
+            merged = merge_headers(default_layer, custom_headers)
+            browser_manager.set_default_headers(merged)
+        except Exception:
+            pass  # best-effort — stale browser manager or env error
 
     sid = scan_id or (orchestrator.scan_id if orchestrator else None)
 
@@ -744,7 +850,7 @@ def _run_focused_mode(target: str, xss: bool = False, sqli: bool = False, lfi: b
 
     # Run agent with dashboard
     try:
-        result = _run_focused_agent_with_dashboard(target, params, report_dir, xss, sqli, jwt, lfi, idor, ssrf)
+        result = _run_focused_agent_headless(target, params, report_dir, xss, sqli, jwt, lfi, idor, ssrf)
         _display_focused_results(target, result, params, report_dir)
     except KeyboardInterrupt:
         console.print("\n[yellow]Test aborted by user.[/yellow]")
@@ -770,7 +876,7 @@ def _setup_focused_mode(target: str, param: str, xss: bool, sqli: bool, jwt: boo
     # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     mode_name = "xss" if xss else ("sqli" if sqli else ("jwt" if jwt else ("lfi" if lfi else ("idor" if idor else "ssrf"))))
-    report_dir = Path(settings.REPORT_DIR) / f"focused_{mode_name}_{timestamp}"
+    report_dir = Path(_settings().REPORT_DIR) / f"focused_{mode_name}_{timestamp}"
     report_dir.mkdir(parents=True, exist_ok=True)
     console.print(f"[bold green]Output:[/bold green] {report_dir}")
     console.print("")
@@ -797,30 +903,14 @@ def _parse_focused_params(target: str, param: str):
     return params
 
 
-def _run_focused_agent_with_dashboard(target: str, params, report_dir: Path, xss: bool, sqli: bool, jwt: bool, lfi: bool, idor: bool, ssrf: bool):
-    """Run the focused agent with dashboard UI."""
+def _run_focused_agent_headless(target: str, params, report_dir: Path, xss: bool, sqli: bool, jwt: bool, lfi: bool, idor: bool, ssrf: bool):
+    """Run a focused agent without starting a terminal renderer or listener."""
     from bugtrace.core.ui import dashboard
-    from rich.live import Live
 
     dashboard.reset()
-    dashboard.start_keyboard_listener()
-
-    result = None
-    try:
-        with Live(dashboard, refresh_per_second=4, screen=True):
-            dashboard.active = True
-            dashboard.set_status("Running", "Initializing focused agent...")
-            result = asyncio.run(_execute_focused_agent(target, params, report_dir, xss, sqli, jwt, lfi, idor, ssrf))
-            dashboard.active = False
-
-            if dashboard.stop_requested:
-                _handle_emergency_stop()
-    finally:
-        # ALWAYS ensure keyboard listener restores terminal settings
-        dashboard.active = False
-        dashboard.stop_keyboard_listener()
-
-    return result
+    dashboard.set_target(target)
+    dashboard.set_status("Running", "Initializing focused agent...")
+    return asyncio.run(_execute_focused_agent(target, params, report_dir, xss, sqli, jwt, lfi, idor, ssrf))
 
 
 def _execute_focused_agent(target: str, params, report_dir: Path, xss: bool, sqli: bool, jwt: bool, lfi: bool, idor: bool, ssrf: bool):
@@ -828,7 +918,7 @@ def _execute_focused_agent(target: str, params, report_dir: Path, xss: bool, sql
     from bugtrace.core.ui import dashboard
 
     async def run_agent():
-        dashboard.current_phase = "FOCUSED_TEST"
+        dashboard.set_phase("FOCUSED_TEST")
         return await _select_and_run_agent(target, params, report_dir, xss, sqli, jwt, lfi, idor, ssrf)
 
     return run_agent()
@@ -914,18 +1004,6 @@ async def _run_ssrf_agent(target: str, params, report_dir: Path):
     return await agent.run_loop()
 
 
-def _handle_emergency_stop():
-    """Handle emergency stop request."""
-    console.print("\n[bold red]🛑 Emergency stop requested. Cleaning up and exiting...[/bold red]")
-    import os
-    import signal
-    try:
-        os.killpg(os.getpgrp(), signal.SIGKILL)
-    except Exception:
-        import sys
-        sys.exit(1)
-
-
 def _display_focused_results(target: str, result: dict, params, report_dir: Path):
     """Display results from focused mode testing."""
     findings = result.get("findings", [])
@@ -967,4 +1045,3 @@ def _display_focused_results(target: str, result: dict, params, report_dir: Path
 
 if __name__ == "__main__":
     app()
-

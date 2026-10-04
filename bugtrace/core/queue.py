@@ -595,12 +595,10 @@ class QueueManager:
 
 
 # Pre-defined specialist names
-SPECIALIST_QUEUES = [
-    "xss", "sqli", "csti", "lfi", "idor", "rce",
-    "ssrf", "xxe", "jwt", "openredirect", "prototype_pollution",
-    "file_upload", "chain_discovery", "api_security", "header_injection",
-    "mass_assignment"
-]
+# Canonical names live in queue_policy (pure); list copy for callers expecting a list.
+from bugtrace.core.queue_policy import SPECIALIST_QUEUE_NAMES as _SPECIALIST_QUEUE_NAMES
+
+SPECIALIST_QUEUES = list(_SPECIALIST_QUEUE_NAMES)
 
 
 # Singleton instance

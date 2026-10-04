@@ -7,34 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [3.7.30-beta] - 2026-09-29
-
-### Fixed
-
-- Docker installs now keep `CLI_PORT` and `MCP_PORT` consistent between
-  `.env`, Compose, health checks, and the MCP service, including fresh installs
-  and existing Launcher-managed deployments.
-- Database timestamps are stored and returned as timezone-aware UTC values,
-  allowing the first target insert and subsequent scan state updates to work
-  with SQLModel's timezone validation.
-
-### Documentation
-
-- Clarified the Launcher versus standalone CLI installation paths and MCP
-  assistant setup.
-
-## [3.7.28-beta] - 2026-09-22
-
-### Changed
-
-- Launcher-selected CLI and MCP ports now drive container listeners, Compose
-  bindings, health checks and the WEB proxy path.
-- Added shared-network integration for standalone BugTraceAI-API and WEB
-  deployments.
+## [4.0.16-beta] - 2026-10-04
 
 ### Added
+- Target authentication setup in the TUI via Auth, F8 and `/auth`: a masked Bearer token or WEB-compatible login YAML with optional TOTP/2FA.
+- Validate login files without blocking the UI; keep credentials in the session and deliver them to the isolated scanner through its existing input channel.
+- Preserve authentication supplied through CLI options until explicitly changed, retain unrelated custom headers and wrap setup controls on compact terminals.
 
-- Public release documentation for the integrated ModelLab and API handoff.
+## [4.0.15-beta] - 2026-10-04
+
+### Fixed
+- Bound Docker health requests and fail installation when the API never becomes healthy instead of reporting success.
+- Bind the Docker API listener to the selected CLI_PORT, matching its published port and health check.
+- Keep the installer in its checkout if optional Go fuzzer compilation fails; report the failure accurately and skip Linux-only Playwright dependencies on macOS.
+- Persist completed installation choices before optional global command registration, so failed registration can be retried.
+- Forward TERM when launching a standalone Docker TUI and reject invalid saved interface values.
+
+## [4.0.14-beta] - 2026-10-04
+
+### Added
+- Optional user-global `btai` command on macOS/Linux, opening the selected local or Docker TUI from any directory.
+- Persist global registration for updates; configure Bash/Zsh PATH without sudo and preserve unrelated existing commands.
+
+## [4.0.13-beta] - 2026-10-04
+
+### Changed
+- Choose TUI, API/MCP or both independently from local/Docker installation. Store choices for `--reuse` updates and repairs.
+- Split optional interface dependencies and Docker build profiles. TUI-only Docker runs interactively without API/MCP services or exposed ports.
+- Prefer the installer's local environment when saved installation choices exist; retain text scans without Textual.
+
+## [4.0.12-beta] - 2026-10-04
+
+### Changed
+- Match WEB stage labels everywhere in the TUI: Recon, Discovery, Strategy, Exploit, Validate and Report. Wrap phase cards into two rows on narrow terminals to retain full names.
+- Install local dependencies from pyproject.toml, verify the TUI import, and present the real terminal workspace as the primary local entry point.
+- Let new installations open the TUI without placeholder API keys; explain Provider/F7 setup, full scans, offline preview and separate server use.
+
+## [4.0.11-beta] - 2026-10-04
+
+### Fixed
+- Use the official BugTraceAI capitalization in the TUI brand header, preserving its white/coral styling.
+
+## [4.0.10-beta] - 2026-10-04
+
+### Added
+- Provider setup from the top scan form, F7 or `/provider`, using the same presets as the web API. Mask API key entry, preserve configured keys, and optionally save a replacement in local `.env`.
+- Deliver session keys through the scanner environment and apply the selected preset before initializing the scan engine. Lock provider changes during scans.
+
+### Changed
+- Restore the phase summary above every tab, including Pipeline.
+
+## [4.0.9-beta] - 2026-10-03
+
+### Fixed
+- Reserve URL entry for the top scan form. The compact lower bar accepts slash commands only; `/start` uses the configured target and rejects URL arguments.
+- Show F1 help in a dedicated scrollable guide, preserving the current tab and keeping instructions out of engine logs.
+- Show resume and stopping hints that match the current scan state.
+
+## [4.0.8-beta] - 2026-10-03
+
+### Changed
+- Organize the TUI into Pipeline, Findings, Agents, Timeline and Logs, with matching F2–F6 shortcuts and clear view descriptions.
+- Move specialist cards into Agents and fold detailed counters and runtime metrics into expandable sections.
+- Keep Timeline focused on milestones and compact evidence links; reserve full vulnerability details for Findings.
+- Remove the duplicate phase summary from Pipeline while retaining scan context in other tabs.
+
+## [4.0.7-beta] - 2026-10-03
+
+### Changed
+- Back up the full active refactor checkout, including pending UTC-aware database timestamp handling and Docker installer port configuration.
+
+## [4.0.6-beta] - 2026-10-03
+
+### Fixed
+- Ignore queued input-change events after the workspace has unmounted, preventing an exception when typing and closing the TUI immediately.
+
+## [4.0.5-beta] - 2026-10-03
+
+### Changed
+- Remove the TUI Mode selector and `/mode` command: the workspace always runs Full, with target, Depth and Max URLs as its scan settings.
+- Keep explicit partial and focused CLI commands on their original text execution paths so they retain their requested scope.
+
+## [4.0.4-beta] - 2026-10-03
+
+### Changed
+- Move target, scan mode and start/pause/stop controls into a fixed panel above the pipeline, following the web scan form.
+- Add editable Depth (1–10) and Max URLs (1–5000), initialized from CLI configuration and passed to the real scan orchestrator. Validate limits before launch, lock controls during a scan, and disable crawl settings for audit and focused modes.
+- Preserve keyboard navigation and the pipeline workspace at 120×40, 80×24 and 60×24 terminal sizes.
+
+## [4.0.3-beta] - 2026-10-03
+
+### Changed
+- Port the purple/coral Textual workspace to the active 4.x refactor. Bare interactive startup and `scan`, `full`, and `audit` now share its visual pipeline and real engine integration.
+- Run scans in an owned subprocess with bounded telemetry updates, selectable phases and specialists, evidence browsing, export, and pause/stop controls. Preserve handoff operation inventory, custom headers, YAML authentication, and scan options.
+- Remove the old Rich terminal renderer, keyboard threads, blocking HITL menu, and renderer-specific signal handlers. Keep a passive telemetry compatibility model for agents and ordinary text output for redirected commands.
+- Anchor the CLI launcher to its checkout, include Textual styles in the wheel, and report missing provider credentials inside the workspace before launching a scan.
 
 ## [3.7.12-beta] - 2026-07-24
 

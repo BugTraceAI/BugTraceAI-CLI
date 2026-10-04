@@ -53,11 +53,13 @@ class PipelineProgress(Message):
         phase: str,
         progress: float,
         status_msg: str = "",
+        observed_at: float | None = None,
     ) -> None:
         super().__init__()
         self.phase = phase
         self.progress = progress
         self.status_msg = status_msg
+        self.observed_at = observed_at
 
 
 class NewFinding(Message):

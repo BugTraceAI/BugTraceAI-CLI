@@ -29,8 +29,20 @@ class BrowserManager:
             self._context: Optional[BrowserContext] = None
             self._lock = asyncio.Lock()
             self._initialized = True
+            # Scan-level default headers applied to every ephemeral context.
+            # Set by the Team orchestrator right after auth so XSS/CSTI/SSRF
+            # validations replay the same contract the recon phase used.
+            self._default_extra_headers: Optional[Dict[str, str]] = None
             # REMOVED: Signal handlers here conflict with FastAPI/Worker loops
             # Cleanup is handled by orchestrator/API lifecycle
+
+    def set_default_headers(self, headers: Optional[Dict[str, str]]) -> None:
+        """Apply scan-level default headers to every NEW page context.
+
+        Existing contexts keep their old header set (Playwright immutability).
+        Call once after auth discovery, before any XSS / CSTI / SSRF validation.
+        """
+        self._default_extra_headers = dict(headers) if headers else None
 
     async def _kill_orphans(self):
         """Kill zombie chrome/chromium processes launched by Playwright only."""
@@ -101,11 +113,16 @@ class BrowserManager:
             logger.info("Browser stopped.")
 
     @asynccontextmanager
-    async def get_page(self, use_auth: bool = False) -> Page:
+    async def get_page(self, use_auth: bool = False, extra_headers: Optional[Dict[str, str]] = None) -> Page:
         """
-        Context manager to get a page. 
+        Context manager to get a page.
         If use_auth is True, attempts to use the shared authenticated context.
         Otherwise creates a fresh ephemeral context.
+
+        extra_headers are merged with the manager-level defaults (set via
+        set_default_headers) and applied to the returned page via
+        Playwright's BrowserContext.extra_http_headers. The per-call argument
+        wins over the manager-level defaults.
         """
         # Ensure browser is running
         if not self._browser or not self._browser.is_connected():
@@ -114,7 +131,14 @@ class BrowserManager:
         # Decide on context
         local_context = None
         page = None
-        
+
+        # Merge manager-level defaults with the per-call override. Per-call wins.
+        effective_headers: Dict[str, str] = {}
+        if self._default_extra_headers:
+            effective_headers.update(self._default_extra_headers)
+        if extra_headers:
+            effective_headers.update(extra_headers)
+
         try:
             if use_auth and self._context:
                 # Use shared context
@@ -123,21 +147,25 @@ class BrowserManager:
             else:
                 # Create ephemeral context
                 from bugtrace.core.config import settings
-                
+
                 # Check config
                 vp_width = settings.VIEWPORT_WIDTH
                 vp_height = settings.VIEWPORT_HEIGHT
                 ua = settings.USER_AGENT
-                
-                local_context = await self._browser.new_context(
-                    viewport={'width': vp_width, 'height': vp_height},
-                    user_agent=ua,
-                    ignore_https_errors=True  # Accept self-signed certs
-                )
+
+                context_options: Dict[str, Any] = {
+                    "viewport": {"width": vp_width, "height": vp_height},
+                    "user_agent": ua,
+                    "ignore_https_errors": True,  # Accept self-signed certs
+                }
+                if effective_headers:
+                    context_options["extra_http_headers"] = effective_headers
+
+                local_context = await self._browser.new_context(**context_options)
                 page = await local_context.new_page()
-            
+
             yield page
-            
+
         finally:
             if page:
                 await page.close()

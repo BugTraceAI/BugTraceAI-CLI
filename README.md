@@ -3,8 +3,8 @@
 [![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white)](https://bugtraceai.com)
 [![Wiki Documentation](https://img.shields.io/badge/Wiki%20Documentation-000?logo=wikipedia&logoColor=white)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
-![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)
-![Version](https://img.shields.io/badge/Version-3.7.30--beta-orange)
+![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)
+![Version](https://img.shields.io/badge/Version-4.0.16--beta-orange)
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Required-blue?logo=docker)
@@ -21,7 +21,6 @@
 - [🏗️ Architecture](#️-architecture)
 - [🛠️ Technology Stack](#️-technology-stack)
 - [🚀 Getting Started](#-getting-started)
-- [🧭 Choose an installation path](#-choose-an-installation-path)
 - [🤖 AI Assistant Setup (MCP)](#-ai-assistant-setup-mcp)
 - [⚙️ Configuration](#️-configuration)
 - [📊 Output](#-output)
@@ -35,7 +34,40 @@ BugTraceAI-CLI is an autonomous offensive security framework that combines LLM-d
 
 The core philosophy is **"Think like a pentester, execute like a machine, validate like an auditor"** - using AI for intelligent hypothesis generation, but relying on real tools for exploitation and validation.
 
-## What's New in v3.7.12-beta
+## Terminal workspace (v4.0.16-beta)
+
+Launch the interactive workspace from this checkout:
+
+```bash
+./bugtraceai-cli
+```
+
+Enter your target in the top panel, choose **Depth** (1–10) and **Max URLs**
+(1–5000), then press **Start**. Defaults come from your CLI configuration. You
+can also open a complete scan directly. The TUI always runs the full pipeline:
+
+```bash
+./bugtraceai-cli full https://target.example
+```
+
+The real scanner uses the same purple/coral pipeline view as the preview, with
+five focused tabs: **Pipeline → Findings → Agents → Timeline → Logs**.
+Inspect six stages and their timings, browse evidence, follow specialist queues,
+review scan milestones, or search engine logs. Runtime details expand inside
+Agents; pause/stop controls remain available above. Use **Provider** (F7) to select a provider and enter a masked API key before
+starting a real scan. Keys stay in the session unless you select Save in .env.
+Use **Auth** (F8 or `/auth`) for the target website: paste a masked **Bearer token**
+or load a **login YAML** using the WEB/CLI schema, including optional TOTP/2FA.
+Apply validates and loads a snapshot for subsequent scans in this TUI session;
+credentials are not saved by the TUI. Reapply the YAML to reload edits. Selecting
+None removes supplied Authorization/Cookie headers and login settings while
+keeping other custom headers. Authentication is editable before a scan or after
+it ends. In Docker, the YAML path must be accessible inside the container.
+`./bugtraceai-cli tui --demo` is the optional offline
+preview with sample data. Redirected commands continue to produce ordinary text.
+See [installation and terminal controls](INSTALLATION.md).
+
+## Engine highlights
 
 - **Anthropic direct-API provider**: Anthropic is now a first-class LLM provider using an API key (`x-api-key`, Messages API), selectable via the `anthropic` preset. A new `api_format` preset field decouples the wire format from the OAuth path, so `generate`, threaded generation, vision, and connectivity all route to the Anthropic Messages API when active. Existing OpenRouter/Z.ai behaviour is unchanged.
 - **Integrated Model Lab (model-eval)**: benchmark and compare OpenRouter models from BugTraceAI-WEB through the CLI API (`/api/model-eval`, `/api/model-eval/models`, `/api/model-eval/test-key`) with a per-request OpenRouter key, live WebSocket progress, cost visibility, and a key-validation check before a run. The recalibration adds a quality-dominant composite (median latency as a side axis), per-slot leaderboards (MUTATION / SKEPTICAL / ANALYSIS / REPORTING), the `quick-v3` / `advanced-v2` suites, and an opt-in MUTATION payload-diversity probe.
@@ -244,20 +276,9 @@ Each phase runs with independent concurrency:
 
 - **For Docker**: Docker & Docker Compose
 - **For Local**: Python 3.10+, Docker (for some agents), nmap (optional)
-- An LLM provider API key (OpenRouter is the default; see [custom provider presets](docs/CUSTOM_PROVIDERS.md) for compatible APIs and local models)
+- OpenRouter API key ([get one here](https://openrouter.ai/keys))
 
-### 🧭 Choose an installation path
-
-Choose one path for each installation:
-
-| Path | Choose it when | Start here |
-|------|----------------|------------|
-| **Launcher (recommended for most users)** | You want the WEB dashboard, automatic service wiring, port allocation, and guided setup | [BugTraceAI-Launcher](https://github.com/BugTraceAI/BugTraceAI-Launcher) |
-| **CLI standalone** | You only want the scanner API/CLI and its MCP server | This repository and `./install.sh` |
-
-Both paths can coexist in separate directories and on separate ports. An AI assistant connects after deployment; it does not replace the deployment step.
-
-### 🎯 Quick Installation — CLI standalone
+### 🎯 Quick Installation (Recommended)
 
 Use the **interactive installation wizard** for automatic setup:
 
@@ -273,23 +294,25 @@ cd BugTraceAI-CLI
 The wizard will:
 
 - ✅ Check system requirements automatically
-- 🔍 Preserve configured ports and find free ports for a new Docker installation
+- 🔍 Detect and use free ports for Docker (no conflicts!)
 - ⚙️ Set up environment configuration
 - 🐳 Build and start Docker containers OR configure local Python environment
 - 🎨 Provide beautiful, interactive terminal UI
 
-**Installation Options:**
+**Installation choices:**
 
-1. **Local Installation** - Python virtual environment (best for development)
-2. **Docker Installation** - Containerized deployment (best for production)
+First choose **TUI**, **API + MCP**, or **both**. Then choose **local Python** or **Docker**. The engine is shared; Textual is installed for TUI, FastAPI/Uvicorn/WebSockets/MCP for API. Docker TUI builds an interactive scanner container without starting a server or publishing ports.
 
-### Custom and local LLM providers
+```bash
+./install.sh --interface tui --runtime local
+./install.sh --interface api --runtime docker
+./install.sh --interface both --runtime docker
+./install.sh --reuse  # update/repair using the saved selection
+```
 
-OpenRouter is the default provider. To use an OpenAI-compatible API or a local
-model server instead, add a provider preset and select it in the CLI
-configuration. See [Custom and Local LLM Provider Presets](docs/CUSTOM_PROVIDERS.md).
-This configures the scanner's LLM; it is separate from connecting Codex, Claude
-Code, Cursor, or another assistant to the MCP endpoint.
+Choices are stored in `.bugtrace-install.env`, without API keys. Existing environments retain previously installed packages; changing profiles does not remove them automatically.
+
+Start local TUI with `./bugtraceai-cli tui`, local API with `./bugtraceai-cli serve`, Docker TUI with `docker compose -f docker-compose.tui.yml run --rm scanner`, or TUI in a combined deployment with `docker compose exec api python3 -m bugtrace tui`.
 
 ### 📖 Manual Installation
 
@@ -304,14 +327,14 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
-pip install -r requirements.txt
+pip install -e ".[tui]"  # use .[api] or .[tui,api] for server support
 
 # Install browser
 playwright install chromium
 
 # Configure environment
 cp .env.example .env
-# Edit .env and add the API key for your active provider (OPENROUTER_API_KEY by default)
+# Edit .env and add your OPENROUTER_API_KEY
 ```
 
 #### Docker Installation
@@ -319,13 +342,13 @@ cp .env.example .env
 ```bash
 # Configure environment
 cp .env.example .env
-# Edit .env and add the API key for your active provider (OPENROUTER_API_KEY by default)
+# Edit .env and add your OPENROUTER_API_KEY
 
 # Build and start
-docker compose up -d
+docker-compose up -d
 
 # View logs
-docker compose logs -f
+docker-compose logs -f
 ```
 
 </details>
@@ -355,19 +378,18 @@ docker compose logs -f
 **Docker Users:**
 
 ```bash
-# Read the actual ports selected for this installation
-grep -E '^(CLI_PORT|MCP_PORT)=' .env
+# API is already running at http://localhost:8000
+# (or whatever port was auto-selected during installation)
 
-# Defaults are API 8000 and MCP 8001
+# Execute scans via API or Web UI
 curl http://localhost:8000/health
-curl http://localhost:8001/sse
 ```
 
 ## 🤖 AI Assistant Setup (MCP)
 
 BugTraceAI is **MCP-compatible** — control your security scans directly from your AI assistant through natural conversation.
 
-Works with **Codex**, [**OpenClaw**](https://openclaw.com), **Claude Code**, **Cursor**, and any MCP-compatible client with MCP/SSE support. Deploy once, then connect the client to its MCP endpoint.
+Works with [**OpenClaw**](https://openclaw.com) (Telegram-based AI assistant), **Claude Code**, **Cursor**, and any MCP-compatible client. Deploy once, control from anywhere.
 
 ### How It Works
 
@@ -375,18 +397,18 @@ BugTraceAI exposes its scanning engine as **MCP tools** via the [Model Context P
 
 ### Quick Setup for AI Agents
 
-> **Using an AI assistant? Tell it which deployment path you want:**
+> **Using OpenClaw or another AI assistant? Just tell it:**
 >
-> _For the full platform, clone https://github.com/BugTraceAI/BugTraceAI-Launcher and run `./launcher.sh`. For scanner-only use, clone this repository, run `./install.sh`, choose Docker, configure the active provider key (OpenRouter by default), and report the `MCP_PORT` written to `.env`._
+> _Clone https://github.com/BugTraceAI/BugTraceAI-CLI and deploy it with Docker. Copy `.env.example` to `.env` and ask me for the `OPENROUTER_API_KEY`. Run `docker compose up -d` to start both the API and MCP server. Then add the MCP server to your config with base URL `http://localhost:8001/sse`._
 
 ### Manual MCP Setup
 
 ```bash
-# 1. Clone and configure the standalone CLI
+# 1. Clone and configure
 git clone https://github.com/BugTraceAI/BugTraceAI-CLI
 cd BugTraceAI-CLI
 cp .env.example .env
-# Edit .env → add the API key for your active provider (OpenRouter by default)
+# Edit .env → add your OPENROUTER_API_KEY
 
 # 2. Start services (API + MCP)
 docker compose up -d
@@ -395,8 +417,6 @@ docker compose up -d
 curl -f http://localhost:8000/health   # API health check
 curl -sf http://localhost:8001/sse     # MCP SSE endpoint
 ```
-
-If you installed through the Launcher, use the endpoint reported by `./launcher.sh` rather than running a second installer in its CLI directory.
 
 ### Connect Your AI Assistant
 
@@ -436,8 +456,8 @@ Once connected, your AI assistant can use these tools:
 
 | Service | Port | Description                     |
 | ------- | ---- | ------------------------------- |
-| API     | `CLI_PORT` (default 8000) | REST API + health check |
-| MCP     | `MCP_PORT` (default 8001) | SSE transport for AI assistants |
+| API     | 8000 | REST API + health check         |
+| MCP     | 8001 | SSE transport for AI assistants |
 
 ## ⚙️ Configuration
 
@@ -525,7 +545,7 @@ CANDIDATE → PENDING_VALIDATION → CONFIRMED / FALSE_POSITIVE → PROBE_VALIDA
 
 ## 📜 License
 
-Apache License 2.0
+AGPL-3.0 License
 
 Copyright (c) 2026 BugTraceAI
 
@@ -536,3 +556,16 @@ See [LICENSE](LICENSE) for details.
 Made with ❤️ by Albert C. [@yz9yt](https://x.com/yz9yt)
 
 [bugtraceai.com](https://bugtraceai.com)
+
+### Global terminal command (macOS / Linux)
+
+After choosing TUI or both and local or Docker, the installer asks whether to install **`btai`** for the current user. It creates `~/.local/bin/btai` without sudo and adds that directory to Bash/Zsh's startup PATH if needed. Open a new terminal, then run `btai` from any folder to open the real TUI. `btai --demo` explicitly opens the preview.
+
+The command targets the selected checkout and local/Docker profile. Keep the checkout at that path, or run the installer again after moving it. API-only installs do not offer the TUI command. An unrelated existing `btai` file is preserved.
+
+```bash
+./install.sh --interface tui --runtime local --global yes
+./install.sh --reuse  # also remembers the global command choice
+# Register the command for an already installed profile, without reinstalling:
+./install.sh --interface both --runtime docker --global yes --global-only
+```

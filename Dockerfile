@@ -71,7 +71,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Python dependencies (includes PyTorch CPU, sentence_transformers, FastAPI, etc.)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY scripts/interface_requirements.py /tmp/interface_requirements.py
+ARG BUGTRACE_INTERFACE=both
+RUN python /tmp/interface_requirements.py "$BUGTRACE_INTERFACE" requirements.txt /tmp/runtime-requirements.txt \
+    && pip install --no-cache-dir -r /tmp/runtime-requirements.txt
 
 # SQLMap - native Python SQL injection tool (replaces googlesky/sqlmap Docker image)
 RUN pip install --no-cache-dir sqlmap

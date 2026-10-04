@@ -27,6 +27,50 @@ GEAR="⚙️"
 DOCKER="🐳"
 PYTHON="🐍"
 ENV_FILE_CREATED=false
+INSTALL_INTERFACE=""
+INSTALL_RUNTIME=""
+INSTALL_GLOBAL=""
+INSTALLER_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$INSTALLER_DIR" || exit 1
+source "$INSTALLER_DIR/scripts/install_global_command.sh"
+
+# Persist only installation choices, never API keys. Read values without sourcing shell code.
+load_install_choices() {
+    [[ -f .bugtrace-install.env ]] || return 0
+    INSTALL_INTERFACE=$(awk -F= '$1=="INTERFACE" {print $2}' .bugtrace-install.env)
+    INSTALL_RUNTIME=$(awk -F= '$1=="RUNTIME" {print $2}' .bugtrace-install.env)
+    INSTALL_GLOBAL=$(awk -F= '$1=="GLOBAL" {print $2}' .bugtrace-install.env)
+    case "$INSTALL_GLOBAL" in yes|no) ;; *) INSTALL_GLOBAL=no ;; esac
+    case "$INSTALL_INTERFACE" in tui|api|both) ;; *) INSTALL_INTERFACE="" ;; esac
+    case "$INSTALL_RUNTIME" in local|docker) ;; *) INSTALL_RUNTIME="" ;; esac
+}
+
+save_install_choices() {
+    printf 'INTERFACE=%s\nRUNTIME=%s\nGLOBAL=%s\n' "$INSTALL_INTERFACE" "$INSTALL_RUNTIME" "$INSTALL_GLOBAL" > .bugtrace-install.env
+    chmod 600 .bugtrace-install.env
+}
+
+install_extras() {
+    case "$INSTALL_INTERFACE" in
+        tui) printf '.[tui]' ;; api) printf '.[api]' ;; both) printf '.[tui,api]' ;;
+        *) return 1 ;;
+    esac
+}
+
+show_launch_commands() {
+    print_info "Installed: $INSTALL_INTERFACE / $INSTALL_RUNTIME"
+    if [[ "$INSTALL_RUNTIME" == local ]]; then
+        [[ "$INSTALL_INTERFACE" == api ]] || print_info "TUI: ./bugtraceai-cli tui (Provider/F7 configures the key)"
+        [[ "$INSTALL_INTERFACE" == tui ]] || print_info "API: ./bugtraceai-cli serve --port 8000"
+    elif [[ "$INSTALL_INTERFACE" == tui ]]; then
+        print_info "TUI: $COMPOSE_CMD -f docker-compose.tui.yml run --rm scanner"
+        print_info "No API server or exposed ports are started."
+    else
+        print_info "API: http://localhost:$(read_env_value CLI_PORT)"
+        [[ "$INSTALL_INTERFACE" == api ]] || print_info "TUI: $COMPOSE_CMD exec api python3 -m bugtrace tui"
+    fi
+    print_info "Update/repair the same selection: ./install.sh --reuse"
+}
 
 # ============================================================
 # Helper Functions
@@ -64,6 +108,32 @@ print_info() {
     echo -e "${CYAN}${ARROW} $1${NC}"
 }
 
+read_env_value() {
+    local key=$1
+    [ -f .env ] || return 0
+    grep -E "^${key}=" .env 2>/dev/null | tail -n 1 | cut -d= -f2-
+}
+
+sed_inplace() {
+    if sed --version &>/dev/null 2>&1; then
+        sed -i "$@"
+    else
+        sed -i '' "$@"
+    fi
+}
+
+set_env_value() {
+    local key=$1 value=$2
+    if grep -qE "^${key}=" .env 2>/dev/null; then
+        sed_inplace "s|^${key}=.*|${key}=${value}|" .env
+    else
+        if [ -s .env ] && [ -n "$(tail -c 1 .env)" ]; then
+            echo "" >> .env
+        fi
+        echo "${key}=${value}" >> .env
+    fi
+}
+
 # ============================================================
 # Port Management Functions
 # ============================================================
@@ -87,8 +157,8 @@ find_free_port() {
     local max_attempts=100
     local port=$start_port
     
-    # This function is used in command substitution; progress must not be
-    # captured together with the numeric port.
+    # This function is commonly used in command substitution; keep progress
+    # messages off stdout so callers receive only the numeric port.
     print_step "Searching for available port starting from $start_port..." >&2
     
     for ((i=0; i<max_attempts; i++)); do
@@ -99,7 +169,7 @@ find_free_port() {
         port=$((port + 1))
     done
     
-    print_error "Could not find a free port after $max_attempts attempts" >&2
+    print_error "Could not find a free port after $max_attempts attempts"
     return 1
 }
 
@@ -117,27 +187,12 @@ find_free_port_avoiding() {
         port=$((port + 1))
     done
 
-    print_error "Could not find a free port after $max_attempts attempts" >&2
+    print_error "Could not find a free port after $max_attempts attempts"
     return 1
 }
 
 is_valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
-}
-
-read_env_value() {
-    local key=$1
-    [ -f .env ] || return 0
-    grep -E "^${key}=" .env 2>/dev/null | tail -n 1 | cut -d= -f2-
-}
-
-set_env_value() {
-    local key=$1 value=$2
-    if grep -qE "^${key}=" .env 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${value}|" .env
-    else
-        printf '\n%s=%s\n' "$key" "$value" >> .env
-    fi
 }
 
 # ============================================================
@@ -247,19 +302,17 @@ setup_env_file() {
             print_warning ".env.example not found, creating basic .env"
             cat > .env << 'EOF'
 # BugTraceAI Environment Configuration
-OPENROUTER_API_KEY=your-openrouter-api-key-here
+# Configure a key through Provider (F7) in the TUI.
+# OPENROUTER_API_KEY=your-openrouter-api-key-here
 BUGTRACE_CORS_ORIGINS=http://localhost:3000,http://localhost:5173,http://localhost:6869
 EOF
             ENV_FILE_CREATED=true
         fi
         
         echo ""
-        print_warning "IMPORTANT: You need to configure your .env file!"
-        print_info "Please edit .env and add your OPENROUTER_API_KEY"
-        print_info "Get your API key from: https://openrouter.ai/keys"
+        print_info "Local TUI: configure your provider and API key with Provider (F7)."
+        print_info "Server/Docker: configure the provider and a real API key in .env before scanning."
         echo ""
-        
-        read -p "$(echo -e ${YELLOW}Press Enter to continue after configuring .env...${NC})"
     else
         print_info ".env file already exists"
     fi
@@ -308,21 +361,33 @@ install_local() {
     echo ""
     print_step "Installing Python dependencies..."
     print_info "This may take several minutes (includes PyTorch CPU and other ML libraries)..."
-    pip install -r requirements.txt
-    print_success "Dependencies installed"
-    
+    pip install -e "$(install_extras)"
+    chmod +x bugtraceai-cli
+    if [[ "$INSTALL_INTERFACE" != api ]]; then
+        python3 -c "from bugtrace.core.ui.tui import BugTraceApp; print('TUI dependencies ready')"
+    fi
+    if [[ "$INSTALL_INTERFACE" != tui ]]; then
+        python3 -c "import fastapi, uvicorn, mcp; print('API/MCP dependencies ready')"
+    fi
+    print_success "Engine and selected interface dependencies installed"
+
     echo ""
     print_step "Installing Playwright browsers..."
     playwright install chromium
-    playwright install-deps chromium
+    if [[ "$(uname -s)" == Linux ]]; then
+        playwright install-deps chromium
+    fi
     print_success "Playwright Chromium installed"
     
     echo ""
     print_step "Building Go fuzzers..."
     if [ -f tools/build_fuzzers.sh ]; then
         chmod +x tools/build_fuzzers.sh
-        cd tools && bash build_fuzzers.sh && cd ..
-        print_success "Go fuzzers built successfully"
+        if command -v go >/dev/null 2>&1 && (cd tools && bash build_fuzzers.sh); then
+            print_success "Go fuzzers built successfully"
+        else
+            print_warning "Go fuzzers were not prebuilt. Install Go to enable on-demand compilation."
+        fi
     else
         print_warning "Go fuzzers build script not found (optional)"
     fi
@@ -340,13 +405,8 @@ install_local() {
     echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     
-    print_info "To start BugTraceAI:"
-    echo -e "  ${CYAN}source .venv/bin/activate${NC}"
-    echo -e "  ${CYAN}./bugtraceai-cli serve --port 8000${NC}"
-    echo ""
-    print_info "Or use the CLI directly:"
-    echo -e "  ${CYAN}./bugtraceai-cli scan <target-url>${NC}"
-    echo ""
+    show_launch_commands
+
 }
 
 # ============================================================
@@ -369,6 +429,16 @@ install_docker() {
     echo ""
     setup_env_file
     
+    # A terminal-only image is built on demand and has no listening services.
+    if [[ "$INSTALL_INTERFACE" == tui ]]; then
+        if docker compose version &>/dev/null; then COMPOSE_CMD="docker compose"; else COMPOSE_CMD="docker-compose"; fi
+        $COMPOSE_CMD -f docker-compose.tui.yml config -q
+        $COMPOSE_CMD -f docker-compose.tui.yml build
+        show_launch_commands
+        return
+    fi
+    set_env_value BUGTRACE_INTERFACE "$INSTALL_INTERFACE"
+
     # Port configuration
     echo ""
     print_step "Configuring network ports..."
@@ -377,47 +447,43 @@ install_docker() {
     local default_mcp_port=8001
     local selected_cli_port=$default_cli_port
     local selected_mcp_port=$default_mcp_port
-    local existing_cli_port existing_mcp_port
+    local existing_cli_port existing_mcp_port preserve_existing_ports=false
 
     existing_cli_port=$(read_env_value CLI_PORT || true)
     existing_mcp_port=$(read_env_value MCP_PORT || true)
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -Eq '^(bugtrace_api|bugtrace_mcp)$'; then
+        preserve_existing_ports=true
+    fi
 
-    # An existing .env may be owned by a Launcher deployment. Preserve its
-    # explicit ports; a newly-created .env can safely choose free defaults.
-    if is_valid_port "$existing_cli_port" && [ "$ENV_FILE_CREATED" = false ]; then
+    if is_valid_port "$existing_cli_port" && {
+        [ "$ENV_FILE_CREATED" = false ] || [ "$preserve_existing_ports" = true ];
+    }; then
         selected_cli_port=$existing_cli_port
-        print_info "Preserving configured CLI port: $selected_cli_port"
     elif is_port_in_use "$default_cli_port"; then
-        print_warning "Default CLI port $default_cli_port is already in use"
         selected_cli_port=$(find_free_port "$default_cli_port")
     fi
 
-    if is_valid_port "$existing_mcp_port" && [ "$ENV_FILE_CREATED" = false ]; then
+    if is_valid_port "$existing_mcp_port" && {
+        [ "$ENV_FILE_CREATED" = false ] || [ "$preserve_existing_ports" = true ];
+    }; then
         selected_mcp_port=$existing_mcp_port
-        print_info "Preserving configured MCP port: $selected_mcp_port"
     elif is_port_in_use "$default_mcp_port"; then
-        print_warning "Default MCP port $default_mcp_port is already in use"
         selected_mcp_port=$(find_free_port "$default_mcp_port")
     fi
 
     if [ "$selected_cli_port" = "$selected_mcp_port" ]; then
-        print_warning "CLI and MCP ports collide; selecting another MCP port"
         selected_mcp_port=$(find_free_port_avoiding "$((selected_mcp_port + 1))" "$selected_cli_port")
-    fi
-
-    if ! is_valid_port "$selected_cli_port" || ! is_valid_port "$selected_mcp_port"; then
-        print_error "Could not determine valid CLI and MCP ports"
-        exit 1
     fi
 
     echo ""
     print_info "Using CLI port: $selected_cli_port, MCP port: $selected_mcp_port"
-    print_step "Writing port configuration to .env..."
     set_env_value CLI_PORT "$selected_cli_port"
     set_env_value MCP_PORT "$selected_mcp_port"
-    print_success "Port configuration written to .env"
-
+    
     echo ""
+    print_step "Building Docker image..."
+    print_info "This may take 5-10 minutes on first build..."
+    
     # Prefer docker compose (V2) over docker-compose (V1) - V1 has Python 3.12 issues
     if docker compose version &> /dev/null; then
         COMPOSE_CMD="docker compose"
@@ -427,18 +493,12 @@ install_docker() {
         print_error "Docker Compose not available"
         exit 1
     fi
-
-    print_step "Validating Docker Compose configuration..."
-    if ! $COMPOSE_CMD config -q &> /dev/null; then
-        print_error "Docker Compose configuration is invalid"
+    
+    if ! $COMPOSE_CMD config -q &>/dev/null; then
+        print_error "Docker compose configuration is invalid"
         $COMPOSE_CMD config
         exit 1
     fi
-    print_success "Docker Compose configuration is valid"
-
-    echo ""
-    print_step "Building Docker image..."
-    print_info "This may take 5-10 minutes on first build..."
     $COMPOSE_CMD build
     print_success "Docker image built successfully"
     
@@ -453,7 +513,7 @@ install_docker() {
     local waited=0
     
     while [ $waited -lt $max_wait ]; do
-        if curl -sf "http://localhost:$selected_cli_port/health" > /dev/null 2>&1; then
+        if curl -sf --max-time 2 "http://localhost:$selected_cli_port/health" > /dev/null 2>&1; then
             print_success "API is ready!"
             break
         fi
@@ -464,8 +524,9 @@ install_docker() {
     echo ""
     
     if [ $waited -ge $max_wait ]; then
-        print_warning "API health check timeout, but container may still be starting..."
+        print_error "API health check timed out; installation could not be verified."
         print_info "Check logs with: $COMPOSE_CMD logs -f"
+        return 1
     fi
     
     echo ""
@@ -479,15 +540,13 @@ install_docker() {
     print_info "BugTraceAI is now running at:"
     echo -e "  ${CYAN}http://localhost:$selected_cli_port${NC}"
     echo ""
-    print_info "MCP SSE endpoint:"
-    echo -e "  ${CYAN}http://localhost:$selected_mcp_port/sse${NC}"
-    echo ""
     print_info "API Health Check:"
     echo -e "  ${CYAN}http://localhost:$selected_cli_port/health${NC}"
     echo ""
     print_info "API Documentation:"
     echo -e "  ${CYAN}http://localhost:$selected_cli_port/docs${NC}"
     echo ""
+    show_launch_commands
     print_info "Useful commands:"
     echo -e "  ${CYAN}$COMPOSE_CMD logs -f${NC}         # View logs"
     echo -e "  ${CYAN}$COMPOSE_CMD stop${NC}            # Stop container"
@@ -520,38 +579,59 @@ show_menu() {
 }
 
 main() {
-    # Check if running from project root
-    if [ ! -f "bugtraceai-cli" ] || [ ! -f "requirements.txt" ]; then
-        print_error "Please run this script from the BugTraceAI project root directory"
-        exit 1
-    fi
-    
-    while true; do
-        show_menu
-        read -p "$(echo -e ${YELLOW}Select option [1-3]: ${NC})" choice
-        echo ""
-        
-        case $choice in
-            1)
-                install_local
-                break
-                ;;
-            2)
-                install_docker
-                break
-                ;;
-            3)
-                print_info "Installation cancelled"
-                exit 0
-                ;;
-            *)
-                print_error "Invalid option. Please choose 1, 2, or 3."
-                echo ""
-                sleep 2
-                clear
-                ;;
+    local reuse=false global_only=false requested_interface="" requested_runtime="" requested_global="" choice
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interface) [[ $# -ge 2 ]] || return 1; requested_interface="$2"; shift 2 ;;
+            --runtime) [[ $# -ge 2 ]] || return 1; requested_runtime="$2"; shift 2 ;;
+            --global-only) global_only=true; shift ;;
+            --global) [[ $# -ge 2 ]] || return 1; requested_global="$2"; shift 2 ;;
+            --reuse) reuse=true; shift ;;
+            --help|-h) echo "Usage: ./install.sh [--interface tui|api|both] [--runtime local|docker] [--global yes|no] [--global-only] [--reuse]"; return ;;
+            *) print_error "Unknown option: $1"; return 1 ;;
         esac
     done
+    if $reuse; then
+        load_install_choices
+        [[ -n "$INSTALL_INTERFACE" && -n "$INSTALL_RUNTIME" ]] || { print_error "No saved choices. Run ./install.sh once."; return 1; }
+    fi
+    [[ -z "$requested_interface" ]] || INSTALL_INTERFACE="$requested_interface"
+    [[ -z "$requested_runtime" ]] || INSTALL_RUNTIME="$requested_runtime"
+    if [[ -z "$INSTALL_INTERFACE" ]]; then
+        print_header
+        echo "How will you use BugTraceAI?"
+        echo "  1) Interactive terminal (TUI)"
+        echo "  2) API server + MCP (WEB / integrations)"
+        echo "  3) Both TUI and API"
+        echo "  4) Cancel"
+        read -r -p "Select interface [1-4]: " choice
+        case "$choice" in 1) INSTALL_INTERFACE=tui ;; 2) INSTALL_INTERFACE=api ;; 3) INSTALL_INTERFACE=both ;; 4) return ;; *) print_error "Invalid interface"; return 1 ;; esac
+    fi
+    case "$INSTALL_INTERFACE" in tui|api|both) ;; *) print_error "Interface must be tui, api or both"; return 1 ;; esac
+    if [[ -z "$INSTALL_RUNTIME" ]]; then
+        show_menu
+        read -r -p "Select runtime [1-3]: " choice
+        case "$choice" in 1) INSTALL_RUNTIME=local ;; 2) INSTALL_RUNTIME=docker ;; 3) return ;; *) print_error "Invalid runtime"; return 1 ;; esac
+    fi
+    case "$INSTALL_RUNTIME" in local|docker) ;; *) print_error "Runtime must be local or docker"; return 1 ;; esac
+    [[ -z "$requested_global" ]] || INSTALL_GLOBAL="$requested_global"
+    if [[ "$INSTALL_INTERFACE" == api ]]; then
+        [[ "$INSTALL_GLOBAL" != yes ]] || { print_error "The global btai command requires TUI or both."; return 1; }
+        INSTALL_GLOBAL=no
+    elif [[ -z "$INSTALL_GLOBAL" ]]; then
+        read -r -p "Install global btai command to open the TUI from any folder? [y/N]: " choice
+        case "$choice" in y|Y|yes|YES) INSTALL_GLOBAL=yes ;; *) INSTALL_GLOBAL=no ;; esac
+    fi
+    case "$INSTALL_GLOBAL" in yes|no) ;; *) print_error "Global choice must be yes or no"; return 1 ;; esac
+    if ! $global_only; then
+        case "$INSTALL_RUNTIME" in
+            local) install_local ;;
+            docker) install_docker ;;
+        esac
+    fi
+    # An optional command/PATH failure must not lose a completed installation's profile.
+    save_install_choices
+    if [[ "$INSTALL_GLOBAL" == yes ]]; then install_global_command; fi
 }
 
 # ============================================================
@@ -562,4 +642,6 @@ main() {
 trap 'print_error "Installation failed at line $LINENO"' ERR
 
 # Run main function
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

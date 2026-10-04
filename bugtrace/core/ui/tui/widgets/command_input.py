@@ -3,6 +3,7 @@
 from textual.widgets import Input
 from textual.message import Message
 from textual.binding import Binding
+from textual.suggester import SuggestFromList
 from typing import List
 
 
@@ -26,26 +27,22 @@ class CommandInput(Input):
         Binding("down", "history_next", "Next command", show=False),
     ]
 
-    CSS = """
-    CommandInput {
-        dock: bottom;
-        height: 3;
-        margin: 0 1;
-        border: solid $primary;
-    }
-
-    CommandInput:focus {
-        border: solid $accent;
-    }
-    """
-
     def __init__(self, **kwargs):
         super().__init__(
-            placeholder="Enter command (e.g., /stop, /help, /filter xss)...",
+            placeholder="/command · / for suggestions",
+            compact=True,
+            suggester=SuggestFromList([key.split()[0] for key in COMMANDS], case_sensitive=False),
+            select_on_focus=False,
             **kwargs
         )
         self._history = []
         self._history_index = -1
+
+    def command_matches(self):
+        value = self.value.strip().lower()
+        if not value.startswith("/") or " " in value:
+            return []
+        return [key.split()[0] for key in COMMANDS if key.split()[0].startswith(value)]
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle command submission."""
@@ -93,12 +90,20 @@ class CommandInput(Input):
 
 # Supported commands documentation
 COMMANDS = {
-    "/stop": "Stop the current scan",
-    "/pause": "Pause the scan",
+    "/start": "Start scanning the target configured above",
+    "/stop": "Stop the scan and its external tools",
+    "/pause": "Pause at the next pipeline checkpoint",
     "/resume": "Resume a paused scan",
-    "/help": "Show available commands",
-    "/filter <text>": "Filter logs and findings by text",
-    "/show <agent>": "Show only specified agent's activity",
+    "/provider": "Choose the LLM provider and configure its API key",
+    "/auth": "Configure the target's Bearer token or login YAML (TOTP/2FA)",
+    "/help": "Show commands and keyboard shortcuts",
+    "/filter <text>": "Search the log view",
+    "/show <agent>": "Filter logs by agent name",
     "/clear": "Clear the log view",
-    "/export": "Export findings to file",
+    "/export [path]": "Export all findings as JSON",
+    "/timeline": "Review scan milestones and alerts",
+    "/findings [text]": "Open the findings explorer, optionally filtered",
+    "/agents": "Inspect agents, metrics and recent payloads",
+    "/pipeline": "Inspect scan phases, progress and elapsed time",
+    "/logs": "Open the searchable log view",
 }

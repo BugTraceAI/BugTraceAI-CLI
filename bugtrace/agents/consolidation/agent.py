@@ -24,6 +24,7 @@ from bugtrace.agents.consolidation.core import (
     DeduplicationCache,
     classify_finding as _classify_finding,
     classify_and_prioritize as _classify_and_prioritize,
+    calculate_priority as _calculate_priority,
 )
 from bugtrace.agents.consolidation.prompts import (
     initialize_embeddings as _initialize_embeddings,
@@ -50,6 +51,13 @@ class ThinkingConsolidationAgent(BaseAgent):
     """
 
     def __init__(self, scan_context: str = None, scan_dir: Path = None):
+        # Python 3.13 no longer creates a main-thread loop implicitly. Keep
+        # synchronous legacy callers that use run_until_complete compatible.
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
+
         super().__init__(
             name="ThinkingConsolidationAgent",
             role="Evaluation Coordinator",
@@ -183,6 +191,19 @@ class ThinkingConsolidationAgent(BaseAgent):
             "manual_review_threshold": settings.EMBEDDINGS_MANUAL_REVIEW_THRESHOLD,
             "log_confidence": settings.EMBEDDINGS_LOG_CONFIDENCE,
         }
+
+    # =====================================================================
+    # Compatibility wrappers (tests call these as instance methods)
+    # =====================================================================
+
+    def _classify_finding(self, finding: Dict[str, Any]) -> Optional[str]:
+        return _classify_finding(finding, self._stats, **self._classify_kwargs(), agent_name=self.name)
+
+    def _calculate_priority(self, finding: Dict[str, Any]) -> float:
+        return _calculate_priority(finding)
+
+    def _classify_and_prioritize(self, finding: Dict[str, Any]):
+        return _classify_and_prioritize(finding, self._stats, **self._classify_kwargs(), agent_name=self.name)
 
     # =====================================================================
     # EVENT SUBSCRIPTIONS

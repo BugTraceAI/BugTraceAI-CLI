@@ -1,0 +1,25 @@
+services:
+  scanner:
+    build:
+      context: .
+      args:
+        BUGTRACE_INTERFACE: tui
+    command: ["tui"]
+    stdin_open: true
+    tty: true
+    init: true
+    shm_size: 2gb
+    env_file: [.env]
+    volumes:
+      - bugtraceai-cli_cli-scans:/app/scans
+      - bugtraceai-cli_cli-reports:/app/reports
+      - bugtraceai-cli_cli-db:/app/data
+      - bugtraceai-cli_cli-logs:/app/logs
+      - ./.env:/app/.env
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  bugtraceai-cli_cli-scans:
+  bugtraceai-cli_cli-reports:
+  bugtraceai-cli_cli-db:
+  bugtraceai-cli_cli-logs:

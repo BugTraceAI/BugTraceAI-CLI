@@ -47,6 +47,8 @@ from bugtrace.agents.prototype_pollution.core import (
     build_specialist_report,
     build_reproduction,
     verify_pollution_in_text,
+    search_json_for_marker,
+    check_rce_output,
     get_payloads_for_tier,
     get_query_param_payloads,
 )
@@ -133,6 +135,149 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
         return self.emit_finding(finding_dict)
 
     # =========================================================================
+    # Compatibility wrappers (tests call these as instance methods)
+    # Pure/I-O logic lives in core.py and testing.py
+    # =========================================================================
+
+    def _discover_param_vectors(self) -> List[Dict]:
+        return discover_param_vectors(self.url, self.params)
+
+    def _severity_rank(self, severity: str) -> int:
+        return severity_rank(severity)
+
+    def _check_rce_output(self, response_text: str) -> Optional[str]:
+        return check_rce_output(response_text)
+
+    def _search_json_for_marker(self, obj: Any, marker: str) -> bool:
+        return search_json_for_marker(obj, marker)
+
+    async def _verify_pollution(self, response_text: str, marker: str) -> bool:
+        return verify_pollution_in_text(response_text, marker)
+
+    def _analyze_response_patterns(self, content: str) -> List[Dict]:
+        return analyze_response_for_vulnerable_patterns(content)
+
+    def _generate_protopollution_fingerprint(self, url: str, parameter: str):
+        return generate_protopollution_fingerprint(url, parameter)
+
+    def _fallback_fingerprint_dedup(self, wet_findings: List[Dict]) -> List[Dict]:
+        return fallback_fingerprint_dedup(wet_findings)
+
+    def _get_validation_status(self, evidence: Dict) -> str:
+        return get_validation_status(evidence)
+
+    def _build_reproduction(self, url: str, result: Dict) -> str:
+        return build_reproduction(url, result)
+
+    async def _discover_json_body_vector(self) -> Optional[Dict]:
+        return await discover_json_body_vector(self.url)
+
+    async def _discover_query_pollution_vectors(self) -> List[Dict]:
+        return await discover_query_pollution_vectors(self.url)
+
+    async def _probe_json_acceptance(self, url: str) -> bool:
+        """Quick probe: does endpoint accept JSON POST? Patchable in tests."""
+        import aiohttp
+
+        try:
+            async with orchestrator.session(DestinationType.TARGET) as session:
+                async with session.post(
+                    url,
+                    json={"test": "probe"},
+                    headers={"Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as response:
+                    return response.status not in (415, 405)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return False
+
+    async def _discover_prototype_pollution_params(self, url: str = None) -> Dict[str, str]:
+        """Autonomous param discovery (HTML + query + JSON probe).
+
+        Calls ``self._probe_json_acceptance`` so unit tests can patch the probe.
+        """
+        from urllib.parse import urlparse, parse_qs
+
+        from bs4 import BeautifulSoup
+
+        from bugtrace.tools.visual.browser import browser_manager
+
+        url = url or self.url
+        all_params: Dict[str, str] = {}
+
+        try:
+            parsed = urlparse(url)
+            for param_name, values in parse_qs(parsed.query).items():
+                all_params[param_name] = values[0] if values else ""
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to parse URL params: {e}")
+
+        try:
+            state = await browser_manager.capture_state(url)
+            html = state.get("html", "")
+            if html:
+                self._last_discovery_html = html
+                soup = BeautifulSoup(html, "html.parser")
+                for tag in soup.find_all(["input", "textarea", "select"]):
+                    param_name = tag.get("name")
+                    if param_name and param_name not in all_params:
+                        input_type = tag.get("type", "text").lower()
+                        if input_type not in ["submit", "button", "reset"]:
+                            if "csrf" not in param_name.lower() and "token" not in param_name.lower():
+                                all_params[param_name] = tag.get("value", "")
+        except Exception as e:
+            logger.error(f"[{self.name}] HTML parsing failed: {e}")
+
+        pp_common_params = [
+            "filter", "config", "options", "data", "settings", "params",
+            "query", "json", "args", "obj", "merge", "extend", "input",
+            "payload", "body", "attributes", "properties", "fields",
+        ]
+        for common_param in pp_common_params:
+            if common_param not in all_params:
+                all_params[common_param] = ""
+
+        if await self._probe_json_acceptance(url):
+            all_params["_accepts_json"] = "true"
+            logger.info(f"[{self.name}] Endpoint accepts JSON POST - PP prime target")
+
+        logger.info(
+            f"[{self.name}] Discovered {len(all_params)} params on {url}: {list(all_params.keys())}"
+        )
+        return all_params
+
+    async def _test_json_payload(self, payload_info: Dict, tier: str) -> Optional[Dict]:
+        return await test_json_payload(self.url, payload_info, tier)
+
+    async def _test_json_body_vector(self) -> Optional[Dict]:
+        return await test_json_body_vector(
+            self.url, verbose_emitter=getattr(self, "_v", None)
+        )
+
+    async def _test_query_param_vector(self, param: str = "__proto__") -> Optional[Dict]:
+        return await test_query_param_vector(
+            self.url, param, verbose_emitter=getattr(self, "_v", None)
+        )
+
+    async def _smart_probe_pollution(self, url: str = None) -> bool:
+        return await smart_probe_pollution(url or self.url)
+
+    async def _smart_probe_client_side(self, url: str = None) -> bool:
+        return await smart_probe_client_side(url or self.url)
+
+    async def _exploit_client_side_pp(self, *args, **kwargs):
+        return await exploit_client_side_pp(*args, **kwargs)
+
+    async def _llm_analyze_and_dedup(self, wet_findings: List[Dict], scan_context: str = "") -> List[Dict]:
+        return await llm_analyze_and_dedup(
+            wet_findings,
+            scan_context,
+            getattr(self, "_tech_stack_context", {}) or {},
+            getattr(self, "_prototype_pollution_prime_directive", "") or "",
+            "",
+        )
+
+    # =========================================================================
     # DIRECT MODE (run_loop)
     # =========================================================================
 
@@ -190,23 +335,20 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
         vectors: List[Dict] = []
 
         # 1. Check if endpoint accepts JSON body
-        json_vector = await discover_json_body_vector(self.url)
+        json_vector = await self._discover_json_body_vector()
         if json_vector:
             vectors.append(json_vector)
 
         # 2. Check existing query parameters for vulnerable names (pure)
-        param_vectors = discover_param_vectors(self.url, self.params)
-        vectors.extend(param_vectors)
+        vectors.extend(self._discover_param_vectors())
 
         # 3. Check for query parameter pollution acceptance (I/O)
-        query_vectors = await discover_query_pollution_vectors(self.url)
-        vectors.extend(query_vectors)
+        vectors.extend(await self._discover_query_pollution_vectors())
 
         # 4. Analyze response for vulnerable patterns (I/O + pure)
         content = await fetch_response_content(self.url)
         if content:
-            content_vectors = analyze_response_for_vulnerable_patterns(content)
-            vectors.extend(content_vectors)
+            vectors.extend(self._analyze_response_patterns(content))
 
         # Deduplicate and sort (pure)
         unique_vectors = deduplicate_vectors(vectors)
@@ -571,7 +713,8 @@ class PrototypePollutionAgent(BaseAgent, TechContextMixin):
         results = await self.exploit_dry_list()
 
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        # dry_findings are CANDIDATES, not confirmations (stable 4074425)
+        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         if results or self._dry_findings:
             await self._generate_specialist_report(results)

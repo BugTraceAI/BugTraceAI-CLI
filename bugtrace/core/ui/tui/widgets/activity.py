@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import random
 
-from rich.panel import Panel
 from rich.text import Text
-from rich import box
 from textual.reactive import reactive
 from textual.widgets import Static
 
@@ -67,16 +65,11 @@ class ActivityGraph(Static):
         if self.req_rate > self.peak_rate:
             self.peak_rate = self.req_rate
 
-    def render(self) -> Panel:
-        """Render the activity graph panel.
-
-        Returns:
-            Rich Panel containing the activity sparkline.
-        """
+    def render(self) -> Text:
+        """Compact network telemetry without a nested terminal panel."""
         data = self.buffer.get_ordered()[-20:]
-
-        result = Text()
-        result.append("req/s\n", style="bright_black")
+        result = Text("Network  ", style="#8A7FA8")
+        result.append(f"{self.req_rate:.1f} req/s\n", style="#FF7F50")
 
         # Render sparkline
         chars = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
@@ -84,14 +77,6 @@ class ActivityGraph(Static):
 
         for val in data:
             idx = int((val / max_val) * (len(chars) - 1)) if max_val > 0 else 0
-            result.append(chars[idx], style="bright_green")
-
-        result.append(f"\n\nRate: {self.req_rate:.1f}/s", style="bright_cyan")
-        result.append(f"\nPeak: {self.peak_rate:.1f}/s", style="bright_yellow")
-
-        return Panel(
-            result,
-            title="[bright_cyan]\U0001F4C8 ACTIVITY[/]",
-            border_style="bright_blue",
-            box=box.ROUNDED,
-        )
+            result.append(chars[idx], style="#FF7F50")
+        result.append(f"  peak {self.peak_rate:.1f}/s", style="#8A7FA8")
+        return result

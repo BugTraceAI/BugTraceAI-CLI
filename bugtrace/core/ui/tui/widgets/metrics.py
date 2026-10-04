@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import random
 
-from rich.panel import Panel
 from rich.text import Text
-from rich import box
 from textual.reactive import reactive
 from textual.widgets import Static
 
@@ -74,36 +72,14 @@ class SystemMetrics(Static):
         self.ram_buffer.add(self.ram_usage)
         self.refresh()
 
-    def render(self) -> Panel:
-        """Render the system metrics panel.
-
-        Returns:
-            Rich Panel containing CPU/RAM metrics with sparklines.
-        """
+    def render(self) -> Text:
+        """Keep host telemetry small and visually secondary."""
         cpu = self.cpu_usage
         ram = self.ram_usage
         threads = self.threads_count
 
-        result = Text()
-
-        # CPU line
-        cpu_color = "bright_green" if cpu < 70 else "bright_red"
-        result.append("CPU ", style="white")
-        result.append(self.cpu_buffer.render(15, cpu_color))
-        result.append(f" {cpu:.0f}%\n", style=cpu_color)
-
-        # RAM line
-        ram_color = "bright_cyan" if ram < 80 else "bright_yellow"
-        result.append("RAM ", style="white")
-        result.append(self.ram_buffer.render(15, ram_color))
-        result.append(f" {ram:.0f}%\n", style=ram_color)
-
-        # Thread count
-        result.append(f"\nThreads: {threads}", style="bright_black")
-
-        return Panel(
-            result,
-            title="[bright_cyan]\U0001F525 SYSTEM[/]",
-            border_style="bright_magenta",
-            box=box.ROUNDED,
-        )
+        result = Text("Host  ", style="#8A7FA8")
+        result.append(f"CPU {cpu:.0f}%  ·  RAM {ram:.0f}%\n", style="#F8F9FA")
+        result.append(self.cpu_buffer.render(15, "#FF7F50"))
+        result.append(f"  {threads} threads", style="#8A7FA8")
+        return result

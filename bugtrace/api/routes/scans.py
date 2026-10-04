@@ -78,7 +78,11 @@ async def create_scan(
             )
     try:
         options = _build_scan_options(request)
-        scan_id = await scan_service.create_scan(options, origin="web")
+        # This route is the CLI REST surface (WEB -> CLI). Record canonical
+        # provenance "web-cli" per B.1; direct/native launchers write "cli".
+        scan_id = await scan_service.create_scan(
+            options, origin="web", launch_origin="web-cli"
+        )
         status_dict = await scan_service.get_scan_status(scan_id)
         logger.info(f"Created scan {scan_id} for target: {request.target_url}")
         return ScanStatusResponse(**status_dict)
@@ -91,28 +95,18 @@ async def create_scan(
 
 
 def _build_scan_options(request: CreateScanRequest) -> ScanOptions:
-    """Convert API request to ScanOptions."""
-    # Extract scope_path from auth config if present
-    scope_path = None
-    if request.auth and isinstance(request.auth, dict):
-        scope_path = request.auth.get("scope_path")
-
-    return ScanOptions(
-        target_url=request.target_url,
-        scan_type=request.scan_type,
-        safe_mode=request.safe_mode,
-        max_depth=request.max_depth,
-        max_urls=request.max_urls,
-        resume=request.resume,
-        use_vertical=request.use_vertical,
-        focused_agents=request.focused_agents,
-        param=request.param,
-        scan_depth=request.scan_depth,
-        auth_token=request.auth_token,
-        auth=request.auth,
-        url_list=request.url_list,
-        scope_path=scope_path,
+    """Convert API request to ScanOptions. Pure map: scan_options_policy."""
+    from bugtrace.services.scan_options_policy import (
+        drop_none_kwargs,
+        scan_options_kwargs_from_request,
     )
+
+    raw = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+    kwargs = drop_none_kwargs(scan_options_kwargs_from_request(raw))
+    # target_url required by ScanOptions — keep even if others default
+    if "target_url" not in kwargs and getattr(request, "target_url", None):
+        kwargs["target_url"] = request.target_url
+    return ScanOptions(**kwargs)
 
 
 @router.get("/scans/{scan_id}/status", response_model=ScanStatusResponse)

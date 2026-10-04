@@ -110,55 +110,12 @@ class PipelineTransition:
         }
 
 
-# Valid transitions from each phase
+# Valid transitions: pure graph in pipeline_policy; enum map for live callers.
+from bugtrace.core import pipeline_policy as _pipeline_policy
+
 VALID_TRANSITIONS: Dict[PipelinePhase, List[PipelinePhase]] = {
-    # IDLE can only start reconnaissance
-    PipelinePhase.IDLE: [PipelinePhase.RECONNAISSANCE],
-
-    # Active phases follow linear progression with pause/error exits
-    PipelinePhase.RECONNAISSANCE: [
-        PipelinePhase.DISCOVERY,
-        PipelinePhase.PAUSED,
-        PipelinePhase.ERROR
-    ],
-    PipelinePhase.DISCOVERY: [
-        PipelinePhase.STRATEGY,
-        PipelinePhase.PAUSED,
-        PipelinePhase.ERROR
-    ],
-    PipelinePhase.STRATEGY: [
-        PipelinePhase.EXPLOITATION,
-        PipelinePhase.PAUSED,
-        PipelinePhase.ERROR
-    ],
-    PipelinePhase.EXPLOITATION: [
-        PipelinePhase.VALIDATION,
-        PipelinePhase.PAUSED,
-        PipelinePhase.ERROR
-    ],
-    PipelinePhase.VALIDATION: [
-        PipelinePhase.REPORTING,
-        PipelinePhase.PAUSED,
-        PipelinePhase.ERROR
-    ],
-    PipelinePhase.REPORTING: [
-        PipelinePhase.COMPLETE,
-        PipelinePhase.ERROR
-    ],
-
-    # PAUSED can resume to any active phase
-    PipelinePhase.PAUSED: [
-        PipelinePhase.RECONNAISSANCE,
-        PipelinePhase.DISCOVERY,
-        PipelinePhase.STRATEGY,
-        PipelinePhase.EXPLOITATION,
-        PipelinePhase.VALIDATION,
-        PipelinePhase.REPORTING
-    ],
-
-    # Terminal states can only reset to IDLE
-    PipelinePhase.COMPLETE: [PipelinePhase.IDLE],
-    PipelinePhase.ERROR: [PipelinePhase.IDLE]
+    PipelinePhase(src): [PipelinePhase(dst) for dst in targets]
+    for src, targets in _pipeline_policy.VALID_TRANSITION_GRAPH.items()
 }
 
 
@@ -190,8 +147,7 @@ class PipelineState:
         Returns:
             True if transition is valid, False otherwise
         """
-        valid_targets = VALID_TRANSITIONS.get(self.current_phase, [])
-        return to_phase in valid_targets
+        return _pipeline_policy.can_transition(self.current_phase, to_phase)
 
     def transition(
         self,
@@ -213,12 +169,10 @@ class PipelineState:
         Raises:
             ValueError: If transition is invalid
         """
-        if not self.can_transition(to_phase):
-            valid_targets = VALID_TRANSITIONS.get(self.current_phase, [])
-            raise ValueError(
-                f"Invalid transition: {self.current_phase.value} -> {to_phase.value}. "
-                f"Valid targets: {[p.value for p in valid_targets]}"
-            )
+        decision = _pipeline_policy.decide_transition(
+            self.current_phase, to_phase, reason
+        )
+        decision.raise_if_denied()
 
         # Create transition record
         transition = PipelineTransition(
@@ -234,19 +188,16 @@ class PipelineState:
         self.phase_started_at = time.monotonic()
         self.transitions.append(transition)
 
-        # Handle pause/error state flags
-        if to_phase == PipelinePhase.PAUSED:
-            self.paused = True
-            self.pause_reason = reason
-        elif self.paused and to_phase != PipelinePhase.PAUSED:
-            self.paused = False
-            self.pause_reason = None
-
-        if to_phase == PipelinePhase.ERROR:
-            self.error = reason
-        elif to_phase == PipelinePhase.IDLE:
-            # Reset clears error
-            self.error = None
+        flags = _pipeline_policy.apply_flags(
+            to_phase.value,
+            paused=self.paused,
+            pause_reason=self.pause_reason,
+            error=self.error,
+            reason=reason,
+        )
+        self.paused = bool(flags["paused"])
+        self.pause_reason = flags["pause_reason"]  # type: ignore[assignment]
+        self.error = flags["error"]  # type: ignore[assignment]
 
         logger.info(
             f"Pipeline transition: {transition.from_phase.value} -> "

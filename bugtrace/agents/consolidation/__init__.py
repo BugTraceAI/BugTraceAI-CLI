@@ -47,6 +47,12 @@ from bugtrace.agents.consolidation.processing import (
     process_batch_items,
 )
 
+from bugtrace.agents.consolidation.semantic_dedup import (
+    finding_strength,
+    semantic_dedup_prioritized,
+    apply_semantic_dedup_batch,
+)
+
 from bugtrace.agents.consolidation.agent import ThinkingConsolidationAgent
 
 __all__ = [
@@ -75,4 +81,8 @@ __all__ = [
     "emit_work_queued_event",
     "process_finding",
     "process_batch_items",
+    # Semantic near-dup (pure + thin shell)
+    "finding_strength",
+    "semantic_dedup_prioritized",
+    "apply_semantic_dedup_batch",
 ]

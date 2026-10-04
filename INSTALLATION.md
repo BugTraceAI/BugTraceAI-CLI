@@ -1,405 +1,153 @@
-# 🚀 Installation Guide — BugTraceAI-CLI
+# BugTraceAI-CLI 4.0 — Installation and terminal workspace
 
-## Quick Start with Installation Wizard
-
-The easiest way to get BugTraceAI-CLI up and running is using the interactive installation wizard:
+## Install
 
 ```bash
+git clone https://github.com/BugTraceAI/BugTraceAI-CLI.git
+cd BugTraceAI-CLI
 ./install.sh
 ```
 
-This guide covers the standalone CLI. For the WEB dashboard and guided service
-wiring, use [BugTraceAI-Launcher](https://github.com/BugTraceAI/BugTraceAI-Launcher).
-Keep Launcher and standalone CLI installations in separate directories.
+The wizard asks for **TUI**, **API + MCP**, or **both**, followed by **local
+Python** or **Docker**. It then offers a user-global **btai** command on Linux
+and macOS. Local installation requires Python 3.10+; Docker installation
+requires Docker Engine and Compose. Some scanner tools also use Docker during
+local scans. The scanning engine and browser dependencies are shared.
 
-The wizard provides two installation modes:
-- **Local Installation**: Python virtual environment setup (best for development)
-- **Docker Installation**: Containerized API + MCP deployment with automatic port handling (best for production)
+TUI adds Textual. API adds FastAPI, Uvicorn, WebSockets and MCP. Local packages
+are installed from the selected extras in `pyproject.toml`. The installer
+prepares the environment, Chromium and scanner tools for the selected runtime.
 
-## 📋 Prerequisites
-
-### For Local Installation
-- ✅ Python 3.10 or higher
-- ✅ pip3 (Python package manager)
-- ✅ Docker (required for some agents: GoSpider, Nuclei, SQLMap)
-- ⚙️ nmap (optional, but recommended)
-- ⚙️ Git (for cloning the repository)
-
-### For Docker Installation
-- ✅ Docker Engine
-- ✅ Docker Compose (or `docker compose` plugin)
-- ✅ Git (for cloning the repository)
-
-### Both Modes Require
-- 🔑 An LLM provider API key (OpenRouter is the default; compatible APIs and local models can use a [custom provider preset](docs/CUSTOM_PROVIDERS.md))
-
-## 🐍 Local Installation (Development Mode)
-
-### What the Wizard Does
-
-When you choose **Option 1: Local Installation**, the wizard will:
-
-1. ✅ Check if Python 3, pip, Docker, and nmap are installed
-2. 📄 Create `.env` file from `.env.example` (if not exists)
-3. 🐍 Create a Python virtual environment in `.venv/`
-4. 📦 Install all Python dependencies from `requirements.txt`
-5. 🌐 Install Playwright Chromium browser
-6. 🔧 Build Go fuzzers (XSS, SSRF, IDOR, LFI)
-7. 📁 Create necessary directories (`reports/`, `logs/`, `data/`)
-
-### After Installation
+For scripted installations:
 
 ```bash
-# Activate the virtual environment
-source .venv/bin/activate
-
-# Configure your API key in .env
-nano .env  # Add the key for your active provider (OPENROUTER_API_KEY by default)
-
-# Run a scan
-./bugtraceai-cli scan https://example.com
-
-# Run an authenticated scan (login-protected target)
-./bugtraceai-cli scan https://example.com --auth-config auth_config.yaml
-
-# Or start the API server
-./bugtraceai-cli serve --port 8000
-
-# Open the integrated ModelLab in BugTraceAI-WEB
-# /bugtraceai/modellab
+./install.sh --interface tui --runtime local --global yes
+./install.sh --interface api --runtime docker --global no
+./install.sh --interface both --runtime docker --global yes
+./install.sh --reuse
 ```
 
-> **Local beta:** do not expose the CLI API directly to the Internet. ModelLab uses the configured OpenRouter API key and provider charges may apply.
+Installation choices are remembered in `.bugtrace-install.env` without API
+keys. Reuse updates or repairs the saved profile. Existing environments retain
+previously installed packages when switching interfaces.
 
-### Pros & Cons
-
-**✅ Advantages:**
-- Full access to source code for customization
-- Faster iteration during development
-- No Docker image rebuild needed for code changes
-- Direct access to logs and debugging
-
-**⚠️ Disadvantages:**
-- Requires Python 3.10+ installed on your system
-- Must manage dependencies manually
-- System-level dependencies (nmap, Docker) required
-
-## 🐳 Docker Installation (Production Mode)
-
-### What the Wizard Does
-
-When you choose **Option 2: Docker Installation**, the wizard will:
-
-1. ✅ Check if Docker and Docker Compose are installed
-2. ✅ Verify Docker daemon is running
-3. 📄 Create `.env` file from `.env.example` (if not exists)
-4. 🔍 **Automatically detect if port 8000 is in use**
-5. 🎯 **Find the next available port** if 8000 is occupied
-6. ⚙️ Write `CLI_PORT` and `MCP_PORT` to `.env` without overwriting an existing deployment's ports
-7. 🏗️ Build the Docker image (includes Go fuzzers, Playwright, PyTorch)
-8. 🚀 Start the container in detached mode
-9. ⏳ Wait for the API to be ready (health check)
-
-### Automatic Port Detection Example
+## Open the real TUI
 
 ```bash
-$ ./install.sh
-...
-⚙️ Configuring network ports...
-⚠ Default port 8000 is already in use
-⚙️ Searching for available port starting from 8000...
-→ Using CLI port: 8003, MCP port: 8004
-⚙️ Writing port configuration to .env...
-✓ Port configuration written to .env
+./bugtraceai-cli
+# If the global command was selected, open a new terminal:
+btai
 ```
 
-### After Installation
+Enter your target URL at the top, set **Depth** (1–10) and **Max URLs**
+(1–5000), configure **Provider** with F7 and press **Start**. Opening the
+workspace does not require an API key; real scans require the selected provider
+key. Provider uses the engine's presets, including OpenRouter, Anthropic and
+Z.ai. Entered keys remain in the session unless you select Save in local .env.
+Provider selection lasts until the TUI closes.
 
-The API will be running at the selected port:
+The TUI runs the full pipeline: **Recon → Discovery → Strategy → Exploit →
+Validate → Report**. Its five tabs show distinct information:
+
+| Tab | Shortcut | Contents |
+| --- | --- | --- |
+| Pipeline | F2 | Stages, counters and elapsed times |
+| Findings | F3 | Searchable vulnerability evidence |
+| Agents | F4 | Specialist states, queues and runtime |
+| Timeline | F5 | Milestones and alerts |
+| Logs | F6 | Searchable engine output |
+
+F1 opens help. Ctrl+S starts, Ctrl+X stops, Ctrl+E exports all captured findings
+and Ctrl+Q quits. Pause takes effect at the next pipeline checkpoint. URLs
+belong in the top form; the lower bar accepts slash commands such as `/help`,
+`/provider`, `/auth`, `/pause`, `/resume`, `/stop` and `/export`.
+
+An explicit preview is available without scanning:
 
 ```bash
-# Check API health
-curl http://localhost:8000/health
-# Or if port was changed: http://localhost:8003/health
-
-# View API documentation
-open http://localhost:8000/docs
-
-# MCP endpoint (MCP_PORT, 8001 by default)
-curl -sf http://localhost:8001/sse
-
-# View container logs
-docker compose logs -f
-
-# Stop the container
-docker compose stop
-
-# Start the container
-docker compose start
-
-# Restart the container
-docker compose restart
-
-# Stop and remove the container
-docker compose down
+./bugtraceai-cli tui --demo
 ```
 
-### Using the API
+## Target authentication
 
-```bash
-# Trigger a scan via API
-curl -X POST http://localhost:8000/api/scans \
-  -H "Content-Type: application/json" \
-  -d '{"target_url": "https://example.com"}'
+Use **Auth**, F8 or `/auth` to configure the website's credentials separately
+from the LLM provider key. Choose a masked **Bearer token** or load a **login
+YAML** using the same format as the WEB. Apply validates the YAML and loads a
+session snapshot; reapply to reload later file edits. Target credentials are
+not saved by the TUI. Authentication can be changed before or after a scan.
+Switching methods replaces supplied Authorization/Cookie headers and login
+settings while preserving unrelated custom headers. None removes the supplied
+authentication; combined CLI authentication can also be kept unchanged.
 
-# Get scan status
-curl http://localhost:8000/api/scans/{scan_id}/status
-
-# List all scans
-curl http://localhost:8000/api/scans
-
-# Trigger an authenticated scan via API
-curl -X POST http://localhost:8000/api/scans \
-  -H "Content-Type: application/json" \
-  -d '{"target_url": "https://example.com"}'
-```
-
-### Pros & Cons
-
-**✅ Advantages:**
-- Isolated environment (no conflicts with system packages)
-- Consistent behavior across different machines
-- Easy deployment to production servers
-- All dependencies bundled (Go fuzzers, Playwright, PyTorch)
-- Automatic port conflict resolution
-
-**⚠️ Disadvantages:**
-- Longer initial build time (5-10 minutes)
-- Must rebuild image after code changes
-- Requires Docker knowledge for troubleshooting
-
-## 🔧 Configuration
-
-### Environment Variables
-
-Edit `.env` to configure BugTraceAI-CLI:
-
-```bash
-# Required: Your OpenRouter API key
-OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxx
-
-# Optional: CORS origins for Web UI
-BUGTRACE_CORS_ORIGINS=http://localhost:3000,http://localhost:5173
-
-# Optional: Override LLM models
-# DEFAULT_MODEL=google/gemini-3-flash-preview
-# SKEPTICAL_MODEL=anthropic/claude-haiku-4.5
-# VISION_MODEL=google/gemini-3-flash-preview
-```
-
-### Custom and Local LLM Providers
-
-The default provider is OpenRouter. You can configure an OpenAI-compatible API
-or a local model server by adding a JSON preset, selecting it in
-`bugtraceaicli.conf`, and providing its key in `.env`. Follow the
-[custom provider preset guide](docs/CUSTOM_PROVIDERS.md) before rebuilding a
-Docker deployment. This configures the scanner's LLM, not an MCP client.
-
-### Authenticated Scanning (YAML + TOTP/2FA)
-
-BugTraceAI-CLI supports scanning **login-protected applications** via a YAML configuration file. This includes support for TOTP (Time-Based One-Time Password) token generation for 2FA-protected targets.
-
-**Create `auth_config.yaml`:**
+Example `auth-config.yaml`:
 
 ```yaml
-login_url: https://target.com/login
-username: pentester@example.com
-password: your_password_here
-totp_secret: BASE32TOTPSECRETHERE   # optional — for 2FA/TOTP apps
-success_condition: "dashboard"      # string that confirms successful login
+authentication:
+  login_url: "/login"
+  login_type: form
+  credentials:
+    username: "user@example.com"
+    password: "your-password"
+    # totp_secret: "YOUR_BASE32_SECRET"
+  login_flow:
+    - "Type $username into the email field"
+    - "Type $password into the password field"
+    - "Click the 'Sign In' button"
+    # - "Enter $totp in the code field"
+  success_condition:
+    type: url_contains
+    value: "/dashboard"
 ```
 
-**Run an authenticated scan:**
+TOTP/2FA is optional. Replace the example values with the target's login flow
+and a valid Base32 TOTP secret when required. Relative login URLs are resolved
+against the scan target. In Docker, use a YAML path accessible inside the
+scanner container.
+
+## Docker TUI
+
+For a TUI-only installation:
 
 ```bash
-./bugtraceai-cli scan https://target.com --auth-config auth_config.yaml
+docker compose -f docker-compose.tui.yml run --rm scanner
 ```
 
-The scanner will automatically:
-1. Navigate to `login_url`
-2. Fill in credentials
-3. Generate a real-time TOTP token (if `totp_secret` is set)
-4. Confirm login success via `success_condition`
-5. Reuse the authenticated session across all 6 scan phases
-
-> The `auth_config.yaml` is automatically included in the report ZIP for audit traceability.
-
-### Port Configuration (Docker Only)
-
-The wizard writes selected Docker ports to `.env`:
-
-```dotenv
-CLI_PORT=8000
-MCP_PORT=8001
-```
-
-When using the Launcher, use the ports and MCP endpoint it reports instead of
-editing its CLI `.env` through this guide.
-
-## 🐛 Troubleshooting
-
-### Local Installation Issues
-
-**Problem: Python version too old**
-```bash
-python3 --version  # Must be 3.10 or higher
-```
-Solution: Install Python 3.10+ or use Docker installation instead.
-
-**Problem: Virtual environment activation fails**
-```bash
-source .venv/bin/activate
-# If using fish shell:
-source .venv/bin/activate.fish
-```
-
-**Problem: Playwright installation fails**
-```bash
-# Manually install Playwright
-playwright install chromium
-playwright install-deps chromium
-```
-
-### Docker Installation Issues
-
-**Problem: Docker daemon not running**
-```bash
-sudo systemctl start docker
-# Or on macOS:
-open -a Docker
-```
-
-**Problem: Permission denied when running Docker commands**
-```bash
-# Add your user to docker group (Linux)
-sudo usermod -aG docker $USER
-newgrp docker
-```
-
-**Problem: Port already in use**
-The wizard automatically detects this, but you can manually:
-```bash
-# Find what's using port 8000
-sudo lsof -i :8000
-# Or
-sudo netstat -tulpn | grep 8000
-```
-
-**Problem: Build fails due to network issues**
-```bash
-# Retry with clean build
-docker compose build --no-cache
-```
-
-**Problem: Container exits immediately**
-```bash
-# Check logs for errors
-docker compose logs
-```
-
-### API Key Issues
-
-**Problem: API returns authentication errors**
-- Verify your OpenRouter API key is correct in `.env`
-- Ensure `.env` file exists and is not named `.env.txt`
-- For Docker: Restart container after changing `.env`
+This profile opens an interactive scanner without starting API/MCP servers or
+publishing ports. With both interfaces installed:
 
 ```bash
-# Verify .env is loaded (Local)
-cat .env
-
-# Verify .env is loaded (Docker)
-docker compose config
+docker compose exec api python3 -m bugtrace tui
 ```
 
-## 📊 Verifying Installation
+The global `btai` helper opens the saved local or Docker TUI profile. Keep the
+registered checkout at its installation path. Global registration uses
+`~/.local/bin` and configures Bash/Zsh PATH without sudo; an unrelated existing
+`btai` command is preserved. Registration can be retried with
+`./install.sh --global-only --global yes`.
 
-### Local Installation
+## API and MCP
+
+For a local API installation:
 
 ```bash
-# Activate virtual environment
-source .venv/bin/activate
+./bugtraceai-cli serve --port 8000
+```
 
-# Check Python packages
-pip list | grep -E "playwright|fastapi|typer"
+API documentation is available at `/docs`; health is available at `/health`.
+MCP is a separate command: `./bugtraceai-cli mcp --help` lists its transport and
+port options. For Docker API/both installations, use `docker compose up -d`.
+The installer stores the selected API port in `.env`; changing that port must
+keep the listener, published port and health check aligned. API/MCP mode can be
+used by BugTraceAI-WEB without opening the TUI.
 
-# Check Go fuzzers
-ls -la tools/bin/
+## Command use
 
-# Test CLI
+The launcher activates the installed local environment automatically.
+Explicit commands such as `scan`, `audit` and focused agents retain text
+output for scripts; redirected output remains ordinary text. To open a full
+interactive scan directly:
+
+```bash
+./bugtraceai-cli full https://target.example
 ./bugtraceai-cli --help
-
-# Quick health check
-python3 -c "import playwright; print('✓ Playwright OK')"
 ```
-
-### Docker Installation
-
-```bash
-# Check container is running
-docker compose ps
-
-# Check API health
-curl http://localhost:8000/health
-
-# Check MCP health
-curl -sf http://localhost:8001/sse
-
-# Expected response:
-# {"status": "healthy", "version": "3.7.12-beta"}
-
-# Check logs
-docker compose logs --tail=50
-
-# Access container shell
-docker compose exec api bash
-```
-
-## 🔄 Switching Between Modes
-
-You can run the wizard multiple times to switch installation modes:
-
-```bash
-# Already have local installation? Add Docker too:
-./install.sh
-# Choose option 2
-
-# Want to switch from Docker to local development?
-docker compose down  # Stop Docker
-./install.sh
-# Choose option 1
-```
-
-Both modes can coexist on the same system.
-
-## 🚀 Next Steps
-
-After installation, see the [README.md](README.md) for:
-- Running your first scan
-- Configuration options
-- Agent documentation
-- Output formats
-- Advanced usage
-
-## 🆘 Need Help?
-
-| Resource | Link |
-|---|---|
-| 📖 **Wiki** | [deepwiki.com/BugTraceAI/BugTraceAI-CLI](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI) |
-| 🌐 **Website** | [bugtraceai.com](https://bugtraceai.com) |
-| 🐛 **Issues** | [GitHub Issues](https://github.com/BugTraceAI/BugTraceAI-CLI/issues) |
-| 💬 **Contact** | [@yz9yt](https://x.com/yz9yt) |
-
----
-
-Made with ❤️ by the BugTraceAI team

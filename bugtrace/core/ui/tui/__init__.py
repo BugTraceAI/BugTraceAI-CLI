@@ -3,6 +3,12 @@
 This module provides the new Textual-based terminal user interface.
 """
 
-from bugtrace.core.ui.tui.app import BugTraceApp
-
 __all__ = ["BugTraceApp"]
+
+
+def __getattr__(name):
+    # The scanner subprocess imports runner without loading Textual's renderer.
+    if name == "BugTraceApp":
+        from .app import BugTraceApp
+        return BugTraceApp
+    raise AttributeError(name)

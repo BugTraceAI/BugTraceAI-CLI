@@ -59,7 +59,7 @@ async def start_scan(
 
         # Get scan service and create scan
         scan_service = get_scan_service()
-        scan_id = await scan_service.create_scan(options)
+        scan_id = await scan_service.create_scan(options, launch_origin="cli")
 
         return {
             "scan_id": scan_id,

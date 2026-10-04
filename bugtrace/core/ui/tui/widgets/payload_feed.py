@@ -8,9 +8,7 @@ from __future__ import annotations
 import random
 from typing import Dict, List, Any
 
-from rich.panel import Panel
 from rich.text import Text
-from rich import box
 from textual.reactive import reactive
 from textual.widgets import Static
 
@@ -170,61 +168,16 @@ class PayloadFeed(Static):
         """Get current spinner frame."""
         return self.SPINNER_FRAMES[self._spinner_idx]
 
-    def render(self) -> Panel:
-        """Render the payload feed panel.
-
-        Returns:
-            Rich Panel containing the payload feed.
-        """
-        result = Text()
-        history = self._payload_history[-6:]
-
-        for entry in reversed(history):
-            num = entry.get("num", 0)
-            agent = entry.get("agent", "Unknown")[:10]
-            vector = entry.get("vector", "")[:12]
-            payload = entry.get("payload", "")[:50]
+    def render(self) -> Text:
+        result = Text(no_wrap=True, overflow="ellipsis")
+        if not self._payload_history:
+            result.append("Payloads appear as the agents test them.\n", style="#8A7FA8")
+        for entry in reversed(self._payload_history[-5:]):
             status = entry.get("status", "testing")
-
-            # Get status indicator
-            if status == "testing":
-                indicator = self._get_spinner()
-                style = "bright_yellow"
-                status_text = "\u25cf TESTING"
-            else:
-                indicator, style, status_text = self.STATUS_CONFIG.get(
-                    status, ("\u25cf", "white", status.upper())
-                )
-
-            # Build the line
-            result.append(f"  {indicator} ", style=style)
-            result.append(f"#{num:4} ", style="bright_black")
-            result.append("\u2502 ", style="bright_black")
-            result.append(f"{agent:10} ", style="bright_magenta")
-            result.append("\u2502 ", style="bright_black")
-            result.append(f"{vector:12} ", style="bright_cyan")
-            result.append("\u2502 ", style="bright_black")
-            result.append(f"{payload:50} ", style="white")
-            result.append("\u2502 ", style="bright_black")
-            result.append(f"{status_text:12}\n", style=style)
-
-        # Pad if needed
-        for _ in range(6 - len(history)):
-            result.append("  " + " " * 110 + "\n", style="bright_black")
-
-        # Throughput sparkline
-        result.append("\n  THROUGHPUT ", style="white")
-        result.append(self._throughput_buffer.render(40, "bright_green"))
-        result.append(
-            f"  avg: {self._payload_rate:.1f}/s  "
-            f"peak: {self._peak_rate:.1f}/s  "
-            f"total: {self._total_payloads}",
-            style="bright_cyan",
-        )
-
-        return Panel(
-            result,
-            title="[bright_green]\U0001F9EA LIVE PAYLOAD FEED[/]",
-            border_style="bright_green",
-            box=box.ROUNDED,
-        )
+            indicator = self._get_spinner() if status == "testing" else self.STATUS_CONFIG.get(status, ("·", "", ""))[0]
+            color = {"testing": "#FFC107", "confirmed": "#2ECC71", "failed": "#8A7FA8", "blocked": "#FF3131"}.get(status, "#8A7FA8")
+            result.append(f"{indicator} {entry.get('agent', 'Unknown')[:10]:10} ", style="#FF7F50")
+            result.append(str(entry.get("payload", "")).replace("\n", " ")[:max(10, self.size.width - 29)], style="#F8F9FA")
+            result.append(f"  {status}\n", style=color)
+        result.append(f"\n{self._payload_rate:.1f} payloads/s  ·  {self._total_payloads} tested", style="#8A7FA8")
+        return result

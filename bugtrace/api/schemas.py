@@ -54,7 +54,7 @@ class CreateScanRequest(BaseModel):
 
     Maps to ScanOptions from scan_context.py.
     """
-    target_url: str = Field(..., description="Target URL to scan")
+    target_url: Optional[str] = Field(default=None, description="Target URL to scan (may come from handoff.target)")
     scan_type: str = Field(default="full", description="Scan type: full, hunter, manager, or focused agent names")
     scan_depth: str = Field(default="", description="Exploitation depth: quick, standard, thorough. Empty = use config default.")
     safe_mode: Optional[bool] = Field(default=None, description="Override global safe mode setting")
@@ -65,8 +65,59 @@ class CreateScanRequest(BaseModel):
     focused_agents: List[str] = Field(default_factory=list, description="List of focused agent names")
     param: Optional[str] = Field(default=None, description="Specific parameter to target")
     auth_token: Optional[str] = Field(default=None, description="Pre-authenticated Bearer token (Level 1)")
-    auth: Optional[Dict[str, Any]] = Field(default=None, description="Auto-login credentials: {login_url, credentials: {email, password, totp_secret?}, login_flow?: [...]} (Level 2/3)")
+    auth: Optional[Dict[str, Any]] = Field(default=None, description="Auto-login credentials: {login_url, login_type?: form|api, request_format?: form|json, credentials: {email, password, totp_secret?}, login_flow?: [...]} (Level 2/3)")
     url_list: Optional[List[str]] = Field(default=None, description="Pre-defined URL list (from URL list file or Swagger import)")
+    handoff: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="BugTraceAI API handoff v1; preserves method-aware inventory and findings hints",
+    )
+    custom_headers: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Per-scan HTTP headers. Precedence (low -> high): DEFAULT_HEADERS_JSON "
+            "< auth discovery < these. Authorization/Cookie may be set here to "
+            "override auto-discovered values. Reserved names (Host, Content-Length, "
+            "Transfer-Encoding, Connection, Upgrade) are rejected."
+        ),
+    )
+
+    @field_validator("custom_headers")
+    @classmethod
+    def _validate_custom_headers(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("custom_headers must be a JSON object (dict)")
+        from bugtrace.utils.headers import (
+            merge_headers,
+            validate_header_name,
+            validate_header_value,
+        )
+        # validate every name + value BEFORE merge_headers (which only strips
+        # reserved names as a safety net). This closes the API-side header
+        # injection path where {"X-Test": "v\r\nX-Injected: evil"} would
+        # otherwise be accepted and reach Nuclei -H / aiohttp verbatim.
+        validated: dict = {}
+        for raw_name, raw_value in v.items():
+            name = validate_header_name(raw_name)
+            value = validate_header_value(name, raw_value)
+            if not value:
+                # Treat empty values at the API boundary the same as a
+                # malformed header: refuse the request rather than silently
+                # dropping the user's intent.
+                raise ValueError(
+                    f"value for header {name!r} is empty; omit the key or "
+                    f"send a non-empty string"
+                )
+            validated[name] = value
+        merged = merge_headers(validated)
+        if not merged:
+            raise ValueError(
+                "custom_headers contains only reserved/empty entries and cannot "
+                "be used; reserved names (Host, Content-Length, Transfer-Encoding, "
+                "Connection, Upgrade) are not permitted"
+            )
+        return merged
 
     @field_validator("target_url")
     @classmethod
@@ -74,6 +125,17 @@ class CreateScanRequest(BaseModel):
         # A pasted leading/trailing space must never reach recon (it yields 0 URLs and
         # fails the scan). Sanitize at the boundary so logs/DB store the clean URL too.
         return v.strip() if isinstance(v, str) else v
+
+    @model_validator(mode="after")
+    def _validate_handoff_contract(self):
+        if self.handoff is not None:
+            from bugtrace.services.handoff_policy import validate_handoff
+            validate_handoff(self.handoff)
+            if not self.target_url and not self.handoff.get("target"):
+                raise ValueError("target_url is required when handoff.target is absent")
+        elif not self.target_url:
+            raise ValueError("target_url is required")
+        return self
 
     @field_validator("url_list")
     @classmethod
@@ -97,7 +159,8 @@ class ScanStatusResponse(BaseModel):
     findings_count: int
     active_agent: Optional[str] = None
     phase: Optional[str] = None
-    origin: str = "unknown"  # "cli", "web", or "unknown" — where scan was launched
+    origin: str = "unknown"  # "cli", "web", or "unknown" — where scan was launched (legacy)
+    launch_origin: str = "legacy-unknown"  # Canonical provenance: "web-cli", "cli", "web-api", "api", "legacy-unknown"
     enrichment_status: Optional[str] = None  # "full", "partial", "none", "pending"
     scan_type: Optional[str] = None
     max_depth: Optional[int] = None
@@ -148,7 +211,8 @@ class ScanSummary(BaseModel):
     status: ScanStatus  # Type-safe enum
     progress: int
     timestamp: str  # ISO format
-    origin: str = "unknown"  # "cli", "web", or "unknown"
+    origin: str = "unknown"  # "cli", "web", or "unknown" (legacy)
+    launch_origin: str = "legacy-unknown"  # Canonical provenance: "web-cli", "cli", "web-api", "api", "legacy-unknown"
     enrichment_status: Optional[str] = None  # "full", "partial", "none", "pending"
     has_report: bool = True  # Whether report files exist on disk
     recovery_available: bool = False  # Whether partial or full scan artifacts exist on disk

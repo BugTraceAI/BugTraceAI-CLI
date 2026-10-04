@@ -3,17 +3,16 @@ import os
 import sys
 from typing import List, Tuple
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.panel import Panel
-from rich.live import Live
 from rich.table import Table
 from rich import box
 from dotenv import load_dotenv
 
-# Load env immediately
-load_dotenv()
+from bugtrace.core.config import settings, test_mode_enabled
 
-from bugtrace.core.config import settings
+# Load env immediately — never in hermetic test mode (credentials / live keys).
+if not test_mode_enabled():
+    load_dotenv()
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
 # Lazy import for llm_client to avoid circular or early init issues if possible,
 # but verifying connectivity requires it.
@@ -51,7 +50,6 @@ class BootSequence:
 
     def _display_boot_banner(self) -> None:
         """Display the initial boot banner."""
-        console.clear()
         console.print(Panel.fit(
             f"[bold cyan]BugtraceAI-CLI[/bold cyan] [dim]v{settings.VERSION} Phoenix Edition[/dim]\n"
             "[italic]Initializing Cyber-Reconnaissance Framework...[/italic]",
@@ -59,32 +57,16 @@ class BootSequence:
             border_style="cyan"
         ))
 
+
     async def _execute_boot_sequence(self) -> None:
-        """Execute all boot checks with progress tracking."""
-        with Progress(
-            SpinnerColumn("dots", style="bold cyan"),
-            TextColumn("[bold white]{task.description}"),
-            BarColumn(bar_width=None, style="cyan", complete_style="bold cyan"),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            console=console,
-            expand=True
-        ) as progress:
+        """Run checks sequentially with append-only text output."""
+        for name, check_func in self.checks:
+            await self._run_single_check(name, check_func)
 
-            boot_task = progress.add_task("System Boot...", total=len(self.checks))
 
-            for name, check_func in self.checks:
-                await self._run_single_check(progress, boot_task, name, check_func)
-
-    async def _run_single_check(
-        self,
-        progress: Progress,
-        boot_task,
-        name: str,
-        check_func
-    ) -> None:
-        """Run a single boot check and record result."""
-        progress.update(boot_task, description=f"Verifying: {name}...")
-
+    async def _run_single_check(self, name: str, check_func) -> None:
+        """Run one check without creating a redraw thread or clearing the screen."""
+        console.print(f"Verifying: {name}...")
         try:
             status, details = await check_func()
             self._record_check_result(name, status, details)
@@ -92,8 +74,6 @@ class BootSequence:
             self.has_critical_error = True
             self.results.append((name, "[bold red]ERROR[/]", str(e)))
 
-        progress.advance(boot_task)
-        await asyncio.sleep(0.3)  # Visual pacing
 
     def _record_check_result(self, name: str, status: str, details: str) -> None:
         """Record the result of a boot check."""

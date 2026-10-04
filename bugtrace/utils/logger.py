@@ -20,9 +20,75 @@ def get_correlation_id() -> str:
     """Return the current correlation_id (empty string if unset)."""
     return correlation_id_var.get("")
 
-# Define log directory
-LOG_DIR = "logs"
-os.makedirs(LOG_DIR, exist_ok=True)
+_LOG_FILE_NAMES = ("bugtrace.jsonl", "execution.log", "errors.log")
+
+
+def _resolve_log_dir_from_env() -> str:
+    """Prefer hermetic runtime root when BUGTRACE_TEST_ROOT is set.
+
+    This runs before settings may be fully applied, so env is the source of
+    truth for early imports during pytest bootstrap.
+    """
+    from bugtrace.core.runtime_paths import resolve_log_dir
+
+    path = str(resolve_log_dir())
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+LOG_DIR = _resolve_log_dir_from_env()
+
+
+def reconfigure_log_directory(log_dir: str | os.PathLike[str]) -> str:
+    """Point module LOG_DIR and existing RotatingFileHandlers at a new directory.
+
+    Called from apply_runtime_root so hermetic rebinds do not keep writing into
+    a discarded temp root or the worktree.
+    """
+    global LOG_DIR
+    new_dir = os.path.abspath(str(log_dir))
+    os.makedirs(new_dir, exist_ok=True)
+    old_dir = os.path.abspath(LOG_DIR)
+    LOG_DIR = new_dir
+    if old_dir == new_dir:
+        return new_dir
+
+    manager = logging.Logger.manager.loggerDict
+    loggers: list[logging.Logger] = [logging.getLogger()]
+    for name, obj in list(manager.items()):
+        if isinstance(obj, logging.Logger):
+            loggers.append(obj)
+        elif isinstance(name, str):
+            loggers.append(logging.getLogger(name))
+
+    for lg in loggers:
+        for handler in list(lg.handlers):
+            if not isinstance(handler, RotatingFileHandler):
+                continue
+            base = os.path.basename(handler.baseFilename)
+            if base not in _LOG_FILE_NAMES:
+                continue
+            # Rebuild an equivalent rotating handler under the new directory.
+            level = handler.level
+            formatter = handler.formatter
+            max_bytes = getattr(handler, "maxBytes", 5 * 1024 * 1024)
+            backup_count = getattr(handler, "backupCount", 5)
+            try:
+                handler.close()
+            except Exception:
+                pass
+            lg.removeHandler(handler)
+            replacement = RotatingFileHandler(
+                os.path.join(new_dir, base),
+                maxBytes=max_bytes,
+                backupCount=backup_count,
+            )
+            replacement.setLevel(level)
+            if formatter is not None:
+                replacement.setFormatter(formatter)
+            lg.addHandler(replacement)
+    return new_dir
+
 
 class JSONFormatter(logging.Formatter):
     """

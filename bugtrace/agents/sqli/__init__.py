@@ -10,6 +10,7 @@ Modules:
     - context: PURE confidence, prioritization, technique mapping
     - payloads: PURE payload generation, URL building, filter mutations
     - validation: PURE response analysis, SQLi confirmation, error extraction
+    - finding_builders: PURE finding constructors / evidence helpers
     - discovery: I/O parameter discovery, SPA detection
     - exploitation: I/O payload sending, technique testing
     - dedup: PURE SQLi fingerprint deduplication
@@ -45,6 +46,9 @@ from bugtrace.agents.sqli.types import (
 # Re-export context functions (PURE)
 from bugtrace.agents.sqli.context import (
     INFRASTRUCTURE_COOKIES,
+    parse_infrastructure_cookie_catalog,
+    default_infrastructure_cookies_path,
+    load_infrastructure_cookies,
     get_confidence_tier,
     determine_validation_status,
     should_stop_testing,
@@ -72,6 +76,24 @@ from bugtrace.agents.sqli.payloads import (
     set_nested_value,
     extract_post_params,
     has_block_indicators,
+)
+
+# Re-export pure finding builders
+from bugtrace.agents.sqli.finding_builders import (
+    has_new_db_error_evidence,
+    create_error_based_finding,
+    create_boolean_finding,
+    create_union_finding,
+    demote_unproven_union,
+    create_sqlmap_finding,
+    create_time_based_finding,
+    create_cookie_sqlmap_finding,
+    create_cookie_probe_finding,
+    create_header_error_finding,
+    create_header_status_finding,
+    create_oob_finding,
+    create_json_body_error_finding,
+    create_l5_manipulator_finding,
 )
 
 # Re-export validation functions (PURE)
@@ -146,6 +168,9 @@ __all__ = [
     "FILTER_MUTATIONS",
     # Context (PURE)
     "INFRASTRUCTURE_COOKIES",
+    "parse_infrastructure_cookie_catalog",
+    "default_infrastructure_cookies_path",
+    "load_infrastructure_cookies",
     "get_confidence_tier",
     "determine_validation_status",
     "should_stop_testing",
@@ -170,6 +195,21 @@ __all__ = [
     "set_nested_value",
     "extract_post_params",
     "has_block_indicators",
+    # Finding builders (PURE)
+    "has_new_db_error_evidence",
+    "create_error_based_finding",
+    "create_boolean_finding",
+    "create_union_finding",
+    "demote_unproven_union",
+    "create_sqlmap_finding",
+    "create_time_based_finding",
+    "create_cookie_sqlmap_finding",
+    "create_cookie_probe_finding",
+    "create_header_error_finding",
+    "create_header_status_finding",
+    "create_oob_finding",
+    "create_json_body_error_finding",
+    "create_l5_manipulator_finding",
     # Validation (PURE)
     "detect_database_type",
     "extract_info_from_error",

@@ -13,12 +13,13 @@ from bugtrace.core.validation_status import ValidationStatus
 # Response analysis indicators (PURE DATA)
 # =========================================================================
 
+# All literals are lowercase — callers lower() response text before matching.
 SSRF_INDICATORS: Tuple[str, ...] = (
     "root:x:",
     "connected to internal",
     "aws metadata",
     "metadata-flavor",
-    "computeMetadata/v1",
+    "computemetadata/v1",
 )
 
 
@@ -71,14 +72,34 @@ def validate_before_emit(
     return True, ""
 
 
-def determine_validation_status(res: Dict) -> bool:
+def is_time_based_confirmed(
+    baseline_s: float,
+    payload_s: float,
+    delay_s: float = 3.0,
+    margin: float = 0.6,
+) -> bool:
+    """PURE: True when payload latency exceeds baseline by delay*margin.
+
+    Absolute wall-clock thresholds are not proof — only differential delay
+    against this target's baseline is accepted (live SSRF contract).
+    """
+    return (payload_s - baseline_s) >= delay_s * margin
+
+
+def determine_validation_status(
+    res: Dict,
+    baseline_elapsed: Optional[float] = None,
+) -> bool:
     """
     Determine if the response indicates a successful SSRF.
 
-    Checks for classic content indicators and timing anomalies.
+    Content indicators confirm immediately. Timing is only accepted as
+    differential evidence when ``baseline_elapsed`` is provided (matches
+    live ``ssrf_agent`` semantics; absolute elapsed>3 is NOT proof).
 
     Args:
         res: Response dict with ``text`` and ``elapsed`` keys.
+        baseline_elapsed: Optional baseline RTT seconds for time-based SSRF.
 
     Returns:
         True if the response indicates SSRF success.
@@ -89,8 +110,9 @@ def determine_validation_status(res: Dict) -> bool:
         if indicator in text:
             return True
 
-    # Timing indicator (potential)
-    if res.get("elapsed", 0) > 3:
+    if baseline_elapsed is not None and is_time_based_confirmed(
+        baseline_elapsed, res.get("elapsed", 0)
+    ):
         return True
 
     return False

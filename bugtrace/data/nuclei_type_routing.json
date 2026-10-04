@@ -86,8 +86,19 @@
     },
     {
       "name": "Insecure Cookies",
-      "match_tags": ["cookies"],
-      "match_template_id_contains": [],
+      "match_tags": ["cookies", "cookie"],
+      "match_template_id_contains": [
+        "cookies-without",
+        "cookie-without",
+        "missing-cookie",
+        "insecure-cookie",
+        "cookie-secure",
+        "cookie-httponly",
+        "cookie-samesite",
+        "httponly",
+        "samesite"
+      ],
+      "match_template_id_starts_with": ["cookies-", "cookie-"],
       "type": "Insecure Cookie Configuration",
       "default_severity": "medium",
       "action": "classify"

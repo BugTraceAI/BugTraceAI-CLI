@@ -709,7 +709,8 @@ Focus on parameter+file deduplication. Same file via different traversal depths 
 
         # Count confirmed vulnerabilities
         vulns_count = len([r for r in results if r]) if results else 0
-        vulns_count += len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
+        # dry_findings are CANDIDATES, not confirmations (stable 4074425)
+        candidates_count = len(self._dry_findings) if hasattr(self, '_dry_findings') else 0
 
         # REPORTING
         if results or self._dry_findings:
