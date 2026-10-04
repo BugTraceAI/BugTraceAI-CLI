@@ -8,8 +8,18 @@ cd BugTraceAI-CLI
 ./install.sh
 ```
 
-The wizard asks for **TUI**, **API + MCP**, or **both**, followed by **local
-Python** or **Docker**. It then offers a user-global **btai** command on Linux
+The wizard separates two choices:
+
+1. **Interfaces:** TUI is the visual terminal workspace. API + MCP provides
+   the backend for WEB, AI agents and integrations. Both enables both interfaces.
+   The WEB app is installed separately.
+2. **Execution:** Local Python runs the chosen interfaces in a `.venv` on your
+   machine, with scanner dependencies installed there. Docker runs them in
+   containers; the TUI still appears in your terminal. With both selected,
+   API/MCP run in the background and the TUI runs inside the API container.
+
+The wizard shows a readable summary of the combination before installing.
+It then offers a user-global **btai** command for TUI/both on Linux
 and macOS. Local installation requires Python 3.10+; Docker installation
 requires Docker Engine and Compose. Some scanner tools also use Docker during
 local scans. The scanning engine and browser dependencies are shared.
