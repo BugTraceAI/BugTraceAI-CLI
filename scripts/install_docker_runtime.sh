@@ -47,6 +47,10 @@ docker_select_compose() {
 
 docker_download() {
     local url=$1 destination=$2
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1 && [[ "$(uname -s)" == Linux ]]; then
+        install_linux_packages curl || return 1
+        hash -r
+    fi
     if command -v curl >/dev/null 2>&1; then
         curl -fSL --retry 3 --connect-timeout 15 "$url" -o "$destination"
     elif command -v wget >/dev/null 2>&1; then

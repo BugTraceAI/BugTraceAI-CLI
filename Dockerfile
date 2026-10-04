@@ -30,8 +30,9 @@ FROM alpine:3.19 AS nuclei-downloader
 ARG NUCLEI_VERSION=3.3.7
 
 RUN apk add --no-cache curl unzip && \
-    curl -sL -o /tmp/nuclei.zip \
-      "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip" && \
+    case "$(uname -m)" in x86_64) nuclei_arch=amd64 ;; aarch64) nuclei_arch=arm64 ;; *) echo "Unsupported Nuclei architecture" >&2; exit 1 ;; esac && \
+    curl -fSL --retry 3 -o /tmp/nuclei.zip \
+      "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_${nuclei_arch}.zip" && \
     unzip -q /tmp/nuclei.zip nuclei -d /usr/local/bin/ && \
     chmod +x /usr/local/bin/nuclei && \
     rm /tmp/nuclei.zip
