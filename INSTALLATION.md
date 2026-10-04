@@ -86,8 +86,8 @@ Enter your target URL at the top, set **Depth** (1–10) and **Max URLs**
 (1–5000), configure **Provider** with F7 and press **Start**. Opening the
 workspace does not require an API key; real scans require the selected provider
 key. Provider uses the engine's presets, including OpenRouter, Anthropic and
-Z.ai. Entered keys remain in the session unless you select Save in local .env.
-Provider selection lasts until the TUI closes.
+Z.ai. Uncheck Save this key in local .env to keep a newly entered key only in the
+current session. Provider selection lasts until the TUI closes.
 
 The TUI runs the full pipeline: **Recon → Discovery → Strategy → Exploit →
 Validate → Report**. Its five tabs show distinct information:

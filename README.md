@@ -1,321 +1,140 @@
 # BugTraceAI-CLI
 
-[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white)](https://bugtraceai.com)
-[![Wiki Documentation](https://img.shields.io/badge/Wiki%20Documentation-000?logo=wikipedia&logoColor=white)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
-![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)
-![Version](https://img.shields.io/badge/Version-4.0.16--beta-orange)
-![Status](https://img.shields.io/badge/Status-Beta-orange)
-![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-Required-blue?logo=docker)
-![MCP](https://img.shields.io/badge/MCP-Compatible-green?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyem0wIDE4Yy00LjQxIDAtOC0zLjU5LTgtOHMzLjU5LTggOC04IDggMy41OSA4IDgtMy41OSA4LTggOHoiLz48L3N2Zz4=)
-![Made with](https://img.shields.io/badge/Made%20with-❤️-red)
+[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.16--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases/tag/v4.0.16-beta) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 
----
+**Autonomous security scans with an interactive terminal workspace, REST API and MCP.**
 
-## 📑 Table of Contents
+BugTraceAI combines LLM-guided analysis with specialist tools and browser
+validation. Follow the scan, inspect evidence and configure providers from the
+terminal, or connect the engine to BugTraceAI-WEB and your own AI assistant.
+Use it only against applications you are authorized to test.
 
-- [🚨 Disclaimer](#-disclaimer)
-- [✨ Features](#-features)
-- [🔬 Core Methodology](#-core-methodology)
-- [🏗️ Architecture](#️-architecture)
-- [🛠️ Technology Stack](#️-technology-stack)
-- [🚀 Getting Started](#-getting-started)
-- [Install with your AI coding agent](#install-with-your-ai-coding-agent)
-- [🤖 AI Assistant Setup (MCP)](#-ai-assistant-setup-mcp)
-- [⚙️ Configuration](#️-configuration)
-- [📊 Output](#-output)
-- [📜 License](#-license)
+## Terminal workspace
 
----
+![BugTraceAI 4.0.16-beta terminal pipeline, showing all six stages with offline sample data](docs/screenshots/tui-pipeline.png)
 
-> 🏆 **The First Agentic Framework Intelligently Designed for Bug Bounty Hunting**
+The TUI follows **Recon → Discovery → Strategy → Exploit → Validate → Report**.
+Set the target URL, Depth and Max URLs at the top. The phase strip, counters,
+timings and scan controls stay visible while you switch views.
 
-BugTraceAI-CLI is an autonomous offensive security framework that combines LLM-driven analysis with deterministic exploitation tools. Unlike passive analysis tools, BugTraceAI-CLI actively exploits vulnerabilities using real payloads, SQLMap integration, and browser-based validation to deliver confirmed, actionable findings.
+<table>
+  <tr>
+    <td width="50%"><strong>Findings</strong><br/>Search, sort and inspect evidence.<br/><img src="docs/screenshots/tui-findings.png" alt="BugTraceAI Findings tab with searchable offline sample findings"/></td>
+    <td width="50%"><strong>Agents</strong><br/>Follow specialist states and queues.<br/><img src="docs/screenshots/tui-agents.png" alt="BugTraceAI Agents tab with specialist cards, queues and processed counts"/></td>
+  </tr>
+  <tr>
+    <td width="50%"><strong>Provider · F7</strong><br/>Select the LLM provider and configure its API key.<br/><img src="docs/screenshots/tui-provider.png" alt="BugTraceAI provider setup with an empty masked API-key field"/></td>
+    <td width="50%"><strong>Target Auth · F8</strong><br/>Use a Bearer token or a login YAML with optional TOTP.<br/><img src="docs/screenshots/tui-auth.png" alt="BugTraceAI target authentication dialog with WEB-compatible login YAML"/></td>
+  </tr>
+</table>
 
-The core philosophy is **"Think like a pentester, execute like a machine, validate like an auditor"** - using AI for intelligent hypothesis generation, but relying on real tools for exploitation and validation.
+Pipeline, Findings and Agents captures use the built-in offline demo in
+4.0.16-beta. Sample findings illustrate the interface. Provider and Auth captures
+show the actual setup dialogs without credentials.
 
-## Terminal workspace (v4.0.16-beta)
+[Install](#install) · [Terminal controls](#terminal-controls) ·
+[Install with your AI coding agent](#install-with-your-ai-coding-agent) ·
+[API and MCP](#api-and-mcp) · [Configuration and reports](#configuration-and-reports)
 
-Launch the interactive workspace from this checkout:
+## Scan engine
+
+The shared engine discovers endpoints, analyzes candidate findings, routes work
+to specialists and collects evidence through the validation/reporting stages.
+Specialist coverage includes SQL injection, XSS, SSRF, IDOR, LFI, RCE, template
+injection, XXE, JWT and redirect checks. Tool and browser evidence accompanies
+the reported findings.
+
+Provider presets include OpenRouter, Anthropic and Z.ai. The WEB connects to the
+same CLI engine for web scans, report access and Model Lab through its API.
+
+## Install
+
+On Linux or macOS, clone the public repository and run its installer:
 
 ```bash
-./bugtraceai-cli
-```
-
-Enter your target in the top panel, choose **Depth** (1–10) and **Max URLs**
-(1–5000), then press **Start**. Defaults come from your CLI configuration. You
-can also open a complete scan directly. The TUI always runs the full pipeline:
-
-```bash
-./bugtraceai-cli full https://target.example
-```
-
-The real scanner uses the same purple/coral pipeline view as the preview, with
-five focused tabs: **Pipeline → Findings → Agents → Timeline → Logs**.
-Inspect six stages and their timings, browse evidence, follow specialist queues,
-review scan milestones, or search engine logs. Runtime details expand inside
-Agents; pause/stop controls remain available above. Use **Provider** (F7) to select a provider and enter a masked API key before
-starting a real scan. Keys stay in the session unless you select Save in .env.
-Use **Auth** (F8 or `/auth`) for the target website: paste a masked **Bearer token**
-or load a **login YAML** using the WEB/CLI schema, including optional TOTP/2FA.
-Apply validates and loads a snapshot for subsequent scans in this TUI session;
-credentials are not saved by the TUI. Reapply the YAML to reload edits. Selecting
-None removes supplied Authorization/Cookie headers and login settings while
-keeping other custom headers. Authentication is editable before a scan or after
-it ends. In Docker, the YAML path must be accessible inside the container.
-`./bugtraceai-cli tui --demo` is the optional offline
-preview with sample data. Redirected commands continue to produce ordinary text.
-See [installation and terminal controls](INSTALLATION.md).
-
-## Engine highlights
-
-- **Anthropic direct-API provider**: Anthropic is now a first-class LLM provider using an API key (`x-api-key`, Messages API), selectable via the `anthropic` preset. A new `api_format` preset field decouples the wire format from the OAuth path, so `generate`, threaded generation, vision, and connectivity all route to the Anthropic Messages API when active. Existing OpenRouter/Z.ai behaviour is unchanged.
-- **Integrated Model Lab (model-eval)**: benchmark and compare OpenRouter models from BugTraceAI-WEB through the CLI API (`/api/model-eval`, `/api/model-eval/models`, `/api/model-eval/test-key`) with a per-request OpenRouter key, live WebSocket progress, cost visibility, and a key-validation check before a run. The recalibration adds a quality-dominant composite (median latency as a side axis), per-slot leaderboards (MUTATION / SKEPTICAL / ANALYSIS / REPORTING), the `quick-v3` / `advanced-v2` suites, and an opt-in MUTATION payload-diversity probe.
-- **Reporting/enrichment failover**: when a PoC or CVSS enrichment call on the active provider fails or degrades (circuit-breaker fallback, timeout, saturation), the reporting layer falls back to a secondary provider for that single enrichment call only — it never changes the scan's active provider. Configurable via `REPORTING_FAILOVER_ENABLED` / `REPORTING_FAILOVER_PROVIDER` (default: Anthropic), with provenance telemetry (`poc_enrichment_provenance`, `reporting_failover_count`) so reporting saturation is visible in the deliverable instead of silently degrading.
-- **Deliverable parity for pending findings**: pending (POTENTIAL) findings now appear in `validated_findings.json`, and the "Findings by Severity" totals plus manual-review ordering match across the Markdown, JSON, and HTML deliverables.
-- **Detection & dedup fixes**: a command injection detected two ways on the same endpoint no longer double-counts as two CRITICALs, a genuine IDOR with strong evidence routes to MANUAL_REVIEW instead of being buried in PENDING, and boolean-blind SQLi response diffing is capped and offloaded off the event loop to prevent stalls on large/hostile pages.
-- **Visible authentication discovery**: live scan events now report AuthDiscovery start, per-URL progress, and JWT/cookie totals.
-- **Bounded JavaScript endpoint mining**: first-party scripts are mined for API endpoints under strict count, size, timeout, and origin limits while `.js` assets remain excluded from normal DAST targets.
-- **Decoupled CDP validation stage**: an `AgenticValidator` Phase-5 stage confirms browser-executed findings (XSS/CSTI/SSTI) over the Chrome DevTools Protocol as a real pipeline stage.
-- **Sharper detection, fewer false positives**: multi-round false-positive discipline across all specialists — SQLi error-based and mass-assignment now require a real differential (not mere reflection), and confirmation relies on genuine error/behavioral signatures instead of static content.
-- **Higher-fidelity reports**: confirmed findings are never silently dropped, evidence panels are populated, CVSS/severity/impact are made consistent, and a reproduction `curl` is synthesized only for genuine injection findings.
-- **Broader coverage**: revived Out-of-Band (interactsh) confirmation for blind SSRF/XXE/RCE/SSTI, generic stored-XSS and POST-only XXE endpoint discovery, cookie-based SQLi, and reliable reflected-DOM XSS.
-- **Target-agnostic**: removed the last practice-target-specific hardcoded values so detection generalizes to any target.
-- **YAML Authentication + TOTP**: `--auth-config` loads login flows, credentials, environment-variable substitutions, and optional TOTP/2FA secrets for authenticated scans.
-- **Scan Resumption**: `--resume` and recoverable scan state tracking allow interrupted scans to continue without losing context or duplicating completed work.
-
-> **Local beta:** keep the CLI API on your machine or a trusted LAN. Do not expose it directly to the Internet. Model Lab uses your configured OpenRouter API key and provider charges may apply.
-
-## 🚨 Disclaimer
-
-This tool is for **authorized security testing only**.
-
-BugTraceAI-CLI performs **active exploitation** including:
-
-- Real SQL injection payloads via SQLMap
-- XSS payload execution in browsers
-- Template injection testing
-- Server-side request forgery probing
-
-**By using this tool, you acknowledge and agree that:**
-
-- You will only test applications for which you have explicit, written permission
-- You understand this tool sends actual attack payloads to targets
-- The creators assume no liability for any misuse or damage caused
-
-**Unauthorized access to computer systems is illegal.**
-
-## ✨ Features
-
-BugTraceAI-CLI implements a 6-phase pipeline that mirrors a professional penetration testing workflow.
-
-### Phase 1: Reconnaissance
-
-- 🕷️ **GoSpider Integration**: Fast async crawling with JavaScript rendering and sitemap parsing
-- 🔍 **Parameter Extraction**: Automatic identification of injectable parameters
-- 🌐 **API Endpoint Enrichment**: Detail URL discovery from list endpoints
-- 🧭 **SPA Route Inference**: Infers API endpoints from frontend routes
-
-### Phase 2: Discovery (DASTySAST)
-
-- 🧠 **Multi-Persona Analysis**: 6 different AI "personas" analyze each URL (bug bounty hunter, code auditor, pentester, etc.)
-- ✅ **Consensus Voting**: Requires 4/5 agreement from analysis personas to reduce false positives
-- 🔎 **Skeptical Review**: The 6th "Skeptical" persona (Claude Haiku) performs final filtering
-- 🎯 **Nuclei CVE Scanning**: Template-based detection of known vulnerabilities (runs in parallel)
-- 🛡️ **Parallel Execution**: All personas analyze simultaneously for speed
-
-### Phase 3: Strategy
-
-- 🎯 **ThinkingConsolidationAgent**: Central brain that routes findings to specialists
-- 🔄 **Deduplication**: Eliminates redundant findings across URLs
-- ⚡ **Priority Routing**: High-confidence findings get tested first
-- 🛡️ **SQLi Bypass**: SQL injection candidates always reach SQLMap (tool decides, not LLM)
-- 🧩 **Auto-Dispatch**: Framework detection triggers specialist agents automatically (e.g., Angular → CSTIAgent)
-
-### Phase 4: Exploitation
-
-Real tools, real payloads, real results — 15 autonomous specialist agents:
-
-| Agent                          | Target                                | Method                                                            |
-| ------------------------------ | ------------------------------------- | ----------------------------------------------------------------- |
-| 🔥 **XSSAgent**                | Cross-Site Scripting                  | Playwright browser + 6-level escalation pipeline                  |
-| 💉 **SQLiAgent**               | SQL Injection                         | SQLMap with WAF bypass tamper scripts                             |
-| 🎭 **CSTIAgent**               | Client/Server-Side Template Injection | AngularJS, Vue, Jinja2, Twig, Mako                                |
-| 🌐 **SSRFAgent**               | Server-Side Request Forgery           | OOB callback verification                                         |
-| 📄 **XXEAgent**                | XML External Entity                   | DTD injection + OOB exfiltration                                  |
-| 🔓 **IDORAgent**               | Insecure Direct Object Reference      | ID manipulation + path segment testing                            |
-| 📁 **LFIAgent**                | Local File Inclusion                  | Path traversal with filter evasion                                |
-| 🧩 **PrototypePollutionAgent** | Prototype Pollution                   | Browser-based property verification                               |
-| 🔌 **APISecurityAgent**        | API Security                          | Broken Object Level Authorization (BOLA) testing                  |
-| 🔑 **JWTAgent**                | JWT Vulnerabilities                   | Algorithm confusion, weak secrets, token forging                  |
-| 🔀 **OpenRedirectAgent**       | Open Redirect                         | HTTP 3xx + DOM-based redirect detection                           |
-| 💀 **RCEAgent**                | Remote Code Execution                 | Command injection + deserialization testing                       |
-| 📨 **HeaderInjectionAgent**    | Header Injection                      | CRLF injection + response splitting                               |
-| 📦 **MassAssignmentAgent**     | Mass Assignment                       | Parameter pollution + privilege escalation                        |
-| 📤 **FileUploadAgent**         | Unrestricted File Upload              | Extension/content-type bypass, path-based write to RCE            |
-
-### Phase 5: Validation
-
-- 🖥️ **Chrome DevTools Protocol**: Low-level browser verification for XSS
-- 👁️ **Vision AI**: Screenshot analysis confirms visual vulnerabilities
-- 📸 **Evidence Capture**: Every confirmed finding includes proof
-
-### Phase 6: Reporting
-
-- 📊 **AI-Powered Reports**: LLM-generated executive and technical assessments
-- 📝 **Multiple Formats**: JSON (machine-readable), Markdown, and HTML reports
-- 🔬 **PoC Enrichment**: Batch proof-of-concept generation for confirmed findings
-- 📁 **Specialist Audit Trail**: Per-agent WET/DRY/Results traceability
-
-### Intelligence Systems
-
-- 🔀 **LLM Shifting**: Automatic fallback through model tiers (Qwen primary → DeepSeek → Claude → Gemini)
-- 🛡️ **WAF Detection**: Identifies Cloudflare, Akamai, AWS WAF, ModSecurity
-- 🎯 **Adaptive Bypass**: Encoding, chunking, and case mixing strategies per WAF type
-- 🛡️ **Ecosystem Robustness**: Built-in circuit breakers for infinite loops, adaptive rate-limiting, and cross-interface (LAN/Remote) compatibility.
-
-## 🔬 Core Methodology
-
-BugTraceAI-CLI uses a multi-layered approach to maximize accuracy while minimizing false positives.
-
-### Multi-Persona Analysis
-
-Instead of a single AI scan, each URL is analyzed by 6 different "personas" providing diverse perspectives:
-
-1. **Bug Bounty Hunter**: Focuses on high-impact, reward-worthy issues (RCE, SQLi, SSRF)
-2. **Code Auditor**: analyzing code patterns, input validation, and logic flaws
-3. **Pentester**: Standard attack-surface mapping and OWASP Top 10 exploitation
-4. **Security Researcher**: Novel attack vectors, race conditions, and edge cases
-5. **Red Team Operator**: Advanced attack chains, privilege escalation, and lateral movement
-6. **Skeptical Reviewer**: A separate "critic" agent that aggressively filters false positives
-
-### Consensus + Skeptical Review
-
-```
-5 Analysis Personas run in parallel
-        ↓
-Consensus voting (Agreement analysis)
-        ↓
-6th Persona "Skeptical Agent" Review (Claude Haiku)
-        ↓
-Passed to specialist agents
-```
-
-### Tool-Based Validation
-
-The key differentiator: **AI hypothesizes, tools validate**.
-
-- SQLi findings → SQLMap confirms with real injection
-- XSS findings → Playwright executes payload in browser
-- All findings → CDP + Vision AI provides evidence
-
-This eliminates the "hallucination problem" of pure-AI scanners.
-
-## 🏗️ Reactor Architecture
-
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         BUGTRACE REACTOR                             │
-├──────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌────────────┐   │
-│  │   Phase 1  │   │   Phase 2  │   │   Phase 3  │   │   Phase 4  │   │
-│  │   Recon    │ → │  Discovery │ → │  Strategy  │ → │Exploitation│   │
-│  │  GoSpider  │   │ DASTySAST  │   │ ThinkingAg.│   │ 15 Agents  │   │
-│  │ URL Enrich │   │ 6 Personas │   │   Dedup    │   │   SQLMap   │   │
-│  │ SPA→API    │   │  + Nuclei  │   │  Routing   │   │ Playwright │   │
-│  └────────────┘   └────────────┘   └────────────┘   └─────┬──────┘   │
-│                                                            │         │
-│                                                            ▼         │
-│                                                     ┌────────────┐   │
-│                                                     │   Phase 5  │   │
-│                                                     │ Validation │   │
-│                                                     │    CDP     │   │
-│                                                     │ Vision AI  │   │
-│                                                     └─────┬──────┘   │
-│                                                           │          │
-│                                                           ▼          │
-│                                                     ┌────────────┐   │
-│                                                     │   Phase 6  │   │
-│                                                     │ Reporting  │   │
-│                                                     │JSON/MD/HTML│   │
-│                                                     └────────────┘   │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-### Parallelization Control
-
-Each phase runs with independent concurrency:
-
-| Phase          | Concurrency | Configurable | Notes                        |
-| -------------- | ----------- | ------------ | ---------------------------- |
-| Reconnaissance | 1           | No           | GoSpider is already fast     |
-| Discovery      | 5           | Yes          | Parallel DAST per URL        |
-| Strategy       | 1           | No           | Sequential dedup + routing   |
-| Exploitation   | 10          | Yes          | Parallel specialist agents   |
-| Validation     | 1           | **No**       | CDP limitation (hardcoded)   |
-| Reporting      | 1           | No           | Sequential report generation |
-
-> **Why is Validation = 1?** Chrome DevTools Protocol doesn't support multiple simultaneous connections. Additionally, `alert()` popups from XSS payloads block CDP indefinitely. Single-threaded with timeouts prevents crashes.
-
-## 🛠️ Technology Stack
-
-- **Language**: Python 3.10+
-- **AI Providers**: OpenRouter (Gemini, Claude, DeepSeek, Qwen), Anthropic (direct API — `x-api-key` / Messages API), and Z.ai
-- **Local AI**: BAAI/bge-small-en-v1.5 (SOTA Embeddings & Semantic Search)
-- **Browser Automation**: Playwright (exploitation), Chrome CDP (validation)
-- **SQL Injection**: SQLMap via Docker
-- **Crawling**: GoSpider via Docker
-- **CVE Scanning**: Nuclei via Docker
-- **Database**: SQLite with WAL mode
-- **Async**: asyncio + aiohttp
-
-## 🚀 Getting Started
-
-### Prerequisites
-
-- **For Docker**: Docker & Docker Compose
-- **For Local**: Python 3.10+, Docker (for some agents), nmap (optional)
-- OpenRouter API key ([get one here](https://openrouter.ai/keys))
-
-### 🎯 Quick Installation (Recommended)
-
-Use the **interactive installation wizard** for automatic setup:
-
-```bash
-# Clone the repository
-git clone https://github.com/BugTraceAI/BugTraceAI-CLI
+git clone https://github.com/BugTraceAI/BugTraceAI-CLI.git
 cd BugTraceAI-CLI
-
-# Run the installation wizard
 ./install.sh
 ```
 
-The wizard will:
+Choose **TUI**, **API + MCP**, or **both**, then **local Python** or **Docker**.
+The installer selects the interface dependencies and offers an optional
+user-global `btai` command for TUI/both.
 
-- ✅ Check system requirements automatically
-- 🔍 Detect and use free ports for Docker (no conflicts!)
-- ⚙️ Set up environment configuration
-- 🐳 Build and start Docker containers OR configure local Python environment
-- 🎨 Provide beautiful, interactive terminal UI
+| Profile | Command |
+| --- | --- |
+| Local TUI + global command | `./install.sh --interface tui --runtime local --global yes` |
+| Docker API + MCP | `./install.sh --interface api --runtime docker --global no` |
+| Docker API + TUI + global command | `./install.sh --interface both --runtime docker --global yes` |
+| Update or repair the saved profile | `./install.sh --reuse` |
 
-**Installation choices:**
+Local installation needs Python 3.10+. Docker runtime needs Docker Engine and
+Compose. Some specialist tools also use Docker during local scans. TUI adds
+Textual; API adds FastAPI, Uvicorn, WebSockets and MCP. Existing environments
+retain previously installed packages when you change profiles.
 
-First choose **TUI**, **API + MCP**, or **both**. Then choose **local Python** or **Docker**. The engine is shared; Textual is installed for TUI, FastAPI/Uvicorn/WebSockets/MCP for API. Docker TUI builds an interactive scanner container without starting a server or publishing ports.
+Choices are saved in `.bugtrace-install.env` without API keys. See
+[INSTALLATION.md](INSTALLATION.md) for prerequisites and runtime-specific setup.
+
+### Open the real TUI
 
 ```bash
-./install.sh --interface tui --runtime local
-./install.sh --interface api --runtime docker
-./install.sh --interface both --runtime docker
-./install.sh --reuse  # update/repair using the saved selection
+./bugtraceai-cli
+# With global registration, open a new terminal and run from any directory:
+btai
 ```
 
-Choices are stored in `.bugtrace-install.env`, without API keys. Existing environments retain previously installed packages; changing profiles does not remove them automatically.
+Configure **Provider/F7**, enter your target, choose crawl limits and press
+**Start**. Opening the workspace does not start a scan. A real scan requires a
+provider key. In Provider, uncheck **Save this key in local .env** to keep a new
+key only for the current session.
 
-Start local TUI with `./bugtraceai-cli tui`, local API with `./bugtraceai-cli serve`, Docker TUI with `docker compose -f docker-compose.tui.yml run --rm scanner`, or TUI in a combined deployment with `docker compose exec api python3 -m bugtrace tui`.
+Use **Auth/F8** for the target website's credentials: a masked Bearer token or
+a WEB-compatible login YAML, with optional TOTP/2FA. These target credentials
+stay in the TUI session. Auth can be edited before a scan or after it finishes.
+The current YAML format and example are in
+[Target authentication](INSTALLATION.md#target-authentication).
 
-### Install with your AI coding agent
+To open a full interactive scan directly, or explicitly preview sample data:
+
+```bash
+./bugtraceai-cli full https://target.example
+./bugtraceai-cli tui --demo
+```
+
+### Docker TUI
+
+```bash
+# TUI-only Docker profile: interactive scanner, no published server ports
+docker compose -f docker-compose.tui.yml run --rm scanner
+
+# Both interfaces installed: open the TUI inside the API container
+docker compose exec api python3 -m bugtrace tui
+```
+
+The global `btai` helper honors the selected local/Docker profile. Keep the
+registered checkout at its installation path; rerun registration after moving
+it. API-only installations do not offer the global TUI command.
+
+## Terminal controls
+
+| View | Key | Purpose |
+| --- | --- | --- |
+| Pipeline | F2 | Scan stages, progress, counters and elapsed times |
+| Findings | F3 | Search, sort, inspect and export vulnerability evidence |
+| Agents | F4 | Specialist states, queues, counts and runtime details |
+| Timeline | F5 | Scan milestones and alerts |
+| Logs | F6 | Search engine output and filter by agent |
+| Provider | F7 | LLM provider and masked API-key setup |
+| Auth | F8 | Target Bearer token or login YAML |
+
+**F1** opens help; **Tab** moves focus; **Ctrl+S** starts; **Ctrl+X** stops;
+**Ctrl+E** exports captured findings; **Ctrl+Q** quits. Pause takes effect at the
+next pipeline checkpoint. The top form accepts the target URL; the lower bar
+accepts commands such as `/help`, `/provider`, `/auth`, `/pause`, `/resume`,
+`/stop`, `/findings` and `/export`.
+
+## Install with your AI coding agent
 
 Copy this prompt into an agent with terminal access, such as Claude Code,
 Cursor or Codex. The default installs the real TUI and a global `btai` command
@@ -361,263 +180,63 @@ needed for btai.
 See [INSTALLATION.md](INSTALLATION.md) for profiles, Provider/F7, Auth/F8 and
 troubleshooting. Installation does not require running a scan.
 
-### 📖 Manual Installation
+## API and MCP
 
-<details>
-<summary>Click to expand manual installation instructions</summary>
-
-#### Local Installation
+Install the `api` or `both` profile to use the engine without opening the TUI.
+For local installations:
 
 ```bash
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -e ".[tui]"  # use .[api] or .[tui,api] for server support
-
-# Install browser
-playwright install chromium
-
-# Configure environment
-cp .env.example .env
-# Edit .env and add your OPENROUTER_API_KEY
-```
-
-#### Docker Installation
-
-```bash
-# Configure environment
-cp .env.example .env
-# Edit .env and add your OPENROUTER_API_KEY
-
-# Build and start
-docker-compose up -d
-
-# View logs
-docker-compose logs -f
-```
-
-</details>
-
-### Quick Start
-
-```bash
-# Full scan
-./bugtraceai-cli scan https://target.com
-
-# Clean scan (reset database)
-./bugtraceai-cli scan https://target.com --clean
-
-# Resume interrupted scan
-./bugtraceai-cli scan https://target.com --resume
-
-# Authenticated scan (YAML config with optional TOTP)
-./bugtraceai-cli scan https://target.com --auth-config auth_config.yaml
-
-# Start API server (for Web UI)
 ./bugtraceai-cli serve --port 8000
-
-# Open ModelLab from BugTraceAI-WEB after starting the API
-# /bugtraceai/modellab
+# In a separate terminal, MCP defaults to STDIO:
+./bugtraceai-cli mcp
+# Optional HTTP/SSE transport:
+./bugtraceai-cli mcp --sse --host 127.0.0.1 --port 8001
 ```
 
-**Docker Users:**
+The API exposes `/health` and `/docs`. For Docker API/both profiles, the
+installer starts the API/MCP Compose services and records the selected ports
+in `.env`; use `docker compose up -d` to start them again. Connect an SSE client
+to `http://localhost:<MCP_PORT>/sse` using the actual configured MCP port.
+
+BugTraceAI-WEB uses the CLI API for scans, progress and reports. MCP clients can
+control scans through the engine's tools. Configure provider credentials locally
+before scanning. See [API and MCP](INSTALLATION.md#api-and-mcp) for details.
+
+## Configuration and reports
+
+`bugtraceaicli.conf` contains the engine settings; provider credentials can be
+configured in local `.env`. The TUI offers Provider/F7 and Auth/F8 for scan setup.
+See [custom provider configuration](docs/CUSTOM_PROVIDERS.md) for additional
+provider options. Read the selected provider preset rather than relying on
+historical model names from older releases.
+
+Reports are written beneath the configured report directory. Scan deliverables
+include `final_report.md`, `validated_findings.json`, `engagement_data.json`
+and `report.html`, with evidence and specialist artifacts as available.
+**Ctrl+E** or `/export` exports the findings captured by the TUI as JSON.
+
+Explicit command-line scans remain available for scripts:
 
 ```bash
-# API is already running at http://localhost:8000
-# (or whatever port was auto-selected during installation)
-
-# Execute scans via API or Web UI
-curl http://localhost:8000/health
+./bugtraceai-cli scan https://target.example
+./bugtraceai-cli scan https://target.example --auth-config auth-config.yaml
+./bugtraceai-cli --help
 ```
 
-## 🤖 AI Assistant Setup (MCP)
+## Documentation and releases
 
-BugTraceAI is **MCP-compatible** — control your security scans directly from your AI assistant through natural conversation.
+- [Installation, profiles, authentication and terminal controls](INSTALLATION.md)
+- [Release notes](https://github.com/BugTraceAI/BugTraceAI-CLI/releases)
+- [BugTraceAI ecosystem](https://github.com/BugTraceAI/BugTraceAI)
+- [Launcher](https://github.com/BugTraceAI/BugTraceAI-Launcher)
+- [WEB dashboard](https://github.com/BugTraceAI/BugTraceAI-WEB)
+- [DeepWiki](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 
-Works with [**OpenClaw**](https://openclaw.com) (Telegram-based AI assistant), **Claude Code**, **Cursor**, and any MCP-compatible client. Deploy once, control from anywhere.
+The public CLI is a beta. Use scans only on explicitly authorized targets.
 
-### How It Works
+## License
 
-BugTraceAI exposes its scanning engine as **MCP tools** via the [Model Context Protocol](https://modelcontextprotocol.io) — the open standard for connecting AI assistants to external tools. Your AI assistant can start scans, monitor progress, query findings, and retrieve reports — all through chat.
+Apache-2.0 for BugTraceAI-owned material in this public distribution.
+See [LICENSE](LICENSE), [NOTICE](NOTICE) and [license history](LICENSE-HISTORY.md).
 
-### Quick Setup for AI Agents
-
-Use the [agent installation prompt](#install-with-your-ai-coding-agent),
-changing its first line to: **Install BugTraceAI-CLI with API + MCP using Docker,
-without the global TUI command.** The installer command for that profile is
-`./install.sh --interface api --runtime docker --global no`.
-
-After setup, connect your MCP client to `http://localhost:<MCP_PORT>/sse` using
-the actual port reported by the installer (default 8001). Configure the provider
-key locally in `.env` before scanning; keep it out of chat and client configs.
-
-### Manual MCP Setup
-
-```bash
-# 1. Clone and configure
-git clone https://github.com/BugTraceAI/BugTraceAI-CLI
-cd BugTraceAI-CLI
-cp .env.example .env
-# Edit .env → add your OPENROUTER_API_KEY
-
-# 2. Start services (API + MCP)
-docker compose up -d
-
-# 3. Verify endpoints
-curl -f http://localhost:8000/health   # API health check
-curl -sf http://localhost:8001/sse     # MCP SSE endpoint
-```
-
-### Connect Your AI Assistant
-
-Add BugTraceAI to your MCP client configuration:
-
-```json
-{
-  "mcpServers": {
-    "bugtraceai": {
-      "baseUrl": "http://localhost:8001/sse",
-      "description": "BugTraceAI Security Scanner"
-    }
-  }
-}
-```
-
-### Available MCP Tools
-
-Once connected, your AI assistant can use these tools:
-
-| Tool              | Description                                           |
-| ----------------- | ----------------------------------------------------- |
-| `start_scan`      | Start a security scan on a target URL                 |
-| `get_scan_status` | Check scan progress and current phase                 |
-| `query_findings`  | Retrieve vulnerability findings with filtering        |
-| `stop_scan`       | Stop a running scan gracefully                        |
-| `export_report`   | Get scan report (summary, critical findings, or full) |
-| `explain_finding` | Get detailed explanation and remediation for a finding|
-
-### Prerequisites
-
-- **Docker & Docker Compose** installed and running
-- **OpenRouter API key** ([get one here](https://openrouter.ai/keys))
-- An MCP-compatible AI assistant ([OpenClaw](https://openclaw.com), Claude Code, Cursor, or any MCP client)
-
-### Ports
-
-| Service | Port | Description                     |
-| ------- | ---- | ------------------------------- |
-| API     | 8000 | REST API + health check         |
-| MCP     | 8001 | SSE transport for AI assistants |
-
-## ⚙️ Configuration
-
-All settings in `bugtraceaicli.conf`:
-
-```ini
-[API]
-OPENROUTER_API_KEY = sk-or-v1-xxxxx
-
-[SCAN]
-MAX_URLS = 100
-MAX_CONCURRENT_ANALYSIS = 5
-MAX_CONCURRENT_SPECIALISTS = 10
-
-[SCANNING]
-MANDATORY_SQLMAP_VALIDATION = True
-STOP_ON_CRITICAL = False
-
-[VALIDATION]
-CDP_ENABLED = True
-VISION_ENABLED = True
-```
-
-### Model Configuration
-
-```ini
-[LLM_MODELS]
-DEFAULT_MODEL = qwen/qwen3-coder
-SKEPTICAL_MODEL = anthropic/claude-haiku-4.5
-VISION_MODEL = google/gemini-3-flash-preview
-```
-
-### Authenticated Scanning (YAML + TOTP/2FA)
-
-BugTraceAI-CLI supports authenticated scans via a YAML configuration file. This enables scanning login-protected applications with optional TOTP (Time-Based One-Time Password) token generation.
-
-**`auth_config.yaml` example:**
-
-```yaml
-login_url: https://target.com/login
-username: pentester@example.com
-password: your_password_here
-totp_secret: BASE32TOTPSECRETHERE   # optional — for 2FA/TOTP protected logins
-success_condition: "Welcome"        # string that confirms successful login
-```
-
-**Usage:**
-
-```bash
-./bugtraceai-cli scan https://target.com --auth-config auth_config.yaml
-```
-
-The scanner will:
-1. Navigate to `login_url`
-2. Fill in credentials automatically
-3. Generate a TOTP token in real-time if `totp_secret` is provided
-4. Confirm login success via `success_condition`
-5. Reuse the authenticated session across all scan phases
-
-> The `auth_config.yaml` file is automatically included in the report download ZIP for audit traceability.
-
-## 📊 Output
-
-### Reports
-
-Generated in `/reports/`:
-
-- `report_*.json` - Machine-readable findings
-- `report_*.md` - Markdown summary
-- `report_*.html` - Executive presentation
-
-### Logs
-
-Located in `/logs/`:
-
-- `execution.log` - Detailed trace
-- `llm_audit.jsonl` - Every AI prompt/response
-- `errors.log` - Error tracking
-
-### Finding Status Flow
-
-```
-CANDIDATE → PENDING_VALIDATION → CONFIRMED / FALSE_POSITIVE → PROBE_VALIDATED
-```
-
-## 📜 License
-
-Apache-2.0 License. See [LICENSE](LICENSE).
-
-Copyright (c) 2026 BugTraceAI
-
-See [LICENSE](LICENSE) for details.
-
----
-
-Made with ❤️ by Albert C. [@yz9yt](https://x.com/yz9yt)
-
-[bugtraceai.com](https://bugtraceai.com)
-
-### Global terminal command (macOS / Linux)
-
-After choosing TUI or both and local or Docker, the installer asks whether to install **`btai`** for the current user. It creates `~/.local/bin/btai` without sudo and adds that directory to Bash/Zsh's startup PATH if needed. Open a new terminal, then run `btai` from any folder to open the real TUI. `btai --demo` explicitly opens the preview.
-
-The command targets the selected checkout and local/Docker profile. Keep the checkout at that path, or run the installer again after moving it. API-only installs do not offer the TUI command. An unrelated existing `btai` file is preserved.
-
-```bash
-./install.sh --interface tui --runtime local --global yes
-./install.sh --reuse  # also remembers the global command choice
-# Register the command for an already installed profile, without reinstalling:
-./install.sh --interface both --runtime docker --global yes --global-only
-```
+[bugtraceai.com](https://bugtraceai.com) · [@yz9yt](https://github.com/yz9yt)
