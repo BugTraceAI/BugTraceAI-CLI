@@ -1,6 +1,6 @@
 # BugTraceAI-CLI
 
-[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.19--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
+[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.20--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 
 **Autonomous security scans with an interactive terminal workspace, REST API and MCP.**
 
@@ -59,7 +59,9 @@ cd BugTraceAI-CLI
 
 Choose **TUI**, **API + MCP**, or **both**, then **local Python** or **Docker**.
 The installer selects the interface dependencies and offers an optional
-user-global `btai` command for TUI/both.
+user-global `btai` command for TUI/both. It also offers to open the TUI when
+installation finishes. Accept to open immediately; the current terminal does
+not need a refreshed PATH. Use `--launch no` for an unattended install.
 
 | Profile | Command |
 | --- | --- |

@@ -703,15 +703,16 @@ install_docker() {
 # ============================================================
 
 main() {
-    local reuse=false global_only=false requested_interface="" requested_runtime="" requested_global="" choice
+    local reuse=false global_only=false requested_interface="" requested_runtime="" requested_global="" requested_launch="" choice
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --interface) [[ $# -ge 2 ]] || return 1; requested_interface="$2"; shift 2 ;;
             --runtime) [[ $# -ge 2 ]] || return 1; requested_runtime="$2"; shift 2 ;;
             --global-only) global_only=true; shift ;;
             --global) [[ $# -ge 2 ]] || return 1; requested_global="$2"; shift 2 ;;
+            --launch) [[ $# -ge 2 ]] || return 1; requested_launch="$2"; shift 2 ;;
             --reuse) reuse=true; shift ;;
-            --help|-h) echo "Usage: ./install.sh [--interface tui|api|both] [--runtime local|docker] [--global yes|no] [--global-only] [--reuse]"; return ;;
+            --help|-h) echo "Usage: ./install.sh [--interface tui|api|both] [--runtime local|docker] [--global yes|no] [--launch yes|no] [--global-only] [--reuse]"; return ;;
             *) print_error "Unknown option: $1"; return 1 ;;
         esac
     done
@@ -732,6 +733,11 @@ main() {
         case "$choice" in 1) INSTALL_INTERFACE=tui ;; 2) INSTALL_INTERFACE=api ;; 3) INSTALL_INTERFACE=both ;; 4) return ;; *) print_error "Invalid interface"; return 1 ;; esac
     fi
     case "$INSTALL_INTERFACE" in tui|api|both) ;; *) print_error "Interface must be tui, api or both"; return 1 ;; esac
+    case "$requested_launch" in ''|yes|no) ;; *) print_error "Launch choice must be yes or no"; return 1 ;; esac
+    if [[ "$requested_launch" == yes ]]; then
+        [[ "$INSTALL_INTERFACE" != api ]] || { print_error "Launching the TUI requires TUI or both interfaces."; return 1; }
+        [[ -t 0 && -t 1 ]] || { print_error "--launch yes requires an interactive terminal. Use --launch no for automation."; return 1; }
+    fi
     if [[ -z "$INSTALL_RUNTIME" ]]; then
         echo ""
         echo "Where should the selected CLI interfaces run?"
@@ -771,6 +777,7 @@ main() {
     # An optional command/PATH failure must not lose a completed installation's profile.
     save_install_choices
     if [[ "$INSTALL_GLOBAL" == yes ]]; then install_global_command; fi
+    offer_tui_launch "$requested_launch" "$global_only"
 }
 
 # ============================================================

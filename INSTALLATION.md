@@ -187,6 +187,29 @@ registered checkout at its installation path. Global registration uses
 `btai` command is preserved. Registration can be retried with
 `./install.sh --global-only --global yes`.
 
+If `btai` is not found in the terminal used for installation, open a new
+terminal or activate the command directory in that same shell:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+btai
+```
+
+You can also start immediately with `~/.local/bin/btai`. The installer cannot
+change the PATH of the shell that launched it. Registering the command needs
+no sudo; a Docker installation may still ask for sudo when starting the TUI.
+
+After a successful interactive TUI/both installation, the wizard offers to
+open the real TUI immediately. Press Enter to accept or `n` to finish. It uses
+the checkout path, so the new command directory need not be in the current
+terminal's PATH. Opening the workspace does not start a scan. Quitting returns
+to the installer; a launch failure keeps the completed installation/profile.
+
+Use `--launch no` to skip that final prompt. `--launch yes` opens directly
+after installation and requires a terminal. Noninteractive runs and
+`--global-only` do not prompt to launch; API-only installations do not offer
+the TUI.
+
 ## API and MCP
 
 For a local API installation:
