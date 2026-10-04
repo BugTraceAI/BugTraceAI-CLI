@@ -259,7 +259,7 @@ install_linux_packages() {
 probe_python_venv() {
     local probe
     probe=$(mktemp -d "${TMPDIR:-/tmp}/bugtraceai-venv.XXXXXX")
-    if python3 -m venv --without-pip "$probe" >/dev/null 2>&1; then
+    if python3 -m venv "$probe" >/dev/null 2>&1 && "$probe/bin/python3" -m pip --version >/dev/null 2>&1; then
         rm -rf "$probe"
         return 0
     fi
@@ -272,6 +272,10 @@ prepare_local_requirements() {
         print_error "Python 3.10 or newer is required. Install Python and run the installer again."
         return 1
     }
+    if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+        print_error "Python 3.10 or newer is required. Upgrade Python and rerun the installer."
+        return 1
+    fi
 
     local need_python_packages=()
     local need_nmap=false
@@ -483,7 +487,8 @@ install_local() {
     print_step "Creating Python virtual environment..."
     
     if [ -d .venv ]; then
-        print_info "Virtual environment already exists"
+        print_info "Refreshing the existing virtual environment without removing packages"
+        python3 -m venv .venv
     else
         python3 -m venv .venv
         print_success "Virtual environment created"
@@ -496,12 +501,15 @@ install_local() {
     
     echo ""
     print_step "Upgrading pip..."
-    pip install --upgrade pip
+    python3 -m pip install --upgrade pip
     
     echo ""
     print_step "Installing Python dependencies..."
     print_info "This may take several minutes (includes PyTorch CPU and other ML libraries)..."
-    pip install -e "$(install_extras)"
+    if [[ "$(uname -s)" == Linux ]]; then
+        python3 -m pip install 'torch>=2.0.0' --index-url https://download.pytorch.org/whl/cpu
+    fi
+    python3 -m pip install -e "$(install_extras)"
     chmod +x bugtraceai-cli
     if [[ "$INSTALL_INTERFACE" != api ]]; then
         python3 -c "from bugtrace.core.ui.tui import BugTraceApp; print('TUI dependencies ready')"

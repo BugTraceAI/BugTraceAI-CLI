@@ -1,6 +1,6 @@
 # BugTraceAI-CLI
 
-[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.18--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
+[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.19--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 
 **Autonomous security scans with an interactive terminal workspace, REST API and MCP.**
 
@@ -68,8 +68,10 @@ user-global `btai` command for TUI/both.
 | Docker API + TUI + global command | `./install.sh --interface both --runtime docker --global yes` |
 | Update or repair the saved profile | `./install.sh --reuse` |
 
-Local installation needs Python 3.10+. Docker runtime needs Docker Engine and
-Compose. Some specialist tools also use Docker during local scans. TUI adds
+Local installation needs Python 3.10+. The installer prepares missing Linux
+pip/venv tools and Docker/Compose for the Docker profile. On macOS, Docker
+setup uses an existing Docker Desktop or Homebrew/Colima. Some specialist tools
+also use Docker during local scans. TUI adds
 Textual; API adds FastAPI, Uvicorn, WebSockets and MCP. Existing environments
 retain previously installed packages when you change profiles.
 

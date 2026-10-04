@@ -17,6 +17,9 @@ local scans. The scanning engine and browser dependencies are shared.
 TUI adds Textual. API adds FastAPI, Uvicorn, WebSockets and MCP. Local packages
 are installed from the selected extras in `pyproject.toml`. The installer
 prepares the environment, Chromium and scanner tools for the selected runtime.
+On Linux, the local installer selects the CPU build of PyTorch before installing
+the engine, avoiding unnecessary CUDA packages. It checks that a virtual
+environment can create its own working pip, including on fresh Ubuntu systems.
 On Linux it automatically installs missing `pip`/`venv` packages and `nmap`
 through the system package manager, asking for `sudo` only when needed. On
 macOS it uses Homebrew when available. Docker is reported as optional for a
@@ -31,6 +34,8 @@ Administrator/password prompts remain in your terminal. Existing working
 Docker installations are reused. If a Linux socket needs administrator access,
 the installer and `btai` use `sudo` for Docker commands without changing groups.
 Unavailable custom Docker contexts are reported rather than switched.
+Docker builds select the Nuclei binary for x86_64 or ARM64; the latter includes
+Apple Silicon Docker runtimes.
 
 For scripted installations:
 
