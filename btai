@@ -18,7 +18,16 @@ fi
 case "$BT_AI_RUNTIME" in
     local) exec "$BT_AI_ROOT/bugtraceai-cli" tui "$@" ;;
     docker)
-        if docker compose version >/dev/null 2>&1; then BT_AI_COMPOSE=(docker compose); else BT_AI_COMPOSE=(docker-compose); fi
+        source "$BT_AI_ROOT/scripts/install_docker_runtime.sh"
+        if ! docker_resolve_access; then
+            echo 'Docker is not ready. Run ./install.sh --reuse to repair this runtime.' >&2
+            exit 1
+        fi
+        if ! docker_select_compose; then
+            echo 'Docker Compose is unavailable. Run ./install.sh --reuse.' >&2
+            exit 1
+        fi
+        BT_AI_COMPOSE=("${COMPOSE_ARGS[@]}")
         if [[ "$BT_AI_INTERFACE" == tui ]]; then
             exec "${BT_AI_COMPOSE[@]}" -f docker-compose.tui.yml run --rm -e "TERM=${TERM:-xterm-256color}" scanner tui "$@"
         else
