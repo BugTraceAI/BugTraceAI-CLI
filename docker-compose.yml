@@ -1,27 +1,26 @@
 services:
   api:
-    build: .
+    build:
+      context: .
+      args:
+        BUGTRACE_INTERFACE: ${BUGTRACE_INTERFACE:-both}
     container_name: bugtrace_api
+    command: ["serve", "--host", "0.0.0.0", "--port", "${CLI_PORT:-8000}"]
     init: true          # run tini so orphaned chromium procs get reaped (no zombie pile-up)
     shm_size: 2gb       # chromium renderers use /dev/shm; the 64MB default exhausts -> renderer wedge -> hang
     ports:
       - "${CLI_PORT:-8000}:${CLI_PORT:-8000}"
-    command: ["serve", "--host", "0.0.0.0", "--port", "${CLI_PORT:-8000}"]
     volumes:
-      - cli-scans:/app/scans
-      - cli-reports:/app/reports
-      - cli-db:/app/data
-      - cli-logs:/app/logs   # persist scanner logs (execution.log / bugtrace.jsonl / errors.log) across rebuilds — enables saturation/timeout forensics
+      - bugtraceai-cli_cli-scans:/app/scans
+      - bugtraceai-cli_cli-reports:/app/reports
+      - bugtraceai-cli_cli-db:/app/data
+      - bugtraceai-cli_cli-logs:/app/logs   # persist scanner logs (execution.log / bugtrace.jsonl / errors.log) across rebuilds — enables saturation/timeout forensics
       - /var/run/docker.sock:/var/run/docker.sock
       - ./.env:/app/.env   # bind the host .env so Provider-tab key changes (update_env_var writes /app/.env) persist across restarts
     env_file:
       - .env
     environment:
       BUGTRACE_CORS_ORIGINS: ${BUGTRACE_CORS_ORIGINS:-http://localhost:5173,http://localhost:6869}
-    networks:
-      bugtraceai-platform:
-        aliases:
-          - bugtrace-cli-api
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:${CLI_PORT:-8000}/health"]
       interval: 30s
@@ -31,22 +30,23 @@ services:
     restart: unless-stopped
 
   mcp:
-    build: .
+    build:
+      context: .
+      args:
+        BUGTRACE_INTERFACE: ${BUGTRACE_INTERFACE:-both}
     container_name: bugtrace_mcp
+    command: ["mcp", "--sse", "--host", "0.0.0.0", "--port", "${MCP_PORT:-8001}"]
     ports:
       - "${MCP_PORT:-8001}:${MCP_PORT:-8001}"
-    command: ["mcp", "--sse", "--host", "0.0.0.0", "--port", "${MCP_PORT:-8001}"]
     volumes:
-      - cli-reports:/app/reports
-      - cli-logs:/app/logs
-      - cli-db:/app/data
+      - bugtraceai-cli_cli-reports:/app/reports
+      - bugtraceai-cli_cli-logs:/app/logs
+      - bugtraceai-cli_cli-db:/app/data
     env_file:
       - .env
     depends_on:
       api:
         condition: service_healthy
-    networks:
-      - bugtraceai-platform
     healthcheck:
       test: ["CMD-SHELL", "curl -sS -m 2 http://localhost:${MCP_PORT:-8001}/sse >/dev/null; res=$$?; [ $$res -eq 0 ] || [ $$res -eq 28 ] || exit 1"]
       interval: 30s
@@ -56,12 +56,7 @@ services:
     restart: unless-stopped
 
 volumes:
-  cli-scans:
-  cli-reports:
-  cli-logs:
-  cli-db:
-
-networks:
-  bugtraceai-platform:
-    name: ${BTAI_SHARED_NETWORK:-bugtraceai-platform}
-    driver: bridge
+  bugtraceai-cli_cli-scans:
+  bugtraceai-cli_cli-reports:
+  bugtraceai-cli_cli-logs:
+  bugtraceai-cli_cli-db:

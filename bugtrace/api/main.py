@@ -115,7 +115,7 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     contact={"name": "BugTraceAI", "url": "https://github.com/BugTraceAI"},
-    license_info={"name": "Apache-2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0"},
+    license_info={"name": "AGPL-3.0", "url": "https://www.gnu.org/licenses/agpl-3.0.html"},
 )
 
 
@@ -474,19 +474,27 @@ async def _ws_stream_live_events(websocket: WebSocket, scan_id: int, highest_sen
 
 
 async def _ws_drain_event_stream(websocket: WebSocket, scan_id: int, highest_sent: int):
-    """Drain service event bus events into the websocket."""
-    async for event in service_event_bus.stream(scan_id):
-        if event.get("event_type") == "heartbeat":
-            continue
+    """Drain service event bus events into the websocket.
 
-        if event.get("seq", 0) <= highest_sent:
+    Skip/terminal rules: pure owner ``ws_envelope_policy`` (P5-WS-1).
+    """
+    from bugtrace.api.ws_envelope_policy import (
+        is_terminal_event_type,
+        should_skip_stream_event,
+    )
+
+    async for event in service_event_bus.stream(scan_id):
+        if should_skip_stream_event(event, highest_sent):
             continue
 
         await websocket.send_json(event)
         highest_sent = event.get("seq", highest_sent)
 
-        if event.get("event_type") in ("scan_complete", "error"):
-            logger.info(f"Scan {scan_id} completed with event_type={event.get('event_type')}, closing WebSocket")
+        if is_terminal_event_type(event.get("event_type")):
+            logger.info(
+                f"Scan {scan_id} completed with event_type={event.get('event_type')}, "
+                "closing WebSocket"
+            )
             break
 
 

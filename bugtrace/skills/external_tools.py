@@ -11,6 +11,7 @@ Contains:
 import asyncio
 from typing import Dict, Any
 from .base import BaseSkill
+from bugtrace.tools.nuclei_results import flatten_nuclei_results
 from bugtrace.utils.logger import get_logger
 
 logger = get_logger("skills.external_tools")
@@ -87,7 +88,7 @@ class SQLMapSkill(BaseSkill):
 
 
 class NucleiSkill(BaseSkill):
-    """Nuclei skill - template-based vulnerability scanning via Docker."""
+    """Nuclei skill - template-based vulnerability scanning."""
     
     description = "Run Nuclei template scan for known CVEs and vulnerabilities"
     
@@ -108,9 +109,10 @@ class NucleiSkill(BaseSkill):
                 logger.debug(f"Session data fetch failed: {e}")
             
             nuclei_results = await external_tools.run_nuclei(url, cookies)
+            nuclei_findings = flatten_nuclei_results(nuclei_results)
             
-            if nuclei_results:
-                for result in nuclei_results:
+            if nuclei_findings:
+                for result in nuclei_findings:
                     template_id = result.get("template-id", "unknown")
                     matched_url = result.get("matched-at", url)
                     info = result.get("info", {})

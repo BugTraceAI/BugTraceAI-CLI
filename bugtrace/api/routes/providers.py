@@ -273,8 +273,11 @@ async def test_provider_key(req: TestProviderRequest):
         body = {
             "model": test_model,
             "messages": [{"role": "user", "content": "Are you alive? Answer only yes."}],
-            "max_tokens": 5,
         }
+        if req.provider == "openai" and test_model.startswith("gpt-5"):
+            body["max_completion_tokens"] = 5
+        else:
+            body["max_tokens"] = 5
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:

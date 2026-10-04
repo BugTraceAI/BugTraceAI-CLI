@@ -16,6 +16,7 @@ from loguru import logger
 
 from bugtrace.agents.base import BaseAgent
 from bugtrace.tools.external import external_tools
+from bugtrace.tools.nuclei_results import is_nuclei_waf_block_response
 from bugtrace.core.ui import dashboard
 
 from bugtrace.agents.nuclei.core import (
@@ -42,16 +43,25 @@ class NucleiAgent(BaseAgent):
     Phase 1 of the Sequential Pipeline.
     """
 
-    def __init__(self, target: str, report_dir: Path, event_bus: Any = None):
+    def __init__(
+        self,
+        target: str,
+        report_dir: Path,
+        event_bus: Any = None,
+        cookies: Optional[List[Dict[str, Any]]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ):
         super().__init__(
             "NucleiAgent", "Tech Discovery",
             event_bus=event_bus, agent_id="nuclei_agent",
         )
         self.target = target
         self.report_dir = report_dir
+        self.cookies = list(cookies or [])
+        self.headers = dict(headers or {})
 
     async def run(self) -> Dict:
-        """Runs three-phase Nuclei scan for technology detection and vulnerability discovery.
+        """Runs three-phase Nuclei scan (tech + deterministic + auto-scan).
 
         Returns:
             Comprehensive tech_profile used by specialist agents.
@@ -63,13 +73,26 @@ class NucleiAgent(BaseAgent):
         )
 
         try:
-            nuclei_results = await external_tools.run_nuclei(self.target)
+            auth_kwargs: Dict[str, Any] = {}
+            if self.cookies:
+                auth_kwargs["cookies"] = self.cookies
+            if self.headers:
+                auth_kwargs["headers"] = self.headers
+            nuclei_results = await external_tools.run_nuclei(
+                self.target,
+                **auth_kwargs,
+            )
         except Exception as e:
-            # A Nuclei subprocess failure (e.g. timeout under concurrent scan load) must
-            # not take down the app-level checks below (headers/cookies/GraphQL/rate-limit/
-            # access-control) — those don't depend on Nuclei and should still run.
-            logger.error(f"Nuclei subprocess failed, continuing with app-level checks only: {e}", exc_info=True)
-            dashboard.log(f"[{self.name}] Nuclei scan failed: {e} (app-level checks still running)", "WARNING")
+            # Nuclei subprocess failure must not kill app-level checks below
+            # (headers/cookies/GraphQL/rate-limit) — those do not depend on Nuclei.
+            logger.error(
+                f"Nuclei subprocess failed, continuing with app-level checks only: {e}",
+                exc_info=True,
+            )
+            dashboard.log(
+                f"[{self.name}] Nuclei scan failed: {e} (app-level checks still running)",
+                "WARNING",
+            )
             nuclei_results = {"tech_findings": [], "vuln_findings": []}
 
         try:
@@ -91,8 +114,8 @@ class NucleiAgent(BaseAgent):
 
             # Verify WAF detections
             if tech_profile["waf"]:
-                verified_wafs = await verify_waf_detections(
-                    tech_profile["waf"], tech_findings, self.target
+                verified_wafs = await self._verify_waf_detections(
+                    tech_profile["waf"], tech_findings
                 )
                 if verified_wafs != tech_profile["waf"]:
                     removed = set(tech_profile["waf"]) - set(verified_wafs)
@@ -106,7 +129,7 @@ class NucleiAgent(BaseAgent):
             # Get HTML content (used for framework fallback + JS version detection)
             html_content = extract_html_from_nuclei_response(tech_findings)
             if not html_content:
-                html_content = await fetch_html(self.target)
+                html_content = await self._fetch_html()
 
             # Framework detection fallback (check for JS frontend frameworks)
             self._run_framework_fallback(tech_profile, html_content)
@@ -116,7 +139,7 @@ class NucleiAgent(BaseAgent):
 
             # JS dependency version detection
             if html_content:
-                js_vulns = detect_js_versions(html_content, self.target)
+                js_vulns = self._detect_js_versions(html_content)
                 if js_vulns:
                     tech_profile["js_vulnerabilities"].extend(js_vulns)
                     # Also route into `misconfigurations` — the proven pipeline that reaches
@@ -148,7 +171,7 @@ class NucleiAgent(BaseAgent):
                 for mc in tech_profile["misconfigurations"]
             }
 
-            header_findings = await check_security_headers(self.target, existing_template_ids)
+            header_findings = await self._check_security_headers(existing_template_ids)
             if header_findings:
                 tech_profile["misconfigurations"].extend(header_findings)
                 dashboard.log(
@@ -228,6 +251,24 @@ class NucleiAgent(BaseAgent):
     # INTERNAL HELPERS
     # =========================================================================
 
+    async def _verify_waf_detections(
+        self, waf_names: List[str], tech_findings: List[Dict]
+    ) -> List[str]:
+        """Legacy class adapter for WAF verification."""
+        return await verify_waf_detections(waf_names, tech_findings, self.target)
+
+    async def _fetch_html(self) -> Optional[str]:
+        """Legacy class adapter for the HTML fallback fetch."""
+        return await fetch_html(self.target)
+
+    async def _check_security_headers(self, existing_template_ids: set) -> List[Dict]:
+        """Legacy class adapter for deterministic header checks."""
+        return await check_security_headers(self.target, existing_template_ids)
+
+    def _detect_js_versions(self, html: str) -> List[Dict]:
+        """Legacy class adapter for pure JavaScript dependency detection."""
+        return detect_js_versions(html, self.target)
+
     def _build_initial_profile(
         self,
         tech_findings: List[Dict],
@@ -259,6 +300,11 @@ class NucleiAgent(BaseAgent):
             category, data = categorize_tech_finding(finding, self.target)
 
             if category == "misconfigurations":
+                if is_nuclei_waf_block_response(finding):
+                    logger.info(
+                        "[NucleiAgent] Ignoring misconfiguration inferred from a WAF denial page"
+                    )
+                    continue
                 tech_profile["misconfigurations"].append(data)
             elif category and isinstance(data, str):
                 tech_profile[category].append(data)

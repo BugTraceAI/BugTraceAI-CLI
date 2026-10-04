@@ -2,37 +2,42 @@ from typing import Optional, List
 from datetime import datetime, timezone
 from enum import Enum
 from sqlmodel import SQLModel, Field, Relationship
-from sqlalchemy import Text, Column, DateTime, Index
+from sqlalchemy import Column, DateTime
 from sqlalchemy.types import TypeDecorator
 from bugtrace.schemas.models import VulnType, ReflectionContext
 
 
 def utcnow() -> datetime:
-    """Return the current time as a timezone-aware UTC datetime."""
+    """Current UTC time as a timezone-aware datetime."""
     return datetime.now(timezone.utc)
 
 
 class UTCDateTime(TypeDecorator):
-    """Store UTC consistently and return timezone-aware datetimes.
+    """Store UTC datetimes and always read them back timezone-aware.
 
-    SQLite strips timezone metadata from SQLAlchemy ``DateTime`` values. This
-    normalizes values on write and restores the UTC marker on read, keeping
-    existing SQLite databases compatible while satisfying SQLModel's timezone
-    requirement in application code.
+    SQLite's DATETIME drops tzinfo on the way out, so a bare
+    ``datetime.now(timezone.utc)`` default still yields a naive value after a
+    round-trip.  Values are normalised to naive UTC on write (the storage
+    format is unchanged, so existing rows stay readable) and re-tagged as UTC
+    on read.
     """
 
     impl = DateTime
     cache_ok = True
 
     def process_bind_param(self, value, dialect):
-        if value is None or not isinstance(value, datetime):
+        if value is None:
+            return None
+        if not isinstance(value, datetime):
             return value
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc).replace(tzinfo=None)
 
     def process_result_value(self, value, dialect):
-        if value is None or not isinstance(value, datetime):
+        if value is None:
+            return None
+        if not isinstance(value, datetime):
             return value
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
@@ -65,7 +70,7 @@ class TargetTable(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     url: str = Field(index=True, unique=True)
     created_at: datetime = Field(sa_column=Column(UTCDateTime(), default=utcnow))
-    
+
     # Relationships
     scans: List["ScanTable"] = Relationship(back_populates="target")
 
@@ -76,7 +81,8 @@ class ScanTable(SQLModel, table=True):
     timestamp: datetime = Field(sa_column=Column(UTCDateTime(), default=utcnow))
     status: ScanStatus = Field(default=ScanStatus.PENDING)
     progress_percent: int = 0
-    origin: str = Field(default="unknown")  # "cli", "web", or "unknown" — tracks where scan was launched
+    origin: str = Field(default="unknown")  # "cli", "web", or "unknown" — tracks where scan was launched (legacy)
+    launch_origin: str = Field(default="unknown")  # Canonical provenance: "web-cli", "cli", "web-api", "api", or "legacy-unknown"
     report_dir: Optional[str] = Field(default=None)  # Absolute path to the unified report directory
     enrichment_status: Optional[str] = Field(default=None)  # "full", "partial", "none", "pending"
     scan_type: Optional[str] = Field(default=None)  # "full", "hunter", "manager", or agent names
@@ -90,6 +96,9 @@ class ScanTable(SQLModel, table=True):
 
     target: Optional[TargetTable] = Relationship(back_populates="scans")
     findings: List["FindingTable"] = Relationship(back_populates="scan")
+
+from sqlalchemy import Text, Index
+
 
 class FindingTable(SQLModel, table=True):
     __tablename__ = "finding"

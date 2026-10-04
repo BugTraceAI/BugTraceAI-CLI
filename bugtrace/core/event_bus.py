@@ -223,7 +223,7 @@ class EventBus:
         self._stats["total_subscribers"] += 1
         logger.debug(f"Pattern subscriber added: {handler.__name__} -> {pattern}")
     
-    async def emit(self, event: str, data: Dict[str, Any]) -> None:
+    async def emit(self, event, data: Dict[str, Any] | None = None) -> None:
         """
         Emit event with optional scan context ordering.
 
@@ -231,8 +231,9 @@ class EventBus:
         delivered in order for that context.
 
         Args:
-            event: Event name (string or EventType)
-            data: Event payload (must include 'scan_context' for ordering)
+            event: Event name (string or EventType) or EventEnvelope
+            data: Event payload (must include 'scan_context' for ordering).
+                  Optional when ``event`` is an EventEnvelope.
 
         Comportamiento:
             - Ejecuta handlers en paralelo (asyncio.create_task)
@@ -245,9 +246,12 @@ class EventBus:
                 "input": {"name": "q", "type": "text"}
             })
         """
-        # Convert EventType to string if needed
-        if isinstance(event, EventType):
-            event = event.value
+        from bugtrace.core.event_envelope import EventEnvelope, ensure_bus_emit_args
+
+        if isinstance(event, EventEnvelope):
+            event, data = event.to_bus_args()
+        else:
+            event, data = ensure_bus_emit_args(event, data if data is not None else {})
 
         # Estadísticas
         self._stats["total_events_emitted"] += 1

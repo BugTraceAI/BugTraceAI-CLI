@@ -1,6 +1,5 @@
-"""BugTraceAI UI Module - Contains both legacy Rich dashboard and new Textual TUI."""
+"""Passive scan telemetry and the Textual terminal interface."""
 
-# Re-export legacy dashboard for backward compatibility
-from bugtrace.core.ui_legacy import dashboard, Dashboard, DashboardHandler, SparklineBuffer
+from bugtrace.core.ui.telemetry import dashboard, ScanTelemetry, Dashboard, DashboardHandler
 
-__all__ = ["dashboard", "Dashboard", "DashboardHandler", "SparklineBuffer"]
+__all__ = ["dashboard", "ScanTelemetry", "Dashboard", "DashboardHandler"]

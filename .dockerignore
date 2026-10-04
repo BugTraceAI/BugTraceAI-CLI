@@ -27,3 +27,5 @@ DEVELOPMENT.md
 HANDOFF_*
 tools/model_eval.py
 tools/model_eval_results.json
+
+.bugtrace-install.env

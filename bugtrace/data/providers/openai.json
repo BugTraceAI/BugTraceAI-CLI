@@ -1,0 +1,42 @@
+{
+    "id": "openai",
+    "name": "OpenAI API",
+    "api_format": "openai",
+    "base_url": "https://api.openai.com/v1/chat/completions",
+    "api_key_env": "OPENAI_API_KEY",
+    "api_key_hint": "sk-...",
+    "failover": [],
+    "features": {
+        "description": "Direct OpenAI API using an OpenAI Platform API key. This does not use a ChatGPT or Codex subscription login.",
+        "online_mode": false,
+        "balance_check": false,
+        "model_discovery": false
+    },
+    "models": {
+        "DEFAULT_MODEL": "gpt-5.6-terra",
+        "CODE_MODEL": "gpt-5.6-terra",
+        "ANALYSIS_MODEL": "gpt-5.6-luna",
+        "ANALYSIS_PENTESTER_MODEL": "gpt-5.6-terra",
+        "ANALYSIS_BUG_BOUNTY_MODEL": "gpt-5.6-terra",
+        "ANALYSIS_AUDITOR_MODEL": "gpt-5.6-terra",
+        "ANALYSIS_RED_TEAM_MODEL": "gpt-5.6-luna",
+        "ANALYSIS_RESEARCHER_MODEL": "gpt-5.6-luna",
+        "PRIMARY_MODELS": "gpt-5.6-terra,gpt-5.6-luna",
+        "VISION_MODEL": "gpt-5.6-terra",
+        "WAF_DETECTION_MODELS": "gpt-5.6-luna",
+        "MUTATION_MODEL": "gpt-5.6-luna",
+        "SKEPTICAL_MODEL": "gpt-5.6-terra",
+        "REPORTING_MODEL": "gpt-5.6-terra",
+        "VALIDATION_VISION_MODEL": "gpt-5.6-terra",
+        "LONEWOLF_MODEL": "gpt-5.6-terra"
+    },
+    "concurrency": {
+        "gpt-5.6-terra": 4,
+        "gpt-5.6-luna": 8,
+        "default": 2
+    },
+    "pricing": {
+        "gpt-5.6-terra": { "input": 2.00, "output": 12.00 },
+        "gpt-5.6-luna": { "input": 0.20, "output": 1.20 }
+    }
+}

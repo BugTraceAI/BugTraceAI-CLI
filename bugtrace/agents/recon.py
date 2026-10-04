@@ -6,6 +6,7 @@ from bugtrace.core.ui import dashboard
 from bugtrace.tools.visual.crawler import visual_crawler
 from bugtrace.memory.manager import memory_manager
 from bugtrace.tools.external import external_tools
+from bugtrace.tools.nuclei_results import nuclei_candidate_records
 from bugtrace.core.llm_client import llm_client
 from bugtrace.tools.visual.browser import browser_manager
 from bugtrace.utils.logger import get_logger
@@ -209,8 +210,13 @@ class ReconAgent(BaseAgent):
 
         # Nuclei: Vulnerability Scanner with session
         nuclei_res = await external_tools.run_nuclei(self.target, cookies=cookies)
-        if nuclei_res:
-            dashboard.log(f"[{self.name}] Nuclei found {len(nuclei_res)} items", "INFO") 
+        nuclei_candidates = nuclei_candidate_records(nuclei_res, self.target)
+        if nuclei_candidates:
+            for label, properties in nuclei_candidates:
+                memory_manager.add_node("FindingCandidate", label, properties)
+            dashboard.log(
+                f"[{self.name}] Nuclei found {len(nuclei_candidates)} items", "INFO"
+            )
 
     async def _generate_contextual_paths(self, analysis_context: str) -> List[str]:
         """

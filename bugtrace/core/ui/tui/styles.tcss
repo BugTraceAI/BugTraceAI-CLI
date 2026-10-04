@@ -1,379 +1,188 @@
-/* BugTraceAI TUI Global Stylesheet
- *
- * Color scheme matches the legacy Rich dashboard dark theme.
- * Uses CSS Grid for responsive layout.
- */
-
-/* ============================================
- * VARIABLES / THEME
- * ============================================ */
-$surface: #1e1e2e;
-$surface-light: #313244;
-$primary: #89b4fa;
-$primary-dark: #7aa2f7;
-$secondary: #cba6f7;
-$success: #a6e3a1;
-$warning: #f9e2af;
-$error: #f38ba8;
-$muted: #6c7086;
-$text: #cdd6f4;
-
-/* Gradient colors for logo (bright_red -> red -> yellow -> bright_yellow) */
-$gradient-1: #ff5555;
-$gradient-2: #e74c3c;
-$gradient-3: #f1fa8c;
-$gradient-4: #f1c40f;
-
-/* Severity colors */
-$severity-critical: #ff5555;
-$severity-high: #f38ba8;
-$severity-medium: #f9e2af;
-$severity-low: #cdd6f4;
-$severity-info: #89b4fa;
-
-/* ============================================
- * SCREEN LAYOUT - CSS GRID
- * ============================================ */
-Screen {
-    layout: vertical;
-    background: $surface;
+$surface: #1A0F2E;
+$surface-light: #2D1B4D;
+$primary: #FF7F50;
+$secondary: #8A7FA8;
+$success: #2ECC71;
+$warning: #FFC107;
+$error: #FF3131;
+$text: #F8F9FA;
+Screen { background: $surface; color: $text; layout: vertical; }
+#brand { height: 1; margin: 1 3 0 3; }
+#scan-setup { height: auto; margin: 1 3; padding: 0 1; background: #24163B; border-left: solid $primary; }
+#scan-setup-title { height: 1; color: $primary; text-style: bold; }
+#scan-options { height: 1; }
+#crawl-options { width: auto; height: 1; }
+#scan-integrations { width: 1fr; height: 1; align-horizontal: right; }
+.scan-label { height: 1; color: $secondary; }
+#depth-label { width: 6; }
+#urls-label { width: 9; }
+#max-depth { width: 5; margin-right: 3; }
+#max-urls { width: 7; }
+#provider-btn { width: auto; min-width: 14; height: 1; color: $primary; background: transparent; }
+#auth-btn { width: auto; min-width: 13; height: 1; margin-left: 2; color: $primary; background: transparent; }
+#provider-btn:focus, #auth-btn:focus { background: #4D3B6F; }
+#pipeline { height: 3; margin: 0 3; }
+#pipeline, #pipeline-flow { text-wrap: nowrap; text-overflow: ellipsis; }
+#workspace-tabs { height: 1fr; margin: 0 3; }
+Tabs { background: $surface; }
+Tab { background: $surface; color: $secondary; padding: 0 2; }
+Tab.-active { color: $primary; text-style: bold; }
+Tabs > .tabs--blank { background: $surface; }
+Underline { background: $surface; color: $surface-light; }
+Underline > .underline--bar { background: $surface-light; color: $primary; }
+TabPane { padding: 1 0 0 0; }
+ContentSwitcher { height: 1fr; }
+#workspace-title { height: 1; color: $text; text-style: bold; }
+#workspace-hint { height: auto; color: $secondary; margin-bottom: 1; }
+#timeline { height: 1fr; background: $surface; scrollbar-size: 1 1; }
+#timeline:focus { background-tint: transparent; }
+.timeline-entry { height: auto; padding: 1 2; margin-bottom: 1; background: $surface-light; border: none; }
+.timeline-entry .entry-heading { height: auto; color: $primary; }
+.timeline-entry .entry-body { height: auto; color: $text; margin-top: 1; }
+.timeline-entry .entry-action { height: 1; color: $secondary; margin-top: 1; }
+.timeline-entry.session, .timeline-entry.phase { background: $surface; padding: 0 1; }
+.timeline-entry.agent { padding: 0 2; background: #281842; }
+.timeline-entry.agent .entry-body { margin-top: 0; color: $secondary; }
+.timeline-entry.finding { background: #2D1B4D; border-left: solid $secondary; }
+.timeline-entry.critical, .timeline-entry.high { border-left: solid $error; }
+.timeline-entry.critical .entry-heading, .timeline-entry.high .entry-heading { color: $error; }
+.timeline-entry.medium { border-left: solid $warning; }
+.timeline-entry.medium .entry-heading, .timeline-entry.warning .entry-heading { color: $warning; }
+.timeline-entry.low { border-left: solid $success; }
+.timeline-entry.low .entry-heading { color: $success; }
+#timeline:focus > .timeline-entry.-highlight { background: #4D3B6F; text-style: none; }
+#timeline > .timeline-entry:hover { background: #3D2B5F; }
+#overview-scroll { height: 1fr; }
+#pipeline-scroll { height: 1fr; }
+#mission-stats { height: 3; margin-bottom: 1; text-wrap: nowrap; text-overflow: ellipsis; }
+#mission-heading { height: 1; }
+#mission-title { width: 1fr; margin-bottom: 0; }
+#replay-btn { width: 11; background: $surface-light; color: $primary; }
+#pipeline-flow { height: auto; margin-bottom: 1; }
+#pipeline-flow:focus { background-tint: transparent; }
+#pipeline-agents { height: auto; margin-bottom: 1; text-wrap: nowrap; text-overflow: ellipsis; }
+#pipeline-agents:focus { background-tint: transparent; }
+#phase-table { height: 8; margin-bottom: 1; }
+#phase-detail { height: auto; margin-bottom: 1; background: $surface-light; border-left: solid $primary; padding: 0 1; }
+#specialist-heading { margin-bottom: 0; }
+#telemetry-row { height: 3; margin-bottom: 1; }
+#activity, #metrics { width: 1fr; height: 3; }
+#activity { margin-right: 2; }
+.section-label { height: 1; color: $secondary; margin-bottom: 1; }
+#swarm { height: 9; margin-bottom: 1; }
+#payload-feed { height: 8; }
+#findings-count { height: auto; color: $secondary; margin-bottom: 1; }
+#finding-tools { height: 1; margin-bottom: 1; }
+#finding-filter { width: 1fr; margin-right: 1; }
+#severity-filter { width: 13; margin-right: 1; }
+#export-btn { width: 9; min-width: 9; }
+#findings-table { height: 1fr; }
+.view-hint { height: auto; color: $secondary; margin-top: 1; }
+#log-inspector { height: 1fr; }
+#log-filter { height: 1; }
+#log-view { border: none; background: $surface; }
+#command-hints { height: 1; margin: 1 3 0 3; color: $secondary; }
+#scan-controls { height: 1; }
+#target-input { width: 1fr; margin-right: 1; }
+#scan-controls Button { min-width: 7; width: 7; margin-left: 1; }
+#command-input { height: 1; margin: 0 3; padding: 0 1; background: $surface; border: none; border-left: solid $secondary; }
+#command-input:focus { border-left: solid $primary; background: $surface-light; }
+#scan-status { height: 1; margin: 0 3; }
+#key-hints { height: 1; margin: 0 3; color: $secondary; }
+Input { background: $surface-light; border: none; padding: 0 1; }
+Input:focus { background: #3D2B5F; border: none; }
+Input > .input--placeholder { color: $secondary; }
+Input > .input--suggestion { color: $secondary; }
+Select, SelectCurrent { background: $surface-light; border: none; }
+SelectCurrent:focus { background: #3D2B5F; border: none; }
+Button { background: $surface-light; color: $text; border: none; height: 1; min-width: 7; }
+Button.-success { background: #2D1B4D; color: $success; }
+Button:focus { background: #4D3B6F; text-style: bold; }
+Button:disabled { opacity: 40%; }
+DataTable { background: $surface; }
+DataTable > .datatable--header { background: $surface-light; color: $primary; text-style: bold; }
+DataTable > .datatable--odd-row { background: $surface; }
+DataTable > .datatable--even-row { background: #211338; }
+DataTable > .datatable--cursor { background: #4D3B6F; color: $text; }
+ListView, DataTable, VerticalScroll, RichLog, TextArea {
+    scrollbar-color: #49345F; scrollbar-background: $surface;
+    scrollbar-color-hover: $secondary; scrollbar-color-active: $primary;
+    scrollbar-background-hover: $surface; scrollbar-background-active: $surface;
+    scrollbar-size: 1 1;
 }
+MainScreen.compact #brand, MainScreen.compact #pipeline, MainScreen.compact #workspace-tabs,
+MainScreen.compact #command-hints, MainScreen.compact #scan-setup, MainScreen.compact #command-input,
+MainScreen.compact #scan-status, MainScreen.compact #key-hints { margin-left: 1; margin-right: 1; }
+MainScreen.compact Tab { padding: 0 1; }
+MainScreen.compact #max-depth { width: 4; margin-right: 1; }
+MainScreen.compact #max-urls { width: 6; }
+MainScreen.compact #scan-options { layout: vertical; height: 2; }
+MainScreen.compact #crawl-options, MainScreen.compact #scan-integrations { width: 1fr; }
 
-/* ============================================
- * LAYOUT CLASSES
- * ============================================ */
-.layout-header {
-    dock: top;
-    height: 3;
-    background: $surface-light;
-    border-bottom: solid $primary;
-}
+MainScreen.short #brand { margin-top: 0; }
+MainScreen.short #scan-setup { margin-top: 0; margin-bottom: 0; }
+MainScreen.short #scan-setup-title { display: none; }
+MainScreen.short #scan-options { margin-top: 0; }
+MainScreen.short #pipeline { margin-top: 0; margin-bottom: 0; }
+MainScreen.short TabPane { padding-top: 0; }
+MainScreen.short #workspace-hint, MainScreen.short .view-hint { display: none; }
+MainScreen.short #mission-stats { display: none; }
+MainScreen.short #mission-heading { margin-bottom: 0; }
+MainScreen.short #pipeline-flow { margin-bottom: 0; }
+MainScreen.short #phase-detail { margin-bottom: 0; }
+MainScreen.short #pipeline-scroll .section-label { margin-bottom: 0; }
+MainScreen.short #command-hints { margin-top: 0; }
+MainScreen.short #scan-controls { margin-top: 0; }
+MainScreen.short #command-input { margin-top: 0; }
+MainScreen.short #findings-count { height: 1; margin-bottom: 0; }
+MainScreen.short #finding-tools { margin-bottom: 0; }
+MainScreen.short #telemetry-row, MainScreen.short #activity, MainScreen.short #metrics { height: 2; }
+MainScreen.short #swarm { height: 8; }
+ModalScreen { background: $surface 85%; }
+FindingDetailsModal { align: center middle; }
+#modal-container { width: 85%; max-width: 100; height: 85%; background: $surface; border: round $secondary; padding: 1 2; }
+#evidence-scroll { height: 1fr; }
+#modal-title { height: auto; text-align: left; color: $primary; text-style: bold; margin-bottom: 1; }
+.modal-field { height: auto; margin-bottom: 1; }
+.section-header { height: 1; color: $secondary; margin: 1 0; }
+#payload-area, #request-area, #response-area { height: 5; background: $surface-light; border: none; margin-bottom: 1; }
+.modal-buttons { height: 1; margin-top: 1; }
+.modal-buttons Button { height: 1; width: auto; margin-right: 2; }
 
-.layout-content {
-    padding: 0 1;
-}
+/* Clear page hierarchy; the overview owns the full phase map. */
 
-.layout-footer {
-    dock: bottom;
-    height: 1;
-    background: $surface-light;
-}
+.view-title { height: 1; color: $primary; text-style: bold; }
+.view-subtitle { height: auto; color: $secondary; margin-bottom: 1; }
+#workspace-title { color: $primary; text-style: bold; }
+.timeline-entry.evidence { background: $surface; padding: 0 1; margin-bottom: 1; }
+.timeline-entry.evidence .entry-heading { color: $secondary; text-style: none; }
+.timeline-entry.evidence .entry-action { margin-top: 0; }
+Collapsible { padding: 0; margin: 0 0 1 0; border: none; background: $surface; }
+Collapsible > Contents { padding: 1 0; }
+CollapsibleTitle { color: $secondary; background: $surface-light; }
+MainScreen.short .view-subtitle { display: none; }
+MainScreen.short .view-title { margin-bottom: 0; }
 
-/* ============================================
- * MAIN CONTENT AREA
- * ============================================ */
-#main-content {
-    layout: vertical;
-    height: 1fr;
-    width: 100%;
-    padding: 0 1;
-}
+WorkspaceHelpModal { align: center middle; }
+#help-container { width: 90%; max-width: 88; height: 85%; background: $surface; border: round $secondary; padding: 1 2; }
+#help-scroll { height: 1fr; }
+#help-title { height: auto; color: $primary; text-style: bold; margin-bottom: 1; }
+.help-text { height: auto; margin-bottom: 1; }
+#help-close { width: auto; margin-top: 1; }
 
-/* Pipeline panel at top */
-#pipeline {
-    height: 5;
-    border: round $primary;
-    padding: 0 1;
-    margin-bottom: 1;
-}
+ProviderModal { align: center middle; }
+#provider-container { width: 90%; max-width: 88; height: 85%; background: $surface; border: round $secondary; padding: 1 2; }
+#provider-scroll { height: 1fr; }
+#provider-title { height: auto; color: $primary; text-style: bold; margin-bottom: 1; }
+#provider-select, #provider-key { margin-bottom: 1; }
+#provider-error { color: $error; }
+#provider-save { height: auto; margin: 1 0; }
 
-/* ============================================
- * METRICS ROW - Activity & System Metrics
- * ============================================ */
-.metrics-row {
-    layout: horizontal;
-    height: 9;
-    margin-bottom: 1;
-}
-
-#activity {
-    width: 1fr;
-    border: round $primary-dark;
-    padding: 0 1;
-    margin-right: 1;
-}
-
-#metrics {
-    width: 1fr;
-    border: round $secondary;
-    padding: 0 1;
-}
-
-/* ============================================
- * DASHBOARD LAYOUT (New Layout)
- * ============================================ */
-.dashboard-row {
-    layout: horizontal;
-    height: auto;
-    min-height: 8;
-    margin-bottom: 1;
-}
-
-.left-panel {
-    width: 1fr;
-    max-width: 40;
-    margin-right: 1;
-}
-
-/* ============================================
- * MIDDLE ROW - Swarm & Payload Feed
- * ============================================ */
-.middle-row {
-    layout: horizontal;
-    height: 1fr;
-    min-height: 12;
-    margin-bottom: 1;
-}
-
-#swarm {
-    width: 1fr;
-    border: round $warning;
-    padding: 0 1;
-    margin-right: 1;
-}
-
-#payload-feed {
-    width: 1fr;
-    border: round $success;
-    padding: 0 1;
-}
-
-/* ============================================
- * BOTTOM ROW - Findings & Logs
- * ============================================ */
-.bottom-row {
-    layout: horizontal;
-    height: 10;
-}
-
-#findings {
-    width: 1fr;
-    border: round $error;
-    padding: 0 1;
-    margin-right: 1;
-}
-
-#logs {
-    width: 1fr;
-    border: round $primary-dark;
-    padding: 0 1;
-}
-
-/* ============================================
- * HIDDEN LEGACY WIDGETS
- * ============================================ */
-.hidden-legacy {
-    display: none;
-}
-
-/* ============================================
- * PANEL STYLING
- * ============================================ */
-.panel {
-    border: round $primary;
-    padding: 0 1;
-}
-
-.panel-title {
-    text-style: bold;
-    color: $primary;
-}
-
-/* ============================================
- * TEXT STYLES
- * ============================================ */
-.text-muted {
-    color: $muted;
-}
-
-.text-success {
-    color: $success;
-}
-
-.text-warning {
-    color: $warning;
-}
-
-.text-error {
-    color: $error;
-}
-
-.text-primary {
-    color: $primary;
-}
-
-/* Severity text styles */
-.text-critical {
-    color: $severity-critical;
-    text-style: bold;
-}
-
-.text-high {
-    color: $severity-high;
-}
-
-.text-medium {
-    color: $severity-medium;
-}
-
-.text-low {
-    color: $severity-low;
-}
-
-.text-info {
-    color: $severity-info;
-}
-
-/* ============================================
- * WIDGET-SPECIFIC OVERRIDES
- * ============================================ */
-PipelineStatus {
-    height: 5;
-}
-
-ActivityGraph {
-    min-height: 7;
-}
-
-SystemMetrics {
-    min-height: 7;
-}
-
-AgentSwarm {
-    min-height: 10;
-}
-
-PayloadFeed {
-    min-height: 10;
-}
-
-FindingsSummary {
-    min-height: 8;
-}
-
-LogPanel {
-    min-height: 8;
-}
-
-/* ============================================
- * LOADER SCREEN
- * ============================================ */
-LoaderScreen {
-    align: center middle;
-    background: $surface;
-}
-
-#loader-container {
-    width: auto;
-    height: auto;
-    align: center middle;
-}
-
-#logo {
-    text-align: center;
-    margin-bottom: 2;
-}
-
-#loader-message {
-    text-align: center;
-    color: $primary;
-}
-
-#loader-spinner {
-    text-align: center;
-    color: $warning;
-    margin-top: 1;
-}
-
-/* Logo gradient line styles */
-.logo-line-1 {
-    color: $gradient-1;
-}
-
-.logo-line-2 {
-    color: $gradient-2;
-}
-
-.logo-line-3 {
-    color: $gradient-3;
-}
-
-.logo-line-4 {
-    color: $gradient-4;
-}
-
-/* ============================================
- * FINDINGS TABLE SECTION
- * ============================================ */
-#findings-table {
-    height: 12;
-    min-height: 8;
-    margin: 1 0;
-    border: solid $error;
-}
-
-#findings-table > .datatable--header {
-    background: $surface-light;
-    text-style: bold;
-}
-
-#findings-table > .datatable--cursor {
-    background: $primary;
-}
-
-/* ============================================
- * LOG INSPECTOR
- * ============================================ */
-#log-inspector {
-    width: 1fr;
-    min-height: 10;
-    border: round $primary-dark;
-}
-
-#log-inspector #log-filter {
-    background: $surface;
-}
-
-#log-inspector #log-view {
-    background: $surface;
-}
-
-/* ============================================
- * COMMAND INPUT
- * ============================================ */
-#command-input {
-    dock: bottom;
-    height: 3;
-    background: $surface;
-    margin: 0 1;
-    border: solid $primary;
-}
-
-#command-input:focus {
-    background: $surface-light;
-    border: solid $warning;
-}
-
-/* ============================================
- * MODAL OVERLAY
- * ============================================ */
-ModalScreen {
-    background: $background 80%;
-}
-
-/* ============================================
- * RESPONSIVE: Small terminals
- * ============================================ */
-/* @media (width < 100) {
-    .dashboard-row {
-        layout: vertical;
-    }
-
-    .left-panel {
-        max-width: 100%;
-    }
-
-    #findings-table {
-        height: 8;
-    }
-} */
+AuthModal { align: center middle; }
+#auth-container { width: 90%; max-width: 88; height: 85%; background: $surface; border: round $secondary; padding: 1 2; }
+#auth-scroll { height: 1fr; }
+#auth-title { height: auto; color: $primary; text-style: bold; margin-bottom: 1; }
+#auth-method, #auth-token, #auth-yaml-path { margin-bottom: 1; }
+#auth-token-fields, #auth-yaml-fields { height: auto; }
+#auth-error { color: $error; }
+#auth-template { height: auto; color: $secondary; }

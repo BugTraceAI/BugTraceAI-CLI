@@ -1,106 +1,95 @@
-"""Interactive findings table with sorting and selection."""
-
-from textual.widgets import DataTable
-from textual.reactive import reactive
-from rich.text import Text
-from typing import Optional, Dict, Any, List
+"""Searchable findings, stable identities and severity ordering."""
 from dataclasses import dataclass
 from datetime import datetime
+from uuid import uuid4
+
+from rich.text import Text
+from textual.widgets import DataTable
 
 
 @dataclass
 class Finding:
-    """Represents a security finding."""
     id: str
     severity: str
     finding_type: str
-    param: Optional[str]
-    payload: Optional[str]
-    request: Optional[str]
-    response_excerpt: Optional[str]
+    param: str | None
+    payload: str | None
+    request: str | None
+    response_excerpt: str | None
     time: str
     status: str = "new"
+    details: str = ""
+    url: str = ""
 
 
 class FindingsTable(DataTable):
-    """Interactive findings table with sorting and selection."""
-
-    # Store findings for lookup when row selected
-    _findings: reactive[Dict[str, Finding]] = reactive({})
+    RANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    COLORS = {"CRITICAL": "bold #FF3131", "HIGH": "#FF3131", "MEDIUM": "#FFC107", "LOW": "#2ECC71", "INFO": "#8A7FA8"}
 
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.cursor_type = "row"
-        self.zebra_stripes = True
+        super().__init__(cursor_type="row", zebra_stripes=True, **kwargs)
         self._findings = {}
+        self._filter = ""
+        self._severity = "all"
+        self._sort_key = "severity"
+        self._sort_reverse = False
 
-    def on_mount(self) -> None:
-        """Set up table columns on mount."""
-        self.add_columns("Severity", "Type", "Parameter", "Time", "Status")
+    @property
+    def findings(self):
+        return list(self._findings.values())
 
-    def add_finding(
-        self,
-        finding_type: str,
-        details: str,
-        severity: str,
-        param: Optional[str] = None,
-        payload: Optional[str] = None,
-        request: Optional[str] = None,
-        response_excerpt: Optional[str] = None,
-    ) -> None:
-        """Add a finding row with severity-based styling."""
-        # Generate unique ID
-        finding_id = f"finding_{len(self._findings)}_{datetime.now().timestamp()}"
+    def on_mount(self):
+        for label, key in (("Severity", "severity"), ("Type", "finding_type"), ("URL", "url"),
+                           ("Parameter", "param"), ("Time", "time")):
+            self.add_column(label, key=key)
 
-        # Create finding object
-        finding = Finding(
-            id=finding_id,
-            severity=severity.upper(),
-            finding_type=finding_type,
-            param=param,
-            payload=payload or details,
-            request=request,
-            response_excerpt=response_excerpt,
-            time=datetime.now().strftime("%H:%M:%S"),
-            status="new",
-        )
+    def add_finding(self, finding_type, details, severity, param=None, payload=None, request=None, response_excerpt=None, url=None):
+        finding = Finding(uuid4().hex, (severity or "info").upper(), str(finding_type or "Finding"),
+                          param, payload, request, response_excerpt, datetime.now().strftime("%H:%M:%S"),
+                          details=str(details or ""), url=str(url or ""))
+        self._findings[finding.id] = finding
+        if self._matches(finding):
+            self._add_row(finding)
+            self._sort()
+        return finding
 
-        # Store for later lookup
-        self._findings[finding_id] = finding
+    def _add_row(self, finding):
+        self.add_row(Text(finding.severity, style=self.COLORS.get(finding.severity, "white")),
+                     Text(finding.finding_type), Text(finding.url or "—"), Text(finding.param or "—"), finding.time, key=finding.id)
 
-        # Style severity text
-        severity_styles = {
-            "CRITICAL": "bold red",
-            "HIGH": "red",
-            "MEDIUM": "yellow",
-            "LOW": "green",
-            "INFO": "dim",
-        }
-        style = severity_styles.get(finding.severity, "white")
-        severity_text = Text(finding.severity, style=style)
+    def _matches(self, finding):
+        text = " ".join(str(value or "") for value in
+                        (finding.finding_type, finding.url, finding.param, finding.details, finding.payload)).lower()
+        return self._filter in text and (self._severity == "all" or finding.severity.lower() == self._severity)
 
-        # Add row with finding_id as key for lookup
-        self.add_row(
-            severity_text,
-            finding.finding_type,
-            finding.param or "-",
-            finding.time,
-            finding.status,
-            key=finding_id,
-        )
+    def filter_findings(self, text="", severity="all"):
+        self._filter, self._severity = text.lower(), severity.lower()
+        selected = self.ordered_rows[self.cursor_row].key.value if self.row_count and self.cursor_row < self.row_count else None
+        self.clear()
+        for finding in self.findings:
+            if self._matches(finding):
+                self._add_row(finding)
+        self._sort()
+        if selected and selected in self.rows:
+            self.move_cursor(row=self.get_row_index(selected))
 
-    def get_finding(self, row_key: str) -> Optional[Finding]:
-        """Get finding by row key."""
+    def _sort(self):
+        if self.row_count:
+            key = self._sort_key
+            transform = (lambda value: self.RANK.get(str(value), 5)) if key == "severity" else str
+            self.sort(key, key=transform, reverse=self._sort_reverse)
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected):
+        if event.column_key.value == self._sort_key:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_key, self._sort_reverse = event.column_key.value, False
+        self._sort()
+
+    def get_finding(self, row_key):
         return self._findings.get(str(row_key))
 
-    def action_sort_by_severity(self) -> None:
-        """Sort table by severity (Critical first)."""
-        self.sort("Severity", reverse=True)
-
-    def action_sort_by_type(self) -> None:
-        """Sort table by finding type."""
-        self.sort("Type")
-
-    def action_sort_by_time(self) -> None:
-        """Sort table by time (newest first)."""
-        self.sort("Time", reverse=True)
+    def reset_findings(self):
+        self._findings.clear()
+        self._filter, self._severity = "", "all"
+        self.clear()

@@ -74,6 +74,14 @@ class FileUploadAgent(BaseAgent):
         self.cookies: List[Dict] = []
         self.headers: Dict[str, str] = {}
 
+    async def _discover_upload_forms(self) -> List[Dict]:
+        """Legacy class adapter for the package-owned upload discovery."""
+        forms, endpoints = await discover_upload_forms(
+            self.url, self._tested_upload_endpoints
+        )
+        self._tested_upload_endpoints = endpoints
+        return forms
+
     async def run_loop(self) -> Dict:
         """Main execution loop for FileUpload testing.
 
@@ -84,9 +92,7 @@ class FileUploadAgent(BaseAgent):
         logger.info(f"[{self.name}] Initiating AUTONOMOUS File Upload discovery for {self.url}")
 
         # Phase A: AUTONOMOUS DISCOVERY
-        forms, self._tested_upload_endpoints = await discover_upload_forms(
-            self.url, self._tested_upload_endpoints
-        )
+        forms = await self._discover_upload_forms()
 
         if not forms:
             logger.info(f"[{self.name}] No upload forms found.")
@@ -171,9 +177,7 @@ class FileUploadAgent(BaseAgent):
     async def analyze_and_dedup_queue(self) -> List[Dict]:
         """Discovery phase: Find all unique upload forms on the target."""
         # For FileUpload, we are autonomous: we ignore the WET hints and just discover
-        forms, self._tested_upload_endpoints = await discover_upload_forms(
-            self.url, self._tested_upload_endpoints
-        )
+        forms = await self._discover_upload_forms()
         
         # Convert forms to DRY items
         dry_list = []

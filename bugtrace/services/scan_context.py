@@ -12,7 +12,7 @@ Version: 2.0.0
 import asyncio
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # Module-level auth token store for cross-agent sharing.
@@ -96,7 +96,10 @@ class ScanOptions(BaseModel):
     auth_token: Optional[str] = None  # Level 1: pre-authenticated Bearer token
     auth: Optional[Dict[str, Any]] = None  # Level 2/3: {login_url, credentials: {email, password, totp_secret?}, login_flow?: [...]}
     url_list: Optional[List[str]] = None  # Pre-defined URL list (from file upload or Swagger import)
+    handoff: Optional[Dict[str, Any]] = None  # Full BugTraceAI API handoff v1
+    api_inventory: List[Dict[str, Any]] = Field(default_factory=list)  # Method-aware operations/endpoints for specialists
     scope_path: Optional[str] = None  # Restrict crawling to URLs under this path (e.g., "/WebPA/")
+    custom_headers: Optional[Dict[str, str]] = None  # Per-scan HTTP headers (validated before use)
 
 
 class ScanContext:
@@ -112,7 +115,7 @@ class ScanContext:
     This solves INF-02 (state isolation) by ensuring scans never share mutable state.
     """
 
-    def __init__(self, scan_id: int, options: ScanOptions, event_bus):
+    def __init__(self, scan_id: int, options: ScanOptions, event_bus, launch_origin: str = "legacy-unknown"):
         """
         Initialize a new scan context.
 
@@ -120,10 +123,12 @@ class ScanContext:
             scan_id: Database scan ID
             options: Scan configuration
             event_bus: Event bus instance for scan-scoped events
+            launch_origin: Canonical provenance ("web-cli", "cli", "web-api", "api").
         """
         self.scan_id = scan_id
         self.options = options
         self.event_bus = event_bus
+        self.launch_origin = launch_origin
 
         # Status tracking
         self.status: str = "initializing"  # maps to ScanStatus enum values
@@ -202,21 +207,22 @@ class ScanContext:
         Export scan status as a dictionary.
 
         Used for API responses and WebSocket status broadcasts.
-
-        Returns:
-            Dictionary with scan_id, target, status, progress, uptime, etc.
+        Projection owner: scan_status_policy.project_active_scan_status.
         """
-        return {
-            "scan_id": self.scan_id,
-            "target": self.options.target_url,
-            "status": self.status.upper(),
-            "progress": self.progress,
-            "uptime_seconds": self.uptime_seconds,
-            "findings_count": self.findings_count,
-            "active_agent": self.active_agent,
-            "phase": self.phase,
-            "scan_type": self.options.scan_type,
-            "max_depth": self.options.max_depth,
-            "max_urls": self.options.max_urls,
-            "provider": self.provider,
-        }
+        from bugtrace.services.scan_status_policy import project_active_scan_status
+
+        return project_active_scan_status(
+            scan_id=self.scan_id,
+            target_url=self.options.target_url,
+            status=self.status,
+            progress=self.progress,
+            uptime_seconds=self.uptime_seconds,
+            findings_count=self.findings_count,
+            active_agent=self.active_agent,
+            phase=self.phase,
+            scan_type=self.options.scan_type,
+            max_depth=self.options.max_depth,
+            max_urls=self.options.max_urls,
+            provider=self.provider,
+            launch_origin=self.launch_origin,
+        )

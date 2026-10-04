@@ -8,12 +8,28 @@ import json
 from datetime import datetime
 from dotenv import load_dotenv
 
-load_dotenv() # Force load .env
-
 from bugtrace import __version__
+from bugtrace.core.runtime_paths import (
+    resolve_package_base_dir,
+    resolve_runtime_root,
+    test_mode_enabled,
+    truthy_env as _truthy_env,
+)
 from bugtrace.utils.logger import get_logger
 
 logger = get_logger("core.config")
+
+# Re-export path helpers for existing callers (tests, boot, harnesses).
+__all_runtime_path_exports__ = (
+    "test_mode_enabled",
+    "resolve_package_base_dir",
+    "resolve_runtime_root",
+)
+
+
+# Load process .env only outside hermetic test mode. Tests inject env explicitly.
+if not test_mode_enabled():
+    load_dotenv()  # Force load .env
 
 # Known valid providers for OpenRouter
 VALID_PROVIDERS = [
@@ -26,7 +42,10 @@ VALID_PROVIDERS = [
 # Placeholder values that should be rejected
 API_KEY_PLACEHOLDERS = ['your-key-here', 'placeholder', 'xxx', 'changeme', 'test', 'sk-xxx']
 
-class Settings(BaseSettings):
+from bugtrace.core.config_loaders import SettingsLoadersMixin
+from bugtrace.core.config_ops import SettingsOpsMixin
+
+class Settings(SettingsLoadersMixin, SettingsOpsMixin, BaseSettings):
     """
     Unified Configuration Management using Pydantic Settings.
     Loads from .env file and environment variables.
@@ -34,19 +53,27 @@ class Settings(BaseSettings):
     # --- Project Metadata ---
     APP_NAME: str = "BugTraceAI-CLI"
     VERSION: str = __version__  # Synced from bugtrace.__version__
-    DEBUG: bool = False
+    # DEBUG used to read from the bare `DEBUG` env var, which collides with
+    # Ubuntu's kernel `DEBUG=release` marker (set by the distribution when a
+    # release kernel is booted). Pydantic v2 rejects "release" as a bool and
+    # the entire Settings() init fails — taking the whole CLI down on stock
+    # Ubuntu. We use validation_alias so the env var is now BUGTRACE_DEBUG and
+    # the in-code attribute stays DEBUG (no caller has to change).
+    DEBUG: bool = Field(default=False, validation_alias="BUGTRACE_DEBUG")
     SAFE_MODE: bool = False # Default to False, override via CLI
 
     # --- Environment (TASK-124) ---
     ENV: str = Field(default="production", description="Environment: development, staging, production")
 
     # --- LLM Provider Selection ---
-    PROVIDER: str = "openrouter"  # Active provider: openrouter, zai, anthropic
+    PROVIDER: str = "openrouter"  # Active provider preset id
 
     # --- API Keys (Secrets) with validation (TASK-118) ---
     OPENROUTER_API_KEY: Optional[str] = Field(default=None, min_length=32, description="OpenRouter API key")
     GLM_API_KEY: Optional[str] = Field(default=None, min_length=20, description="GLM API key")
     ANTHROPIC_API_KEY: Optional[str] = Field(default=None, min_length=20, description="Anthropic API key (sk-ant-...)")
+    OPENAI_API_KEY: Optional[str] = Field(default=None, description="OpenAI-compatible API key (sk-... for OpenAI)")
+    MINIMAX_API_KEY: Optional[str] = Field(default=None, description="MiniMax API key")
     
     # --- LLM Models ---
     DEFAULT_MODEL: str = "qwen/qwen3-coder"
@@ -330,6 +357,26 @@ class Settings(BaseSettings):
             raise ValueError(f"{info.field_name} must be positive (got {v})")
         return v
 
+    @field_validator('DEFAULT_HEADERS_JSON')
+    @classmethod
+    def validate_default_headers_json(cls, v):
+        """Validate DEFAULT_HEADERS_JSON parses cleanly. Empty string is OK.
+
+        We refuse to start a scan if the configured global headers are
+        malformed: silently ignoring the failure would make the user believe
+        the headers are being sent when they are not, which can mask
+        authentication and produce silent misconfiguration.
+        """
+        if not v:
+            return v
+        # Late import: config.py is loaded very early; utils may not be ready.
+        from bugtrace.utils.headers import parse_default_headers_json, InvalidHeaderError
+        try:
+            parse_default_headers_json(v)
+        except InvalidHeaderError as e:
+            raise ValueError(str(e)) from e
+        return v
+
     # --- OpenRouter Configuration ---
     OPENROUTER_ONLINE: bool = True  # Enable internet access for models
     
@@ -354,6 +401,14 @@ class Settings(BaseSettings):
     MANDATORY_SQLMAP_VALIDATION: bool = True
     SKIP_VALIDATED_PARAMS: bool = True
     SCAN_DEPTH: str = "standard"  # quick, standard, thorough
+
+    # --- Custom HTTP Headers ---
+    # Global default headers sent with every scan request. Must be a JSON object.
+    # Values may reference environment variables via ${VAR} syntax.
+    # Sensitive headers (Authorization, Cookie) should NOT be set here — use
+    # per-scan custom_headers or auth discovery instead.
+    # Example: {"X-Bug-Bounty": "MyProgram", "X-Forwarded-For": "203.0.113.42"}
+    DEFAULT_HEADERS_JSON: str = ""
 
     # --- XSS COVERAGE (negative evidence) ---
     # The escalation pipeline returns None both for "tested hard, found nothing" and for
@@ -462,712 +517,42 @@ class Settings(BaseSettings):
 
 
 
-    def _load_core_config(self, config):
-        """Load CORE section config (DEBUG, SAFE_MODE)."""
-        if "CORE" not in config:
-            return
-        section = config["CORE"]
-        if "DEBUG" in section:
-            self.DEBUG = section.getboolean("DEBUG")
-        if "SAFE_MODE" in section:
-            self.SAFE_MODE = section.getboolean("SAFE_MODE")
 
-    def _load_crawler_config(self, config):
-        """Load CRAWLER section config."""
-        if "CRAWLER" not in config:
-            return
-        section = config["CRAWLER"]
-        if "EXCLUDE_EXTENSIONS" in section:
-            self.CRAWLER_EXCLUDE_EXTENSIONS = section["EXCLUDE_EXTENSIONS"]
-        if "INCLUDE_EXTENSIONS" in section:
-            self.CRAWLER_INCLUDE_EXTENSIONS = section["INCLUDE_EXTENSIONS"]
-        if "SPA_WAIT_MS" in section:
-            self.SPA_WAIT_MS = section.getint("SPA_WAIT_MS")
-        if "MAX_QUEUE_SIZE" in section:
-            self.MAX_QUEUE_SIZE = section.getint("MAX_QUEUE_SIZE")
-        if "JS_ENDPOINT_MINING" in section:
-            self.CRAWLER_JS_ENDPOINT_MINING = section.getboolean("JS_ENDPOINT_MINING")
-        if "JS_MAX_SCRIPTS" in section:
-            self.CRAWLER_JS_MAX_SCRIPTS = section.getint("JS_MAX_SCRIPTS")
-        if "JS_MAX_ENDPOINTS" in section:
-            self.CRAWLER_JS_MAX_ENDPOINTS = section.getint("JS_MAX_ENDPOINTS")
-        if "JS_MAX_RESPONSE_BYTES" in section:
-            self.CRAWLER_JS_MAX_RESPONSE_BYTES = section.getint("JS_MAX_RESPONSE_BYTES")
-        if "JS_FETCH_TIMEOUT" in section:
-            self.CRAWLER_JS_FETCH_TIMEOUT = section.getfloat("JS_FETCH_TIMEOUT")
 
-    def _load_scan_config(self, config):
-        """Load SCAN section config."""
-        if "SCAN" not in config:
-            return
-        if "MAX_DEPTH" in config["SCAN"]:
-            self.MAX_DEPTH = config["SCAN"].getint("MAX_DEPTH")
-        if "MAX_URLS" in config["SCAN"]:
-            self.MAX_URLS = config["SCAN"].getint("MAX_URLS")
-        if "MAX_CONCURRENT_URL_AGENTS" in config["SCAN"]:
-            self.MAX_CONCURRENT_URL_AGENTS = config["SCAN"].getint("MAX_CONCURRENT_URL_AGENTS")
-        if "GOSPIDER_NO_REDIRECT" in config["SCAN"]:
-            self.GOSPIDER_NO_REDIRECT = config["SCAN"].getboolean("GOSPIDER_NO_REDIRECT")
-        if "GOSPIDER_USE_ARCHIVES" in config["SCAN"]:
-            self.GOSPIDER_USE_ARCHIVES = config["SCAN"].getboolean("GOSPIDER_USE_ARCHIVES")
-        if "GOSPIDER_CONCURRENCY" in config["SCAN"]:
-            self.GOSPIDER_CONCURRENCY = config["SCAN"].getint("GOSPIDER_CONCURRENCY")
-        if "URL_PATTERN_DEDUP" in config["SCAN"]:
-            self.URL_PATTERN_DEDUP = config["SCAN"].getboolean("URL_PATTERN_DEDUP")
 
-    def _load_parallelization_config(self, config):
-        """Load PARALLELIZATION section config for granular per-phase concurrency."""
-        if "PARALLELIZATION" not in config:
-            return
-        section = config["PARALLELIZATION"]
-        if "MAX_CONCURRENT_DISCOVERY" in section:
-            self.MAX_CONCURRENT_DISCOVERY = section.getint("MAX_CONCURRENT_DISCOVERY")
-        if "MAX_CONCURRENT_ANALYSIS" in section:
-            self.MAX_CONCURRENT_ANALYSIS = section.getint("MAX_CONCURRENT_ANALYSIS")
-        if "MAX_CONCURRENT_SPECIALISTS" in section:
-            self.MAX_CONCURRENT_SPECIALISTS = section.getint("MAX_CONCURRENT_SPECIALISTS")
-        if "JWT_HEAD_START_TIMEOUT" in section:
-            self.JWT_HEAD_START_TIMEOUT = section.getint("JWT_HEAD_START_TIMEOUT")
-        if "LANCEDB_ENABLED" in section:
-            self.LANCEDB_ENABLED = section.getboolean("LANCEDB_ENABLED")
-        if "DAST_ANALYSIS_TIMEOUT" in section:
-            self.DAST_ANALYSIS_TIMEOUT = section.getfloat("DAST_ANALYSIS_TIMEOUT")
-        if "DAST_MAX_RETRIES" in section:
-            self.DAST_MAX_RETRIES = section.getint("DAST_MAX_RETRIES")
-        if "DAST_CONSECUTIVE_TIMEOUT_LIMIT" in section:
-            self.DAST_CONSECUTIVE_TIMEOUT_LIMIT = section.getint("DAST_CONSECUTIVE_TIMEOUT_LIMIT")
-        if "DAST_TIMEOUT_PERCENT_LIMIT" in section:
-            self.DAST_TIMEOUT_PERCENT_LIMIT = section.getint("DAST_TIMEOUT_PERCENT_LIMIT")
-        if "DAST_AUTO_RESUME_DELAY" in section:
-            self.DAST_AUTO_RESUME_DELAY = section.getint("DAST_AUTO_RESUME_DELAY")
         # NOTE: MAX_CONCURRENT_VALIDATION is NOT loaded from config
         # CDP client only supports 1 concurrent session - hardcoded in defaults
 
-    def _load_url_prioritization_config(self, config):
-        """Load URL_PRIORITIZATION section config for intelligent URL ordering."""
-        if "URL_PRIORITIZATION" not in config:
-            return
-        section = config["URL_PRIORITIZATION"]
-        if "ENABLED" in section:
-            self.URL_PRIORITIZATION_ENABLED = section.getboolean("ENABLED")
-        if "LOG_SCORES" in section:
-            self.URL_PRIORITIZATION_LOG_SCORES = section.getboolean("LOG_SCORES")
-        if "CUSTOM_PATHS" in section:
-            self.URL_PRIORITIZATION_CUSTOM_PATHS = section["CUSTOM_PATHS"].strip()
-        if "CUSTOM_PARAMS" in section:
-            self.URL_PRIORITIZATION_CUSTOM_PARAMS = section["CUSTOM_PARAMS"].strip()
-
-    def _load_thinking_config(self, config):
-        """Load THINKING section config for ThinkingConsolidationAgent."""
-        if "THINKING" not in config:
-            return
-        section = config["THINKING"]
-        if "FP_THRESHOLD" in section:
-            self.THINKING_FP_THRESHOLD = section.getfloat("FP_THRESHOLD")
-        if "MODE" in section:
-            self.THINKING_MODE = section["MODE"].strip()
-        if "BATCH_SIZE" in section:
-            self.THINKING_BATCH_SIZE = section.getint("BATCH_SIZE")
-        if "DEDUP_WINDOW" in section:
-            self.THINKING_DEDUP_WINDOW = section.getint("DEDUP_WINDOW")
-        # NEW: Embeddings classification settings
-        if "USE_EMBEDDINGS_CLASSIFICATION" in section:
-            self.USE_EMBEDDINGS_CLASSIFICATION = section.getboolean("USE_EMBEDDINGS_CLASSIFICATION")
-        if "EMBEDDINGS_CONFIDENCE_THRESHOLD" in section:
-            self.EMBEDDINGS_CONFIDENCE_THRESHOLD = section.getfloat("EMBEDDINGS_CONFIDENCE_THRESHOLD")
-        if "EMBEDDINGS_MANUAL_REVIEW_THRESHOLD" in section:
-            self.EMBEDDINGS_MANUAL_REVIEW_THRESHOLD = section.getfloat("EMBEDDINGS_MANUAL_REVIEW_THRESHOLD")
-        if "EMBEDDINGS_LOG_CONFIDENCE" in section:
-            self.EMBEDDINGS_LOG_CONFIDENCE = section.getboolean("EMBEDDINGS_LOG_CONFIDENCE")
-
-    def _load_provider_section(self, config):
-        """Load [PROVIDER] section — sets self.PROVIDER."""
-        if "PROVIDER" not in config:
-            return
-        section = config["PROVIDER"]
-        if "ACTIVE" in section:
-            self.PROVIDER = section["ACTIVE"].strip().lower()
-
-    def _load_provider_preset(self):
-        """Load provider preset JSON and set model defaults.
-
-        Called BEFORE _load_llm_models_config so user overrides in
-        [LLM_MODELS] take precedence over preset defaults.
-        """
-        preset_path = self.BASE_DIR / "bugtrace" / "data" / "providers" / f"{self.PROVIDER}.json"
-        if not preset_path.exists():
-            logger.warning(f"Provider preset not found: {preset_path} — using defaults")
-            self._provider_config = {}
-            return
-
-        try:
-            preset = json.loads(preset_path.read_text())
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error(f"Failed to load provider preset {preset_path}: {e}")
-            self._provider_config = {}
-            return
-
-        self._provider_config = preset
-
-        # Apply model defaults from preset
-        models = preset.get("models", {})
-        for field, value in models.items():
-            if hasattr(self, field):
-                object.__setattr__(self, field, value)
-
-        # Vision validation must run on a model the ACTIVE provider actually serves:
-        # a slug belonging to another provider is rejected outright (HTTP 404), not
-        # degraded, which silently disables visual XSS proof. Presets that do not pin
-        # VALIDATION_VISION_MODEL inherit their own VISION_MODEL rather than keeping
-        # whatever the previous provider left behind.
-        if "VALIDATION_VISION_MODEL" not in models and "VISION_MODEL" in models:
-            object.__setattr__(self, "VALIDATION_VISION_MODEL", models["VISION_MODEL"])
-
-        logger.info(f"Provider preset loaded: {preset.get('name', self.PROVIDER)} ({len(models)} model defaults)")
-
-    def _load_llm_models_config(self, config):
-        """Load LLM_MODELS section config.
-
-        When a non-default provider is active, model overrides from [LLM_MODELS]
-        are skipped — the provider preset already set the correct models.
-        Only numeric/non-model settings (MIN_CREDITS, batch sizes) still apply.
-        """
-        if "LLM_MODELS" not in config:
-            return
-        section = config["LLM_MODELS"]
-
-        # Skip model overrides when a provider preset is active —
-        # the preset already configured the right models for this provider.
-        # Users can still override via env vars if needed.
-        if not self._provider_config:
-            # No preset loaded, apply conf overrides as before
-            model_fields = [
-                "DEFAULT_MODEL", "PRIMARY_MODELS", "VISION_MODEL",
-                "WAF_DETECTION_MODELS", "CODE_MODEL", "MUTATION_MODEL",
-                "ANALYSIS_MODEL", "SKEPTICAL_MODEL", "REPORTING_MODEL",
-            ]
-            for field in model_fields:
-                if field in section:
-                    setattr(self, field, section[field])
-        else:
-            logger.debug(f"Skipping [LLM_MODELS] overrides — provider preset '{self.PROVIDER}' is active")
-        if "MIN_CREDITS" in section:
-            self.MIN_CREDITS = section.getfloat("MIN_CREDITS")
-        if "MAX_CONCURRENT_REQUESTS" in section:
-            self.MAX_CONCURRENT_REQUESTS = section.getint("MAX_CONCURRENT_REQUESTS")
-        if "REPORTING_POC_BATCH_SIZE" in section:
-            self.REPORTING_POC_BATCH_SIZE = section.getint("REPORTING_POC_BATCH_SIZE")
-        if "REPORTING_POC_TOKENS_PER_FINDING" in section:
-            self.REPORTING_POC_TOKENS_PER_FINDING = section.getint("REPORTING_POC_TOKENS_PER_FINDING")
-        if "REPORTING_POC_MIN_TOKENS" in section:
-            self.REPORTING_POC_MIN_TOKENS = section.getint("REPORTING_POC_MIN_TOKENS")
-        if "REPORTING_POC_MAX_TOKENS" in section:
-            self.REPORTING_POC_MAX_TOKENS = section.getint("REPORTING_POC_MAX_TOKENS")
-        if "REPORTING_FAILOVER_ENABLED" in section:
-            self.REPORTING_FAILOVER_ENABLED = section.getboolean("REPORTING_FAILOVER_ENABLED")
-        if "REPORTING_FAILOVER_PROVIDER" in section:
-            self.REPORTING_FAILOVER_PROVIDER = section["REPORTING_FAILOVER_PROVIDER"].strip()
-
-    def _load_modellab_config(self, config):
-        """Load [MODELLAB] section: model-eval benchmark scoring calibration.
-
-        These knobs are independent of provider presets (ModelLab may run with its
-        own key), so they are always applied when present. Weights are normalized
-        downstream in the runner, so any non-negative set is safe.
-        """
-        if "MODELLAB" not in config:
-            return
-        section = config["MODELLAB"]
-        float_fields = [
-            "MODELLAB_W_CORRECTNESS", "MODELLAB_W_SKEPTICISM",
-            "MODELLAB_W_COMPLIANCE", "MODELLAB_W_PERFORMANCE",
-            "MODELLAB_GATE_MIN_CORRECTNESS", "MODELLAB_GATE_MIN_SKEPTICISM",
-            "MODELLAB_GATE_MIN_COMPLIANCE", "MODELLAB_FAILURE_PENALTY",
-            "MODELLAB_MUTATION_DIVERSITY_WEIGHT",
-        ]
-        for field in float_fields:
-            if field in section:
-                try:
-                    setattr(self, field, section.getfloat(field))
-                except ValueError:
-                    logger.warning(f"[MODELLAB] {field} is not a number; keeping default")
-        if "MODELLAB_SCORING_VERSION" in section:
-            self.MODELLAB_SCORING_VERSION = section["MODELLAB_SCORING_VERSION"].strip()
-        if "MODELLAB_LATENCY_STAT" in section:
-            stat = section["MODELLAB_LATENCY_STAT"].strip().lower()
-            self.MODELLAB_LATENCY_STAT = stat if stat in ("median", "p95") else self.MODELLAB_LATENCY_STAT
-
-    def _load_conductor_and_scanning_config(self, config):
-        """Load CONDUCTOR and SCANNING sections."""
-        if "OPENROUTER" in config:
-            if "ONLINE" in config["OPENROUTER"]:
-                self.OPENROUTER_ONLINE = config["OPENROUTER"].getboolean("ONLINE")
-
-        if "CONDUCTOR" in config:
-            section = config["CONDUCTOR"]
-            if "DISABLE_VALIDATION" in section:
-                self.CONDUCTOR_DISABLE_VALIDATION = section.getboolean("DISABLE_VALIDATION")
-            if "CONTEXT_REFRESH_INTERVAL" in section:
-                self.CONDUCTOR_CONTEXT_REFRESH_INTERVAL = section.getint("CONTEXT_REFRESH_INTERVAL")
-            if "MIN_CONFIDENCE" in section:
-                self.CONDUCTOR_MIN_CONFIDENCE = section.getfloat("MIN_CONFIDENCE")
-            if "ENABLE_FP_DETECTION" in section:
-                self.CONDUCTOR_ENABLE_FP_DETECTION = section.getboolean("ENABLE_FP_DETECTION")
-
-        if "SCANNING" in config:
-            section = config["SCANNING"]
-            if "STOP_ON_CRITICAL" in section:
-                self.STOP_ON_CRITICAL = section.getboolean("STOP_ON_CRITICAL")
-            if "CRITICAL_TYPES" in section: self.CRITICAL_TYPES = section["CRITICAL_TYPES"]
-            if "MANDATORY_SQLMAP_VALIDATION" in section:
-                self.MANDATORY_SQLMAP_VALIDATION = section.getboolean("MANDATORY_SQLMAP_VALIDATION")
-            if "SKIP_VALIDATED_PARAMS" in section:
-                self.SKIP_VALIDATED_PARAMS = section.getboolean("SKIP_VALIDATED_PARAMS")
-            if "SCAN_DEPTH" in section:
-                val = section["SCAN_DEPTH"].strip().lower()
-                if val in ("quick", "standard", "thorough"):
-                    self.SCAN_DEPTH = val
-            if "XSS_COVERAGE_ENABLED" in section:
-                self.XSS_COVERAGE_ENABLED = section.getboolean("XSS_COVERAGE_ENABLED")
-            if "XSS_COVERAGE_SUBDIR" in section:
-                self.XSS_COVERAGE_SUBDIR = section["XSS_COVERAGE_SUBDIR"].strip()
-            if "XSS_COVERAGE_FILENAME" in section:
-                self.XSS_COVERAGE_FILENAME = section["XSS_COVERAGE_FILENAME"].strip()
-            if "XSS_COVERAGE_MAX_PARAMS" in section:
-                self.XSS_COVERAGE_MAX_PARAMS = section.getint("XSS_COVERAGE_MAX_PARAMS")
-
-    def _load_authority_config(self, config):
-        """Load AUTHORITY section config."""
-        if "AUTHORITY" not in config:
-            return
-        section = config["AUTHORITY"]
-        if "ENABLE_SELF_VALIDATION" in section:
-            self.ENABLE_SELF_VALIDATION = section.getboolean("ENABLE_SELF_VALIDATION")
-        if "XSS_SELF_VALIDATE" in section:
-            self.XSS_SELF_VALIDATE = section.getboolean("XSS_SELF_VALIDATE")
-        if "SQLI_SELF_VALIDATE" in section:
-            self.SQLI_SELF_VALIDATE = section.getboolean("SQLI_SELF_VALIDATE")
-        if "RCE_SELF_VALIDATE" in section:
-            self.RCE_SELF_VALIDATE = section.getboolean("RCE_SELF_VALIDATE")
-
-    def _load_lonewolf_config(self, config):
-        """Load LONEWOLF section config."""
-        if "LONEWOLF" not in config:
-            return
-        section = config["LONEWOLF"]
-        if "ENABLED" in section:
-            self.LONEWOLF_ENABLED = section.getboolean("ENABLED")
-        if "MODEL" in section:
-            self.LONEWOLF_MODEL = section["MODEL"]
-        if "RATE_LIMIT" in section:
-            self.LONEWOLF_RATE_LIMIT = section.getfloat("RATE_LIMIT")
-        if "MAX_CONTEXT" in section:
-            self.LONEWOLF_MAX_CONTEXT = section.getint("MAX_CONTEXT")
-        if "RESPONSE_TRUNCATE" in section:
-            self.LONEWOLF_RESPONSE_TRUNCATE = section.getint("RESPONSE_TRUNCATE")
-        if "MAX_CYCLES" in section:
-            self.LONEWOLF_MAX_CYCLES = section.getint("MAX_CYCLES")
-        if "NO_PROGRESS_LIMIT" in section:
-            self.LONEWOLF_NO_PROGRESS_LIMIT = section.getint("NO_PROGRESS_LIMIT")
-        if "RECENT_WINDOW" in section:
-            self.LONEWOLF_RECENT_WINDOW = section.getint("RECENT_WINDOW")
-
-    def _load_anthropic_config(self, config):
-        """Load ANTHROPIC section config for direct Claude API via OAuth."""
-        if "ANTHROPIC" not in config:
-            return
-        section = config["ANTHROPIC"]
-        if "ENABLED" in section:
-            self.ANTHROPIC_OAUTH_ENABLED = section.getboolean("ENABLED")
-        if "TOKEN_FILE" in section:
-            self.ANTHROPIC_TOKEN_FILE = section["TOKEN_FILE"].strip()
 
 
-    def _load_validation_config(self, config):
-        """Load VALIDATION section config for Vision-Based XSS Validation."""
-        if "VALIDATION" not in config:
-            return
-        section = config["VALIDATION"]
-        if "VISION_MODEL" in section:
-            # Mirror _load_llm_models_config: when a provider preset is active it has
-            # already selected a vision model that provider serves, so a conf value
-            # left over from another provider must not overwrite it (it would be a
-            # hard 404 on every vision call). Users can still override via env vars.
-            if not self._provider_config:
-                self.VALIDATION_VISION_MODEL = section["VISION_MODEL"]
-            else:
-                logger.debug(
-                    f"Skipping [VALIDATION] VISION_MODEL override — provider preset "
-                    f"'{self.PROVIDER}' is active (using {self.VALIDATION_VISION_MODEL})"
-                )
-        if "VISION_ENABLED" in section:
-            self.VALIDATION_VISION_ENABLED = section.getboolean("VISION_ENABLED")
-        if "VISION_ONLY_FOR_XSS" in section:
-            self.VALIDATION_VISION_ONLY_FOR_XSS = section.getboolean("VISION_ONLY_FOR_XSS")
-        if "MAX_VISION_CALLS_PER_URL" in section:
-            self.VALIDATION_MAX_VISION_CALLS_PER_URL = section.getint("MAX_VISION_CALLS_PER_URL")
 
-    def _load_qlearning_config(self, config):
-        """Load QLEARNING section config for WAF bypass system."""
-        if "QLEARNING" not in config:
-            return
-        section = config["QLEARNING"]
-        if "INITIAL_EPSILON" in section:
-            self.WAF_QLEARNING_INITIAL_EPSILON = section.getfloat("INITIAL_EPSILON")
-        if "MIN_EPSILON" in section:
-            self.WAF_QLEARNING_MIN_EPSILON = section.getfloat("MIN_EPSILON")
-        if "DECAY_RATE" in section:
-            self.WAF_QLEARNING_DECAY_RATE = section.getfloat("DECAY_RATE")
-        if "UCB_CONSTANT" in section:
-            self.WAF_QLEARNING_UCB_CONSTANT = section.getfloat("UCB_CONSTANT")
-        if "MAX_BACKUPS" in section:
-            self.WAF_QLEARNING_MAX_BACKUPS = section.getint("MAX_BACKUPS")
 
-    def _load_manipulator_config(self, config):
-        """Load MANIPULATOR section config for HTTP Exploitation Tool."""
-        if "MANIPULATOR" not in config:
-            return
-        section = config["MANIPULATOR"]
-        if "GLOBAL_RATE_LIMIT" in section:
-            self.MANIPULATOR_GLOBAL_RATE_LIMIT = section.getfloat("GLOBAL_RATE_LIMIT")
-        if "USE_GLOBAL_RATE_LIMITER" in section:
-            self.MANIPULATOR_USE_GLOBAL_RATE_LIMITER = section.getboolean("USE_GLOBAL_RATE_LIMITER")
-        if "ENABLE_LLM_EXPANSION" in section:
-            self.MANIPULATOR_ENABLE_LLM_EXPANSION = section.getboolean("ENABLE_LLM_EXPANSION")
-        if "ENABLE_AGENTIC_FALLBACK" in section:
-            self.MANIPULATOR_ENABLE_AGENTIC_FALLBACK = section.getboolean("ENABLE_AGENTIC_FALLBACK")
-        if "BREAKOUT_PRIORITY_LEVEL" in section:
-            self.MANIPULATOR_BREAKOUT_PRIORITY_LEVEL = section.getint("BREAKOUT_PRIORITY_LEVEL")
-        if "MAX_LLM_PAYLOADS" in section:
-            self.MANIPULATOR_MAX_LLM_PAYLOADS = section.getint("MAX_LLM_PAYLOADS")
 
-    def _load_asset_discovery_config(self, config):
-        """Load ASSET_DISCOVERY section config."""
-        if "ASSET_DISCOVERY" not in config:
-            return
-        section = config["ASSET_DISCOVERY"]
-        if "ENABLE_ASSET_DISCOVERY" in section:
-            self.ENABLE_ASSET_DISCOVERY = section.getboolean("ENABLE_ASSET_DISCOVERY")
-        if "ENABLE_DNS_ENUMERATION" in section:
-            self.ENABLE_DNS_ENUMERATION = section.getboolean("ENABLE_DNS_ENUMERATION")
-        if "ENABLE_CERTIFICATE_TRANSPARENCY" in section:
-            self.ENABLE_CERTIFICATE_TRANSPARENCY = section.getboolean("ENABLE_CERTIFICATE_TRANSPARENCY")
-        if "ENABLE_WAYBACK_DISCOVERY" in section:
-            self.ENABLE_WAYBACK_DISCOVERY = section.getboolean("ENABLE_WAYBACK_DISCOVERY")
-        if "ENABLE_CLOUD_STORAGE_ENUM" in section:
-            self.ENABLE_CLOUD_STORAGE_ENUM = section.getboolean("ENABLE_CLOUD_STORAGE_ENUM")
-        if "ENABLE_COMMON_PATHS" in section:
-            self.ENABLE_COMMON_PATHS = section.getboolean("ENABLE_COMMON_PATHS")
-        if "MAX_SUBDOMAINS" in section:
-            self.MAX_SUBDOMAINS = section.getint("MAX_SUBDOMAINS")
 
-    def _load_paths_config(self, config):
-        """Load PATHS section config for LOG_DIR and REPORT_DIR.
 
-        This ensures paths defined in bugtraceaicli.conf are properly loaded.
-        Without this, LOG_DIR and REPORT_DIR from [PATHS] section are ignored.
-        """
-        if "PATHS" not in config:
-            return
-        section = config["PATHS"]
-        if "LOG_DIR" in section:
-            self.LOG_DIR_PATH = section["LOG_DIR"].strip()
-        if "REPORT_DIR" in section:
-            self.REPORT_DIR_PATH = section["REPORT_DIR"].strip()
 
-    def _load_analysis_and_misc_config(self, config):
-        """Load ANALYSIS, BROWSER, ADVANCED, REPORT, OPTIMIZATION sections."""
-        if "ANALYSIS" in config:
-            section = config["ANALYSIS"]
-            if "ENABLE_ANALYSIS" in section:
-                self.ANALYSIS_ENABLE = section.getboolean("ENABLE_ANALYSIS")
-            if "APPROACH_PENTESTER" in section:
-                self.ANALYSIS_APPROACH_PENTESTER = section.getboolean("APPROACH_PENTESTER")
-            if "APPROACH_BUG_BOUNTY" in section:
-                self.ANALYSIS_APPROACH_BUG_BOUNTY = section.getboolean("APPROACH_BUG_BOUNTY")
-            if "APPROACH_CODE_AUDITOR" in section:
-                self.ANALYSIS_APPROACH_CODE_AUDITOR = section.getboolean("APPROACH_CODE_AUDITOR")
-            if "APPROACH_RED_TEAM" in section:
-                self.ANALYSIS_APPROACH_RED_TEAM = section.getboolean("APPROACH_RED_TEAM")
-            if "APPROACH_RESEARCHER" in section:
-                self.ANALYSIS_APPROACH_RESEARCHER = section.getboolean("APPROACH_RESEARCHER")
-            if "APPROACH_MODE" in section:
-                self.APPROACH_MODE = section["APPROACH_MODE"].strip().upper()
-            if "PENTESTER_MODEL" in section:
-                self.ANALYSIS_PENTESTER_MODEL = section["PENTESTER_MODEL"]
-            if "BUG_BOUNTY_MODEL" in section:
-                self.ANALYSIS_BUG_BOUNTY_MODEL = section["BUG_BOUNTY_MODEL"]
-            if "AUDITOR_MODEL" in section:
-                self.ANALYSIS_AUDITOR_MODEL = section["AUDITOR_MODEL"]
-            if "RED_TEAM_MODEL" in section:
-                self.ANALYSIS_RED_TEAM_MODEL = section["RED_TEAM_MODEL"]
-            if "RESEARCHER_MODEL" in section:
-                self.ANALYSIS_RESEARCHER_MODEL = section["RESEARCHER_MODEL"]
-            if "CONFIDENCE_THRESHOLD" in section:
-                self.ANALYSIS_CONFIDENCE_THRESHOLD = section.getfloat("CONFIDENCE_THRESHOLD")
-            if "SKIP_THRESHOLD" in section:
-                self.ANALYSIS_SKIP_THRESHOLD = section.getfloat("SKIP_THRESHOLD")
-            if "CONSENSUS_VOTES" in section:
-                self.ANALYSIS_CONSENSUS_VOTES = section.getint("CONSENSUS_VOTES")
-            if "DAST_ANALYSIS_TIMEOUT" in section:
-                self.DAST_ANALYSIS_TIMEOUT = section.getfloat("DAST_ANALYSIS_TIMEOUT")
 
-        if "BROWSER" in config:
-            section = config["BROWSER"]
-            if "HEADLESS" in section:
-                self.HEADLESS_BROWSER = section.getboolean("HEADLESS")
-            if "USER_AGENT" in section:
-                self.USER_AGENT = section["USER_AGENT"]
-            if "VIEWPORT_WIDTH" in section:
-                self.VIEWPORT_WIDTH = section.getint("VIEWPORT_WIDTH")
-            if "VIEWPORT_HEIGHT" in section:
-                self.VIEWPORT_HEIGHT = section.getint("VIEWPORT_HEIGHT")
-            if "TIMEOUT_MS" in section:
-                self.TIMEOUT_MS = section.getint("TIMEOUT_MS")
-            if "DOM_CLICK_MAX_LINKS" in section:
-                self.DOM_CLICK_MAX_LINKS = section.getint("DOM_CLICK_MAX_LINKS")
-            if "DOM_CLICK_MAX_TEXT_LINKS" in section:
-                self.DOM_CLICK_MAX_TEXT_LINKS = section.getint("DOM_CLICK_MAX_TEXT_LINKS")
-            if "DOM_CLICK_WAIT_SEC" in section:
-                self.DOM_CLICK_WAIT_SEC = section.getfloat("DOM_CLICK_WAIT_SEC")
-            if "DOM_CLICK_INITIAL_WAIT_SEC" in section:
-                self.DOM_CLICK_INITIAL_WAIT_SEC = section.getfloat("DOM_CLICK_INITIAL_WAIT_SEC")
 
-        if "ADVANCED" in config:
-            if "TRACING_ENABLED" in config["ADVANCED"]:
-                self.TRACING_ENABLED = config["ADVANCED"].getboolean("TRACING_ENABLED")
-            if "INTERACTSH_SERVER" in config["ADVANCED"]:
-                self.INTERACTSH_SERVER = config["ADVANCED"]["INTERACTSH_SERVER"]
-        
-        if "BROWSER_ADVANCED" in config:
-            section = config["BROWSER_ADVANCED"]
-            if "NAVIGATION_TIMEOUT_MS" in section:
-                self.NAVIGATION_TIMEOUT_MS = section.getint("NAVIGATION_TIMEOUT_MS")
-            if "NETWORKIDLE_TIMEOUT_MS" in section:
-                self.NETWORKIDLE_TIMEOUT_MS = section.getint("NETWORKIDLE_TIMEOUT_MS")
-            if "PAYLOAD_EXECUTION_WAIT_MS" in section:
-                self.PAYLOAD_EXECUTION_WAIT_MS = section.getint("PAYLOAD_EXECUTION_WAIT_MS")
-            if "SCREENSHOT_TIMEOUT_MS" in section:
-                self.SCREENSHOT_TIMEOUT_MS = section.getint("SCREENSHOT_TIMEOUT_MS")
-            if "SCREENSHOT_MAX_RETRIES" in section:
-                self.SCREENSHOT_MAX_RETRIES = section.getint("SCREENSHOT_MAX_RETRIES")
-            if "WAIT_STRATEGY" in section:
-                self.WAIT_STRATEGY = section["WAIT_STRATEGY"].strip().lower()
-            if "STAGGERED_WAIT_INITIAL" in section:
-                self.STAGGERED_WAIT_INITIAL = section.getint("STAGGERED_WAIT_INITIAL")
-            if "STAGGERED_WAIT_EXTRA" in section:
-                self.STAGGERED_WAIT_EXTRA = section.getint("STAGGERED_WAIT_EXTRA")
-            if "SCREENSHOT_FULL_PAGE" in section:
-                self.SCREENSHOT_FULL_PAGE = section.getboolean("SCREENSHOT_FULL_PAGE")
-            if "SCREENSHOT_ON_ERROR" in section:
-                self.SCREENSHOT_ON_ERROR = section.getboolean("SCREENSHOT_ON_ERROR")
 
-        if "REPORT" in config:
-            if "ONLY_VALIDATED" in config["REPORT"]:
-                self.REPORT_ONLY_VALIDATED = config["REPORT"].getboolean("ONLY_VALIDATED")
-            if "EVIDENCE_MAX_FIELDS" in config["REPORT"]:
-                self.REPORT_EVIDENCE_MAX_FIELDS = config["REPORT"].getint("EVIDENCE_MAX_FIELDS")
-            if "EVIDENCE_VALUE_CHARS" in config["REPORT"]:
-                self.REPORT_EVIDENCE_VALUE_CHARS = config["REPORT"].getint("EVIDENCE_VALUE_CHARS")
 
-        if "OPTIMIZATION" in config:
-            if "EARLY_EXIT_ON_FINDING" in config["OPTIMIZATION"]:
-                self.EARLY_EXIT_ON_FINDING = config["OPTIMIZATION"].getboolean("EARLY_EXIT_ON_FINDING")
 
-        if "SKEPTICAL_THRESHOLDS" in config:
-            for key in config["SKEPTICAL_THRESHOLDS"]:
-                self.SKEPTICAL_THRESHOLDS[key.upper()] = config["SKEPTICAL_THRESHOLDS"].getint(key)
 
-    def load_from_conf(self):
-        """Overrides settings with values from bugtraceaicli.conf"""
-        import configparser
-        config = configparser.ConfigParser()
-        conf_path = self.BASE_DIR / "bugtraceaicli.conf"
 
-        if not conf_path.exists():
-            return
 
-        config.read(conf_path)
-        # Load CORE first (DEBUG, SAFE_MODE)
-        self._load_core_config(config)
-        # Load paths early - other sections may depend on LOG_DIR/REPORT_DIR
-        self._load_paths_config(config)
-        self._load_provider_section(config)  # Read [PROVIDER] → sets self.PROVIDER
-        self._load_provider_preset()          # Load JSON → sets model defaults
-        self._load_crawler_config(config)
-        self._load_scan_config(config)
-        self._load_parallelization_config(config)
-        self._load_url_prioritization_config(config)
-        self._load_thinking_config(config)
-        self._load_llm_models_config(config)  # User overrides from [LLM_MODELS]
-        self._load_modellab_config(config)    # Model-eval scoring calibration [MODELLAB]
-        self._load_conductor_and_scanning_config(config)
-        self._load_analysis_and_misc_config(config)
-        self._load_authority_config(config)
-        self._load_lonewolf_config(config)
-        self._load_anthropic_config(config)
-        self._load_validation_config(config)
-        self._load_qlearning_config(config)
-        self._load_manipulator_config(config)
-        self._load_asset_discovery_config(config)
+
 
     # --- Configuration Validation (TASK-120) ---
-    def validate_config(self) -> List[str]:
-        """
-        Validate entire configuration.
-        Returns list of errors (empty if valid).
-        Raises ValueError if critical errors found.
-        """
-        errors = []
-        warnings = []
-
-        # Check required API key for active provider
-        provider_cfg = getattr(self, '_provider_config', {})
-        provider_key_env = provider_cfg.get("api_key_env", "OPENROUTER_API_KEY")
-        provider_key = getattr(self, provider_key_env, None) or os.environ.get(provider_key_env)
-        if not provider_key:
-            errors.append(f"{provider_key_env} is required for provider '{self.PROVIDER}'")
-
-        # Check numeric bounds
-        if self.MAX_DEPTH < 1:
-            errors.append("MAX_DEPTH must be >= 1")
-        if self.MAX_URLS < 1:
-            errors.append("MAX_URLS must be >= 1")
-        if self.MAX_CONCURRENT_REQUESTS < 1:
-            errors.append("MAX_CONCURRENT_REQUESTS must be >= 1")
-        if self.MAX_CONCURRENT_URL_AGENTS < 1:
-            errors.append("MAX_CONCURRENT_URL_AGENTS must be >= 1")
-
-        # Granular phase concurrency validators
-        if self.MAX_CONCURRENT_DISCOVERY < 1:
-            errors.append("MAX_CONCURRENT_DISCOVERY must be >= 1")
-        if self.MAX_CONCURRENT_ANALYSIS < 1:
-            errors.append("MAX_CONCURRENT_ANALYSIS must be >= 1")
-        if self.MAX_CONCURRENT_SPECIALISTS < 1:
-            errors.append("MAX_CONCURRENT_SPECIALISTS must be >= 1")
-        # MAX_CONCURRENT_VALIDATION is hardcoded to 1 (CDP limitation) - no validation needed
-
-        # Check confidence thresholds (0.0 - 1.0)
-        if not 0.0 <= self.CONDUCTOR_MIN_CONFIDENCE <= 1.0:
-            errors.append("CONDUCTOR_MIN_CONFIDENCE must be 0.0-1.0")
-        if not 0.0 <= self.ANALYSIS_CONFIDENCE_THRESHOLD <= 1.0:
-            errors.append("ANALYSIS_CONFIDENCE_THRESHOLD must be 0.0-1.0")
-        if not 0.0 <= self.ANALYSIS_SKIP_THRESHOLD <= 1.0:
-            errors.append("ANALYSIS_SKIP_THRESHOLD must be 0.0-1.0")
-
-        # Check file paths
-        if not self.BASE_DIR.exists():
-            errors.append(f"BASE_DIR does not exist: {self.BASE_DIR}")
-
-        # Log warnings
-        for w in warnings:
-            logger.warning(f"Config warning: {w}")
-
-        if errors:
-            error_msg = "Configuration errors:\n" + "\n".join(f"  - {e}" for e in errors)
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-
-        return warnings
 
     # --- Secret Masking (TASK-118 additional) ---
-    def mask_secrets(self) -> Dict[str, Any]:
-        """Return config dict with masked secrets for safe logging."""
-        masked = self.model_dump()
-        secret_fields = ['OPENROUTER_API_KEY', 'GLM_API_KEY', 'ANTHROPIC_API_KEY']
-        for key in secret_fields:
-            if masked.get(key):
-                val = masked[key]
-                if len(val) > 12:
-                    masked[key] = val[:8] + '...' + val[-4:]
-                else:
-                    masked[key] = '***'
-        return masked
 
     # --- Debug Logging (TASK-122) ---
-    def log_config(self):
-        """Log configuration with masked secrets (only in DEBUG mode)."""
-        if not self.DEBUG:
-            return
-        logger.debug("Configuration loaded:")
-        for key, value in self.mask_secrets().items():
-            if not key.startswith('_') and key != 'model_config':
-                logger.debug(f"  {key}: {value}")
 
     # --- Config Schema Documentation (TASK-123) ---
-    def generate_config_docs(self) -> str:
-        """Generate markdown documentation for all configuration fields."""
-        docs = ["# BugTraceAI Configuration Reference\n"]
-        docs.append(f"Generated: {datetime.now().isoformat()}\n")
-        docs.append("---\n")
-
-        for field_name, field_info in self.model_fields.items():
-            if field_name.startswith('_'):
-                continue
-            docs.append(f"## {field_name}")
-            docs.append(f"- **Type**: `{field_info.annotation}`")
-            docs.append(f"- **Default**: `{field_info.default}`")
-            if field_info.description:
-                docs.append(f"- **Description**: {field_info.description}")
-            docs.append("")
-
-        return "\n".join(docs)
 
     # --- Config Export/Import (TASK-125) ---
-    def export_config(self, path: Path = None) -> str:
-        """Export configuration to JSON file."""
-        config_data = {
-            '_meta': {
-                'version': self.VERSION,
-                'exported_at': datetime.now().isoformat(),
-                'env': self.ENV
-            },
-            'config': self.mask_secrets()  # Never export real secrets
-        }
-        json_str = json.dumps(config_data, indent=2, default=str)
 
-        if path:
-            path.write_text(json_str)
-            logger.info(f"Config exported to {path}")
-
-        return json_str
-
-    def import_config(self, path: Path) -> Dict[str, Any]:
-        """
-        Import configuration from JSON file.
-        Returns dict of changes that would be applied.
-        Does NOT auto-apply - caller must decide.
-        """
-        if not path.exists():
-            raise FileNotFoundError(f"Config file not found: {path}")
-
-        data = json.loads(path.read_text())
-        config_data = data.get('config', data)
-
-        changes = {}
-        for key, value in config_data.items():
-            if hasattr(self, key) and not key.startswith('_'):
-                current = getattr(self, key)
-                if current != value:
-                    changes[key] = {'from': current, 'to': value}
-
-        return changes
 
     # --- Config Diffing (TASK-126) ---
-    def diff_config(self, other: 'Settings') -> Dict[str, Dict[str, Any]]:
-        """Compare two configurations and return differences."""
-        diff = {}
-        for field_name in self.model_fields:
-            if field_name.startswith('_'):
-                continue
-            self_val = getattr(self, field_name)
-            other_val = getattr(other, field_name)
-            if self_val != other_val:
-                diff[field_name] = {
-                    'self': self_val,
-                    'other': other_val
-                }
-        return diff
 
     # --- Provider Config (loaded from preset JSON) ---
     _provider_config: Dict[str, Any] = {}
@@ -1175,53 +560,10 @@ class Settings(BaseSettings):
     # --- Config Versioning (TASK-127) ---
     _config_history: List[Dict[str, Any]] = []
 
-    def snapshot(self, label: str = None) -> Dict[str, Any]:
-        """Take a snapshot of current configuration for versioning."""
-        snapshot_data = {
-            'timestamp': datetime.now().isoformat(),
-            'label': label or f"snapshot_{len(self._config_history)}",
-            'config': self.model_dump()
-        }
-        self._config_history.append(snapshot_data)
-        logger.debug(f"Config snapshot taken: {snapshot_data['label']}")
-        return snapshot_data
 
-    def get_config_history(self) -> List[Dict[str, Any]]:
-        """Get all configuration snapshots."""
-        return self._config_history.copy()
 
-    def restore_snapshot(self, index: int) -> Dict[str, str]:
-        """
-        Restore configuration from a snapshot.
-        Returns dict of fields that were changed.
-        """
-        if index >= len(self._config_history):
-            raise IndexError(f"Snapshot index {index} not found")
-
-        snapshot = self._config_history[index]
-        changes = {}
-
-        for key, value in snapshot['config'].items():
-            if hasattr(self, key) and not key.startswith('_'):
-                current = getattr(self, key)
-                if current != value:
-                    changes[key] = f"{current} -> {value}"
-                    object.__setattr__(self, key, value)
-
-        logger.info(f"Restored config from snapshot: {snapshot['label']}")
-        return changes
 
     # --- Environment-Specific Config Loading (TASK-124) ---
-    def load_env_specific(self):
-        """Load environment-specific .env file if exists."""
-        env_file = f".env.{self.ENV}"
-        env_path = self.BASE_DIR / env_file
-
-        if env_path.exists():
-            load_dotenv(env_path, override=True)
-            logger.info(f"Loaded environment config: {env_file}")
-        elif self.ENV != "production":
-            logger.debug(f"No environment-specific config found: {env_file}")
 
     # --- Scan Configuration (Mapped from [SCAN] in conf) ---
     MAX_DEPTH: int = 2
@@ -1235,7 +577,8 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_DISCOVERY: int = 1      # GoSpider (single-threaded by design)
     MAX_CONCURRENT_ANALYSIS: int = 5       # DAST/SAST per URL
     MAX_CONCURRENT_SPECIALISTS: int = 10   # SQLi, XSS, CSTI paralelos
-    JWT_HEAD_START_TIMEOUT: int = 300      # Seconds JWTAgent gets to crack/forge before other specialists start (Phase 4)
+    # JWT specialist head-start before other specialists (stable 891f012)
+    JWT_HEAD_START_TIMEOUT: int = 300      # Seconds for JWTAgent crack/forge before Phase 4 pool
     # HARDCODED: CDP client only supports 1 concurrent session (crashes with more)
     # Playwright can handle multiple, but AgenticValidator uses CDP exclusively
     MAX_CONCURRENT_VALIDATION: int = 1     # DO NOT CHANGE - CDP limitation
@@ -1262,9 +605,11 @@ class Settings(BaseSettings):
     HEADLESS_BROWSER: bool = True
     
     # --- Paths ---
-    # Calculated relative to this file: bugtrace/core/config.py -> bugtrace/core -> bugtrace -> Root
-    BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent
-    
+    # Package/project root (conf, bugtrace/data). Writable runtime may use RUNTIME_ROOT.
+    BASE_DIR: Path = Field(default_factory=resolve_package_base_dir)
+    # When set (via BUGTRACE_TEST_ROOT / apply_runtime_root), data/logs/reports go here.
+    RUNTIME_ROOT: Optional[Path] = Field(default_factory=resolve_runtime_root)
+
     # These can be overridden by env vars, but default to standard relative paths
     LOG_DIR_PATH: str = "logs"
     REPORT_DIR_PATH: str = "reports"
@@ -1276,21 +621,31 @@ class Settings(BaseSettings):
     @property
     def LOG_DIR(self) -> Path:
         start = Path(self.LOG_DIR_PATH)
-        if start.is_absolute(): return start
-        return self.BASE_DIR / start
+        if start.is_absolute():
+            return start
+        root = self.RUNTIME_ROOT or self.BASE_DIR
+        return Path(root) / start
 
     @property
     def REPORT_DIR(self) -> Path:
         start = Path(self.REPORT_DIR_PATH)
-        if start.is_absolute(): return start
-        return self.BASE_DIR / start
+        if start.is_absolute():
+            return start
+        root = self.RUNTIME_ROOT or self.BASE_DIR
+        return Path(root) / start
+
+    @property
+    def DATA_DIR(self) -> Path:
+        """SQLite and other mutable store directory (never package source tree under test)."""
+        root = self.RUNTIME_ROOT or self.BASE_DIR
+        return Path(root) / "data"
         
     @property
     def database(self):
         """Compat helper for legacy access"""
         class DBConfig:
             url = self.DATABASE_URL
-            vector_path = str(self.BASE_DIR / self.VECTOR_DB_PATH)
+            vector_path = str(self.LOG_DIR / "lancedb")
         return DBConfig()
         
     @property
@@ -1298,8 +653,59 @@ class Settings(BaseSettings):
         """Self-reference for legacy compatibility where settings.global_config was used"""
         return self
 
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def _accept_bare_DEBUG_env_with_fallback(cls, v):
+        """Backwards-compat: accept the bare `DEBUG` env var when BUGTRACE_DEBUG
+        is unset. Lets users keep their existing .env files working.
+
+        We tolerate values that aren't strict bools ("release", "1", "yes",
+        etc.) so Ubuntu's kernel DEBUG marker doesn't crash Settings init.
+        Only explicit BUGTRACE_DEBUG=true / =1 / =yes forces debug on.
+
+        Precedence: BUGTRACE_DEBUG > DEBUG > False.
+        """
+        import os
+        has_bugtrace = "BUGTRACE_DEBUG" in os.environ
+
+        # v arrives already coerced by Pydantic's env adapter:
+        # - BUGTRACE_DEBUG="true" → True
+        # - BUGTRACE_DEBUG=""    → "0" (string) after Pydantic coercion
+        # - BUGTRACE_DEBUG missing → False (the field default)
+        if has_bugtrace:
+            # User explicitly set the new alias. Use that value strictly.
+            if isinstance(v, bool):
+                return v
+            lowered = str(v).strip().lower()
+            if lowered in ("true", "1", "yes", "on"):
+                return True
+            if lowered in ("false", "0", "no", "off", "", "none", "null"):
+                return False
+            # Unrecognised string → False + one warning.
+            import warnings
+            warnings.warn(
+                f"BUGTRACE_DEBUG={os.environ.get('BUGTRACE_DEBUG')!r} is not a "
+                f"recognised bool; ignoring. Use BUGTRACE_DEBUG=true/1/yes or "
+                f"false/0/no.",
+                stacklevel=2,
+            )
+            return False
+
+        # BUGTRACE_DEBUG is NOT set. Fall back to the legacy DEBUG env var.
+        legacy = os.environ.get("DEBUG")
+        if legacy is None:
+            return False  # default
+        lowered = str(legacy).strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        # Anything else ("release", "0", etc.) → False. "release" is Ubuntu's
+        # kernel debug marker — silently ignore it; a user who genuinely wants
+        # debug on Ubuntu must set BUGTRACE_DEBUG=1.
+        return False
+
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # In test mode, do not auto-read a worktree .env (credentials / live keys).
+        env_file=None if test_mode_enabled() else ".env",
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore"
@@ -1392,8 +798,16 @@ class Settings(BaseSettings):
     """HTTP request timeout during exploitation phases."""
 
 
+from bugtrace.core.config_runtime import (
+    ensure_runtime_directories,
+    apply_runtime_root,
+    start_config_watcher,
+    stop_config_watcher,
+)
+
 # Singleton Instance
 settings = Settings()
+ensure_runtime_directories(settings.RUNTIME_ROOT)
 # Load environment-specific config first (TASK-124)
 settings.load_env_specific()
 # Load configuration from bugtraceaicli.conf
@@ -1401,57 +815,6 @@ settings.load_from_conf()
 # Log config in debug mode (TASK-122)
 settings.log_config()
 
-
-# --- Config File Watcher (TASK-121) ---
-# Optional: Enable config hot-reload by setting BUGTRACE_WATCH_CONFIG=1
-_config_watcher = None
-
-def start_config_watcher():
-    """Start watching config file for changes (requires watchdog package)."""
-    global _config_watcher
-    try:
-        from watchdog.observers import Observer
-        from watchdog.events import FileSystemEventHandler
-
-        class ConfigFileHandler(FileSystemEventHandler):
-            def __init__(self, config_path, callback):
-                self.config_path = str(config_path)
-                self.callback = callback
-
-            def on_modified(self, event):
-                if event.src_path == self.config_path:
-                    logger.info("Config file changed, reloading...")
-                    self.callback()
-
-        def reload_config():
-            settings.load_from_conf()
-            settings.log_config()
-            logger.info("Configuration reloaded successfully")
-
-        conf_path = settings.BASE_DIR / "bugtraceaicli.conf"
-        observer = Observer()
-        observer.schedule(
-            ConfigFileHandler(conf_path, reload_config),
-            path=str(settings.BASE_DIR),
-            recursive=False
-        )
-        observer.start()
-        _config_watcher = observer
-        logger.info("Config file watcher started")
-        return observer
-    except ImportError:
-        logger.debug("watchdog not installed, config hot-reload disabled")
-        return None
-
-def stop_config_watcher():
-    """Stop the config file watcher."""
-    global _config_watcher
-    if _config_watcher:
-        _config_watcher.stop()
-        _config_watcher.join()
-        _config_watcher = None
-        logger.info("Config file watcher stopped")
-
-# Auto-start watcher if enabled
-if os.environ.get('BUGTRACE_WATCH_CONFIG', '').lower() in ('1', 'true', 'yes'):
+# Auto-start watcher if enabled (never in hermetic test mode)
+if not test_mode_enabled() and _truthy_env("BUGTRACE_WATCH_CONFIG"):
     start_config_watcher()

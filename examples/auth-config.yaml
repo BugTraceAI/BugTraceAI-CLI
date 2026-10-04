@@ -13,6 +13,9 @@ authentication:
   # Login type: form (default), sso, api, or basic
   login_type: form
 
+  # Optional POST encoding override: form (default) or json
+  # request_format: json
+
   # URL of the login page (can be relative to target URL)
   login_url: "/login"
 

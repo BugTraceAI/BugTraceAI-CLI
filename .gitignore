@@ -90,7 +90,9 @@ tests/**
 tests/**/__pycache__/
 
 # Dev scripts and archives (local-only)
-scripts/
+scripts/*
+!scripts/interface_requirements.py
+!scripts/install_global_command.sh
 archive/
 analyze_*.py
 check_*.py
@@ -132,3 +134,6 @@ bugtrace/data/xss_proven_payloads.json
 # Backup files
 *.backup
 AUDIT_P0_FIXES.md
+
+# Installer choices (contains no credentials)
+.bugtrace-install.env

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Global terminal entry point; the generated user wrapper invokes this absolute path.
+set -euo pipefail
+BT_AI_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$BT_AI_ROOT"
+BT_AI_RUNTIME=local
+BT_AI_INTERFACE=tui
+if [[ -f .bugtrace-install.env ]]; then
+    BT_AI_RUNTIME=$(awk -F= '$1=="RUNTIME" {print $2}' .bugtrace-install.env)
+    BT_AI_INTERFACE=$(awk -F= '$1=="INTERFACE" {print $2}' .bugtrace-install.env)
+fi
+case "$BT_AI_INTERFACE" in tui|api|both) ;; *) echo 'Invalid saved interface. Run ./install.sh again.' >&2; exit 1 ;; esac
+if [[ "$BT_AI_INTERFACE" == api ]]; then
+    echo 'This installation has API only. Add the TUI with ./install.sh.' >&2
+    exit 1
+fi
+[[ "${1:-}" != tui ]] || shift
+case "$BT_AI_RUNTIME" in
+    local) exec "$BT_AI_ROOT/bugtraceai-cli" tui "$@" ;;
+    docker)
+        if docker compose version >/dev/null 2>&1; then BT_AI_COMPOSE=(docker compose); else BT_AI_COMPOSE=(docker-compose); fi
+        if [[ "$BT_AI_INTERFACE" == tui ]]; then
+            exec "${BT_AI_COMPOSE[@]}" -f docker-compose.tui.yml run --rm -e "TERM=${TERM:-xterm-256color}" scanner tui "$@"
+        else
+            exec "${BT_AI_COMPOSE[@]}" exec -e "TERM=${TERM:-xterm-256color}" api python3 -m bugtrace tui "$@"
+        fi
+        ;;
+    *) echo 'Invalid saved runtime. Run ./install.sh again.' >&2; exit 1 ;;
+esac

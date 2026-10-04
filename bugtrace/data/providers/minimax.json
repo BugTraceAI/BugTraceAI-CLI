@@ -1,0 +1,37 @@
+{
+    "id": "minimax",
+    "name": "MiniMax",
+    "api_format": "openai",
+    "base_url": "https://api.minimax.io/v1/chat/completions",
+    "api_key_env": "MINIMAX_API_KEY",
+    "api_key_hint": "eyJ...",
+    "failover": [],
+    "features": {
+        "description": "Direct MiniMax API through its OpenAI-compatible Chat Completions endpoint.",
+        "online_mode": false,
+        "balance_check": false,
+        "model_discovery": false
+    },
+    "models": {
+        "DEFAULT_MODEL": "MiniMax-M3",
+        "CODE_MODEL": "MiniMax-M3",
+        "ANALYSIS_MODEL": "MiniMax-M3",
+        "ANALYSIS_PENTESTER_MODEL": "MiniMax-M3",
+        "ANALYSIS_BUG_BOUNTY_MODEL": "MiniMax-M3",
+        "ANALYSIS_AUDITOR_MODEL": "MiniMax-M3",
+        "ANALYSIS_RED_TEAM_MODEL": "MiniMax-M3",
+        "ANALYSIS_RESEARCHER_MODEL": "MiniMax-M3",
+        "PRIMARY_MODELS": "MiniMax-M3",
+        "VISION_MODEL": "MiniMax-M3",
+        "WAF_DETECTION_MODELS": "MiniMax-M3",
+        "MUTATION_MODEL": "MiniMax-M3",
+        "SKEPTICAL_MODEL": "MiniMax-M3",
+        "REPORTING_MODEL": "MiniMax-M3",
+        "VALIDATION_VISION_MODEL": "MiniMax-M3",
+        "LONEWOLF_MODEL": "MiniMax-M3"
+    },
+    "concurrency": {
+        "MiniMax-M3": 4,
+        "default": 2
+    }
+}

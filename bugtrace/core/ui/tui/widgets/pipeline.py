@@ -1,161 +1,237 @@
-"""Pipeline status widget for BugTraceAI TUI.
+"""The six real pipeline phases, observed completions, and live specialist work."""
+from dataclasses import dataclass
+import time
 
-Displays the current phase of the security scan pipeline with
-progress visualization matching the legacy Rich dashboard.
-"""
-
-from __future__ import annotations
-
-import random
-from typing import List, Tuple
-
-from rich.align import Align
-from rich.panel import Panel
+from rich.style import Style
 from rich.text import Text
-from rich import box
 from textual.reactive import reactive
 from textual.widgets import Static
 
+from .. import theme
 
-class PipelineStatus(Static):
-    """Pipeline progress visualization widget.
 
-    Displays the current scan phase with visual progress indicators.
-    Matches the legacy _render_phase_pipeline() appearance.
+@dataclass(frozen=True)
+class PhaseSpec:
+    key: str
+    label: str
+    short: str
+    owner: str
+    description: str
 
-    Attributes:
-        phase: Current phase name (e.g., "DISCOVERY", "ANALYSIS").
-        progress: Progress percentage (0.0 to 100.0).
-        status_msg: Current status message.
-        urls_analyzed: Number of URLs analyzed.
-        urls_total: Total URLs to analyze.
-        payloads_tested: Number of payloads tested.
-        demo_mode: When True, generates random demo data.
-    """
 
-    # Phase definitions: (name, keywords for detection)
-    PHASES: List[Tuple[str, List[str]]] = [
-        ("RECON", ["recon", "init", "warm", "assembl", "start"]),
-        ("DISCOVER", ["discover", "spider", "crawl", "gospider", "endpoint"]),
-        ("ANALYZE", ["analy", "dast", "hunt", "think", "process"]),
-        ("EXPLOIT", ["exploit", "attack", "specialist", "test", "payload"]),
-        ("REPORT", ["report", "generat", "complete", "done", "mission", "finish"]),
-    ]
+PHASES = (
+    PhaseSpec("reconnaissance", "Recon", "Recon", "ReconAgent", "Crawl and discover target endpoints."),
+    PhaseSpec("discovery", "Discovery", "Discovery", "DASTySAST", "Analyze discovered URLs and collect candidate findings."),
+    PhaseSpec("strategy", "Strategy", "Strategy", "ThinkingAgent", "Deduplicate findings and distribute specialist queues."),
+    PhaseSpec("exploitation", "Exploit", "Exploit", "Specialists", "Test candidate findings with parallel specialist agents."),
+    PhaseSpec("validation", "Validate", "Validate", "Validator / Auditor", "Review evidence and confirm findings."),
+    PhaseSpec("reporting", "Report", "Report", "ReportingAgent", "Generate the scan reports."),
+)
 
-    # Reactive attributes for real-time updates
-    phase = reactive("INITIALIZING")
+
+@dataclass
+class PhaseState:
+    state: str = "pending"
+    progress: float = 0
+    message: str = ""
+    started: float | None = None
+    elapsed: float = 0
+
+    def seconds(self, now):
+        return self.elapsed + (max(0, now - self.started) if self.started is not None else 0)
+
+
+class PipelineLinks(Static):
+    """Clickable text keeps the phase and agent colors in its Rich spans."""
+
+    @property
+    def link_style(self):
+        return Style()
+
+    @property
+    def link_style_hover(self):
+        return Style(underline=True, bold=True, bgcolor=theme.ELEVATED)
+
+
+class PipelineStatus(PipelineLinks):
+    phase = reactive("ready")
     progress = reactive(0.0)
-    status_msg = reactive("Starting...")
+    status_msg = reactive("Waiting for a target")
     urls_analyzed = reactive(0)
     urls_total = reactive(0)
     payloads_tested = reactive(0)
     demo_mode = reactive(False)
+    STATES = {
+        "pending": ("○", "Pending", theme.MUTED),
+        "running": ("●", "Running", theme.ACCENT),
+        "complete": ("✓", "Complete", theme.SUCCESS),
+        "skipped": ("–", "Not used", theme.MUTED),
+        "unobserved": ("○", "Not observed", theme.MUTED),
+        "stopped": ("■", "Stopped", theme.WARNING),
+        "failed": ("!", "Failed", theme.ERROR),
+    }
+    SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-    def __init__(self, *args, **kwargs):
-        """Initialize the pipeline status widget."""
+    def __init__(self, *args, clock=time.monotonic, **kwargs):
         super().__init__(*args, **kwargs)
-        self._demo_phase_idx = 0
-        self._demo_progress = 0.0
+        self.clock = clock
+        self.stages = {spec.key: PhaseState() for spec in PHASES}
+        self.agents = {}
+        self.scan_state = "idle"
+        self.selected_phase = None
+        self.last_phase = "reconnaissance"
+        self._frame = 0
 
-    def on_mount(self) -> None:
-        """Set up demo mode interval if enabled."""
-        self.set_interval(1.0, self._demo_tick)
+    def on_mount(self):
+        self.set_interval(0.2, self._tick)
 
-    def _demo_tick(self) -> None:
-        """Update demo data on each tick."""
-        if not self.demo_mode:
+    def _tick(self):
+        if self.scan_state in {"running", "starting", "demo"}:
+            self._frame = (self._frame + 1) % len(self.SPINNER)
+            self.refresh()
+
+    def reset(self, mode="all", focused=False):
+        enabled = {"exploitation", "reporting"} if focused else {"validation"} if mode == "manager" else {spec.key for spec in PHASES}
+        self.stages = {spec.key: PhaseState(state="pending" if spec.key in enabled else "skipped") for spec in PHASES}
+        self.agents.clear()
+        self.phase, self.progress, self.status_msg = "ready", 0, "Waiting for a target"
+        self.urls_total = self.urls_analyzed = self.payloads_tested = 0
+        self.selected_phase = None
+        self.last_phase = "exploitation" if focused else "validation" if mode == "manager" else "reconnaissance"
+        self.scan_state = "idle"
+        self.refresh()
+
+    def observe_phase(self, phase, progress, message="", observed_at=None):
+        key = str(phase).lower()
+        value = max(0, min(1, float(progress)))
+        self.phase, self.progress, self.status_msg = key, value * 100, message
+        if key not in self.stages:
             return
-
-        # Cycle through phases
-        self._demo_progress += random.uniform(5, 15)
-        if self._demo_progress >= 100:
-            self._demo_progress = 0
-            self._demo_phase_idx = (self._demo_phase_idx + 1) % len(self.PHASES)
-
-        phase_name = self.PHASES[self._demo_phase_idx][0]
-        self.phase = phase_name
-        self.progress = self._demo_progress
-        self.urls_analyzed = int(self._demo_progress)
-        self.urls_total = 100
-        self.payloads_tested = self._demo_phase_idx * 50 + int(self._demo_progress)
-        self.status_msg = f"Phase {phase_name} in progress..."
-
-    def _get_phase_index(self) -> int:
-        """Determine current phase index based on state.
-
-        Returns:
-            Index of current phase (0-4).
-        """
-        current_phase = self.phase.lower()
-        payloads = self.payloads_tested
-        urls_analyzed = self.urls_analyzed
-        urls_total = self.urls_total
-
-        # Determine phase based on progress metrics
-        if payloads > 0 or "exploit" in current_phase or "specialist" in current_phase:
-            return 3  # EXPLOIT
-        elif urls_analyzed > 0 or "analy" in current_phase or "dast" in current_phase:
-            return 2  # ANALYZE
-        elif urls_total > 0 or "discover" in current_phase or "spider" in current_phase:
-            return 1  # DISCOVER
-        elif "report" in current_phase or "complete" in current_phase:
-            return 4  # REPORT
+        stage = self.stages[key]
+        self.last_phase = key
+        now = self.clock() if observed_at is None else min(self.clock(), float(observed_at))
+        for other_key, other in self.stages.items():
+            if other_key != key and other.state == "running":
+                other.elapsed, other.started = other.seconds(now), None
+                other.state = "unobserved"
+        if value < 1:
+            if stage.state != "running":
+                stage.started = now
+            stage.state = "running"
         else:
-            return 0  # RECON
+            stage.elapsed = stage.seconds(now)
+            stage.started, stage.state = None, "complete"
+        stage.progress, stage.message = value * 100, message
+        self.refresh()
 
-    def _calculate_progress(self, phase_idx: int) -> int:
-        """Calculate progress percentage for current phase.
+    def set_scan_state(self, state):
+        self.scan_state = state
+        if state in {"complete", "stopped", "failed"}:
+            for stage in self.stages.values():
+                if stage.state == "running":
+                    stage.elapsed, stage.started = stage.seconds(self.clock()), None
+                    stage.state = state
+                    if state == "complete":
+                        stage.progress = 100
+                elif stage.state == "pending" and state == "complete":
+                    stage.state = "unobserved"
+        self.refresh()
 
-        Args:
-            phase_idx: Current phase index.
+    def update_agent(self, name, status, queue=0, processed=0, vulns=0):
+        self.agents[theme.agent_key(name)] = {
+            "name": name, "status": str(status).lower(), "queue": queue, "processed": processed, "vulns": vulns,
+        }
+        self.refresh()
 
-        Returns:
-            Progress percentage (0-100).
-        """
-        if phase_idx == 0:
-            return 50
-        elif phase_idx == 1:
-            return min(100, self.urls_total * 2) if self.urls_total > 0 else 10
-        elif phase_idx == 2:
-            return int((self.urls_analyzed / max(self.urls_total, 1)) * 100)
-        elif phase_idx == 3:
-            return min(100, self.payloads_tested) if self.payloads_tested > 0 else 10
-        elif phase_idx == 4:
-            return 100
-        return 0
+    def state_style(self, stage):
+        icon, label, color = self.STATES[stage.state]
+        if stage.state == "running":
+            if self.scan_state == "paused":
+                return "Ⅱ", "Paused", theme.WARNING
+            if self.scan_state == "stopping":
+                return "■", "Stopping", theme.WARNING
+            icon = self.SPINNER[self._frame]
+        return icon, label, color
 
-    def render(self) -> Panel:
-        """Render the pipeline status panel.
+    def route_text(self, width=None, clickable=True):
+        width = width or self.size.width
+        compact = width < 85
+        result = Text(no_wrap=True, overflow="ellipsis")
+        for index, spec in enumerate(PHASES):
+            if index:
+                result.append(" › " if not compact else " ›", style=theme.MUTED)
+            stage = self.stages[spec.key]
+            icon, _, color = self.state_style(stage)
+            meta = {"@click": f"app.select_pipeline_phase('{spec.key}')"} if clickable else {}
+            base = Style(bgcolor=theme.PANEL if stage.state == "running" else None, meta=meta)
+            result.append(icon + " ", style=base + Style(color=color))
+            result.append(spec.short if compact else spec.label, style=base + Style(
+                color=theme.SECONDARY if stage.state == "complete" else color, bold=stage.state == "running"))
+        return result
 
-        Returns:
-            Rich Panel containing the pipeline visualization.
-        """
-        phase_idx = self._get_phase_index()
-        progress_pct = self._calculate_progress(phase_idx)
+    def agents_text(self, width=None):
+        width = width or self.size.width
+        result = Text(no_wrap=True, overflow="ellipsis")
+        active = [a for a in self.agents.values() if a["status"] in {"running", "active", "testing", "working"}]
+        if self.scan_state in {"complete", "stopped", "failed"}:
+            active = []
+        if not active:
+            spec = next((spec for spec in PHASES if spec.key == self.phase), None)
+            result.append(spec.owner if spec else "Pipeline", style=theme.SECONDARY)
+            result.append("  ·  " + ("waiting" if self.scan_state == "idle" else self.scan_state), style=theme.MUTED)
+            return result
+        result.append("├─ ", style=theme.MUTED)
+        shown = active[:max(1, min(6, (width - 10) // 14))]
+        for index, agent in enumerate(shown):
+            if index:
+                result.append("  ", style=theme.MUTED)
+            key = theme.agent_key(agent["name"])
+            color = theme.AGENT_COLORS.get(key, theme.ACCENT)
+            result.append(str(agent["name"]).removesuffix("Agent"), style=Style(color=color, meta={"@click": f"app.inspect_pipeline_agent('{key}')"}))
+            result.append(f" {agent['queue']}q", style=theme.MUTED)
+        if len(active) > len(shown):
+            result.append(f"  +{len(active) - len(shown)}", style=theme.MUTED)
+        return result
 
-        # Build pipeline visualization
-        pipeline = Text()
+    def detail_text(self, key=None, compact=False):
+        key = key or self.selected_phase or (self.phase if self.phase in self.stages else self.last_phase)
+        spec = next((spec for spec in PHASES if spec.key == key), PHASES[0])
+        stage = self.stages[spec.key]
+        icon, label, color = self.state_style(stage)
+        if compact:
+            result = Text(f"{icon} {spec.label} · {label} · {spec.owner}\n", style=color)
+            result.append(stage.message or spec.description, style=theme.SECONDARY)
+            return result
+        result = Text(f"{icon} {spec.label} · {label}\n", style=color)
+        result.append(spec.description + "\n", style=theme.TEXT)
+        result.append(f"Component: {spec.owner}\n", style=theme.SECONDARY)
+        if stage.message:
+            result.append(stage.message + "\n", style=theme.SECONDARY)
+        if spec.key == "exploitation" and self.agents:
+            for agent in self.agents.values():
+                result.append(f"  {agent['name']} · {agent['status']} · {agent['queue']} queued · {agent['processed']} processed · {agent['vulns']} findings\n", style=theme.SECONDARY)
+        return result
 
-        for i, (name, _) in enumerate(self.PHASES):
-            if i < phase_idx:
-                # Completed phase
-                pipeline.append(f"[green]\u2705{name}[/]", style="bright_green")
-            elif i == phase_idx:
-                # Current phase
-                pipeline.append(f"\u23f5{name}", style="bright_yellow bold")
-            else:
-                # Future phase
-                pipeline.append(f"\u25cb{name}", style="bright_black")
-
-            if i < len(self.PHASES) - 1:
-                arrow_style = "bright_green" if i < phase_idx else "bright_black"
-                pipeline.append("\u2192", style=arrow_style)
-
-        pipeline.append(f"  [{progress_pct}%]", style="bright_cyan")
-
-        return Panel(
-            Align.center(pipeline),
-            title="[bright_cyan]PROGRESS[/]",
-            border_style="bright_cyan",
-            box=box.ROUNDED,
-        )
+    def render(self):
+        result = self.route_text()
+        result.append("\n")
+        result.append(self.agents_text())
+        result.append("\n")
+        stage = self.stages.get(self.phase if self.phase in self.stages else self.last_phase)
+        if stage:
+            _, label, color = self.state_style(stage)
+            if self.scan_state in {"complete", "stopped", "failed"}:
+                _, label, color = self.STATES[self.scan_state]
+            completed = sum(s.state == "complete" for s in self.stages.values())
+            enabled = sum(s.state != "skipped" for s in self.stages.values())
+            compact = self.size.width < 85
+            percentage = (f"  ·  {'' if compact else 'phase '}{self.progress:.0f}%"
+                          if self.progress and self.phase in self.stages else "")
+            result.append(f"{label}{percentage}  ·  {completed}/{enabled} {'phases' if compact else 'stages complete'}", style=color)
+            if self.urls_total:
+                result.append(f"  ·  URLs {self.urls_analyzed}/{self.urls_total}", style=theme.SECONDARY)
+        else:
+            result.append("Click a phase to inspect it · F6 pipeline", style=theme.MUTED)
+        result.no_wrap = True
+        result.overflow = "ellipsis"
+        return result
