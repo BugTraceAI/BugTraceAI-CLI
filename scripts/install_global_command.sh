@@ -13,7 +13,7 @@ install_global_command() {
     )
     chmod 755 "$command_path"
     case ":$PATH:" in
-        *":$command_dir:"*) ;;
+        *":$command_dir:"*) print_success "Global TUI command ready: btai" ;;
         *)
             case "${SHELL:-/bin/bash}" in
                 */zsh) profile="$HOME/.zshrc" ;;
@@ -22,9 +22,40 @@ install_global_command() {
             if ! grep -q '^# BugTraceAI user commands$' "$profile" 2>/dev/null; then
                 printf '\n# BugTraceAI user commands\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$profile"
             fi
-            print_info "Open a new terminal to use btai (PATH configured in $profile)."
+            print_success "btai registered for new terminals"
+            print_info "This terminal still needs its PATH refreshed."
+            print_info "To enable it here, run this in your current shell:"
+            printf '  export PATH="$HOME/.local/bin:$PATH"\n'
+            print_info "Or open a new terminal (PATH configured in $profile)."
             ;;
     esac
-    print_success "Global TUI command installed: btai"
-    print_info "It opens this installation from any folder; no sudo required."
+    local quoted_command
+    printf -v quoted_command '%q' "$command_path"
+    print_info "Start the TUI immediately: $quoted_command"
+    print_info "It opens this installation from any folder."
+    if [[ "${INSTALL_RUNTIME:-local}" == docker ]]; then
+        print_info "Global registration needs no sudo; Docker may ask for your sudo password at launch."
+    fi
+}
+
+# Use the checkout path to launch; the parent shell may not have the new PATH yet.
+offer_tui_launch() {
+    local requested=${1:-} registration_only=${2:-false} answer
+    [[ "$INSTALL_INTERFACE" != api && "$requested" != no ]] || return 0
+    if [[ -z "$requested" ]]; then
+        [[ "$registration_only" != true && -t 0 && -t 1 ]] || return 0
+        read -r -p "Open the BugTraceAI TUI now? [Y/n]: " answer || return 0
+        case "$answer" in n|N|no|NO) return 0 ;; ''|y|Y|yes|YES) ;; *) return 0 ;; esac
+    fi
+    print_step "Opening the BugTraceAI TUI..."
+    if bash "$INSTALLER_DIR/btai"; then
+        print_info "TUI closed. Your installation and saved profile are ready."
+    else
+        print_warning "The TUI did not open successfully; the installation and saved profile were kept."
+        print_info "Retry with: ./btai"
+    fi
+    if [[ "$INSTALL_GLOBAL" == yes && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+        print_info "To use btai by name in this terminal, run:"
+        printf '  export PATH="$HOME/.local/bin:$PATH"\n'
+    fi
 }
