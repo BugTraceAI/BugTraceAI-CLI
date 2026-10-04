@@ -58,8 +58,21 @@ install_extras() {
     esac
 }
 
+show_install_selection() {
+    print_step "${1:-Selected setup}"
+    case "$INSTALL_INTERFACE" in
+        tui) print_info "Interfaces: Terminal TUI" ;;
+        api) print_info "Interfaces: API server + MCP" ;;
+        both) print_info "Interfaces: Terminal TUI + API server + MCP" ;;
+    esac
+    case "$INSTALL_RUNTIME" in
+        local) print_info "Runs in: Python .venv on this machine" ;;
+        docker) print_info "Runs in: Docker containers on this machine" ;;
+    esac
+}
+
 show_launch_commands() {
-    print_info "Installed: $INSTALL_INTERFACE / $INSTALL_RUNTIME"
+    show_install_selection "Installed setup"
     if [[ "$INSTALL_RUNTIME" == local ]]; then
         [[ "$INSTALL_INTERFACE" == api ]] || print_info "TUI: ./bugtraceai-cli tui (Provider/F7 configures the key)"
         [[ "$INSTALL_INTERFACE" == tui ]] || print_info "API: ./bugtraceai-cli serve --port 8000"
@@ -724,11 +737,22 @@ main() {
     [[ -z "$requested_runtime" ]] || INSTALL_RUNTIME="$requested_runtime"
     if [[ -z "$INSTALL_INTERFACE" ]]; then
         print_header
-        echo "Which BugTraceAI CLI interfaces do you want?"
-        echo "  1) Interactive terminal (TUI)"
-        echo "  2) API server + MCP (WEB / integrations)"
-        echo "  3) Both TUI and API/MCP"
+        echo "Step 1 - Which interfaces do you want to enable?"
+        echo ""
+        echo "  1) Terminal TUI"
+        echo "     -> Visual workspace to configure and monitor scans in your terminal."
+        echo ""
+        echo "  2) API server + MCP"
+        echo "     -> Backend for the WEB app, AI agents and other integrations."
+        echo "     -> No terminal TUI."
+        echo ""
+        echo "  3) Both terminal TUI and API/MCP"
+        echo "     -> Use the terminal workspace and connect WEB or integrations."
+        echo ""
         echo "  4) Cancel"
+        echo ""
+        echo "  WEB is a separate install. API/MCP provides its backend."
+        echo ""
         read -r -p "Select interface [1-4]: " choice
         case "$choice" in 1) INSTALL_INTERFACE=tui ;; 2) INSTALL_INTERFACE=api ;; 3) INSTALL_INTERFACE=both ;; 4) return ;; *) print_error "Invalid interface"; return 1 ;; esac
     fi
@@ -740,18 +764,25 @@ main() {
     fi
     if [[ -z "$INSTALL_RUNTIME" ]]; then
         echo ""
-        echo "Where should the selected CLI interfaces run?"
+        echo "Step 2 - How should BugTraceAI be installed and run?"
+        echo "Your interfaces stay the same; choose how to run them on this machine."
         echo ""
-        echo "  1) Local Python virtual environment"
-        echo "     -> The selected interfaces run in a local .venv"
+        echo "  1) Local Python (.venv)"
+        echo "     -> Runs directly on this machine in a Python virtual environment."
+        echo "     -> Python and scanner dependencies are installed on this machine."
+        echo "     -> Useful for development or editing the code."
         echo ""
         echo "  2) Docker containers"
+        echo "     -> Runs in containers with the scanner dependencies inside."
         case "$INSTALL_INTERFACE" in
-            tui) echo "     -> TUI runs in an interactive container; no API server is started" ;;
-            api) echo "     -> API/MCP run as Compose services" ;;
-            both) echo "     -> API/MCP run in Compose; the TUI opens inside the API container" ;;
+            tui) echo "     -> TUI appears in your terminal; no API server is started." ;;
+            api) echo "     -> API/MCP run as background services." ;;
+            both)
+                echo "     -> API/MCP run in the background; TUI appears in your terminal."
+                echo "     -> The TUI process runs inside the API container."
+                ;;
         esac
-        echo "     -> Missing Docker/Compose will be installed; sudo may be requested"
+        echo "     -> Missing Docker/Compose will be installed; sudo may be requested."
         echo ""
         echo "  3) Cancel"
         echo ""
@@ -759,6 +790,9 @@ main() {
         case "$choice" in 1) INSTALL_RUNTIME=local ;; 2) INSTALL_RUNTIME=docker ;; 3) return ;; *) print_error "Invalid runtime"; return 1 ;; esac
     fi
     case "$INSTALL_RUNTIME" in local|docker) ;; *) print_error "Runtime must be local or docker"; return 1 ;; esac
+    echo ""
+    show_install_selection
+    echo ""
     [[ -z "$requested_global" ]] || INSTALL_GLOBAL="$requested_global"
     if [[ "$INSTALL_INTERFACE" == api ]]; then
         [[ "$INSTALL_GLOBAL" != yes ]] || { print_error "The global btai command requires TUI or both."; return 1; }
