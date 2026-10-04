@@ -3,7 +3,7 @@
 [![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue?logo=google-chrome&logoColor=white)](https://bugtraceai.com)
 [![Wiki Documentation](https://img.shields.io/badge/Wiki%20Documentation-000?logo=wikipedia&logoColor=white)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
-![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)
+![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)
 ![Version](https://img.shields.io/badge/Version-4.0.16--beta-orange)
 ![Status](https://img.shields.io/badge/Status-Beta-orange)
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
@@ -21,6 +21,7 @@
 - [🏗️ Architecture](#️-architecture)
 - [🛠️ Technology Stack](#️-technology-stack)
 - [🚀 Getting Started](#-getting-started)
+- [Install with your AI coding agent](#install-with-your-ai-coding-agent)
 - [🤖 AI Assistant Setup (MCP)](#-ai-assistant-setup-mcp)
 - [⚙️ Configuration](#️-configuration)
 - [📊 Output](#-output)
@@ -314,6 +315,52 @@ Choices are stored in `.bugtrace-install.env`, without API keys. Existing enviro
 
 Start local TUI with `./bugtraceai-cli tui`, local API with `./bugtraceai-cli serve`, Docker TUI with `docker compose -f docker-compose.tui.yml run --rm scanner`, or TUI in a combined deployment with `docker compose exec api python3 -m bugtrace tui`.
 
+### Install with your AI coding agent
+
+Copy this prompt into an agent with terminal access, such as Claude Code,
+Cursor or Codex. The default installs the real TUI and a global `btai` command
+on Linux/macOS. To deploy a server instead, change the first line to specify
+**API + MCP** or **both**, and **local** or **Docker**.
+
+```text
+Install the current public BugTraceAI-CLI 4.x on this machine: local TUI,
+with the user-global btai command. Perform the installation, not just a plan.
+
+Check the OS, Python version and available tools. Read README.md,
+INSTALLATION.md and ./install.sh --help from
+https://github.com/BugTraceAI/BugTraceAI-CLI.git before installing.
+
+Clone into a suitable user-owned directory. If an installation already exists,
+preserve its configuration, credentials and uncommitted changes. Reuse its
+saved profile with ./install.sh --reuse unless I request a profile change.
+Do not replace an existing checkout or change its repository/branch silently.
+
+For a fresh local TUI installation, run:
+./install.sh --interface tui --runtime local --global yes
+If I request API + MCP or both, use --interface api or both and my selected
+--runtime local or docker. Use --global no for API-only installations.
+Handle the installer's prompts, install the required dependencies and resolve
+setup errors using the repository instructions. Do not switch runtime without
+asking. Keep any system privilege/password prompt in my local terminal.
+
+I will configure the LLM key later through Provider/F7 in the TUI; do not ask
+me to paste credentials into chat or print existing secrets. Target login
+credentials are configured separately through Auth/F8.
+
+Verify the installed version, saved profile and selected interface. For TUI,
+check startup and quit in an interactive terminal if available; otherwise
+verify imports and report that the visual check is still pending. When requested, verify btai
+registration and PATH in a fresh shell. For an API installation, check /health
+using the actual configured port. Do not start a scan as part of installation.
+
+Finish with the installation directory, selected profile, verification results
+and exact commands to open the TUI or API. Tell me whether a new terminal is
+needed for btai.
+```
+
+See [INSTALLATION.md](INSTALLATION.md) for profiles, Provider/F7, Auth/F8 and
+troubleshooting. Installation does not require running a scan.
+
 ### 📖 Manual Installation
 
 <details>
@@ -397,9 +444,14 @@ BugTraceAI exposes its scanning engine as **MCP tools** via the [Model Context P
 
 ### Quick Setup for AI Agents
 
-> **Using OpenClaw or another AI assistant? Just tell it:**
->
-> _Clone https://github.com/BugTraceAI/BugTraceAI-CLI and deploy it with Docker. Copy `.env.example` to `.env` and ask me for the `OPENROUTER_API_KEY`. Run `docker compose up -d` to start both the API and MCP server. Then add the MCP server to your config with base URL `http://localhost:8001/sse`._
+Use the [agent installation prompt](#install-with-your-ai-coding-agent),
+changing its first line to: **Install BugTraceAI-CLI with API + MCP using Docker,
+without the global TUI command.** The installer command for that profile is
+`./install.sh --interface api --runtime docker --global no`.
+
+After setup, connect your MCP client to `http://localhost:<MCP_PORT>/sse` using
+the actual port reported by the installer (default 8001). Configure the provider
+key locally in `.env` before scanning; keep it out of chat and client configs.
 
 ### Manual MCP Setup
 
@@ -545,7 +597,7 @@ CANDIDATE → PENDING_VALIDATION → CONFIRMED / FALSE_POSITIVE → PROBE_VALIDA
 
 ## 📜 License
 
-AGPL-3.0 License
+Apache-2.0 License. See [LICENSE](LICENSE).
 
 Copyright (c) 2026 BugTraceAI
 

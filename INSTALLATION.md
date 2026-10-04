@@ -31,6 +31,49 @@ Installation choices are remembered in `.bugtrace-install.env` without API
 keys. Reuse updates or repairs the saved profile. Existing environments retain
 previously installed packages when switching interfaces.
 
+## Install with your AI coding agent
+
+Copy this prompt into an agent with terminal access, such as Claude Code,
+Cursor or Codex. The default installs the real TUI and a global `btai` command
+on Linux/macOS. To deploy a server instead, change the first line to specify
+**API + MCP** or **both**, and **local** or **Docker**.
+
+```text
+Install the current public BugTraceAI-CLI 4.x on this machine: local TUI,
+with the user-global btai command. Perform the installation, not just a plan.
+
+Check the OS, Python version and available tools. Read README.md,
+INSTALLATION.md and ./install.sh --help from
+https://github.com/BugTraceAI/BugTraceAI-CLI.git before installing.
+
+Clone into a suitable user-owned directory. If an installation already exists,
+preserve its configuration, credentials and uncommitted changes. Reuse its
+saved profile with ./install.sh --reuse unless I request a profile change.
+Do not replace an existing checkout or change its repository/branch silently.
+
+For a fresh local TUI installation, run:
+./install.sh --interface tui --runtime local --global yes
+If I request API + MCP or both, use --interface api or both and my selected
+--runtime local or docker. Use --global no for API-only installations.
+Handle the installer's prompts, install the required dependencies and resolve
+setup errors using the repository instructions. Do not switch runtime without
+asking. Keep any system privilege/password prompt in my local terminal.
+
+I will configure the LLM key later through Provider/F7 in the TUI; do not ask
+me to paste credentials into chat or print existing secrets. Target login
+credentials are configured separately through Auth/F8.
+
+Verify the installed version, saved profile and selected interface. For TUI,
+check startup and quit in an interactive terminal if available; otherwise
+verify imports and report that the visual check is still pending. When requested, verify btai
+registration and PATH in a fresh shell. For an API installation, check /health
+using the actual configured port. Do not start a scan as part of installation.
+
+Finish with the installation directory, selected profile, verification results
+and exact commands to open the TUI or API. Tell me whether a new terminal is
+needed for btai.
+```
+
 ## Open the real TUI
 
 ```bash
