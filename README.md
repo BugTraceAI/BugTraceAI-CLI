@@ -49,17 +49,26 @@ same CLI engine for web scans, report access and Model Lab through its API.
 
 ## Install
 
-For the platform installation menu, use the [universal Launcher](https://github.com/BugTraceAI/BugTraceAI-Launcher)
-(3.3.14+). It offers Terminal, WEB, both workspaces and server profiles:
+For guided setup, use the [universal Launcher](https://github.com/BugTraceAI/BugTraceAI-Launcher)
+(current release 3.3.26). It can install WEB, CLI and the API-target engine
+independently or in any combination:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/BugTraceAI/BugTraceAI-Launcher/main/install.sh | bash
 ```
 
-From a CLI checkout, `./install.sh` opens the same universal visual menu with
-`terminal` suggested (Launcher 3.3.14+). The component entry point checks the
-public Launcher version and stops without installing if it is older. Review the
-products and runtime before installing. The Launcher is the only guided installer.
+From a CLI checkout, `./install.sh` opens the same menu with CLI suggested.
+The component entry point requires Launcher 3.3.14 or newer; use 3.3.26 for the
+current provider, Wizard and AI-assisted setup screens. Review the checked
+modules and runtime before installing.
+
+In the Launcher, enter and verify the required provider API key first. Then
+choose **Install with Wizard** for guided setup, or **Install with AI** to have
+the built-in assistant guide installation inside the TUI. The AI assistant
+uses provider tokens and supports API-only or the full WEB + CLI + API
+selection, including the CLI TUI, with OpenRouter or Anthropic. Use Wizard for
+every other module combination or for Z.ai. Enter the provider key locally;
+never paste it into an AI coding-agent chat.
 
 For a direct installation in this checkout, specify the options explicitly:
 
@@ -174,9 +183,12 @@ For a fresh install, review the documented CLI options, then run:
 ./scripts/install-runtime.sh --interface tui --runtime local --global yes
 
 If I ask for Docker or API/MCP, use the corresponding CLI installer options.
-If I ask for the connected WEB platform, use the BugTraceAI Launcher `web`
-profile; `full` adds this terminal TUI. Universal profiles require Launcher
-3.3.14 or newer.
+If I ask for the universal installer, run its official command and let me
+interact with its TUI. I will enter and verify the provider key locally, choose
+Wizard or AI, and select exactly the modules I want. The `web` suggestion
+starts with WEB only; `full` preselects WEB, CLI, API and the CLI TUI.
+The built-in AI installer supports API-only or that complete selection with
+OpenRouter or Anthropic; use Wizard for other combinations.
 
 Handle the required prompts and resolve setup errors using the repository
 instructions. Keep system privilege/password prompts in my local terminal.
