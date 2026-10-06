@@ -1,6 +1,6 @@
 # BugTraceAI-CLI
 
-[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.21--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
+[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.31--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 
 **Autonomous security scans with an interactive terminal workspace, REST API and MCP.**
 
@@ -11,7 +11,7 @@ Use it only against applications you are authorized to test.
 
 ## Terminal workspace
 
-![BugTraceAI 4.0.16-beta terminal pipeline, showing all six stages with offline sample data](docs/screenshots/tui-pipeline.png)
+![BugTraceAI 4.0.27-beta terminal pipeline, showing all six stages with offline sample data](docs/screenshots/tui-pipeline.png)
 
 The TUI follows **Recon → Discovery → Strategy → Exploit → Validate → Report**.
 Set the target URL, Depth and Max URLs at the top. The phase strip, counters,
@@ -29,7 +29,7 @@ timings and scan controls stay visible while you switch views.
 </table>
 
 Pipeline, Findings and Agents captures use the built-in offline demo in
-4.0.16-beta. Sample findings illustrate the interface. Provider and Auth captures
+4.0.27-beta. Sample findings illustrate the interface. Provider and Auth captures
 show the actual setup dialogs without credentials.
 
 [Install](#install) · [Terminal controls](#terminal-controls) ·
@@ -49,30 +49,38 @@ same CLI engine for web scans, report access and Model Lab through its API.
 
 ## Install
 
-On Linux or macOS, clone the public repository and run its installer:
+For the platform installation menu, use the [universal Launcher](https://github.com/BugTraceAI/BugTraceAI-Launcher)
+(3.3.14+). It offers Terminal, WEB, both workspaces and server profiles:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BugTraceAI/BugTraceAI-Launcher/main/install.sh | bash
+```
+
+From a CLI checkout, `./install.sh` opens the same universal visual menu with
+`terminal` suggested (Launcher 3.3.14+). The component entry point checks the
+public Launcher version and stops without installing if it is older. Review the
+products and runtime before installing. The Launcher is the only guided installer.
+
+For a direct installation in this checkout, specify the options explicitly:
 
 ```bash
 git clone https://github.com/BugTraceAI/BugTraceAI-CLI.git
 cd BugTraceAI-CLI
-./install.sh
+./scripts/install-runtime.sh --interface tui --runtime local --global yes
 ```
 
-First choose how to use BugTraceAI: **TUI** for a visual terminal workspace,
-**API + MCP** for WEB/agent integrations, or **both**. The WEB app is installed
-separately. Then choose how those interfaces run: **local Python** in a `.venv`
-on your machine, or **Docker** containers. A Docker TUI still appears in your
-terminal. The wizard explains each option and summarizes your chosen setup.
-The installer selects the interface dependencies and offers an optional
-user-global `btai` command for TUI/both. It also offers to open the TUI when
-installation finishes. Accept to open immediately; the current terminal does
-not need a refreshed PATH. Use `--launch no` for an unattended install.
+`--interface` selects the terminal TUI, web-scanning API/MCP, or both.
+`--runtime` selects local Python or Docker. The backend has no selection menu;
+`--global` and `--launch` default to `no`. Use `--global yes` to register `btai`,
+and `--launch yes` to open the TUI after installation in an interactive terminal.
+Direct installation includes only the CLI engine and selected interfaces.
 
 | Profile | Command |
 | --- | --- |
-| Local TUI + global command | `./install.sh --interface tui --runtime local --global yes` |
-| Docker API + MCP | `./install.sh --interface api --runtime docker --global no` |
-| Docker API + TUI + global command | `./install.sh --interface both --runtime docker --global yes` |
-| Update or repair the saved profile | `./install.sh --reuse` |
+| Local TUI + global command | `./scripts/install-runtime.sh --interface tui --runtime local --global yes` |
+| Docker API + MCP | `./scripts/install-runtime.sh --interface api --runtime docker --global no` |
+| Docker API + TUI + global command | `./scripts/install-runtime.sh --interface both --runtime docker --global yes` |
+| Update or repair the saved profile | `./scripts/install-runtime.sh --reuse` |
 
 Local installation needs Python 3.10+. The installer prepares missing Linux
 pip/venv tools and Docker/Compose for the Docker profile. On macOS, Docker
@@ -84,7 +92,11 @@ retain previously installed packages when you change profiles.
 Choices are saved in `.bugtrace-install.env` without API keys. See
 [INSTALLATION.md](INSTALLATION.md) for prerequisites and runtime-specific setup.
 
-### Open the real TUI
+Explicit legacy `./install.sh` options and `--standalone [options]` delegate
+to this backend. Incomplete direct selections fail before installing anything.
+See [INSTALLATION.md](INSTALLATION.md) for prerequisites and manual-agent setup.
+
+## Open the real TUI
 
 ```bash
 ./bugtraceai-cli
@@ -145,44 +157,41 @@ accepts commands such as `/help`, `/provider`, `/auth`, `/pause`, `/resume`,
 ## Install with your AI coding agent
 
 Copy this prompt into an agent with terminal access, such as Claude Code,
-Cursor or Codex. The default installs the real TUI and a global `btai` command
-on Linux/macOS. To deploy a server instead, change the first line to specify
-**API + MCP** or **both**, and **local** or **Docker**.
+Cursor or Codex. The default installs this CLI checkout directly as a local
+TUI and registers a global `btai` command on Linux/macOS. For the connected
+platform, use the universal Launcher profile instead.
 
 ```text
-Install the current public BugTraceAI-CLI 4.x on this machine: local TUI,
-with the user-global btai command. Perform the installation, not just a plan.
+Install BugTraceAI-CLI directly from this checkout as a standalone terminal
+workspace. Use the local Python runtime and register the current-user btai
+command. Perform the installation; do not start a scan.
 
-Check the OS, Python version and available tools. Read README.md,
-INSTALLATION.md and ./install.sh --help from
-https://github.com/BugTraceAI/BugTraceAI-CLI.git before installing.
+Read README.md and INSTALLATION.md first. Preserve existing configuration,
+credentials and uncommitted changes. Do not replace this checkout or switch
+its repository or branch silently.
 
-Clone into a suitable user-owned directory. If an installation already exists,
-preserve its configuration, credentials and uncommitted changes. Reuse its
-saved profile with ./install.sh --reuse unless I request a profile change.
-Do not replace an existing checkout or change its repository/branch silently.
+For a fresh install, review the documented CLI options, then run:
+./scripts/install-runtime.sh --interface tui --runtime local --global yes
 
-For a fresh local TUI installation, run:
-./install.sh --interface tui --runtime local --global yes
-If I request API + MCP or both, use --interface api or both and my selected
---runtime local or docker. Use --global no for API-only installations.
-Handle the installer's prompts, install the required dependencies and resolve
-setup errors using the repository instructions. Do not switch runtime without
-asking. Keep any system privilege/password prompt in my local terminal.
+If I ask for Docker or API/MCP, use the corresponding CLI installer options.
+If I ask for the connected WEB platform, use the BugTraceAI Launcher `web`
+profile; `full` adds this terminal TUI. Universal profiles require Launcher
+3.3.14 or newer.
 
-I will configure the LLM key later through Provider/F7 in the TUI; do not ask
-me to paste credentials into chat or print existing secrets. Target login
-credentials are configured separately through Auth/F8.
+Handle the required prompts and resolve setup errors using the repository
+instructions. Keep system privilege/password prompts in my local terminal.
+Never ask me to paste credentials into chat or print existing secrets. I will
+configure an LLM provider locally through Provider/F7. Auth/F8 configures
+target login separately.
 
-Verify the installed version, saved profile and selected interface. For TUI,
-check startup and quit in an interactive terminal if available; otherwise
-verify imports and report that the visual check is still pending. When requested, verify btai
-registration and PATH in a fresh shell. For an API installation, check /health
-using the actual configured port. Do not start a scan as part of installation.
+Verify the version, saved profile and installed components. For TUI, verify
+startup and quit in an interactive terminal when available; otherwise state
+that visual verification is pending. Check btai registration and PATH in a
+fresh shell. For servers, check health and MCP on the actual configured
+ports. Do not start a scan as part of installation.
 
-Finish with the installation directory, selected profile, verification results
-and exact commands to open the TUI or API. Tell me whether a new terminal is
-needed for btai.
+Finish with the installation directory, selected profile, checks performed
+and exact commands to open the installed interfaces.
 ```
 
 See [INSTALLATION.md](INSTALLATION.md) for profiles, Provider/F7, Auth/F8 and
@@ -214,7 +223,7 @@ before scanning. See [API and MCP](INSTALLATION.md#api-and-mcp) for details.
 
 `bugtraceaicli.conf` contains the engine settings; provider credentials can be
 configured in local `.env`. The TUI offers Provider/F7 and Auth/F8 for scan setup.
-See [custom provider configuration](docs/CUSTOM_PROVIDERS.md) for additional
+See [public custom provider configuration](https://github.com/BugTraceAI/BugTraceAI-CLI/blob/main/docs/CUSTOM_PROVIDERS.md) for additional
 provider options. Read the selected provider preset rather than relying on
 historical model names from older releases.
 
@@ -244,7 +253,7 @@ The public CLI is a beta. Use scans only on explicitly authorized targets.
 
 ## License
 
-Apache-2.0 for BugTraceAI-owned material in this public distribution.
-See [LICENSE](LICENSE), [NOTICE](NOTICE) and [license history](LICENSE-HISTORY.md).
+Apache-2.0. See [LICENSE](LICENSE), [LICENSE-HISTORY.md](LICENSE-HISTORY.md)
+and [NOTICE](NOTICE).
 
 [bugtraceai.com](https://bugtraceai.com) · [@yz9yt](https://github.com/yz9yt)

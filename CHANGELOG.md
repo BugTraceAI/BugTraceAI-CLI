@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+---
+
+## [4.0.31-beta] - 2026-10-05
+
+### Fixed
+- Handle GraphQL `data: null` error responses during reversible mutation checks without raising an exception or treating a mutation as successful.
+- Import GraphQL automation tests from the implementation module after the testing facade split, and cover null-data query and mutation responses.
+
+## [4.0.30-beta] - 2026-10-05
+
+### Changed
+- Require BugTraceAI Launcher 3.3.14 or newer from the universal component entry point, matching the version that fixes combined WEB/API Docker networking.
+- Align CLI installation and AI-agent instructions with the supported Launcher minimum.
+
+## [4.0.29-beta] - 2026-10-05
+
+### Security
+- Require cryptography 48.0.1 or newer in the 48.x series to avoid the vulnerable OpenSSL wheels flagged for earlier releases.
+
+### Fixed
+- Remove obsolete Alembic copies from the MCP image; the active database setup uses the CLI's SQLModel migrations and the source tree has no `alembic.ini`.
+
+## [4.0.28-beta] - 2026-10-05
+
+### Fixed
+- Abort provider preflight on rejected or expired OpenRouter credentials and insufficient credit; show the failure reason in scan errors before starting the diagnostic browser.
+- Check the current key's remaining budget rather than subtracting historical usage across budget resets; allow a retryable balance endpoint outage without treating it as a rejected key.
+- Clear previous diagnostics before a new scan. Exercise cookie SQLi reconfirmation and TUI subprocess failure cleanup in regression tests.
+
+## [4.0.27-beta] - 2026-10-05
+
+### Fixed
+- Remove time-based cookie SQLi candidates from reports when their isolation re-check fails; re-check candidates before per-scan deduplication.
+
+## [4.0.26-beta] - 2026-10-05
+
+### Fixed
+- Keep the standalone Launcher bootstrap compatible with macOS's system Bash 3.2 regex parser.
+
+### Changed
+- Update the coordinated release candidate to CLI 4.0.26-beta.
+
+## [4.0.25-beta] - 2026-10-05
+
+### Fixed
+- Verify the published universal Launcher meets the required version before a component entry point runs it; older Launchers now stop before installation.
+
+### Changed
+- Update the coordinated release candidate to CLI 4.0.25-beta.
+
+## [4.0.24-beta] - 2026-10-05
+
+### Changed
+- Route guided setup through the universal Launcher; retain explicit, non-interactive runtime backends for coding agents.
+- Participate in coordinated Launcher releases that preserve provider configuration, saved interface/runtime choices and scan data.
+
 ## [4.0.16-beta] - 2026-10-04
 
 ### Added

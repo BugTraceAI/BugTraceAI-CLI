@@ -1,6 +1,7 @@
 import shutil
 import asyncio
 import os
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -51,6 +52,7 @@ class DiagnosticSystem:
 
     async def run_all(self):
         """Runs a suite of health checks on the environment."""
+        self.results.clear()
         dashboard.set_phase("⚡ SYSTEMS CHECK")
         dashboard.log("Running system health check...", "INFO")
 
@@ -62,10 +64,7 @@ class DiagnosticSystem:
         await self._check_connectivity()
         await self._check_credits()
 
-        # Non-critical check (scan can run in headless/degraded mode)
-        await self._check_browser()
-
-        critical_checks = ["api_key", "connectivity"]
+        critical_checks = ["api_key", "connectivity", "credits"]
         all_passed = True
 
         for check in critical_checks:
@@ -75,6 +74,8 @@ class DiagnosticSystem:
                 all_passed = False
 
         if all_passed:
+            # Start the optional browser only after provider preflight succeeds.
+            await self._check_browser()
             dashboard.log("Diagnostics complete. System ready.", "SUCCESS")
         else:
             dashboard.log("Diagnostics failed - critical components offline.", "ERROR")
@@ -181,12 +182,13 @@ class DiagnosticSystem:
         success_conn, _ = self.results.get("connectivity", (False, ""))
 
         if not (success_key and success_conn):
+            self.results["credits"] = (True, "Skipped after a failed prerequisite")
             return
 
         _, api_key = _resolve_api_key(preset)
         # OpenRouter-shaped endpoint. Only presets that declare balance_check reach
         # this line, and those are the ones that speak this API.
-        balance_url = f"{_api_origin(preset)}/api/v1/auth/key"
+        balance_url = f"{_api_origin(preset)}/api/v1/key"
 
         logger.info(f"Initiating {label} credit check...")
         try:
@@ -197,11 +199,22 @@ class DiagnosticSystem:
                     if resp.status == 200:
                         data = await resp.json()
                         key_data = data.get('data', {})
+                        expires_at = key_data.get('expires_at')
+                        if expires_at:
+                            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                            if expiry.tzinfo is None:
+                                expiry = expiry.replace(tzinfo=timezone.utc)
+                            if expiry <= datetime.now(timezone.utc):
+                                message = f"{label} API key expired; update it in Provider or .env"
+                                self.results["credits"] = (False, message)
+                                dashboard.log(message, "ERROR")
+                                return
                         limit = key_data.get('limit')
                         usage = key_data.get('usage', 0)
+                        remaining = key_data.get('limit_remaining')
 
-                        if limit is not None:
-                            balance = limit - usage
+                        if remaining is not None or limit is not None:
+                            balance = float(remaining) if remaining is not None else float(limit) - float(usage)
                             dashboard.credits = balance
                             if balance < settings.MIN_CREDITS:
                                 msg = f"⛔ INSUFFICIENT FUNDS: ${balance:.2f} (Required: ${settings.MIN_CREDITS:.2f})"
@@ -215,8 +228,17 @@ class DiagnosticSystem:
                             dashboard.log(f"{label} Key: Unlimited/Free Tier", "SUCCESS")
                             self.results["credits"] = (True, "")
                     else:
-                        dashboard.log(f"Credit check failed (Status {resp.status})", "WARN")
-                        self.results["credits"] = (False, f"HTTP {resp.status}")
+                        if resp.status in {401, 403}:
+                            message = f"{label} rejected the API key (HTTP {resp.status}); update it in Provider or .env"
+                            self.results["credits"] = (False, message)
+                            dashboard.log(message, "ERROR")
+                        elif resp.status == 402:
+                            message = f"{label} requires account credit (HTTP 402)"
+                            self.results["credits"] = (False, message)
+                            dashboard.log(message, "ERROR")
+                        else:
+                            dashboard.log(f"Could not verify {label} credits (HTTP {resp.status}); continuing", "WARN")
+                            self.results["credits"] = (True, f"Verification unavailable (HTTP {resp.status})")
         except Exception as e:
             logger.error(f"Credit check failed: {e}", exc_info=True)
             dashboard.log("Could not verify credits", "DEBUG")

@@ -2,27 +2,42 @@
 
 ## Install
 
+The [universal Launcher](https://github.com/BugTraceAI/BugTraceAI-Launcher)
+(3.3.14+) provides the platform installation menu and connects the selected
+components. Choose Terminal for TUI, WEB for the browser workspace, or a
+server profile for integrations. Install through the visual menu:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BugTraceAI/BugTraceAI-Launcher/main/install.sh | bash
+```
+
+In a CLI checkout, bare `./install.sh` opens that same menu with `terminal`
+suggested. The Launcher is the only guided installer. Direct installation in
+this checkout uses an explicit runtime backend, with no second menu:
+
 ```bash
 git clone https://github.com/BugTraceAI/BugTraceAI-CLI.git
 cd BugTraceAI-CLI
-./install.sh
+./scripts/install-runtime.sh --interface tui --runtime local --global yes
 ```
 
-The wizard separates two choices:
+Choose the required interface and execution method in the command:
 
-1. **Interfaces:** TUI is the visual terminal workspace. API + MCP provides
-   the backend for WEB, AI agents and integrations. Both enables both interfaces.
-   The WEB app is installed separately.
-2. **Execution:** Local Python runs the chosen interfaces in a `.venv` on your
-   machine, with scanner dependencies installed there. Docker runs them in
-   containers; the TUI still appears in your terminal. With both selected,
-   API/MCP run in the background and the TUI runs inside the API container.
+| Option | Meaning |
+| --- | --- |
+| `--interface tui` | Terminal workspace only; no API services |
+| `--interface api` | Web-scanning API/MCP for WEB, agents and integrations |
+| `--interface both` | Terminal workspace plus web-scanning API/MCP |
+| `--runtime local` | Python environment and scanner dependencies on this machine |
+| `--runtime docker` | Scanner dependencies inside containers; TUI still opens in your terminal |
+| `--global yes` | Register the current-user `btai` command on Linux/macOS |
+| `--launch yes` | Open the TUI when installation finishes; requires a terminal |
 
-The wizard shows a readable summary of the combination before installing.
-It then offers a user-global **btai** command for TUI/both on Linux
-and macOS. Local installation requires Python 3.10+; Docker installation
-requires Docker Engine and Compose. Some scanner tools also use Docker during
-local scans. The scanning engine and browser dependencies are shared.
+`--interface` and `--runtime` are required for a fresh direct installation.
+`--global` and `--launch` default to `no`. Missing options fail before installing
+anything. A direct install does not include the WEB application. Local
+installation requires Python 3.10+; Docker installation requires Docker Engine
+and Compose. Some scanner tools also use Docker during local scans.
 
 TUI adds Textual. API adds FastAPI, Uvicorn, WebSockets and MCP. Local packages
 are installed from the selected extras in `pyproject.toml`. The installer
@@ -50,11 +65,16 @@ Apple Silicon Docker runtimes.
 For scripted installations:
 
 ```bash
-./install.sh --interface tui --runtime local --global yes
-./install.sh --interface api --runtime docker --global no
-./install.sh --interface both --runtime docker --global yes
-./install.sh --reuse
+./scripts/install-runtime.sh --interface tui --runtime local --global yes
+./scripts/install-runtime.sh --interface api --runtime docker --global no
+./scripts/install-runtime.sh --interface both --runtime docker --global yes
+./scripts/install-runtime.sh --reuse
 ```
+
+For compatibility, explicit `./install.sh --interface ... --runtime ...`
+options, `./install.sh --reuse` and `--standalone [options]` still delegate to
+the same backend. `--standalone` alone does not open a component wizard.
+System privilege/password prompts remain in your terminal when required.
 
 Installation choices are remembered in `.bugtrace-install.env` without API
 keys. Reuse updates or repairs the saved profile. Existing environments retain
@@ -63,44 +83,41 @@ previously installed packages when switching interfaces.
 ## Install with your AI coding agent
 
 Copy this prompt into an agent with terminal access, such as Claude Code,
-Cursor or Codex. The default installs the real TUI and a global `btai` command
-on Linux/macOS. To deploy a server instead, change the first line to specify
-**API + MCP** or **both**, and **local** or **Docker**.
+Cursor or Codex. The default installs this CLI checkout directly as a local
+TUI and registers a global `btai` command on Linux/macOS. For the connected
+platform, use the universal Launcher profile instead.
 
 ```text
-Install the current public BugTraceAI-CLI 4.x on this machine: local TUI,
-with the user-global btai command. Perform the installation, not just a plan.
+Install BugTraceAI-CLI directly from this checkout as a standalone terminal
+workspace. Use the local Python runtime and register the current-user btai
+command. Perform the installation; do not start a scan.
 
-Check the OS, Python version and available tools. Read README.md,
-INSTALLATION.md and ./install.sh --help from
-https://github.com/BugTraceAI/BugTraceAI-CLI.git before installing.
+Read README.md and INSTALLATION.md first. Preserve existing configuration,
+credentials and uncommitted changes. Do not replace this checkout or switch
+its repository or branch silently.
 
-Clone into a suitable user-owned directory. If an installation already exists,
-preserve its configuration, credentials and uncommitted changes. Reuse its
-saved profile with ./install.sh --reuse unless I request a profile change.
-Do not replace an existing checkout or change its repository/branch silently.
+For a fresh install, review the documented CLI options, then run:
+./scripts/install-runtime.sh --interface tui --runtime local --global yes
 
-For a fresh local TUI installation, run:
-./install.sh --interface tui --runtime local --global yes
-If I request API + MCP or both, use --interface api or both and my selected
---runtime local or docker. Use --global no for API-only installations.
-Handle the installer's prompts, install the required dependencies and resolve
-setup errors using the repository instructions. Do not switch runtime without
-asking. Keep any system privilege/password prompt in my local terminal.
+If I ask for Docker or API/MCP, use the corresponding CLI installer options.
+If I ask for the connected WEB platform, use the BugTraceAI Launcher `web`
+profile; `full` adds this terminal TUI. Universal profiles require Launcher
+3.3.14 or newer.
 
-I will configure the LLM key later through Provider/F7 in the TUI; do not ask
-me to paste credentials into chat or print existing secrets. Target login
-credentials are configured separately through Auth/F8.
+Resolve setup errors using the repository
+instructions. Keep system privilege/password prompts in my local terminal.
+Never ask me to paste credentials into chat or print existing secrets. I will
+configure an LLM provider locally through Provider/F7. Auth/F8 configures
+target login separately.
 
-Verify the installed version, saved profile and selected interface. For TUI,
-check startup and quit in an interactive terminal if available; otherwise
-verify imports and report that the visual check is still pending. When requested, verify btai
-registration and PATH in a fresh shell. For an API installation, check /health
-using the actual configured port. Do not start a scan as part of installation.
+Verify the version, saved profile and installed components. For TUI, verify
+startup and quit in an interactive terminal when available; otherwise state
+that visual verification is pending. Check btai registration and PATH in a
+fresh shell. For servers, check health and MCP on the actual configured
+ports. Do not start a scan as part of installation.
 
-Finish with the installation directory, selected profile, verification results
-and exact commands to open the TUI or API. Tell me whether a new terminal is
-needed for btai.
+Finish with the installation directory, selected profile, checks performed
+and exact commands to open the installed interfaces.
 ```
 
 ## Open the real TUI
@@ -195,7 +212,7 @@ The global `btai` helper opens the saved local or Docker TUI profile. Keep the
 registered checkout at its installation path. Global registration uses
 `~/.local/bin` and configures Bash/Zsh PATH without sudo; an unrelated existing
 `btai` command is preserved. Registration can be retried with
-`./install.sh --global-only --global yes`.
+`./scripts/install-runtime.sh --reuse --global-only --global yes`.
 
 If `btai` is not found in the terminal used for installation, open a new
 terminal or activate the command directory in that same shell:
@@ -246,3 +263,16 @@ interactive scan directly:
 ./bugtraceai-cli full https://target.example
 ./bugtraceai-cli --help
 ```
+
+## Updates and compatible versions
+
+For Launcher-managed installations, use Launcher 3.3.14+ and review
+`./launcher.sh update --plan` before `./launcher.sh update`. The visual menu also
+has **Update installation**. Source tags come from one compatible release
+manifest; preparation finishes before activation, and saved settings/data remain
+in place. Use `./launcher.sh update --recover` for an interrupted activation.
+
+See the [release and recovery guide](https://github.com/BugTraceAI/BugTraceAI-Launcher/blob/main/RELEASES.md).
+Direct component checkouts keep their explicit runtime backend. Choose tagged
+versions deliberately, retain local configuration and data, and rerun that
+backend; a development checkout is not silently moved to a public release.
