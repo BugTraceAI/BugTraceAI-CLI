@@ -165,13 +165,51 @@ accepts commands such as `/help`, `/provider`, `/auth`, `/pause`, `/resume`,
 
 ## Install with your AI coding agent
 
-Copy this prompt into an agent with terminal access, such as Claude Code,
-Cursor or Codex. The default installs this CLI checkout directly as a local
-TUI and registers a global `btai` command on Linux/macOS. For the connected
-platform, use the universal Launcher profile instead.
+Copy this self-contained prompt into an agent with local terminal access,
+such as Claude Code, Cursor or Codex. It installs only the CLI module through
+the universal Launcher, with the terminal TUI enabled:
 
 ```text
-Install BugTraceAI-CLI directly from this checkout as a standalone terminal
+Install BugTraceAI-CLI only on this machine using the official universal Launcher.
+
+First read:
+https://github.com/BugTraceAI/BugTraceAI-CLI#readme
+https://github.com/BugTraceAI/BugTraceAI-Launcher#readme
+
+Follow those instructions using the official installer:
+https://raw.githubusercontent.com/BugTraceAI/BugTraceAI-Launcher/main/install.sh
+
+Select only BugTraceAI-CLI. Do not select BugTraceAI-API or BugTraceAI-WEB.
+Enable the terminal TUI. Use Install with Wizard and let me choose the
+runtime and whether to register the global btai command.
+
+Preserve any existing installation, configuration and data. Run the
+Launcher in my local interactive terminal. I will enter and verify the
+provider API key there, choose ports and review the plan before installation.
+Keep credentials out of chat and logs. Do not start a scan.
+
+Verify TUI startup and exit in an interactive terminal. If I enable the
+global btai command, check it from a fresh shell. Verify health and MCP
+only if those CLI services are enabled.
+Report the installation location, launch commands, checks completed
+and any checks still pending.
+```
+
+### Advanced: direct installation with your agent
+
+For direct setup without the Launcher, use this separate prompt. It installs
+only the CLI terminal workspace with local Python and the global btai command:
+
+```text
+Install BugTraceAI-CLI directly from the official public repository:
+https://github.com/BugTraceAI/BugTraceAI-CLI
+
+First read:
+https://github.com/BugTraceAI/BugTraceAI-CLI#readme
+https://github.com/BugTraceAI/BugTraceAI-CLI/blob/main/INSTALLATION.md
+
+Use an existing checkout of that repository if available; otherwise clone it
+into a new directory. Enter that directory and install a standalone terminal
 workspace. Use the local Python runtime and register the current-user btai
 command. Perform the installation; do not start a scan.
 
@@ -183,12 +221,8 @@ For a fresh install, review the documented CLI options, then run:
 ./scripts/install-runtime.sh --interface tui --runtime local --global yes
 
 If I ask for Docker or API/MCP, use the corresponding CLI installer options.
-If I ask for the universal installer, run its official command and let me
-interact with its TUI. I will enter and verify the provider key locally, choose
-Wizard or AI, and select exactly the modules I want. The `web` suggestion
-starts with WEB only; `full` preselects WEB, CLI, API and the CLI TUI.
-The built-in AI installer supports API-only or that complete selection with
-OpenRouter or Anthropic; use Wizard for other combinations.
+Do not install BugTraceAI-WEB or BugTraceAI-API unless I explicitly request
+those separate modules.
 
 Handle the required prompts and resolve setup errors using the repository
 instructions. Keep system privilege/password prompts in my local terminal.
