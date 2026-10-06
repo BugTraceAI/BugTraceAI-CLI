@@ -865,13 +865,12 @@ class AnalysisSqliProbesMixin:
             # cannot re-test cookie injection -> the confirmed finding is silently
             # dropped before the report. Emit directly, same architecture as the
             # V-008 cookie-config emit above and the Nuclei misconfig path.
+            failed_rechecks = set()
             for _f in findings:
                 if "sql" not in str(_f.get("type", "")).lower():
                     continue  # deser/other cookie findings already survive normal routing
                 _cookie_param = _f.get("parameter", "")
                 _dedup_key = f"sqli::{_cookie_param}"
-                if _dedup_key in type(self)._emitted_cookie_sqli:
-                    continue
                 # ANTI-FP re-confirmation. Time-based findings carry _recheck data;
                 # re-verify in isolation that the delay is REPRODUCIBLE (a real
                 # injection sleeps on every sample, ambient SLEEP load from
@@ -879,11 +878,14 @@ class AnalysisSqliProbesMixin:
                 _recheck = _f.get("_recheck")
                 if _recheck:
                     if not await self._reconfirm_cookie_sqli(_recheck):
+                        failed_rechecks.add(id(_f))
                         logger.info(
                             f"[Cookie SQLi Probe] Re-confirm FAILED (ambient load / FP) — "
                             f"dropping {_cookie_param}"
                         )
                         continue
+                if _dedup_key in type(self)._emitted_cookie_sqli:
+                    continue
                 type(self)._emitted_cookie_sqli.add(_dedup_key)
                 _ev = _f.get("evidence")
                 await event_bus.emit(
@@ -913,6 +915,10 @@ class AnalysisSqliProbesMixin:
                 )
                 logger.info(f"[Cookie SQLi Probe] Emitted VALIDATED_CONFIRMED cookie SQLi: {_cookie_param}")
 
+            # A failed re-check must also remove the candidate from the returned
+            # findings; otherwise report generation can still label it confirmed.
+            findings = self._filter_failed_cookie_sqli_rechecks(findings, failed_rechecks)
+
             # Strip internal re-check scaffolding so it never leaks into the report.
             for _f in findings:
                 _f.pop("_recheck", None)
@@ -924,6 +930,13 @@ class AnalysisSqliProbesMixin:
         except Exception as e:
             logger.error(f"Cookie SQLi probe check failed: {e}", exc_info=True)
             return {"vulnerabilities": []}
+
+    @staticmethod
+    def _filter_failed_cookie_sqli_rechecks(
+        findings: List[Dict[str, Any]], failed_recheck_ids: Set[int]
+    ) -> List[Dict[str, Any]]:
+        """Remove candidates that failed isolation re-confirmation."""
+        return [finding for finding in findings if id(finding) not in failed_recheck_ids]
 
     async def _reconfirm_cookie_sqli(self, recheck: Dict, rounds: int = 3) -> bool:
         """Re-confirm a time-based cookie SQLi in isolation to reject false

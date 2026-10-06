@@ -523,6 +523,19 @@ async def _do_graphql_mutation(endpoint: str, mutation_name: str, args: dict, se
         return None, str(e), 0
 
 
+def _graphql_result_data(response_data: Any) -> Optional[dict]:
+    """Return the GraphQL ``data`` object only when the response has one.
+
+    GraphQL servers commonly return ``{"data": null, "errors": [...]}`` when
+    a resolver rejects a query or mutation. Treat that as an unusable result;
+    calling ``.get`` on the null payload used to escape the mutation tester.
+    """
+    if not isinstance(response_data, dict):
+        return None
+    result = response_data.get("data")
+    return result if isinstance(result, dict) else None
+
+
 async def test_graphql_unauth_read_exposure(endpoint: str) -> Dict:
     """Schema-driven unauthenticated GraphQL read exposure check.
 
@@ -870,7 +883,10 @@ async def _read_current_value(
             if not data or status != 200:
                 continue
 
-            result_data = data.get("data", {}).get(qname)
+            graphql_data = _graphql_result_data(data)
+            if graphql_data is None:
+                continue
+            result_data = graphql_data.get(qname)
             if isinstance(result_data, list) and result_data and isinstance(result_data[0], dict):
                 item = result_data[0]
                 id_val = item.get(id_arg_name) or item.get("id")
@@ -905,7 +921,10 @@ async def _try_set_value(
     data, text, status = await _do_graphql_mutation(endpoint, mutation_name, args, selection)
     if not data or status != 200:
         return False
-    result = data.get("data", {}).get(mutation_name)
+    graphql_data = _graphql_result_data(data)
+    if graphql_data is None:
+        return False
+    result = graphql_data.get(mutation_name)
     if result is None and "errors" in data:
         return False
     return True
@@ -927,5 +946,4 @@ async def _verify_value(
 
 
 # ==================== REST API TESTING ====================
-
 

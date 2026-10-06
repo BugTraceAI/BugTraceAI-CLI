@@ -54,7 +54,7 @@ dependencies = [
     
     # Security
     "PyJWT>=2.8.0,<3.0",
-    "cryptography>=41.0.0,<47.0",
+    "cryptography>=48.0.1,<49.0",
     
     # Browser Automation (XSS validation)
     "playwright>=1.40.0,<2.0",

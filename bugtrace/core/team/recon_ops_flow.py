@@ -254,7 +254,10 @@ class TeamReconOpsMixin(TeamReconHtmlMixin, TeamReconHitlMixin, TeamReconDispatc
         from bugtrace.core.diagnostics import diagnostics
         if not await diagnostics.run_all():
             dashboard.log("❌ CRITICAL SYSTEM FAILURE: Diagnostics failed. Aborting.", "CRITICAL")
-            raise RuntimeError("Diagnostics failed (AI connectivity or System checks) — check your .env and Internet access")
+            failures = [error for check, (passed, error) in diagnostics.results.items()
+                        if check in {"api_key", "connectivity", "credits"} and not passed]
+            reason = "; ".join(failures) or "critical provider checks failed"
+            raise RuntimeError(f"Scanner preflight failed: {reason}")
         return True
     def _setup_scan_directory(self, start_time: datetime) -> tuple:
         """Setup scan folder with organized structure using unified report_dir."""

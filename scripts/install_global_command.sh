@@ -1,4 +1,4 @@
-# Sourced by install.sh; install only a user-owned command, without sudo.
+# Sourced by scripts/install-runtime.sh; install only a user-owned command, without sudo.
 install_global_command() {
     local command_dir="$HOME/.local/bin" command_path="$HOME/.local/bin/btai" profile
     mkdir -p "$command_dir"
@@ -40,13 +40,8 @@ install_global_command() {
 
 # Use the checkout path to launch; the parent shell may not have the new PATH yet.
 offer_tui_launch() {
-    local requested=${1:-} registration_only=${2:-false} answer
-    [[ "$INSTALL_INTERFACE" != api && "$requested" != no ]] || return 0
-    if [[ -z "$requested" ]]; then
-        [[ "$registration_only" != true && -t 0 && -t 1 ]] || return 0
-        read -r -p "Open the BugTraceAI TUI now? [Y/n]: " answer || return 0
-        case "$answer" in n|N|no|NO) return 0 ;; ''|y|Y|yes|YES) ;; *) return 0 ;; esac
-    fi
+    local requested=${1:-no}
+    [[ "$INSTALL_INTERFACE" != api && "$requested" == yes ]] || return 0
     print_step "Opening the BugTraceAI TUI..."
     if bash "$INSTALLER_DIR/btai"; then
         print_info "TUI closed. Your installation and saved profile are ready."

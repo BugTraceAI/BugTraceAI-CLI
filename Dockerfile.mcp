@@ -29,8 +29,6 @@ RUN pip install --no-cache-dir \
 
 # Copy the bugtrace package
 COPY bugtrace/ ./bugtrace/
-COPY alembic/ ./alembic/
-COPY alembic.ini .
 COPY pyproject.toml .
 COPY README.md .
 
