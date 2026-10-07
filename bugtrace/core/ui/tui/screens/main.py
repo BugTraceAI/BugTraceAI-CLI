@@ -113,7 +113,7 @@ class MainScreen(Screen):
         result = Text("◈ ", style=theme.ACCENT)
         result.append("BugTrace", style=f"bold {theme.TEXT}")
         result.append("AI", style=f"bold {theme.ACCENT}")
-        result.append(f"  {__version__}", style=theme.MUTED)
+        result.append(f"  {__version__}", style=theme.ACCENT)
         state = "demo" if self.demo_mode else self.app.scan_state
         color = theme.WARNING if state in {"demo", "paused", "stopping"} else theme.ERROR if state == "failed" else theme.ACCENT
         badge = Text(f" {state.upper()} ", style=f"bold {color} on {theme.PANEL}")

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.0.32-beta] - 2026-10-07
+
+### Changed
+- Use the BugTraceAI coral accent for the version in the TUI header so it is clearly visible and consistent with the brand.
+
 ## [4.0.31-beta] - 2026-10-05
 
 ### Fixed
