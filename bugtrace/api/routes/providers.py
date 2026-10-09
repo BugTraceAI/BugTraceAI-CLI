@@ -49,11 +49,13 @@ class ProviderDetail(BaseModel):
 class TestProviderRequest(BaseModel):
     provider: str
     api_key: Optional[str] = None
+    region: Optional[str] = None
 
 
 class SwitchProviderRequest(BaseModel):
     provider: str
     api_key: Optional[str] = None
+    region: Optional[str] = None
 
 
 class ModelOverrideRequest(BaseModel):
@@ -94,6 +96,58 @@ def _check_api_key(preset: Dict[str, Any]) -> tuple:
     key_env = preset.get("api_key_env", "")
     key_value = os.environ.get(key_env) or getattr(settings, key_env, None)
     return bool(key_value), _mask_api_key(key_value)
+
+
+async def _test_bedrock(req: "TestProviderRequest", preset: Dict[str, Any]) -> Dict[str, Any]:
+    """Server-side Bedrock test: one `converse` call via boto3 off the event loop.
+
+    Maps boto3 exceptions to the route's {success, message} contract; never raises
+    an unhandled 500. Uses req.api_key or the configured bearer token (otherwise the
+    boto3 default credential chain applies) and req.region or settings.BEDROCK_REGION.
+    """
+    import asyncio
+
+    models = preset.get("models", {})
+    test_model = models.get("ANALYSIS_MODEL") or models.get("DEFAULT_MODEL") or ""
+    if not test_model:
+        return {"success": False, "message": "No model configured for this provider."}
+
+    region = (req.region or "").strip() or settings.BEDROCK_REGION or "us-east-1"
+
+    # Make the bearer token visible to boto3 for this test when one is supplied.
+    key_env = preset.get("api_key_env", "AWS_BEARER_TOKEN_BEDROCK")
+    if req.api_key:
+        os.environ[key_env] = req.api_key
+
+    try:
+        import boto3
+        from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
+
+        def _call():
+            client = boto3.client("bedrock-runtime", region_name=region)
+            return client.converse(
+                modelId=test_model,
+                messages=[{"role": "user", "content": [{"text": "Are you alive? Answer only yes."}]}],
+                inferenceConfig={"maxTokens": 5, "temperature": 0.0},
+            )
+
+        await asyncio.to_thread(_call)
+        return {"success": True, "message": "API Key Valid Response"}
+    except ImportError:
+        return {"success": False, "message": "boto3 is not installed on the CLI host."}
+    except (NoCredentialsError, PartialCredentialsError):
+        return {"success": False, "message": "No Bedrock credentials found (bearer token or AWS credential chain)."}
+    except ClientError as e:
+        code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+        if code in ("UnrecognizedClientException", "InvalidSignatureException", "AccessDeniedException"):
+            return {"success": False, "message": "Invalid Bedrock credentials or insufficient permissions."}
+        if code == "ThrottlingException":
+            return {"success": False, "message": "Throttled — credentials valid but rate limited."}
+        if code in ("ResourceNotFoundException", "ValidationException"):
+            return {"success": False, "message": "Model/inference-profile not available in this region."}
+        return {"success": False, "message": f"Bedrock error: {code or str(e)}"}
+    except Exception as e:
+        return {"success": False, "message": f"Connection failed: {str(e)}"}
 
 
 # ──── Endpoints ────
@@ -197,6 +251,16 @@ async def switch_provider(req: SwitchProviderRequest):
     # Switch provider
     object.__setattr__(settings, 'PROVIDER', req.provider)
 
+    # Bedrock region write MUST happen here: PROVIDER is already 'bedrock' so the
+    # preset loads correctly, and the user's region is set before _load_provider_preset
+    # so the preset-default seeding guard (seeds only when BEDROCK_REGION is still the
+    # class default) sees the override and does not clobber it.
+    if req.provider == "bedrock" and req.region:
+        region = req.region.strip()
+        update_env_var("BEDROCK_REGION", region)
+        object.__setattr__(settings, "BEDROCK_REGION", region)
+        os.environ["BEDROCK_REGION"] = region
+
     # Reload preset (applies model defaults)
     settings._load_provider_preset()
 
@@ -228,6 +292,12 @@ async def test_provider_key(req: TestProviderRequest):
     import httpx
 
     preset = _load_preset(req.provider)
+
+    # Bedrock has no base_url (boto3 builds the endpoint from the region), so its
+    # test branch MUST sit above the base_url 400 guard below.
+    if preset.get("api_format") == "bedrock":
+        return await _test_bedrock(req, preset)
+
     base_url = preset.get("base_url", "")
     if not base_url:
         raise HTTPException(status_code=400, detail="Provider has no base_url configured")

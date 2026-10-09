@@ -17,6 +17,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from bugtrace.core.ui import dashboard
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+from bugtrace.core.llm_shell.bedrock_wire import _BEDROCK_SHIFT
 
 if TYPE_CHECKING:
     from bugtrace.core.conversation_thread import ConversationThread
@@ -137,6 +138,12 @@ class LLMThreadMixin:
         prompt: str
     ) -> Optional[str]:
         """Attempt threaded generation with a single model."""
+        if self.api_format == 'bedrock':
+            return await self._attempt_thread_model_bedrock(
+                current_model, messages, temperature, max_tokens,
+                module_name, thread, prompt
+            )
+
         is_anthropic = (self.api_format == 'anthropic')
         if is_anthropic:
             api_headers = self._build_anthropic_apikey_headers(self.api_key or "")
@@ -164,6 +171,57 @@ class LLMThreadMixin:
             logger.error(f"LLM Thread Exception with {current_model}: {str(e)}", exc_info=True)
             return None
 
+    async def _attempt_thread_model_bedrock(
+        self,
+        current_model: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+        module_name: str,
+        thread: "ConversationThread",
+        prompt: str
+    ) -> Optional[str]:
+        """Threaded Bedrock generation via boto3 Converse.
+
+        Preserves the thread-specific post-success steps that _handle_thread_response
+        performs: thread.add_message('assistant', ...), telemetry increment, and the
+        '[Thread: ...]' audit log. Returns None on any failure (model shift).
+        """
+        converse_args = self._build_bedrock_converse_args(
+            current_model, messages, temperature, max_tokens
+        )
+        try:
+            result = await self._bedrock_converse_call(current_model, converse_args)
+        except Exception as e:
+            logger.error(f"LLM Thread (Bedrock) exception with {current_model}: {e}", exc_info=True)
+            return None
+
+        if result[0] is _BEDROCK_SHIFT:
+            logger.warning(f"LLM Thread: Bedrock {current_model} failed. Shifting...")
+            return None
+
+        data, _ = result
+        response_text = self._parse_bedrock_text(data)
+        if not response_text:
+            logger.warning(f"LLM Thread: Bedrock {current_model} returned empty response.")
+            return None
+
+        thread.add_message("assistant", response_text)
+
+        # Update telemetry (mirror _handle_thread_response)
+        self.req_count += 1
+        dashboard.total_requests += 1
+        usage = (data or {}).get("usage", {}) or {}
+        tokens = usage.get("totalTokens", 0)
+        cost = (tokens / 1_000_000) * 0.20
+        dashboard.session_cost += cost
+        if self.req_count % 10 == 0:
+            asyncio.create_task(self.update_balance())
+
+        await self._audit_log(module_name, current_model, f"[Thread: {thread.thread_id}] {prompt}", response_text)
+        logger.info(f"LLM Thread Success: {current_model} for {module_name} (thread: {thread.thread_id})")
+        return response_text
+
     async def generate_with_thread(
         self,
         prompt: str,
@@ -176,8 +234,11 @@ class LLMThreadMixin:
         """Generate text using ConversationThread for persistent context."""
         from bugtrace.core.conversation_thread import ConversationThread
 
-        # No global semaphore - each agent runs independently
-        if not self.api_key:
+        # No global semaphore - each agent runs independently.
+        # Bedrock may authenticate via the boto3 default credential chain (no key),
+        # so a keyless Bedrock client must not be short-circuited here.
+        is_bedrock = (self.api_format == 'bedrock')
+        if not self.api_key and not is_bedrock:
             logger.warning(f"LLM Client: No API Key for {module_name}")
             return None
 

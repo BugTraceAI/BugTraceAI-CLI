@@ -51,6 +51,9 @@ dependencies = [
     # LLM Providers
     "openai>=1.0.0,<3.0",
     "google-generativeai>=0.8.0,<1.0",
+
+    # AWS Bedrock (Converse API via boto3)
+    "boto3>=1.34,<2.0",
     
     # Security
     "PyJWT>=2.8.0,<3.0",
