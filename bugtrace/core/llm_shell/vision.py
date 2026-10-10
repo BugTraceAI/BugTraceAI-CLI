@@ -18,6 +18,7 @@ from bugtrace.core.ui import dashboard
 from bugtrace.utils.logger import get_logger
 from bugtrace.core.config import settings
 from bugtrace.core.http_orchestrator import orchestrator, DestinationType
+from bugtrace.core.llm_shell.bedrock_wire import _bedrock_image_format
 from bugtrace.core.exceptions import (
     LLMError,
     LLMTimeoutError,
@@ -54,6 +55,11 @@ class LLMVisionMixin:
         """
         Uses the specialized vision model (Qwen 3 VL or similar) to analyze screenshots.
         """
+        # Bedrock has no api_format fork here: _build_vision_payload /
+        # _process_vision_response are OpenAI-only and intentionally bypassed.
+        if self.api_format == 'bedrock':
+            return await self._bedrock_analyze_visual(image_data, prompt, module_name)
+
         import base64
         base64_image = base64.b64encode(image_data).decode('utf-8')
 
@@ -126,6 +132,16 @@ class LLMVisionMixin:
         if not image_file.exists():
             logger.error(f"[{module_name}] Image not found: {image_path}")
             return ""
+
+        # Bedrock takes RAW image bytes (not base64) via converse image blocks.
+        # Branch BEFORE base64-encoding so the raw bytes reach _bedrock_generate_with_image.
+        if self.api_format == 'bedrock':
+            with open(image_path, 'rb') as f:
+                raw = f.read()
+            img_format = _bedrock_image_format(image_path)
+            return await self._bedrock_generate_with_image(
+                prompt, raw, img_format, model_override, module_name, temperature,
+            )
 
         with open(image_path, 'rb') as f:
             image_data = base64.b64encode(f.read()).decode('utf-8')

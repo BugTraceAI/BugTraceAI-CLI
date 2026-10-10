@@ -221,7 +221,11 @@ class LLMGenerateMixin:
         """
         # No global semaphore - each agent runs independently
         # Rate limiting handled by retry with exponential backoff (tenacity)
-        if not self.api_key and not settings.ANTHROPIC_OAUTH_ENABLED:
+        # Bedrock may authenticate via the boto3 default credential chain (no
+        # AWS_BEARER_TOKEN_BEDROCK), so a keyless Bedrock client must NOT be
+        # short-circuited here — let dispatch run and surface a credentials error.
+        is_bedrock = (self.api_format == 'bedrock')
+        if not self.api_key and not settings.ANTHROPIC_OAUTH_ENABLED and not is_bedrock:
             logger.warning(f"LLM Client: No API Key found for {module_name}. Skipping generation.")
             await self._audit_log(module_name, "NONE", prompt, "SKIPPED: Missing API Key")
             return None
@@ -467,9 +471,16 @@ class LLMGenerateMixin:
         (or the failover provider in `provider_ctx`, when set).
         """
         # Routing precedence:
+        #  0. api_format=='bedrock' provider → boto3 Converse (no aiohttp path)
         #  1. api_format=='anthropic' provider  → Anthropic Messages API via x-api-key
         #  2. OAuth path (anthropic/ model + ANTHROPIC_OAUTH_ENABLED) → Bearer token
         #  3. everything else → OpenAI-format (OpenRouter/Z.ai)
+        is_bedrock = (self.api_format == 'bedrock')
+        if is_bedrock:
+            return await self._bedrock_generate(
+                current_model, messages, module_name, prompt,
+                temperature, max_tokens, model_override, system_prompt, provider_ctx,
+            )
         is_anthropic_apikey = (self.api_format == 'anthropic')
         is_anthropic = is_anthropic_apikey or self._is_anthropic_model(current_model)
         if is_anthropic_apikey:

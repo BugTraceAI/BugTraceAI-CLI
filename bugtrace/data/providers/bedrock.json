@@ -1,0 +1,32 @@
+{
+    "id": "bedrock",
+    "name": "AWS Bedrock",
+    "api_format": "bedrock",
+    "base_url": "",
+    "api_key_env": "AWS_BEARER_TOKEN_BEDROCK",
+    "api_key_hint": "ABSKQmVk... (Bedrock API key / bearer token)",
+    "failover": [],
+    "features": {
+        "description": "AWS Bedrock via boto3 (Converse API). Primary auth: Bedrock API key (bearer token, AWS_BEARER_TOKEN_BEDROCK). Optional: standard AWS credentials (profile / access key / IAM role) via the boto3 default chain. Supports serverless models and cross-region inference profiles.",
+        "online_mode": false,
+        "balance_check": false,
+        "model_discovery": false
+    },
+    "region": "us-east-1",
+    "models": {
+        "DEFAULT_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "CODE_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "ANALYSIS_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "PRIMARY_MODELS": "us.anthropic.claude-haiku-4-5-20251001-v1:0,us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "VISION_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "WAF_DETECTION_MODELS": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "MUTATION_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "SKEPTICAL_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "REPORTING_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "VALIDATION_VISION_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    },
+    "concurrency": {
+        "default": 2
+    },
+    "pricing": {}
+}

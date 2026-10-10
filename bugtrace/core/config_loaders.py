@@ -195,6 +195,13 @@ class SettingsLoadersMixin:
         if "VALIDATION_VISION_MODEL" not in models and "VISION_MODEL" in models:
             object.__setattr__(self, "VALIDATION_VISION_MODEL", models["VISION_MODEL"])
 
+        # Seed BEDROCK_REGION from the preset's top-level `region` key ONLY when the
+        # user has not already overridden it (BEDROCK_REGION still equals its class
+        # default 'us-east-1'). An explicit env/conf/WEB region stays authoritative.
+        preset_region = preset.get("region")
+        if preset_region and getattr(self, "BEDROCK_REGION", None) == "us-east-1":
+            object.__setattr__(self, "BEDROCK_REGION", preset_region)
+
         logger.info(f"Provider preset loaded: {preset.get('name', self.PROVIDER)} ({len(models)} model defaults)")
     def _load_llm_models_config(self, config):
         """Load LLM_MODELS section config.

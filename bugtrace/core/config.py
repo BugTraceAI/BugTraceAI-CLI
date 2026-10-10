@@ -74,7 +74,11 @@ class Settings(SettingsLoadersMixin, SettingsOpsMixin, BaseSettings):
     ANTHROPIC_API_KEY: Optional[str] = Field(default=None, min_length=20, description="Anthropic API key (sk-ant-...)")
     OPENAI_API_KEY: Optional[str] = Field(default=None, description="OpenAI-compatible API key (sk-... for OpenAI)")
     MINIMAX_API_KEY: Optional[str] = Field(default=None, description="MiniMax API key")
-    
+
+    # --- AWS Bedrock ---
+    AWS_BEARER_TOKEN_BEDROCK: Optional[str] = Field(default=None, description="Bedrock API key / bearer token (primary Bedrock auth)")
+    BEDROCK_REGION: str = Field(default="us-east-1", description="AWS region for Bedrock Runtime (e.g. us-east-1). Used for serverless + cross-region inference profiles.")
+
     # --- LLM Models ---
     DEFAULT_MODEL: str = "qwen/qwen3-coder"
     CODE_MODEL: str = "qwen/qwen3-coder"
@@ -289,12 +293,24 @@ class Settings(SettingsLoadersMixin, SettingsOpsMixin, BaseSettings):
                      'VALIDATION_VISION_MODEL')
     @classmethod
     def validate_model_name(cls, v, info):
-        """Validate model name format (TASK-119)."""
+        """Validate model name format (TASK-119).
+
+        Accepts two shapes:
+          1. OpenRouter/OpenAI `provider/model` (e.g. anthropic/claude-haiku-4.5)
+          2. AWS Bedrock model/inference-profile ids — a dotted/segmented id with
+             an optional ':' version suffix and no '/' (e.g.
+             us.anthropic.claude-haiku-4-5-20251001-v1:0). Preset values bypass
+             validators (object.__setattr__), but env-supplied Bedrock ids hit
+             this path, so the Bedrock shape must be accepted here.
+        """
         if not v:
             return v  # Allow empty for optional models
-        # OpenRouter format: provider/model-name
+        # Bedrock-style id: no slash, dotted/segmented with optional :version suffix.
         if '/' not in v:
-            raise ValueError(f"Invalid model name format: {v} (expected: provider/model)")
+            if re.match(r'^[A-Za-z0-9][A-Za-z0-9._:-]+$', v):
+                return v
+            raise ValueError(f"Invalid model name format: {v} (expected: provider/model or Bedrock id)")
+        # OpenRouter format: provider/model-name
         provider, model = v.split('/', 1)
         # Warn about unknown providers (don't fail - new providers may appear)
         if provider not in VALID_PROVIDERS:
@@ -307,13 +323,39 @@ class Settings(SettingsLoadersMixin, SettingsOpsMixin, BaseSettings):
     @field_validator('PRIMARY_MODELS', 'WAF_DETECTION_MODELS')
     @classmethod
     def validate_model_list(cls, v):
-        """Validate comma-separated model list (TASK-119)."""
+        """Validate comma-separated model list (TASK-119).
+
+        Accepts `provider/model` entries and AWS Bedrock ids (dotted/segmented
+        with an optional ':' version suffix, no '/'), mirroring validate_model_name.
+        """
         if not v:
             return v
         models = [m.strip() for m in v.split(',')]
         for model in models:
-            if model and '/' not in model:
-                raise ValueError(f"Invalid model in list: {model} (expected: provider/model)")
+            if not model:
+                continue
+            if '/' in model:
+                continue
+            # Bedrock-style id: no slash, dotted/segmented with optional :version.
+            if re.match(r'^[A-Za-z0-9][A-Za-z0-9._:-]+$', model):
+                continue
+            raise ValueError(f"Invalid model in list: {model} (expected: provider/model or Bedrock id)")
+        return v
+
+    @field_validator('BEDROCK_REGION')
+    @classmethod
+    def validate_bedrock_region(cls, v):
+        """Lenient AWS region check for Bedrock.
+
+        Lowercases the value and warns (never fails) on a shape that does not
+        look like an AWS region (e.g. us-east-1). A typo should surface later as
+        a clear 'model not available in region' test result, not a startup crash.
+        """
+        if not v:
+            return v
+        v = v.strip().lower()
+        if not re.match(r'^[a-z]{2}-[a-z]+-\d$', v):
+            logger.warning(f"BEDROCK_REGION '{v}' does not look like an AWS region (expected e.g. us-east-1)")
         return v
 
     @field_validator('QUEUE_PERSISTENCE_MODE')
