@@ -75,6 +75,12 @@ class LLMConnectivityMixin:
         """Ping a single model to check connectivity."""
         dashboard.log(f"Pinging model: {model}...", "INFO")
 
+        # Bedrock speaks boto3 Converse (no HTTP base_url — it is ""), so the
+        # generic HTTP POST below can never reach it. Route Bedrock to a boto3
+        # ping that reuses the bedrock_wire seam.
+        if self.api_format == 'bedrock':
+            return await self._ping_model_bedrock(model)
+
         if self.api_format == 'anthropic':
             headers = self._build_anthropic_apikey_headers(self.api_key or "")
             payload = self._build_anthropic_payload(
@@ -97,6 +103,43 @@ class LLMConnectivityMixin:
         except Exception as e:
             dashboard.log(f"Model {model} unreachable: {e}. Check API key and limits.", "ERROR")
             return False
+
+    async def _ping_model_bedrock(self, model: str) -> bool:
+        """Ping a Bedrock model via boto3 Converse (reuses the bedrock_wire seam).
+
+        A normal converse response means the model is online. A throttle proves
+        the credentials are valid (just rate limited), so it also counts as
+        ONLINE for connectivity purposes. Auth/validation/not-found errors and
+        missing credentials drop the model (returns False). Never raises — the
+        boto3 call runs off the event loop inside _bedrock_converse_call.
+        """
+        from botocore.exceptions import NoCredentialsError, PartialCredentialsError
+        from bugtrace.core.llm_shell.bedrock_wire import _BEDROCK_SHIFT
+
+        converse_args = self._build_bedrock_converse_args(
+            model, [{"role": "user", "content": "Ping"}],
+            temperature=0.0, max_tokens=5,
+        )
+
+        try:
+            result = await self._bedrock_converse_call(model, converse_args)
+        except LLMRateLimitError:
+            # Throttled: credentials are valid, so the model is reachable.
+            dashboard.log(f"Model {model} is ONLINE (throttled — credentials valid).", "SUCCESS")
+            return True
+        except (NoCredentialsError, PartialCredentialsError):
+            dashboard.log(f"Model {model} failed health check (no Bedrock credentials).", "ERROR")
+            return False
+        except Exception as e:
+            dashboard.log(f"Model {model} unreachable: {e}. Check API key and limits.", "ERROR")
+            return False
+
+        if result[0] is _BEDROCK_SHIFT:
+            dashboard.log(f"Model {model} failed health check. API Key may be invalid or out of credits.", "ERROR")
+            return False
+
+        dashboard.log(f"Model {model} is ONLINE.", "SUCCESS")
+        return True
 
     def _log_ping_result(self, model: str, status: int) -> bool:
         """Log ping result and return success status."""

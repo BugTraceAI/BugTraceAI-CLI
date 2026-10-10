@@ -157,6 +157,76 @@ async def test_converse_unexpected_exception_returns_shift(client, monkeypatch):
     assert result[0] is _BEDROCK_SHIFT
 
 
+# ──── pre-scan connectivity health check (Bedrock-aware) ────
+
+
+@pytest.mark.asyncio
+async def test_ping_bedrock_success(client, monkeypatch):
+    """A normal converse response marks the Bedrock model ONLINE."""
+    client.api_format = "bedrock"
+    client.models = [BEDROCK_ID]
+    client.api_key = "bearer-token"
+    mock_client = MagicMock()
+    mock_client.converse.return_value = {
+        "output": {"message": {"content": [{"text": "yes"}]}},
+    }
+    monkeypatch.setattr(client, "_get_bedrock_client", lambda region: mock_client)
+
+    assert await client._ping_model(BEDROCK_ID) is True
+    assert await client.verify_connectivity() is True
+    assert client.models == [BEDROCK_ID]
+    assert mock_client.converse.called
+
+
+@pytest.mark.asyncio
+async def test_ping_bedrock_throttle_counts_online(client, monkeypatch):
+    """Throttling proves the credentials are valid -> model counts as ONLINE."""
+    client.api_format = "bedrock"
+    client.models = [BEDROCK_ID]
+    client.api_key = "bearer-token"
+    mock_client = MagicMock()
+    mock_client.converse.side_effect = _client_error("ThrottlingException")
+    monkeypatch.setattr(client, "_get_bedrock_client", lambda region: mock_client)
+
+    assert await client._ping_model(BEDROCK_ID) is True
+    assert await client.verify_connectivity() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [
+    "AccessDeniedException",
+    "UnrecognizedClientException",
+    "InvalidSignatureException",
+])
+async def test_ping_bedrock_auth_error_fails(client, monkeypatch, code):
+    """An auth/signature error drops the model -> connectivity False."""
+    client.api_format = "bedrock"
+    client.models = [BEDROCK_ID]
+    client.api_key = "bearer-token"
+    mock_client = MagicMock()
+    mock_client.converse.side_effect = _client_error(code)
+    monkeypatch.setattr(client, "_get_bedrock_client", lambda region: mock_client)
+
+    assert await client._ping_model(BEDROCK_ID) is False
+    assert await client.verify_connectivity() is False
+
+
+@pytest.mark.asyncio
+async def test_ping_bedrock_no_credentials_fails(client, monkeypatch):
+    """Missing Bedrock credentials -> model dropped, connectivity False."""
+    from botocore.exceptions import NoCredentialsError
+
+    client.api_format = "bedrock"
+    client.models = [BEDROCK_ID]
+    client.api_key = "bearer-token"
+    mock_client = MagicMock()
+    mock_client.converse.side_effect = NoCredentialsError()
+    monkeypatch.setattr(client, "_get_bedrock_client", lambda region: mock_client)
+
+    assert await client._ping_model(BEDROCK_ID) is False
+    assert await client.verify_connectivity() is False
+
+
 # ──── _bedrock_image_format (pure) ────
 
 
