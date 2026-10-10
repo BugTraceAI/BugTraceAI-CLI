@@ -16,14 +16,14 @@
     "models": {
         "DEFAULT_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         "CODE_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "ANALYSIS_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "PRIMARY_MODELS": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "VISION_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "ANALYSIS_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "PRIMARY_MODELS": "us.anthropic.claude-haiku-4-5-20251001-v1:0,us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "VISION_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "WAF_DETECTION_MODELS": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "MUTATION_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "SKEPTICAL_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "REPORTING_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-        "VALIDATION_VISION_MODEL": "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        "MUTATION_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "SKEPTICAL_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "REPORTING_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "VALIDATION_VISION_MODEL": "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
     },
     "concurrency": {
         "default": 2
