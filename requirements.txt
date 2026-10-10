@@ -41,6 +41,7 @@ sqlparse>=0.4.4,<1.0
 # LLM providers
 openai>=1.0.0,<3.0
 google-generativeai>=0.8.0,<1.0
+boto3>=1.34,<2.0  # AWS Bedrock (Converse API)
 
 # Vector DB
 lancedb>=0.4.0,<1.0
