@@ -138,6 +138,8 @@ async def _test_bedrock(req: TestProviderRequest, preset: Dict[str, Any]) -> Dic
     """
     models = preset.get("models", {}) or {}
     test_model = models.get("ANALYSIS_MODEL") or models.get("DEFAULT_MODEL") or ""
+    if settings.PROVIDER == req.provider:
+        test_model = getattr(settings, "ANALYSIS_MODEL", None) or test_model
     if not test_model:
         return {"success": False, "message": "No model configured for this provider."}
 
