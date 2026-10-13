@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.0.34-beta] - 2026-10-13
+
+### Fixed
+- Include Bedrock runtime-authentication preflight in the released scanner. A missing bearer key no longer rejects an AWS role/profile; connectivity is checked through Converse rather than the generic HTTP provider origin. Failed model access still blocks the scan.
+- Cover both successful and failed keyless AWS connectivity in the full diagnostic gate.
+
 ## [4.0.33-beta] - 2026-10-13
 
 ### Added
