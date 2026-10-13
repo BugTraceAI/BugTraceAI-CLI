@@ -67,13 +67,23 @@ class LLMProviderMixin:
         # Provider wire format: "openai" (OpenRouter/Z.ai chat/completions) or "anthropic"
         # (Anthropic Messages API, x-api-key). Drives payload build + response parsing.
         self.api_format = provider_cfg.get('api_format', 'openai')
+        self.bedrock_region = (
+            getattr(settings, "BEDROCK_REGION", None)
+            or provider_cfg.get("region")
+            or None
+        )
+        if self.api_format == "bedrock" and self.api_key:
+            # Boto3's bearer-token provider reads this process environment value.
+            # This is the active saved/session provider credential; the provider
+            # test route never writes an unsaved request key here.
+            os.environ[api_key_env] = self.api_key
 
         # Priority list for Model Shifting
         self.models = [m.strip() for m in settings.PRIMARY_MODELS.split(",") if m.strip()]
         if not self.models:
             logger.critical("No PRIMARY_MODELS found in configuration. Please check bugtraceaicli.conf.")
             self.models = []
-        if not self.api_key:
+        if not self.api_key and self.api_format != "bedrock":
             logger.warning(f"{api_key_env} is not set. LLM features will be disabled.")
 
         # Provider custom headers (e.g., Accept-Language for Z.ai)

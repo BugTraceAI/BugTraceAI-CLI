@@ -137,6 +137,12 @@ class LLMThreadMixin:
         prompt: str
     ) -> Optional[str]:
         """Attempt threaded generation with a single model."""
+        if self.api_format == "bedrock":
+            return await self._bedrock_thread(
+                current_model, messages, module_name, thread, prompt,
+                temperature, max_tokens,
+            )
+
         is_anthropic = (self.api_format == 'anthropic')
         if is_anthropic:
             api_headers = self._build_anthropic_apikey_headers(self.api_key or "")
@@ -177,7 +183,7 @@ class LLMThreadMixin:
         from bugtrace.core.conversation_thread import ConversationThread
 
         # No global semaphore - each agent runs independently
-        if not self.api_key:
+        if not self.api_key and self.api_format != "bedrock":
             logger.warning(f"LLM Client: No API Key for {module_name}")
             return None
 

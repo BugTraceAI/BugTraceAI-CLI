@@ -221,7 +221,7 @@ class LLMGenerateMixin:
         """
         # No global semaphore - each agent runs independently
         # Rate limiting handled by retry with exponential backoff (tenacity)
-        if not self.api_key and not settings.ANTHROPIC_OAUTH_ENABLED:
+        if not self.api_key and not settings.ANTHROPIC_OAUTH_ENABLED and self.api_format != "bedrock":
             logger.warning(f"LLM Client: No API Key found for {module_name}. Skipping generation.")
             await self._audit_log(module_name, "NONE", prompt, "SKIPPED: Missing API Key")
             return None
@@ -323,6 +323,12 @@ class LLMGenerateMixin:
         Scoped to the reporting phase — never used for scan-time generation. Never raises.
         """
         pid = (getattr(settings, "REPORTING_FAILOVER_PROVIDER", "anthropic") or "").strip().lower()
+        if (
+            self.provider_id == "bedrock"
+            and not getattr(settings, "BEDROCK_ALLOW_EXTERNAL_REPORTING_FAILOVER", False)
+        ):
+            logger.info("[ReportingFailover] External failover disabled for Bedrock provider")
+            return None
         if not pid or pid == self.provider_id:
             return None
         try:
@@ -466,6 +472,14 @@ class LLMGenerateMixin:
         Routes anthropic/ models to Anthropic API, everything else to the active provider
         (or the failover provider in `provider_ctx`, when set).
         """
+        if self.api_format == "bedrock" and (
+            not provider_ctx or provider_ctx.get("provider_id") == self.provider_id
+        ):
+            return await self._bedrock_generate(
+                current_model, messages, module_name, prompt, temperature,
+                max_tokens, model_override, system_prompt,
+            )
+
         # Routing precedence:
         #  1. api_format=='anthropic' provider  → Anthropic Messages API via x-api-key
         #  2. OAuth path (anthropic/ model + ANTHROPIC_OAUTH_ENABLED) → Bearer token

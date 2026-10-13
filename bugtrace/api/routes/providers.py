@@ -7,8 +7,10 @@ for runtime provider management and API key configuration.
 
 import os
 import json
+import asyncio
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -44,16 +46,19 @@ class ProviderDetail(BaseModel):
     features: Dict[str, Any]
     models: Dict[str, str]
     pricing: Dict[str, Any]
+    region: Optional[str] = None
 
 
 class TestProviderRequest(BaseModel):
     provider: str
     api_key: Optional[str] = None
+    region: Optional[str] = None
 
 
 class SwitchProviderRequest(BaseModel):
     provider: str
     api_key: Optional[str] = None
+    region: Optional[str] = None
 
 
 class ModelOverrideRequest(BaseModel):
@@ -94,6 +99,106 @@ def _check_api_key(preset: Dict[str, Any]) -> tuple:
     key_env = preset.get("api_key_env", "")
     key_value = os.environ.get(key_env) or getattr(settings, key_env, None)
     return bool(key_value), _mask_api_key(key_value)
+
+
+def _resolve_bedrock_region(request_region: Optional[str] = None) -> Optional[str]:
+    """Resolve an explicit region, saved BugTraceAI region, then AWS SDK config."""
+    if request_region is not None:
+        region = request_region.strip()
+    else:
+        region = (getattr(settings, "BEDROCK_REGION", None) or "").strip()
+    if region:
+        return region
+    for name in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        region = (os.environ.get(name) or "").strip()
+        if region:
+            return region
+    try:
+        from botocore.session import get_session
+        return get_session().get_config_variable("region")
+    except Exception:
+        # A malformed or unreadable local AWS config should be reported later as
+        # a missing region, not turn the provider test endpoint into a 500.
+        return None
+
+
+def _bedrock_test_payload() -> Dict[str, Any]:
+    return {
+        "messages": [{"role": "user", "content": [{"text": "Are you alive? Answer only yes."}]}],
+        "inferenceConfig": {"maxTokens": 5, "temperature": 0.0},
+    }
+
+
+async def _test_bedrock(req: TestProviderRequest, preset: Dict[str, Any]) -> Dict[str, Any]:
+    """Test Bedrock without mutating process credentials for an unsaved key.
+
+    A request key uses Bedrock's documented bearer-token HTTPS endpoint. When no
+    key is supplied/configured, boto3 uses the CLI host's normal AWS credential
+    chain (profile, environment credentials, or workload role).
+    """
+    models = preset.get("models", {}) or {}
+    test_model = models.get("ANALYSIS_MODEL") or models.get("DEFAULT_MODEL") or ""
+    if not test_model:
+        return {"success": False, "message": "No model configured for this provider."}
+
+    region = _resolve_bedrock_region(req.region)
+    if not region:
+        return {"success": False, "message": "Set a Bedrock region or configure one in the AWS profile."}
+
+    key_env = preset.get("api_key_env", "AWS_BEARER_TOKEN_BEDROCK")
+    api_key = req.api_key or os.environ.get(key_env) or getattr(settings, key_env, None)
+    if api_key:
+        import httpx
+
+        suffix = "amazonaws.com.cn" if region.startswith("cn-") else "amazonaws.com"
+        model_path = quote(test_model, safe=":._-")
+        url = f"https://bedrock-runtime.{region}.{suffix}/model/{model_path}/converse"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=_bedrock_test_payload(),
+                )
+            if response.status_code == 200:
+                return {"success": True, "message": "Bedrock responded successfully."}
+            if response.status_code == 401:
+                return {"success": False, "message": "Bedrock rejected the API key."}
+            if response.status_code == 403:
+                return {"success": False, "message": "Bedrock denied access to this model or region."}
+            if response.status_code == 429:
+                return {"success": False, "message": "Bedrock throttled the test request; try again shortly."}
+            if response.status_code in (400, 404):
+                return {"success": False, "message": "The model is unavailable in this region or the request was rejected."}
+            return {"success": False, "message": f"Bedrock returned HTTP {response.status_code}."}
+        except httpx.TimeoutException:
+            return {"success": False, "message": "Bedrock test timed out."}
+        except httpx.HTTPError:
+            return {"success": False, "message": "Could not connect to the Bedrock endpoint."}
+
+    def _call_with_aws_chain():
+        import boto3
+        client = boto3.client("bedrock-runtime", region_name=region)
+        return client.converse(modelId=test_model, **_bedrock_test_payload())
+
+    try:
+        await asyncio.to_thread(_call_with_aws_chain)
+        return {"success": True, "message": "Bedrock responded successfully using the AWS credential chain."}
+    except ImportError:
+        return {"success": False, "message": "boto3 is not installed on the CLI host."}
+    except Exception as exc:
+        details = getattr(exc, "response", None)
+        error = details.get("Error", {}) if isinstance(details, dict) else {}
+        code = str(error.get("Code") or type(exc).__name__)
+        if code in {"NoCredentialsError", "PartialCredentialsError"}:
+            return {"success": False, "message": "No AWS credentials found for the CLI runtime."}
+        if code in {"UnrecognizedClientException", "InvalidSignatureException", "AccessDeniedException"}:
+            return {"success": False, "message": "AWS credentials lack Bedrock access or were rejected."}
+        if code in {"ThrottlingException", "TooManyRequestsException"}:
+            return {"success": False, "message": "Bedrock throttled the test request; try again shortly."}
+        if code in {"ResourceNotFoundException", "ValidationException"}:
+            return {"success": False, "message": "The model is unavailable in this region or the request was rejected."}
+        return {"success": False, "message": f"Bedrock test failed ({code})."}
 
 
 # ──── Endpoints ────
@@ -152,6 +257,7 @@ async def get_current_provider():
         features=provider_cfg.get("features", {}),
         models=current_models,
         pricing=provider_cfg.get("pricing", {}),
+        region=getattr(settings, "BEDROCK_REGION", None) if settings.PROVIDER == "bedrock" else None,
     )
 
 
@@ -169,6 +275,7 @@ async def get_provider_detail(provider_id: str):
         features=preset.get("features", {}),
         models=preset.get("models", {}),
         pricing=preset.get("pricing", {}),
+        region=getattr(settings, "BEDROCK_REGION", None) if provider_id == "bedrock" else None,
     )
 
 
@@ -194,11 +301,20 @@ async def switch_provider(req: SwitchProviderRequest):
             object.__setattr__(settings, key_env, req.api_key)
         os.environ[key_env] = req.api_key
 
-    # Switch provider
-    object.__setattr__(settings, 'PROVIDER', req.provider)
+    if req.provider == "bedrock" and req.region is not None:
+        region = req.region.strip()
+        if not update_env_var("BEDROCK_REGION", region):
+            raise HTTPException(status_code=500, detail="Failed to save Bedrock region")
+        if region:
+            os.environ["BEDROCK_REGION"] = region
+            object.__setattr__(settings, "BEDROCK_REGION", region)
+        else:
+            os.environ.pop("BEDROCK_REGION", None)
+            object.__setattr__(settings, "BEDROCK_REGION", None)
 
-    # Reload preset (applies model defaults)
-    settings._load_provider_preset()
+    # Apply the selected preset while retaining configured model overrides
+    # when selecting the provider configured in bugtraceaicli.conf.
+    settings.activate_provider(req.provider)
 
     # Reinitialize LLM client with new provider. Delegate to the client's own
     # consolidated reconfigure so EVERY provider-scoped attribute moves together
@@ -219,6 +335,7 @@ async def switch_provider(req: SwitchProviderRequest):
         "api_key_configured": configured,
         "api_key_hint": hint,
         "models": {k: getattr(settings, k, "") for k in preset.get("models", {}).keys()},
+        "region": getattr(settings, "BEDROCK_REGION", None) if req.provider == "bedrock" else None,
     }
 
 
@@ -228,6 +345,9 @@ async def test_provider_key(req: TestProviderRequest):
     import httpx
 
     preset = _load_preset(req.provider)
+    if preset.get("api_format") == "bedrock":
+        return await _test_bedrock(req, preset)
+
     base_url = preset.get("base_url", "")
     if not base_url:
         raise HTTPException(status_code=400, detail="Provider has no base_url configured")

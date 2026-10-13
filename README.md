@@ -1,6 +1,6 @@
 # BugTraceAI-CLI
 
-[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.32--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
+[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.33--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 
 **Autonomous security scans with an interactive terminal workspace, REST API and MCP.**
 
@@ -303,3 +303,7 @@ Apache-2.0. See [LICENSE](LICENSE), [LICENSE-HISTORY.md](LICENSE-HISTORY.md)
 and [NOTICE](NOTICE).
 
 [bugtraceai.com](https://bugtraceai.com) · [@yz9yt](https://github.com/yz9yt)
+
+## Amazon Bedrock (beta)
+
+Bedrock Converse is available for the CLI and its WEB Provider panel. AWS role/profile authentication and optional Bedrock API keys are supported. [Setup, routing policy and pending AWS validation](BEDROCK.md).

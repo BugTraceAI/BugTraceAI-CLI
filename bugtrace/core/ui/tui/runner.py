@@ -86,12 +86,15 @@ async def execute(target: str, options: dict, events: ScanEvents) -> int:
         from .provider_config import provider_presets
         if options["provider"] not in provider_presets():
             raise ValueError("Unknown provider preset")
-        object.__setattr__(settings, "PROVIDER", options["provider"])
-        settings._load_provider_preset()
+        settings.activate_provider(options["provider"])
         key_env = provider_presets()[options["provider"]].get("api_key_env")
         if key_env in session_keys:
             os.environ[key_env] = session_keys[key_env]
             object.__setattr__(settings, key_env, session_keys[key_env])
+        if options["provider"] == "bedrock" and "BEDROCK_REGION" in session_keys:
+            region = session_keys["BEDROCK_REGION"].strip()
+            os.environ["BEDROCK_REGION"] = region
+            object.__setattr__(settings, "BEDROCK_REGION", region or None)
     from bugtrace.core.conductor import conductor
     from bugtrace.core.ui import dashboard
 

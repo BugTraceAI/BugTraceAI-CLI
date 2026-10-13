@@ -14,6 +14,25 @@ from bugtrace.utils.logger import get_logger
 
 logger = get_logger("core.config")
 
+_LLM_MODEL_FIELDS = (
+    "DEFAULT_MODEL",
+    "CODE_MODEL",
+    "ANALYSIS_MODEL",
+    "ANALYSIS_PENTESTER_MODEL",
+    "ANALYSIS_BUG_BOUNTY_MODEL",
+    "ANALYSIS_AUDITOR_MODEL",
+    "ANALYSIS_RED_TEAM_MODEL",
+    "ANALYSIS_RESEARCHER_MODEL",
+    "PRIMARY_MODELS",
+    "VISION_MODEL",
+    "VALIDATION_VISION_MODEL",
+    "WAF_DETECTION_MODELS",
+    "MUTATION_MODEL",
+    "SKEPTICAL_MODEL",
+    "REPORTING_MODEL",
+    "LONEWOLF_MODEL",
+)
+
 
 class SettingsLoadersMixin:
     """Config file / provider / section loaders for Settings."""
@@ -160,11 +179,20 @@ class SettingsLoadersMixin:
         section = config["PROVIDER"]
         if "ACTIVE" in section:
             self.PROVIDER = section["ACTIVE"].strip().lower()
+        if "BEDROCK_REGION" in section:
+            region = section["BEDROCK_REGION"].strip()
+            object.__setattr__(self, "BEDROCK_REGION", region or None)
+        if "BEDROCK_ALLOW_EXTERNAL_REPORTING_FAILOVER" in section:
+            object.__setattr__(
+                self,
+                "BEDROCK_ALLOW_EXTERNAL_REPORTING_FAILOVER",
+                section.getboolean("BEDROCK_ALLOW_EXTERNAL_REPORTING_FAILOVER"),
+            )
     def _load_provider_preset(self):
         """Load provider preset JSON and set model defaults.
 
-        Called BEFORE _load_llm_models_config so user overrides in
-        [LLM_MODELS] take precedence over preset defaults.
+        Called BEFORE _load_llm_models_config so provider values become
+        defaults and explicit [LLM_MODELS] values can override them.
         """
         preset_path = self.BASE_DIR / "bugtrace" / "data" / "providers" / f"{self.PROVIDER}.json"
         if not preset_path.exists():
@@ -187,6 +215,18 @@ class SettingsLoadersMixin:
             if hasattr(self, field):
                 object.__setattr__(self, field, value)
 
+        # Older presets omit some specialist slots. Resolve those within the
+        # selected provider instead of carrying models from the previous one.
+        analysis_model = models.get("ANALYSIS_MODEL") or models.get("DEFAULT_MODEL")
+        for field in _LLM_MODEL_FIELDS:
+            if (
+                field.startswith("ANALYSIS_") and field != "ANALYSIS_MODEL"
+                and field not in models and hasattr(self, field) and analysis_model
+            ):
+                object.__setattr__(self, field, analysis_model)
+        if "LONEWOLF_MODEL" not in models and models.get("DEFAULT_MODEL"):
+            object.__setattr__(self, "LONEWOLF_MODEL", models["DEFAULT_MODEL"])
+
         # Vision validation must run on a model the ACTIVE provider actually serves:
         # a slug belonging to another provider is rejected outright (HTTP 404), not
         # degraded, which silently disables visual XSS proof. Presets that do not pin
@@ -196,32 +236,35 @@ class SettingsLoadersMixin:
             object.__setattr__(self, "VALIDATION_VISION_MODEL", models["VISION_MODEL"])
 
         logger.info(f"Provider preset loaded: {preset.get('name', self.PROVIDER)} ({len(models)} model defaults)")
+
+    def activate_provider(self, provider_id: str):
+        """Select a session provider while preserving configured model choices."""
+        provider_id = provider_id.strip().lower()
+        current_preset = getattr(self, "_provider_config", {}) or {}
+        if self.PROVIDER == provider_id and current_preset.get("id") == provider_id:
+            return
+
+        self.PROVIDER = provider_id
+        self._load_provider_preset()
+        if provider_id == getattr(self, "_configured_model_provider", None):
+            for field, value in getattr(self, "_configured_models", {}).items():
+                setattr(self, field, value)
+
     def _load_llm_models_config(self, config):
         """Load LLM_MODELS section config.
 
-        When a non-default provider is active, model overrides from [LLM_MODELS]
-        are skipped — the provider preset already set the correct models.
-        Only numeric/non-model settings (MIN_CREDITS, batch sizes) still apply.
+        Provider presets supply model defaults. Explicit model assignments in
+        [LLM_MODELS] override those defaults. This loader runs after the other
+        config sections so the dedicated model override section has one clear,
+        highest-priority config-file source.
         """
         if "LLM_MODELS" not in config:
             return
         section = config["LLM_MODELS"]
 
-        # Skip model overrides when a provider preset is active —
-        # the preset already configured the right models for this provider.
-        # Users can still override via env vars if needed.
-        if not self._provider_config:
-            # No preset loaded, apply conf overrides as before
-            model_fields = [
-                "DEFAULT_MODEL", "PRIMARY_MODELS", "VISION_MODEL",
-                "WAF_DETECTION_MODELS", "CODE_MODEL", "MUTATION_MODEL",
-                "ANALYSIS_MODEL", "SKEPTICAL_MODEL", "REPORTING_MODEL",
-            ]
-            for field in model_fields:
-                if field in section:
-                    setattr(self, field, section[field])
-        else:
-            logger.debug(f"Skipping [LLM_MODELS] overrides — provider preset '{self.PROVIDER}' is active")
+        for field in _LLM_MODEL_FIELDS:
+            if field in section:
+                setattr(self, field, section[field].strip())
         if "MIN_CREDITS" in section:
             self.MIN_CREDITS = section.getfloat("MIN_CREDITS")
         if "MAX_CONCURRENT_REQUESTS" in section:
@@ -353,10 +396,10 @@ class SettingsLoadersMixin:
             return
         section = config["VALIDATION"]
         if "VISION_MODEL" in section:
-            # Mirror _load_llm_models_config: when a provider preset is active it has
-            # already selected a vision model that provider serves, so a conf value
-            # left over from another provider must not overwrite it (it would be a
-            # hard 404 on every vision call). Users can still override via env vars.
+            # Legacy [VALIDATION] VISION_MODEL is only a fallback when no preset
+            # exists. With a preset active, use its provider-compatible validation
+            # model; explicit overrides belong in [LLM_MODELS] as
+            # VALIDATION_VISION_MODEL and are applied after this section.
             if not self._provider_config:
                 self.VALIDATION_VISION_MODEL = section["VISION_MODEL"]
             else:
@@ -557,7 +600,6 @@ class SettingsLoadersMixin:
         self._load_parallelization_config(config)
         self._load_url_prioritization_config(config)
         self._load_thinking_config(config)
-        self._load_llm_models_config(config)  # User overrides from [LLM_MODELS]
         self._load_modellab_config(config)    # Model-eval scoring calibration [MODELLAB]
         self._load_conductor_and_scanning_config(config)
         self._load_analysis_and_misc_config(config)
@@ -568,6 +610,15 @@ class SettingsLoadersMixin:
         self._load_qlearning_config(config)
         self._load_manipulator_config(config)
         self._load_asset_discovery_config(config)
+        # Apply explicit model overrides last so they consistently win over
+        # both provider defaults and legacy model settings in other sections.
+        self._load_llm_models_config(config)
+        # Preserve the effective config (including legacy aliases) when a
+        # session switches away from this provider and later selects it again.
+        object.__setattr__(self, "_configured_model_provider", self.PROVIDER)
+        object.__setattr__(self, "_configured_models", {
+            field: getattr(self, field) for field in _LLM_MODEL_FIELDS if hasattr(self, field)
+        })
     def load_env_specific(self):
         """Load environment-specific .env file if exists."""
         if test_mode_enabled():

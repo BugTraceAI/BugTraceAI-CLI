@@ -1,0 +1,37 @@
+{
+  "id": "bedrock",
+  "name": "Amazon Bedrock",
+  "api_format": "bedrock",
+  "base_url": "",
+  "api_key_env": "AWS_BEARER_TOKEN_BEDROCK",
+  "api_key_hint": "Optional; the CLI host AWS role/profile can authenticate",
+  "failover": [],
+  "features": {
+    "description": "Amazon Bedrock Converse via boto3. The runtime's AWS role/profile is the recommended enterprise authentication path. A Bedrock API key is optional. Model access and region depend on the AWS account.",
+    "online_mode": false,
+    "balance_check": false,
+    "model_discovery": false
+  },
+  "models": {
+    "DEFAULT_MODEL": "amazon.nova-pro-v1:0",
+    "CODE_MODEL": "amazon.nova-pro-v1:0",
+    "ANALYSIS_MODEL": "amazon.nova-pro-v1:0",
+    "ANALYSIS_PENTESTER_MODEL": "amazon.nova-pro-v1:0",
+    "ANALYSIS_BUG_BOUNTY_MODEL": "amazon.nova-pro-v1:0",
+    "ANALYSIS_AUDITOR_MODEL": "amazon.nova-pro-v1:0",
+    "ANALYSIS_RESEARCHER_MODEL": "amazon.nova-pro-v1:0",
+    "ANALYSIS_RED_TEAM_MODEL": "amazon.nova-pro-v1:0",
+    "PRIMARY_MODELS": "amazon.nova-pro-v1:0",
+    "VISION_MODEL": "amazon.nova-pro-v1:0",
+    "VALIDATION_VISION_MODEL": "amazon.nova-pro-v1:0",
+    "WAF_DETECTION_MODELS": "amazon.nova-pro-v1:0",
+    "MUTATION_MODEL": "amazon.nova-pro-v1:0",
+    "SKEPTICAL_MODEL": "amazon.nova-pro-v1:0",
+    "REPORTING_MODEL": "amazon.nova-pro-v1:0",
+    "LONEWOLF_MODEL": "amazon.nova-pro-v1:0"
+  },
+  "concurrency": {
+    "default": 2
+  },
+  "pricing": {}
+}

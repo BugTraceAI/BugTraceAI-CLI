@@ -54,6 +54,19 @@ class LLMVisionMixin:
         """
         Uses the specialized vision model (Qwen 3 VL or similar) to analyze screenshots.
         """
+        if self.api_format == "bedrock":
+            from bugtrace.core.llm_shell.bedrock_wire import bedrock_image_format_from_bytes
+            try:
+                image_format = bedrock_image_format_from_bytes(image_data)
+            except ValueError:
+                logger.warning("[%s] Unsupported Bedrock image bytes", module_name)
+                return None
+            return await self._bedrock_vision(
+                image_data, prompt, module_name,
+                settings.VISION_MODEL or settings.VALIDATION_VISION_MODEL,
+                image_format, max_tokens=1500,
+            )
+
         import base64
         base64_image = base64.b64encode(image_data).decode('utf-8')
 
@@ -126,6 +139,20 @@ class LLMVisionMixin:
         if not image_file.exists():
             logger.error(f"[{module_name}] Image not found: {image_path}")
             return ""
+
+        if self.api_format == "bedrock":
+            from bugtrace.core.llm_shell.bedrock_wire import bedrock_image_format
+            model = model_override or settings.VALIDATION_VISION_MODEL or settings.VISION_MODEL
+            try:
+                image_bytes = image_file.read_bytes()
+                image_format = bedrock_image_format(image_path)
+            except (OSError, ValueError) as exc:
+                logger.error("[%s] Unable to prepare Bedrock vision image: %s", module_name, exc)
+                return ""
+            return await self._bedrock_vision(
+                image_bytes, prompt, module_name, model, image_format,
+                max_tokens=100, temperature=temperature,
+            ) or ""
 
         with open(image_path, 'rb') as f:
             image_data = base64.b64encode(f.read()).decode('utf-8')

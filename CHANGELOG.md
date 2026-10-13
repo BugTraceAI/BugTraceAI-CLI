@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.0.33-beta] - 2026-10-13
+
+### Added
+- Bedrock Converse for generation, threaded conversation, vision and connectivity, with optional bearer credentials or AWS runtime authentication.
+- Bedrock region controls in Provider/F7 and CLI provider endpoints.
+
+### Fixed
+- Isolate unsaved Bedrock credential tests and block external reporting failover unless explicitly enabled.
+- Honor configured per-slot model overrides and restore them when returning to the configured provider.
+- Pass scan safe mode to Nuclei and skip active deterministic/automatic vulnerability passes in that mode.
+
+### Validation
+- AWS account validation remains pending; offline checks include the real minimum supported SDK authentication and image serialization.
+- Thanks to the community contributors for the Bedrock proposal and reported regressions.
+
+
 ## [4.0.32-beta] - 2026-10-07
 
 ### Changed

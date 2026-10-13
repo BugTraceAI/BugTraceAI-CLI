@@ -32,7 +32,7 @@ class SettingsOpsMixin:
         provider_cfg = getattr(self, '_provider_config', {})
         provider_key_env = provider_cfg.get("api_key_env", "OPENROUTER_API_KEY")
         provider_key = getattr(self, provider_key_env, None) or os.environ.get(provider_key_env)
-        if not provider_key:
+        if not provider_key and provider_cfg.get("api_format") != "bedrock":
             errors.append(f"{provider_key_env} is required for provider '{self.PROVIDER}'")
 
         # Check numeric bounds
@@ -79,7 +79,10 @@ class SettingsOpsMixin:
     def mask_secrets(self) -> Dict[str, Any]:
         """Return config dict with masked secrets for safe logging."""
         masked = self.model_dump()
-        secret_fields = ['OPENROUTER_API_KEY', 'GLM_API_KEY', 'ANTHROPIC_API_KEY']
+        secret_fields = [
+            'OPENROUTER_API_KEY', 'GLM_API_KEY', 'ANTHROPIC_API_KEY',
+            'AWS_BEARER_TOKEN_BEDROCK',
+        ]
         for key in secret_fields:
             if masked.get(key):
                 val = masked[key]
