@@ -111,13 +111,17 @@ class DiagnosticSystem:
         key_env, api_key = _resolve_api_key(preset)
         label = _provider_label(preset)
 
-        success = bool(api_key) and len(api_key) > 10
+        uses_aws_chain = preset.get("api_format") == "bedrock"
+        success = (bool(api_key) and len(api_key) > 10) or uses_aws_chain
         self.results["api_key"] = (
             success,
             "" if success else f"{key_env} missing or too short (active provider: {label})",
         )
         if success:
-            dashboard.log(f"{label} API Key detected (Brain Online)", "SUCCESS")
+            if uses_aws_chain and not api_key:
+                dashboard.log(f"{label} will use the AWS credential chain; checking access next", "INFO")
+            else:
+                dashboard.log(f"{label} API Key detected (Brain Online)", "SUCCESS")
         else:
             # This check is critical — the scan aborts. Say so instead of implying
             # a degraded-but-working mode that does not exist.
@@ -151,6 +155,23 @@ class DiagnosticSystem:
         preset = _active_preset()
         origin = _api_origin(preset)
         label = _provider_label(preset)
+        if preset.get("api_format") == "bedrock":
+            try:
+                from bugtrace.core.llm_client import llm_client
+                reachable = await llm_client.verify_connectivity()
+                self.results["connectivity"] = (
+                    reachable,
+                    "Bedrock Converse could not reach a configured model" if not reachable else "",
+                )
+                dashboard.log(
+                    f"Bedrock Converse connectivity: {'OK' if reachable else 'FAILED'}",
+                    "SUCCESS" if reachable else "ERROR",
+                )
+            except Exception as e:
+                self.results["connectivity"] = (False, f"Bedrock check failed: {type(e).__name__}")
+                logger.warning("Bedrock connectivity check failed: %s", type(e).__name__)
+                dashboard.log("Bedrock Converse connectivity: FAILED", "ERROR")
+            return
         try:
             timeout = aiohttp.ClientTimeout(total=10, connect=5)
             async with aiohttp.ClientSession(timeout=timeout) as session:
