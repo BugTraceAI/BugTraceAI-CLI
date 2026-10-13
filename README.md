@@ -2,11 +2,12 @@
 
 [![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.34--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://img.shields.io/badge/DeepWiki-Ask%20AI-blue)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 
-**Autonomous security scans with an interactive terminal workspace, REST API and MCP.**
+**Agentic web pentesting with a terminal workspace, specialist tools, browser validation, REST and MCP.**
 
-BugTraceAI combines LLM-guided analysis with specialist tools and browser
-validation. Follow the scan, inspect evidence and configure providers from the
-terminal, or connect the engine to BugTraceAI-WEB and your own AI assistant.
+BugTraceAI-CLI is the web-scanning engine in the [BugTraceAI suite](https://github.com/BugTraceAI/BugTraceAI). It combines LLM-guided investigation with specialist tools and browser validation. Follow a scan and inspect its evidence in the terminal, connect [BugTraceAI-WEB](https://github.com/BugTraceAI/BugTraceAI-WEB) for a browser workspace, or automate the engine through REST and MCP.
+
+[Install](#install) · [See the terminal](#terminal-workspace) · [API and MCP](#api-and-mcp) · [Explore the suite](https://github.com/BugTraceAI/BugTraceAI)
+
 Use it only against applications you are authorized to test.
 
 ## Terminal workspace
@@ -45,12 +46,12 @@ injection, XXE, JWT and redirect checks. Tool and browser evidence accompanies
 the reported findings.
 
 Provider presets include OpenRouter, Anthropic and Z.ai. The WEB connects to the
-same CLI engine for web scans, report access and Model Lab through its API.
+same CLI engine for web scans and report access.
 
 ## Install
 
 For guided setup, use the [universal Launcher](https://github.com/BugTraceAI/BugTraceAI-Launcher)
-(current release 3.3.26). It can install WEB, CLI and the API-target engine
+([current public release](https://github.com/BugTraceAI/BugTraceAI-Launcher/releases)). It can install WEB, CLI and the API-target engine
 independently or in any combination:
 
 ```bash
@@ -58,16 +59,16 @@ curl -fsSL https://raw.githubusercontent.com/BugTraceAI/BugTraceAI-Launcher/main
 ```
 
 From a CLI checkout, `./install.sh` opens the same menu with CLI suggested.
-The component entry point requires Launcher 3.3.14 or newer; use 3.3.26 for the
-current provider, Wizard and AI-assisted setup screens. Review the checked
+The component entry point requires Launcher 3.3.14 or newer; use the current public Launcher release for its
+provider, Wizard and AI-assisted setup screens. Review the checked
 modules and runtime before installing.
 
 In the Launcher, enter and verify the required provider API key first. Then
 choose **Install with Wizard** for guided setup, or **Install with AI** to have
 the built-in assistant guide installation inside the TUI. The AI assistant
-uses provider tokens and supports API-only or the full WEB + CLI + API
-selection, including the CLI TUI, with OpenRouter or Anthropic. Use Wizard for
-every other module combination or for Z.ai. Enter the provider key locally;
+uses OpenRouter or Anthropic provider tokens; use Wizard for Z.ai.
+See the [current Launcher guide](https://github.com/BugTraceAI/BugTraceAI-Launcher#readme)
+for supported module combinations and installation options. Enter the provider key locally;
 never paste it into an AI coding-agent chat.
 
 For a direct installation in this checkout, specify the options explicitly:
