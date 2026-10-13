@@ -135,7 +135,7 @@ class BugTraceApp(App):
         from bugtrace.core.config import settings
         preset = provider_presets().get(self.provider, {})
         key_env = preset.get("api_key_env")
-        if key_env:
+        if key_env and preset.get("api_format") != "bedrock":
             import os
             if not (self._provider_keys.get(key_env) or os.environ.get(key_env) or getattr(settings, key_env, None)):
                 raise ValueError(f"Open Provider (F7) and configure an API key for {self.provider} before starting a scan.")
@@ -368,6 +368,8 @@ class BugTraceApp(App):
         self.provider = result["provider"]
         if result["key"]:
             self._provider_keys[result["key_env"]] = result["key"]
+        if result.get("provider") == "bedrock" and result.get("region") is not None:
+            self._provider_keys["BEDROCK_REGION"] = result["region"]
         self.main_screen.query_one("#provider-btn", Button).label = f"Provider · {self.provider}"
         self.notify("Provider ready for the next scan.")
 

@@ -381,12 +381,17 @@ class ExternalToolManager(ExternalGospiderMixin, ExternalFuzzersMixin, ExternalS
         target: str,
         cookies: List[Dict] = None,
         headers: Dict[str, str] = None,
+        safe_mode: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
-        Runs three-phase Nuclei scan (native preferred, Docker fallback):
+        Runs a Nuclei scan (native preferred, Docker fallback):
         1. Tech Detection (-tags tech,misconfig,exposure,token)
         2. Deterministic Scan (fixed -tags) — guaranteed floor, same tags every run
         3. Automatic Scan (-as) — opportunistic re-fishing on top of the floor
+
+        Safe mode runs only the technology/misconfiguration pass. It omits the
+        deterministic vulnerability templates (including default-login checks)
+        and the automatic scan, which may send intrusive probes.
 
         Returns:
             Dict with 'tech_findings' and 'vuln_findings' (vulns deduped across 2/3)
@@ -395,9 +400,12 @@ class ExternalToolManager(ExternalGospiderMixin, ExternalFuzzersMixin, ExternalS
         if not native and not self.docker_cmd:
             return {"tech_findings": [], "vuln_findings": []}
 
+        if safe_mode is None:
+            safe_mode = settings.SAFE_MODE
+
         self._record_tool_run("nuclei")
         mode = "native" if native else "Docker"
-        logger.info(f"Starting Three-Phase Nuclei Scan on {target} ({mode})...")
+        logger.info(f"Starting Nuclei scan on {target} ({mode}, safe_mode={safe_mode})...")
         dashboard.log(f"[External] Launching Nuclei Engine ({mode}) against {target}", "INFO")
 
         cookie_header = None
@@ -423,6 +431,12 @@ class ExternalToolManager(ExternalGospiderMixin, ExternalFuzzersMixin, ExternalS
 
         logger.info(f"[Nuclei] Phase 1: {len(tech_findings)} tech/infrastructure detections")
         dashboard.log(f"[External] Tech-Detect: {len(tech_findings)} technologies identified", "INFO")
+
+        if safe_mode:
+            logger.info("[Nuclei] SAFE MODE: skipping deterministic vulnerability and automatic scans")
+            dashboard.log("[External] Safe mode: skipped active Nuclei vulnerability scans", "INFO")
+            dashboard.update_task("nuclei", name="Nuclei Tech-Detect", status="Complete · safe mode")
+            return {"tech_findings": tech_findings, "vuln_findings": []}
 
         # === PHASE 2: Deterministic Scan (the floor) ===
         dashboard.update_task(

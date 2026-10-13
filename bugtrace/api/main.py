@@ -115,7 +115,7 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     contact={"name": "BugTraceAI", "url": "https://github.com/BugTraceAI"},
-    license_info={"name": "Apache-2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0"},
+    license_info={"name": "AGPL-3.0", "url": "https://www.gnu.org/licenses/agpl-3.0.html"},
 )
 
 
@@ -245,6 +245,7 @@ async def health_check(
     # Check provider preset availability
     provider_ready = False
     api_key_configured = False
+    provider_auth_supported = False
     provider_name = settings.PROVIDER
     try:
         providers_dir = settings.BASE_DIR / "bugtrace" / "data" / "providers"
@@ -256,8 +257,13 @@ async def health_check(
             key_env = preset_data.get("api_key_env", "")
             key_value = os.environ.get(key_env) or getattr(settings, key_env, None)
             api_key_configured = bool(key_value)
+            provider_auth_supported = api_key_configured or preset_data.get("api_format") == "bedrock"
             provider_name = preset_data.get("name", settings.PROVIDER)
-            if not api_key_configured:
+            if not api_key_configured and preset_data.get("api_format") == "bedrock":
+                warnings.append(
+                    "Bedrock will use the AWS credential chain; model access is checked when a scan starts."
+                )
+            elif not api_key_configured:
                 warnings.append(f"API key not configured for provider '{provider_name}'. Set {key_env} in your .env file.")
         else:
             warnings.append(f"Provider preset '{settings.PROVIDER}' not found. Check bugtrace/data/providers/ directory.")
@@ -275,7 +281,7 @@ async def health_check(
     event_stats = event_bus.get_stats()
 
     # Determine overall status
-    if not provider_ready or not api_key_configured:
+    if not provider_ready or not provider_auth_supported:
         status = "misconfigured"  # Engine online but can't run scans
     elif not docker_available:
         status = "degraded"  # Can run API but some tools disabled

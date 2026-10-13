@@ -42,6 +42,19 @@ VALID_PROVIDERS = [
 # Placeholder values that should be rejected
 API_KEY_PLACEHOLDERS = ['your-key-here', 'placeholder', 'xxx', 'changeme', 'test', 'sk-xxx']
 
+
+def _is_bedrock_model_id(value: str) -> bool:
+    """Recognize Bedrock model/profile IDs and resource ARNs."""
+    if re.fullmatch(r"(?:[a-z]{2,10}\.)+[a-z0-9][a-z0-9._-]*(?::\d+)?", value, re.IGNORECASE):
+        return True
+    return bool(re.fullmatch(
+        r"arn:(?:aws|aws-us-gov|aws-cn):bedrock:[a-z0-9-]+:\d{12}:"
+        r"(?:inference-profile|application-inference-profile|foundation-model|custom-model|provisioned-model)/"
+        r"[a-z0-9.:/_-]+",
+        value,
+        re.IGNORECASE,
+    ))
+
 from bugtrace.core.config_loaders import SettingsLoadersMixin
 from bugtrace.core.config_ops import SettingsOpsMixin
 
@@ -74,6 +87,9 @@ class Settings(SettingsLoadersMixin, SettingsOpsMixin, BaseSettings):
     ANTHROPIC_API_KEY: Optional[str] = Field(default=None, min_length=20, description="Anthropic API key (sk-ant-...)")
     OPENAI_API_KEY: Optional[str] = Field(default=None, description="OpenAI-compatible API key (sk-... for OpenAI)")
     MINIMAX_API_KEY: Optional[str] = Field(default=None, description="MiniMax API key")
+    AWS_BEARER_TOKEN_BEDROCK: Optional[str] = Field(default=None, description="Optional Amazon Bedrock API key; IAM role/profile is preferred for managed runtimes")
+    BEDROCK_REGION: Optional[str] = Field(default=None, description="Optional Bedrock source region; otherwise boto3 resolves AWS configuration")
+    BEDROCK_ALLOW_EXTERNAL_REPORTING_FAILOVER: bool = Field(default=False, description="Allow reporting data to leave Bedrock for the configured external failover provider")
     
     # --- LLM Models ---
     DEFAULT_MODEL: str = "qwen/qwen3-coder"
@@ -292,6 +308,8 @@ class Settings(SettingsLoadersMixin, SettingsOpsMixin, BaseSettings):
         """Validate model name format (TASK-119)."""
         if not v:
             return v  # Allow empty for optional models
+        if _is_bedrock_model_id(v):
+            return v
         # OpenRouter format: provider/model-name
         if '/' not in v:
             raise ValueError(f"Invalid model name format: {v} (expected: provider/model)")
@@ -312,9 +330,19 @@ class Settings(SettingsLoadersMixin, SettingsOpsMixin, BaseSettings):
             return v
         models = [m.strip() for m in v.split(',')]
         for model in models:
+            if model and _is_bedrock_model_id(model):
+                continue
             if model and '/' not in model:
                 raise ValueError(f"Invalid model in list: {model} (expected: provider/model)")
         return v
+
+    @field_validator('BEDROCK_REGION')
+    @classmethod
+    def validate_bedrock_region(cls, value):
+        if value is None:
+            return None
+        value = value.strip()
+        return value or None
 
     @field_validator('QUEUE_PERSISTENCE_MODE')
     @classmethod

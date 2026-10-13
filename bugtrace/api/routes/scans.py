@@ -69,7 +69,7 @@ async def create_scan(
     """
     from bugtrace.core.llm_client import llm_client
 
-    if llm_client.api_key:
+    if llm_client.api_key or llm_client.api_format == "bedrock":
         is_online = await llm_client.verify_connectivity()
         if not is_online:
             raise HTTPException(

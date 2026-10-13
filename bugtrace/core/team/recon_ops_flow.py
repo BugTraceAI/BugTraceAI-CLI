@@ -379,6 +379,7 @@ class TeamReconOpsMixin(TeamReconHtmlMixin, TeamReconHitlMixin, TeamReconDispatc
                 recon_dir,
                 cookies=self.captured_session.get("cookies", []),
                 headers=self.get_effective_headers(),
+                safe_mode=self.safe_mode,
             )
             tech_profile = await nuclei_agent.run()
             self._v.emit("recon.nuclei.completed", {

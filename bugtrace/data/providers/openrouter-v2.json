@@ -28,7 +28,7 @@
         "SKEPTICAL_MODEL":  "anthropic/claude-haiku-4.5",
         "REPORTING_MODEL":  "anthropic/claude-haiku-4.5",
         "VALIDATION_VISION_MODEL": "google/gemini-2.5-flash",
-        "LONEWOLF_MODEL":   "x-ai/grok-4.5"
+        "LONEWOLF_MODEL":   "anthropic/claude-haiku-4.5"
     },
     "model_selection_rationale": {
         "anthropic/claude-haiku-4-5": "BullshitBench v2 Software: 67-75% pushback. Empirical test: TTFT 0.9s, BS:1/4, Refused:0/4, Pushback:1/4. Best anti-hallucination/cost tradeoff. Used for all slots where honesty is critical (ANALYSIS, SKEPTICAL, REPORTING, DEFAULT).",

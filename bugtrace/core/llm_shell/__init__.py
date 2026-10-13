@@ -19,6 +19,7 @@ from bugtrace.core.llm_shell.circuit import LLMCircuitMixin
 from bugtrace.core.llm_shell.connectivity import LLMConnectivityMixin
 from bugtrace.core.llm_shell.provider import LLMProviderMixin
 from bugtrace.core.llm_shell.anthropic_wire import LLMAnthropicMixin
+from bugtrace.core.llm_shell.bedrock_wire import LLMBedrockMixin
 from bugtrace.core.llm_shell.generate import LLMGenerateMixin
 from bugtrace.core.llm_shell.thread import LLMThreadMixin
 from bugtrace.core.llm_shell.vision import LLMVisionMixin
@@ -36,6 +37,7 @@ __all__ = [
     "LLMConnectivityMixin",
     "LLMProviderMixin",
     "LLMAnthropicMixin",
+    "LLMBedrockMixin",
     "LLMGenerateMixin",
     "LLMThreadMixin",
     "LLMVisionMixin",

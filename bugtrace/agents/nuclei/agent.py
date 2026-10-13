@@ -50,6 +50,7 @@ class NucleiAgent(BaseAgent):
         event_bus: Any = None,
         cookies: Optional[List[Dict[str, Any]]] = None,
         headers: Optional[Dict[str, str]] = None,
+        safe_mode: Optional[bool] = None,
     ):
         super().__init__(
             "NucleiAgent", "Tech Discovery",
@@ -59,16 +60,17 @@ class NucleiAgent(BaseAgent):
         self.report_dir = report_dir
         self.cookies = list(cookies or [])
         self.headers = dict(headers or {})
+        self.safe_mode = safe_mode
 
     async def run(self) -> Dict:
-        """Runs three-phase Nuclei scan (tech + deterministic + auto-scan).
+        """Runs Nuclei discovery, respecting the scan's safe-mode setting.
 
         Returns:
             Comprehensive tech_profile used by specialist agents.
         """
         dashboard.current_agent = self.name
         dashboard.log(
-            f"[{self.name}] Starting 3-phase Nuclei scan (tech-detect + deterministic + auto-scan)...",
+            f"[{self.name}] Starting Nuclei discovery...",
             "INFO",
         )
 
@@ -80,6 +82,7 @@ class NucleiAgent(BaseAgent):
                 auth_kwargs["headers"] = self.headers
             nuclei_results = await external_tools.run_nuclei(
                 self.target,
+                safe_mode=self.safe_mode,
                 **auth_kwargs,
             )
         except Exception as e:

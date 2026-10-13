@@ -56,7 +56,7 @@ class LLMConnectivityMixin:
         Returns True if at least one model is responsive.
         Removes unresponsive models from self.models.
         """
-        if not self.api_key:
+        if not self.api_key and self.api_format != "bedrock":
             return False
 
         dashboard.log("Verifying AI Model Connectivity...", "INFO")
@@ -74,6 +74,18 @@ class LLMConnectivityMixin:
     async def _ping_model(self, model: str) -> bool:
         """Ping a single model to check connectivity."""
         dashboard.log(f"Pinging model: {model}...", "INFO")
+
+        if self.api_format == "bedrock":
+            try:
+                from bugtrace.core.llm_shell.bedrock_wire import parse_converse_response
+                response, _ = await self._bedrock_request(
+                    model, [{"role": "user", "content": "Ping"}], 0.0, 5
+                )
+                text, _ = parse_converse_response(response or {})
+                return self._log_ping_result(model, 200 if text else 503)
+            except Exception as exc:
+                dashboard.log(f"Model {model} unreachable ({type(exc).__name__}). Check Bedrock access.", "ERROR")
+                return False
 
         if self.api_format == 'anthropic':
             headers = self._build_anthropic_apikey_headers(self.api_key or "")
