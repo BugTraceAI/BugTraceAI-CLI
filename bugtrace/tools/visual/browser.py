@@ -25,6 +25,8 @@ class BrowserManager:
         # Ensure init only runs once
         if not hasattr(self, "_initialized"):
             self._playwright = None
+            self._playwright_manager = None
+            self._startup_error: Optional[str] = None
             self._browser: Optional[Browser] = None
             self._context: Optional[BrowserContext] = None
             self._lock = asyncio.Lock()
@@ -63,12 +65,21 @@ class BrowserManager:
         async with self._lock:
             if self._browser and self._browser.is_connected():
                 return
+            if self._startup_error:
+                # A missing executable must not launch another driver for every URL.
+                # stop() clears this failure for the next scan or explicit recovery.
+                raise RuntimeError(self._startup_error)
             
             try:
+                if self._playwright or self._playwright_manager:
+                    await self._close_resources()
                 # Async cleanup of orphan processes (non-blocking)
                 await self._kill_orphans()
                 # Add timeout to playwright start
-                self._playwright = await asyncio.wait_for(async_playwright().start(), timeout=15.0)
+                # Keep the context manager even if start() is cancelled before it
+                # returns a Playwright object; it owns the underlying driver.
+                self._playwright_manager = async_playwright()
+                self._playwright = await asyncio.wait_for(self._playwright_manager.start(), timeout=15.0)
                 # Add timeout to browser launch to prevent indefinite hang
                 self._browser = await asyncio.wait_for(
                     self._playwright.chromium.launch(
@@ -78,37 +89,48 @@ class BrowserManager:
                     timeout=30.0
                 )
                 logger.info("Browser started successfully.")
-            except asyncio.TimeoutError:
-                logger.error("Playwright start timed out. Headless browser will be unavailable.")
+            except asyncio.CancelledError:
+                self._startup_error = "Browser startup was cancelled before completion."
+                await asyncio.shield(self._close_resources())
+                raise
             except Exception as e:
-                logger.error(f"Failed to start browser: {e}", exc_info=True)
+                reason = "Playwright or Chromium startup timed out." if isinstance(e, asyncio.TimeoutError) else str(e)
+                self._startup_error = f"Browser startup failed: {reason}"
+                await asyncio.shield(self._close_resources())
+                logger.error(self._startup_error)
+                raise RuntimeError(self._startup_error) from e
+
+    async def _close_resources(self):
+        """Release owned resources, including a partially started driver."""
+        context, browser = self._context, self._browser
+        playwright, manager = self._playwright, self._playwright_manager
+        self._context = self._browser = self._playwright = self._playwright_manager = None
+
+        async def close(name, operation, timeout=1.0):
+            try:
+                await asyncio.wait_for(operation(), timeout=timeout)
+            except Exception as e:
+                logger.warning(f"Browser {name} cleanup failed: {e}")
+
+        try:
+            if context:
+                await close("context", context.close)
+            if browser:
+                await close("instance", browser.close)
+        finally:
+            # Always start driver shutdown, even if page/browser cleanup is cancelled.
+            if manager:
+                await asyncio.shield(close("driver", lambda: manager.__aexit__(None, None, None), 2.0))
+            elif playwright:
+                await asyncio.shield(close("driver", playwright.stop, 2.0))
 
     async def stop(self):
         """Stops the browser and cleans up resources (resilient to loop errors)."""
         async with self._lock:
             try:
-                if self._context:
-                    await self._context.close()
-            except Exception as e:
-                logger.debug(f"Context close error: {e}")
+                await self._close_resources()
             finally:
-                self._context = None
-            
-            try:
-                if self._browser:
-                    await self._browser.close()
-            except Exception as e:
-                logger.warning(f"Browser stop loop mismatch or error: {e}")
-            finally:
-                self._browser = None
-                
-            try:
-                if self._playwright:
-                    await self._playwright.stop()
-            except Exception as e:
-                logger.debug(f"Playwright stop error: {e}")
-            finally:
-                self._playwright = None
+                self._startup_error = None
                 
             logger.info("Browser stopped.")
 
@@ -210,16 +232,10 @@ class BrowserManager:
     async def emergency_cleanup(self):
         """Hard cleanup of all chromium processes and sessions."""
         try:
-            if self._browser:
-                await self._browser.close()
-            if self._playwright:
-                await self._playwright.stop()
+            await self.stop()
         except Exception as e:
             logger.debug(f"Emergency cleanup error: {e}")
         finally:
-            self._browser = None
-            self._playwright = None
-            self._context = None
             # Only kill Playwright's Chrome (with debugging port), not user's Chrome
             import subprocess
             try:

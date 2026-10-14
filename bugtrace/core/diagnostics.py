@@ -50,7 +50,7 @@ class DiagnosticSystem:
     def __init__(self):
         self.results = {}  # {check_name: (success_bool, error_message)}
 
-    async def run_all(self):
+    async def run_all(self, require_browser: bool = False):
         """Runs a suite of health checks on the environment."""
         self.results.clear()
         dashboard.set_phase("⚡ SYSTEMS CHECK")
@@ -74,9 +74,17 @@ class DiagnosticSystem:
                 all_passed = False
 
         if all_passed:
-            # Start the optional browser only after provider preflight succeeds.
+            # Full scans require DOM capture and visual confirmation. Other
+            # callers may use the provider checks without requiring a browser.
             await self._check_browser()
-            dashboard.log("Diagnostics complete. System ready.", "SUCCESS")
+            if self.results.get("browser", (False, ""))[0]:
+                dashboard.log("Diagnostics complete. System ready.", "SUCCESS")
+            elif require_browser:
+                all_passed = False
+                error = self.results.get("browser", (False, "Browser check failed"))[1]
+                dashboard.log(f"CRITICAL FAILURE: browser - {error}", "CRITICAL")
+            else:
+                dashboard.log("Diagnostics complete. Browser unavailable; visual checks cannot run.", "WARNING")
         else:
             dashboard.log("Diagnostics failed - critical components offline.", "ERROR")
 
@@ -131,15 +139,16 @@ class DiagnosticSystem:
         """Check Playwright browser availability."""
         try:
             from bugtrace.tools.visual.browser import browser_manager
-            # Use a short timeout for diagnostic start
-            await asyncio.wait_for(browser_manager.start(), timeout=20.0)
+            # Allow the bounded driver (15s) and Chromium (30s) startup to finish.
+            await asyncio.wait_for(browser_manager.start(), timeout=50.0)
             self.results["browser"] = (True, "")
             dashboard.log("Visual Intelligence Engine: READY", "SUCCESS")
             # Don't stop it here, keep it ready for the scan
         except Exception as e:
-            self.results["browser"] = (False, str(e))
-            dashboard.log(f"Visual Intelligence (Browser) Failure: {e}", "WARN")
-            logger.warning(f"Browser check failed: {e}")
+            error = str(e) or f"{type(e).__name__}: browser startup did not complete."
+            self.results["browser"] = (False, error)
+            dashboard.log(f"Visual Intelligence (Browser) Failure: {error}", "WARNING")
+            logger.warning(f"Browser check failed: {error}")
 
     async def _check_connectivity(self):
         """Check that the ACTIVE provider's API host is reachable.

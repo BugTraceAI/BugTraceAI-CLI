@@ -51,28 +51,35 @@ class AnalysisExtractMixin:
         }
 
         # Fetch HTML Content
+        html_full = ""
         try:
             from bugtrace.tools.visual.browser import browser_manager
-            await browser_manager.start()
             capture = await browser_manager.capture_state(self.url)
             if capture and capture.get("html"):
                 html_full = capture["html"]
-                self._analysis_html = html_full  # Store full HTML for SQLi probes
-                if len(html_full) > 15000:
-                     context["html_content"] = html_full[:7500] + "\n...[TRUNCATED]...\n" + html_full[-7500:]
-                else:
-                    context["html_content"] = html_full
-
-                logger.info(f"[{self.name}] Fetched HTML content ({len(context['html_content'])} chars) for analysis.")
-                self._v.emit("discovery.url.html_captured", {"url": self.url, "html_length": len(context['html_content'])})
-
-                # FIX (2026-02-04): Detect frontend frameworks from HTML
-                # This ensures CSTI detection even when Nuclei misses Angular/Vue
-                self._detect_frontend_frameworks_from_html(html_full)
-                if self.tech_profile.get('frameworks'):
-                    self._v.emit("discovery.url.frameworks_detected", {"url": self.url, "frameworks": self.tech_profile['frameworks'][:5]})
         except Exception as e:
-            logger.warning(f"[{self.name}] Failed to fetch HTML content: {e}")
+            logger.warning(f"[{self.name}] Browser capture unavailable: {e}")
+
+        if not html_full:
+            # Browser support is optional. Preserve source/probe evidence when
+            # Chromium is unavailable, using the shared authenticated HTTP path.
+            try:
+                _, html_full = await http_manager.get(self.url)
+            except Exception as e:
+                logger.warning(f"[{self.name}] Failed to fetch HTML content over HTTP: {e}")
+
+        if html_full:
+            self._analysis_html = html_full  # Store full HTML for SQLi probes
+            if len(html_full) > 15000:
+                context["html_content"] = html_full[:7500] + "\n...[TRUNCATED]...\n" + html_full[-7500:]
+            else:
+                context["html_content"] = html_full
+
+            logger.info(f"[{self.name}] Fetched HTML content ({len(context['html_content'])} chars) for analysis.")
+            self._v.emit("discovery.url.html_captured", {"url": self.url, "html_length": len(context['html_content'])})
+            self._detect_frontend_frameworks_from_html(html_full)
+            if self.tech_profile.get('frameworks'):
+                self._v.emit("discovery.url.frameworks_detected", {"url": self.url, "frameworks": self.tech_profile['frameworks'][:5]})
 
         # ADDED (2026-02-04): Detect JWTs and cookies in HTML/JavaScript
         # If found, emit findings for ThinkingAgent to route to JWT/IDOR queues

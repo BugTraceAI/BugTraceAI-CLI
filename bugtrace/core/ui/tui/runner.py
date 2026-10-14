@@ -146,6 +146,24 @@ async def execute(target: str, options: dict, events: ScanEvents) -> int:
                 api_handoff=options.get("handoff"),
                 api_inventory=(__import__("bugtrace.services.handoff_policy", fromlist=["inventory_from_handoff"]).inventory_from_handoff(options["handoff"]) if options.get("handoff") else None),
             )
+            from bugtrace.core.event_bus import event_bus
+            from bugtrace.services.scan_context import ScanContext, ScanOptions
+            ctx = ScanContext(
+                orchestrator.scan_id,
+                ScanOptions(
+                    target_url=target, scan_type="hunter" if phase == "hunter" else "full",
+                    safe_mode=settings.SAFE_MODE, resume=resume, use_vertical=True,
+                    max_depth=options.get("max_depth", settings.MAX_DEPTH),
+                    max_urls=options.get("max_urls", settings.MAX_URLS),
+                    url_list=options.get("url_list"), auth=options.get("auth_data"),
+                    custom_headers=options.get("custom_headers"), handoff=options.get("handoff"),
+                ),
+                event_bus, launch_origin="cli",
+            )
+            ctx.status = "running"
+            ctx._task = pipeline
+            orchestrator._scan_context = ctx
+            orchestrator._stop_event = ctx.stop_event
             events.emit("started", scan_id=orchestrator.scan_id)
             await orchestrator.start()
         if phase in {"manager", "all"}:
@@ -184,6 +202,14 @@ async def execute(target: str, options: dict, events: ScanEvents) -> int:
                     ok = await method()
                 if ok:
                     events.emit("state", state="paused" if command == "pause" else "running")
+                    try:
+                        from bugtrace.schemas.db_models import ScanStatus
+                        orchestrator.db.update_scan_status(
+                            orchestrator.scan_id,
+                            ScanStatus.PAUSED if command == "pause" else ScanStatus.RUNNING,
+                        )
+                    except Exception as exc:
+                        events.on_log("WARNING", f"Could not persist {command} status: {exc}")
                     if command == "pause":
                         events.on_log("INFO", "Pause requested; in-flight work finishes at the next checkpoint.")
                 else:
@@ -237,6 +263,9 @@ async def execute(target: str, options: dict, events: ScanEvents) -> int:
         await asyncio.gather(controls, metrics, return_exceptions=True)
         if orchestrator:
             from bugtrace.schemas.db_models import ScanStatus
+            ctx = getattr(orchestrator, "_scan_context", None)
+            if ctx:
+                ctx.status = status
             if stopped or status == "failed":
                 try:
                     orchestrator.db.update_scan_status(orchestrator.scan_id, ScanStatus.STOPPED if stopped else ScanStatus.FAILED)
@@ -249,7 +278,7 @@ async def execute(target: str, options: dict, events: ScanEvents) -> int:
             orchestrator._unsubscribe_events()
         try:
             from bugtrace.tools.visual.browser import browser_manager
-            await asyncio.wait_for(browser_manager.stop(), 2)
+            await asyncio.wait_for(browser_manager.stop(), 5)
         except Exception:
             pass
         from bugtrace.__main__ import _save_qlearning_data
