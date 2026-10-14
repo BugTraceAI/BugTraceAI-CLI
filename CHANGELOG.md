@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [4.0.35-beta] - 2026-10-14
+
+### Fixed
+- Dispose Playwright drivers on failed or cancelled Chromium startup and prevent repeated failed startups from accumulating subprocesses during Discovery.
+- Require a working browser before full scans; report browser preflight failures accurately and keep the startup deadline consistent with driver and Chromium startup limits.
+- Restore standalone TUI pause, resume and stop control through a per-scan context and Discovery checkpoints.
+- Use the selected Python environment to install Playwright browsers and verify Chromium launches before completing native installation.
+- Preserve HTTP source capture for individual browser-capture failures.
+
+### Validation
+- Python and shell syntax and patch whitespace checks completed. A live target scan has not been run for this release.
+
 ## [4.0.34-beta] - 2026-10-13
 
 ### Fixed

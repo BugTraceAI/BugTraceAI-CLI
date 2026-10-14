@@ -531,9 +531,29 @@ install_local() {
 
     echo ""
     print_step "Installing Playwright browsers..."
-    playwright install chromium
+    python3 -m playwright install chromium || return 1
     if [[ "$(uname -s)" == Linux ]]; then
-        playwright install-deps chromium
+        python3 -m playwright install-deps chromium || return 1
+    fi
+    print_step "Checking Chromium startup in the installed Python environment..."
+    if ! python3 - <<'PY'
+import asyncio
+from playwright.async_api import async_playwright
+
+async def check_browser():
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-setuid-sandbox"],
+            timeout=30000,
+        )
+        await browser.close()
+
+asyncio.run(asyncio.wait_for(check_browser(), timeout=45.0))
+PY
+    then
+        print_error "Chromium could not start. Local installation is incomplete."
+        return 1
     fi
     print_success "Playwright Chromium installed"
     

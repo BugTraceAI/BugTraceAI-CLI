@@ -1,6 +1,6 @@
 # BugTraceAI-CLI
 
-[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.34--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://img.shields.io/badge/DeepWiki-Ask%20AI-blue)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
+[![Website](https://img.shields.io/badge/Website-bugtraceai.com-blue)](https://bugtraceai.com) [![Version](https://img.shields.io/badge/Version-4.0.35--beta-orange)](https://github.com/BugTraceAI/BugTraceAI-CLI/releases) [![Python](https://img.shields.io/badge/Python-3.10+-blue)](INSTALLATION.md) [![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE) [![DeepWiki](https://img.shields.io/badge/DeepWiki-Ask%20AI-blue)](https://deepwiki.com/BugTraceAI/BugTraceAI-CLI)
 
 **Agentic web pentesting with a terminal workspace, specialist tools, browser validation, REST and MCP.**
 

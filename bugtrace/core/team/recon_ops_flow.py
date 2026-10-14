@@ -252,11 +252,11 @@ class TeamReconOpsMixin(TeamReconHtmlMixin, TeamReconHitlMixin, TeamReconDispatc
     async def _run_diagnostics(self) -> bool:
         """Run system diagnostics."""
         from bugtrace.core.diagnostics import diagnostics
-        if not await diagnostics.run_all():
+        if not await diagnostics.run_all(require_browser=True):
             dashboard.log("❌ CRITICAL SYSTEM FAILURE: Diagnostics failed. Aborting.", "CRITICAL")
             failures = [error for check, (passed, error) in diagnostics.results.items()
-                        if check in {"api_key", "connectivity", "credits"} and not passed]
-            reason = "; ".join(failures) or "critical provider checks failed"
+                        if check in {"api_key", "connectivity", "credits", "browser"} and not passed]
+            reason = "; ".join(failures) or "critical system checks failed"
             raise RuntimeError(f"Scanner preflight failed: {reason}")
         return True
     def _setup_scan_directory(self, start_time: datetime) -> tuple:

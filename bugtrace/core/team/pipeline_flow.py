@@ -630,6 +630,9 @@ class TeamPipelineMixin:
                     if timeout_tracker["auto_paused"]:
                         return (url, [])
 
+                    if await self._check_stop_requested(dashboard):
+                        return (url, [])
+
                     logger.info(f"[DAST] ▶ Starting: {url[:60]}")
                     conductor.notify_log("INFO", f"[DAST] Analyzing URL {url_index}/{total_urls}: {url[:80]}")
 
