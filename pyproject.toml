@@ -3,7 +3,7 @@ name = "bugtraceai-cli"
 dynamic = ["version"]
 description = "AI-Driven Professional Penetration Testing Framework - Autonomous offensive security scanner with LLM-powered analysis"
 authors = [
-    { name = "BugTraceAI Team", email = "hello@bugtraceai.com" }
+    { name = "BugTraceAI Team", email = "info@bugtraceai.com" }
 ]
 license = { text = "Apache-2.0" }
 readme = "README.md"
