@@ -308,13 +308,21 @@ class BugTraceApp(App):
         if self._tui_quitting:
             return
         self._tui_quitting = True
-        await self.action_stop_scan()
-        self.exit()
+        try:
+            await self.action_stop_scan()
+        except Exception:
+            self.log.error("Failed to stop scan during shutdown")
+        finally:
+            self.exit()
 
     async def on_unmount(self) -> None:
-        if self.scan_process:
-            await self.scan_process.stop()
-        self._release_scan_lock()
+        try:
+            if self.scan_process:
+                await self.scan_process.stop()
+        except Exception as exc:
+            self.log.error(f"Failed to stop scan during unmount: {exc}")
+        finally:
+            self._release_scan_lock()
 
     def action_view(self, pane: str) -> None:
         self.main_screen.query_one("#workspace-tabs", TabbedContent).active = pane
