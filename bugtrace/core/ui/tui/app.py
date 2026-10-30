@@ -139,20 +139,20 @@ class BugTraceApp(App):
             import os
             if not (self._provider_keys.get(key_env) or os.environ.get(key_env) or getattr(settings, key_env, None)):
                 raise ValueError(f"Open Provider (F7) and configure an API key for {self.provider} before starting a scan.")
-        from bugtrace.core.instance_lock import check_existing_instance, write_lock_file
-        existing = check_existing_instance()
+        from bugtrace.core.instance_lock import check_existing_scan, write_scan_lock_file
+        existing = check_existing_scan()
         if existing:
             self.notify(f"Another scan is active (PID {existing[0]}). Stop it before starting a new scan.", severity="error")
             return False
-        self._owned_lock = write_lock_file(f"bugtrace tui {self.target}")
+        self._owned_lock = write_scan_lock_file(f"bugtrace tui {self.target}")
         if not self._owned_lock:
             self.notify("Cannot acquire the scan lock. Check the logs directory permissions.", severity="error")
         return self._owned_lock
 
     def _release_scan_lock(self) -> None:
         if self._owned_lock:
-            from bugtrace.core.instance_lock import remove_lock_file
-            remove_lock_file()
+            from bugtrace.core.instance_lock import remove_scan_lock_file
+            remove_scan_lock_file()
             self._owned_lock = False
 
     def _update_crawl_controls(self) -> None:

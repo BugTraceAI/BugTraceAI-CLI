@@ -19,6 +19,7 @@ console = Console()
 
 # Lock file location - stored in logs directory
 LOCK_FILE_NAME = ".bugtrace.lock"
+SCAN_LOCK_FILE_NAME = ".bugtrace-scan.lock"
 
 
 def get_lock_file_path() -> Path:
@@ -28,12 +29,17 @@ def get_lock_file_path() -> Path:
     return settings.LOG_DIR / LOCK_FILE_NAME
 
 
-def read_lock_file() -> Optional[Tuple[int, str]]:
+def get_scan_lock_file_path() -> Path:
+    """Get the lock path shared by CLI and TUI scan entry points."""
+    settings.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return settings.LOG_DIR / SCAN_LOCK_FILE_NAME
+
+
+def _read_lock_file(lock_path: Path) -> Optional[Tuple[int, str]]:
     """
-    Read the lock file and return (pid, command) if it exists.
+    Read a lock file and return (pid, command) if it exists.
     Returns None if lock file doesn't exist or is invalid.
     """
-    lock_path = get_lock_file_path()
     if not lock_path.exists():
         return None
 
@@ -58,6 +64,16 @@ def read_lock_file() -> Optional[Tuple[int, str]]:
     return None
 
 
+def read_lock_file() -> Optional[Tuple[int, str]]:
+    """Read the general BugTraceAI instance lock."""
+    return _read_lock_file(get_lock_file_path())
+
+
+def read_scan_lock_file() -> Optional[Tuple[int, str]]:
+    """Read the active scan lock, independent of long-running services."""
+    return _read_lock_file(get_scan_lock_file_path())
+
+
 def is_process_running(pid: int) -> bool:
     """Check if a process with the given PID is still running."""
     try:
@@ -70,12 +86,11 @@ def is_process_running(pid: int) -> bool:
         return False
 
 
-def write_lock_file(command: str = "") -> bool:
+def _write_lock_file(lock_path: Path, command: str = "") -> bool:
     """
-    Write the current PID to the lock file.
+    Write the current PID to a lock file.
     Returns True on success, False on failure.
     """
-    lock_path = get_lock_file_path()
     try:
         current_pid = os.getpid()
         lock_path.write_text(f"{current_pid}\n{command}")
@@ -85,17 +100,36 @@ def write_lock_file(command: str = "") -> bool:
         return False
 
 
-def remove_lock_file():
-    """Remove the lock file (called on clean exit)."""
-    lock_path = get_lock_file_path()
+def write_lock_file(command: str = "") -> bool:
+    """Write the current PID to the general instance lock."""
+    return _write_lock_file(get_lock_file_path(), command)
+
+
+def write_scan_lock_file(command: str = "") -> bool:
+    """Write the current PID to the active scan lock."""
+    return _write_lock_file(get_scan_lock_file_path(), command)
+
+
+def _remove_lock_file(lock_path: Path):
+    """Remove a lock file when it belongs to the current process."""
     try:
         if lock_path.exists():
             # Only remove if it's our PID
-            lock_info = read_lock_file()
+            lock_info = _read_lock_file(lock_path)
             if lock_info and lock_info[0] == os.getpid():
                 lock_path.unlink()
     except Exception:
         pass
+
+
+def remove_lock_file():
+    """Remove the general instance lock on clean exit."""
+    _remove_lock_file(get_lock_file_path())
+
+
+def remove_scan_lock_file():
+    """Remove the active scan lock on clean exit."""
+    _remove_lock_file(get_scan_lock_file_path())
 
 
 def terminate_other_instance(pid: int) -> bool:
@@ -131,12 +165,12 @@ def terminate_other_instance(pid: int) -> bool:
         return False
 
 
-def check_existing_instance() -> Optional[Tuple[int, str]]:
+def _check_existing_instance(lock_path: Path) -> Optional[Tuple[int, str]]:
     """
-    Check if another BugTraceAI instance is running.
+    Check if the process recorded in a lock file is still running.
     Returns (pid, command) if running, None otherwise.
     """
-    lock_info = read_lock_file()
+    lock_info = _read_lock_file(lock_path)
     if lock_info is None:
         return None
 
@@ -165,11 +199,21 @@ def check_existing_instance() -> Optional[Tuple[int, str]]:
 
     # Process no longer running - clean up stale lock
     try:
-        get_lock_file_path().unlink()
+        lock_path.unlink()
     except Exception:
         pass
 
     return None
+
+
+def check_existing_instance() -> Optional[Tuple[int, str]]:
+    """Check whether another general BugTraceAI instance is running."""
+    return _check_existing_instance(get_lock_file_path())
+
+
+def check_existing_scan() -> Optional[Tuple[int, str]]:
+    """Check whether another CLI or TUI scan is already running."""
+    return _check_existing_instance(get_scan_lock_file_path())
 
 
 def prompt_instance_conflict(pid: int, command: str) -> str:
@@ -215,8 +259,17 @@ def acquire_instance_lock(command: str = "") -> bool:
 
     Returns True if we should proceed, False if we should abort.
     """
-    # Check for existing instance
-    existing = check_existing_instance()
+    # Scans must not collide with long-running services such as `bugtrace serve`.
+    # Keep their locks separate while sharing one scan lock between CLI and TUI.
+    command_parts = command.strip().split()
+    command_name = command_parts[1] if len(command_parts) > 1 and command_parts[0] == "bugtrace" else ""
+    scan_command = command_name in {"scan", "full", "audit", "tui", "all", "hunter", "manager"}
+    check_existing = check_existing_scan if scan_command else check_existing_instance
+    write_lock = write_scan_lock_file if scan_command else write_lock_file
+    remove_lock = remove_scan_lock_file if scan_command else remove_lock_file
+
+    # Check for an existing instance or scan, depending on the command.
+    existing = check_existing()
 
     if existing:
         pid, old_command = existing
@@ -242,10 +295,10 @@ def acquire_instance_lock(command: str = "") -> bool:
             return False
 
     # No conflict - write our lock file
-    write_lock_file(command)
+    write_lock(command)
 
     # Register cleanup on exit
     import atexit
-    atexit.register(remove_lock_file)
+    atexit.register(remove_lock)
 
     return True
