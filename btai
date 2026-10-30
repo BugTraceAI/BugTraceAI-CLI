@@ -3,6 +3,9 @@
 set -euo pipefail
 BT_AI_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$BT_AI_ROOT"
+# Rich/Textual otherwise downgrades the TUI palette to 256 colors when the
+# terminal sets TERM=xterm-256color but leaves COLORTERM unset.
+export COLORTERM="${COLORTERM:-truecolor}"
 BT_AI_RUNTIME=local
 BT_AI_INTERFACE=tui
 if [[ -f .bugtrace-install.env ]]; then
@@ -29,9 +32,9 @@ case "$BT_AI_RUNTIME" in
         fi
         BT_AI_COMPOSE=("${COMPOSE_ARGS[@]}")
         if [[ "$BT_AI_INTERFACE" == tui ]]; then
-            exec "${BT_AI_COMPOSE[@]}" -f docker-compose.tui.yml run --rm -e "TERM=${TERM:-xterm-256color}" scanner tui "$@"
+            exec "${BT_AI_COMPOSE[@]}" -f docker-compose.tui.yml run --rm -e "TERM=${TERM:-xterm-256color}" -e "COLORTERM=$COLORTERM" scanner tui "$@"
         else
-            exec "${BT_AI_COMPOSE[@]}" exec -e "TERM=${TERM:-xterm-256color}" api python3 -m bugtrace tui "$@"
+            exec "${BT_AI_COMPOSE[@]}" exec -e "TERM=${TERM:-xterm-256color}" -e "COLORTERM=$COLORTERM" api python3 -m bugtrace tui "$@"
         fi
         ;;
     *) echo 'Invalid saved runtime. Run ./install.sh again.' >&2; exit 1 ;;
