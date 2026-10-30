@@ -1,4 +1,5 @@
 from rich.logging import RichHandler
+from rich.console import Console
 import contextvars
 import logging
 import sys
@@ -121,7 +122,7 @@ def get_logger(name: str):
     logger.setLevel(logging.INFO)
 
     # 1. Console Handler (Rich)
-    console_handler = RichHandler(rich_tracebacks=True, show_time=False, show_level=True)
+    console_handler = RichHandler(rich_tracebacks=True, show_time=False, show_level=True, console=Console(stderr=True))
     console_handler.setLevel(logging.INFO)
     logger.addHandler(console_handler)
 
