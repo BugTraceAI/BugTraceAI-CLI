@@ -1,0 +1,50 @@
+{
+    "id": "featherless",
+    "name": "Featherless AI",
+    "api_format": "openai",
+    "base_url": "https://api.featherless.ai/v1/chat/completions",
+    "api_key_env": "FEATHERLESS_API_KEY",
+    "api_key_hint": "rc_...",
+    "headers": {
+        "HTTP-Referer": "https://bugtraceai.com",
+        "X-Title": "Bugtrace-featherless"
+    },
+    "failover": [],
+    "features": {
+        "description": "Featherless AI serverless inference for open-weight models via the OpenAI-compatible endpoint at https://api.featherless.ai/v1. Model IDs use the 'org/model' form (e.g. Qwen/Qwen3.8-27B). Billing is by concurrent-unit credits rather than a prepaid USD balance, so balance_check is disabled to bypass the OpenRouter credit gate.",
+        "online_mode": false,
+        "balance_check": false,
+        "model_discovery": false
+    },
+    "models": {
+        "DEFAULT_MODEL": "Qwen/Qwen3.8-27B",
+        "CODE_MODEL": "Qwen/Qwen3.8-27B",
+        "ANALYSIS_MODEL": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "ANALYSIS_PENTESTER_MODEL": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "ANALYSIS_BUG_BOUNTY_MODEL": "zai-org/GLM-5.3",
+        "ANALYSIS_AUDITOR_MODEL": "Qwen/Qwen3.8-27B",
+        "ANALYSIS_RED_TEAM_MODEL": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "ANALYSIS_RESEARCHER_MODEL": "zai-org/GLM-5.3",
+        "PRIMARY_MODELS": "Qwen/Qwen3.8-27B,deepseek-ai/DeepSeek-V4.1-Flash",
+        "VISION_MODEL": "google/gemma-4-31B-it",
+        "WAF_DETECTION_MODELS": "Qwen/Qwen3.8-27B",
+        "MUTATION_MODEL": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "SKEPTICAL_MODEL": "zai-org/GLM-5.3",
+        "REPORTING_MODEL": "Qwen/Qwen3.8-27B",
+        "VALIDATION_VISION_MODEL": "google/gemma-4-31B-it",
+        "LONEWOLF_MODEL": "Qwen/Qwen3.8-27B"
+    },
+    "concurrency": {
+        "Qwen/Qwen3.8-27B": 2,
+        "deepseek-ai/DeepSeek-V4.1-Flash": 2,
+        "zai-org/GLM-5.3": 1,
+        "google/gemma-4-31B-it": 2,
+        "default": 1
+    },
+    "pricing": {
+        "Qwen/Qwen3.8-27B": { "input": 0.40, "output": 3.00 },
+        "deepseek-ai/DeepSeek-V4.1-Flash": { "input": 0.30, "output": 1.20 },
+        "zai-org/GLM-5.3": { "input": 1.40, "output": 4.40 },
+        "google/gemma-4-31B-it": { "input": 0.12, "output": 0.36 }
+    }
+}

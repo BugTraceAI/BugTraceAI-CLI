@@ -135,7 +135,7 @@ _JOB_SEQ = {"n": 0}
 _MAX_JOBS = 50  # keep memory bounded; evict oldest finished jobs
 _MAX_RUNNING_JOBS = 3
 _MAX_CANDIDATE_CALLS_PER_JOB = 120
-_SUPPORTED_PROVIDERS = {"openrouter", "openrouter-v2"}
+_SUPPORTED_PROVIDERS = {"openrouter", "openrouter-v2", "featherless"}
 
 
 def _job_is_active(job: _Job) -> bool:
